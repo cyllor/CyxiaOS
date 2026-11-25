@@ -43,8 +43,16 @@ pub struct CommitEvidence{
 }
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Outcome{Boot{epoch:u64},Service{role:Role,generation:u64,isolated:bool},ConfigInstalled{generation:u64}}
+/// Exact protected journal reservation, bound before the first write.
+/// Not a new on-disk format. The native journal owner validates that this
+/// is the current exclusive extent on the correct mounted device.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct RedoPlacement{
+    pub fs_uuid:[u8;16],pub log_epoch:u64,pub first:u32,pub state_home:u32,
+    pub boot_home:Option<u32>,pub txid:u64,pub commit_lsn:u64,
+}
 #[derive(Clone,Copy)]
-struct Pending{ticket:PreparedEpoch,after:SecurityStateStoreV2,outcome:Outcome}
+struct Pending{ticket:PreparedEpoch,after:SecurityStateStoreV2,outcome:Outcome,placement:Option<RedoPlacement>}
 /// No public method turns a prepared or UNKNOWN update into a boot/service
 /// grant. An in-progress state survives ambiguous callback results; retries
 /// use the same after-image, not a second monotonic increment.
@@ -53,6 +61,7 @@ pub struct DurableEpochGate{
     slots:[SlotBinding;ROLE_COUNT],
     pending:Option<Pending>,
     last:Option<(PreparedEpoch,CommitEvidence,Outcome)>,
+    last_placement:Option<RedoPlacement>,
     boot_confirmed:bool,
     paired_store:bool,
     startup_verified:bool,
@@ -73,7 +82,7 @@ impl DurableEpochGate{
             }
         }
         verify_recovered(&state)?;
-        Ok(Self{committed:state,slots,pending:None,last:None,boot_confirmed:false,
+        Ok(Self{committed:state,slots,pending:None,last:None,last_placement:None,boot_confirmed:false,
             paired_store:false,startup_verified:false,paired_confirmed:false})
     }
     /// Reconcile both actual protected startup stores. This alone is
@@ -166,7 +175,7 @@ impl DurableEpochGate{
             old_state_generation:self.committed.state_generation,
             new_state_generation:after.state_generation,target_boot_epoch:after.last_boot_epoch,
             after_digest:hash(&raw)};
-        self.pending=Some(Pending{ticket,after,outcome});
+        self.pending=Some(Pending{ticket,after,outcome,placement:None});
         Ok(ticket)
     }
     /// Offline startup only. The caller must supply the actual verified
@@ -213,8 +222,41 @@ impl DurableEpochGate{
         }
         verify_quiesced(config,&old,&after)?;
         self.startup_verified=false;
-        self.pending=Some(Pending{ticket,after,outcome:Outcome::ConfigInstalled{generation:h.generation}});
+        self.pending=Some(Pending{ticket,after,outcome:Outcome::ConfigInstalled{generation:h.generation},placement:None});
         Ok(ticket)
+    }
+    /// Bind the one actual transaction before any side-effecting I/O.
+    /// A repeat, even with identical bytes, is query-only; callers must
+    /// independently reconcile the retained extent rather than append again.
+    pub fn claim_redo_once(&mut self,ticket:PreparedEpoch,placement:RedoPlacement,
+        verify_reserved_extent:impl FnOnce(&RedoPlacement)->Result<(),Error>)->Result<(),Error>{
+        use super::file_media_v0199::{DATA_START,BLOCK_COUNT};
+        let p=self.pending.as_mut().ok_or(Error::Stale)?;
+        if p.ticket!=ticket{return Err(Error::Conflict);}
+        if let Some(prior)=p.placement{
+            return Err(if prior==placement{Error::Busy}else{Error::Conflict});
+        }
+        let paired=self.paired_store&&ticket.change==Change::AllocateBoot;
+        if placement.fs_uuid!=ticket.fs_uuid||placement.log_epoch==0||placement.txid==0
+            ||placement.commit_lsn<if paired{4}else{3}
+            ||!(2..=if paired{4092}else{4094}).contains(&placement.first)
+            ||!(DATA_START..BLOCK_COUNT).contains(&placement.state_home)
+            ||placement.boot_home.is_some()!=paired
+            ||placement.boot_home.is_some_and(|b|b==placement.state_home||!(DATA_START..BLOCK_COUNT).contains(&b)){
+            return Err(Error::Invalid);
+        }
+        verify_reserved_extent(&placement)?;
+        p.placement=Some(placement);Ok(())
+    }
+    fn check_redo_placement(&self,ticket:PreparedEpoch,placement:RedoPlacement)->Result<(),Error>{
+        if let Some(p)=self.pending{
+            if p.ticket!=ticket{return Err(Error::Busy);}
+            return if p.placement==Some(placement){Ok(())}
+                else if p.placement.is_none(){Err(Error::Unauthorized)}else{Err(Error::Conflict)};
+        }
+        if self.last.is_some_and(|(t,_,_)|t==ticket)&&self.last_placement==Some(placement){
+            Ok(())
+        }else{Err(Error::Stale)}
     }
     pub fn after_image(&self,ticket:PreparedEpoch)->Result<[u8;BLOCK_BYTES],Error>{
         let p=self.pending.ok_or(Error::Stale)?;
@@ -240,9 +282,12 @@ impl DurableEpochGate{
         if superblock.fs_uuid!=receipt.fs_uuid || superblock.log_epoch!=receipt.log_epoch{
             return Err(Error::Conflict);
         }
+        if redos.len()!=1{return Err(Error::Conflict);}
+        self.check_redo_placement(ticket,RedoPlacement{fs_uuid:receipt.fs_uuid,log_epoch:receipt.log_epoch,
+            first:first_log_block,state_home:u32::try_from(state_home).map_err(|_|Error::Invalid)?,
+            boot_home:None,txid:receipt.txid,commit_lsn:receipt.commit_lsn})?;
         verify_state_redo_v1(superblock,first_log_block,state_home,begin,redos,commit,
             readback,receipt.txid,receipt.commit_lsn)?;
-        if matches!(ticket.change,Change::InstallConfig{..})&&redos.len()!=1{return Err(Error::Conflict);}
         self.confirm_inner(ticket,receipt,readback,false,true,verify_native)
     }
     /// Atomic startup proof: both exact state and BootEpochStore images
@@ -258,6 +303,8 @@ impl DurableEpochGate{
         if !self.paired_store||ticket.change!=Change::AllocateBoot{return Err(Error::Unauthorized);}
         let sb=super::file_media_v0199::SuperblockV1::decode(superblock_raw)?;
         if sb.fs_uuid!=receipt.fs_uuid||sb.log_epoch!=receipt.log_epoch{return Err(Error::Conflict);}
+        self.check_redo_placement(ticket,RedoPlacement{fs_uuid:receipt.fs_uuid,log_epoch:receipt.log_epoch,
+            first:first_log_block,state_home,boot_home:Some(boot_home),txid:receipt.txid,commit_lsn:receipt.commit_lsn})?;
         let state=super::boot_epoch_v1::verify_boot_pair(sb,first_log_block,state_home,boot_home,
             begin,redos,commit,readback,boot_readback,receipt.txid,receipt.commit_lsn)?;
         if state.last_boot_epoch!=ticket.target_boot_epoch{return Err(Error::Conflict);}
@@ -281,7 +328,8 @@ impl DurableEpochGate{
         paired:bool,redo_verified:bool,verify_commit:impl FnOnce(&PreparedEpoch,&CommitEvidence)->Result<(),Error>)
         ->Result<Outcome,Error>{
         if self.paired_store&&ticket.change==Change::AllocateBoot&&!paired{return Err(Error::Unauthorized);}
-        if matches!(ticket.change,Change::InstallConfig{..})&&!redo_verified{return Err(Error::Unauthorized);}
+        if !redo_verified&&(self.paired_store||matches!(ticket.change,Change::InstallConfig{..})
+            ||self.pending.is_some_and(|p|p.placement.is_some())){return Err(Error::Unauthorized);}
         // The prior receipt is historical, not current startup authority.
         // Never return its successful outcome while a newer transaction
         // fences boot/service generation reads (even if bytes still match).
@@ -304,6 +352,7 @@ impl DurableEpochGate{
         self.committed=p.after;
         if matches!(p.outcome,Outcome::Boot{..}){self.boot_confirmed=true;}
         self.last=Some((ticket,receipt,p.outcome));
+        self.last_placement=p.placement;
         self.pending=None;
         Ok(p.outcome)
     }
