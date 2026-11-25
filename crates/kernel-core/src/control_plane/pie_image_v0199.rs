@@ -235,6 +235,15 @@ impl<'a> PieImage<'a> {
         el0_end:u64,
         relocations:&[RelativeRelocation],
     )->Result<(),Error>{
+        self.stage_private_image_checkpointed(staging,random_base,el0_start,el0_end,relocations,||{})
+    }
+    /// Same fully preflighted private staging operation, with bounded
+    /// progress points after each page-sized copy or scrub. The native
+    /// loader retains exclusive ownership and never maps unfinished data.
+    pub fn stage_private_image_checkpointed(
+        &self,staging:&mut [u8],random_base:u64,el0_start:u64,el0_end:u64,
+        relocations:&[RelativeRelocation],mut checkpoint:impl FnMut(),
+    )->Result<(),Error>{
         if staging.is_empty() || staging.len()>MAX_IMAGE_BYTES {
             return Err(Error::Invalid);
         }
@@ -247,20 +256,27 @@ impl<'a> PieImage<'a> {
                 return Err(Error::Invalid);
             }
         }
-        staging.fill(0);
+        for chunk in staging.chunks_mut(PAGE_BYTES as usize){
+            chunk.fill(0);checkpoint();
+        }
         for seg in self.loads[..self.load_count].iter().flatten() {
             let off=usize::try_from(seg.file_offset).map_err(|_|Error::Invalid)?;
             let n=usize::try_from(seg.file_bytes).map_err(|_|Error::Invalid)?;
             let at=usize::try_from(seg.virtual_address).map_err(|_|Error::Invalid)?;
-            staging[at..at+n].copy_from_slice(&self.verified_bytes[off..off+n]);
+            for (dst,src) in staging[at..at+n].chunks_mut(PAGE_BYTES as usize)
+                .zip(self.verified_bytes[off..off+n].chunks(PAGE_BYTES as usize)){
+                dst.copy_from_slice(src);checkpoint();
+            }
             // The remaining p_memsz-p_filesz bytes are already zero.
         }
-        for relocation in relocations {
+        for (i,relocation) in relocations.iter().enumerate() {
             let at=usize::try_from(relocation.offset).map_err(|_|Error::Invalid)?;
             let value=(random_base as i128)+(relocation.addend as i128);
             let relocated=u64::try_from(value).map_err(|_|Error::Invalid)?;
             staging[at..at+8].copy_from_slice(&relocated.to_le_bytes());
+            if i%16==15{checkpoint();}
         }
+        checkpoint();
         Ok(())
     }
 
@@ -375,8 +391,12 @@ impl<'a> VerifiedRolePackage<'a>{
     /// All writes remain in unpublished staging. The native owner separately
     /// accounts mapped pages, guard stack, RELRO, TLB/cache sync and publication.
     pub fn stage(&self,staging:&mut[u8],base:u64,start:u64,end:u64)->Result<u64,Error>{
+        self.stage_checkpointed(staging,base,start,end,||{})
+    }
+    pub fn stage_checkpointed(&self,staging:&mut[u8],base:u64,start:u64,end:u64,
+        checkpoint:impl FnMut())->Result<u64,Error>{
         let entry=base.checked_add(self.image.entry).ok_or(Error::Invalid)?;
-        self.image.stage_private_image(staging,base,start,end,self.relative)?;
+        self.image.stage_private_image_checkpointed(staging,base,start,end,self.relative,checkpoint)?;
         Ok(entry)
     }
 }
