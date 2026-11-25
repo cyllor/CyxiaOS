@@ -579,7 +579,7 @@ def main():
         result['cross_process_formatted_mount_checkpoint_verified']=True
         result['native_d15_actual_effect_fixture_verified']=True
         result['native_d07_actual_effect_fixture_verified']=True
-        result['native_d02_actual_effect_fixture_verified']=all(b.get('native_d02_effect_fixture_verified') for b in result['boots'])
+        result['native_d02_actual_effect_fixture_verified']=all(b.get('observations',{}).get('native_d02_effect_fixture_verified') for b in result['boots'])
         verify_smp.require(result['native_d02_actual_effect_fixture_verified'],'missing D02 actual physical proof')
     except (OSError,ValueError,RuntimeError) as e:
         result['error']=str(e)
