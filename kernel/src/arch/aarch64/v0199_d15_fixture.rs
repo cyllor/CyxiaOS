@@ -5,11 +5,11 @@
 //! training or formal G4 claim, and no complete CPU0 budget claim.
 use super::*;
 use cyxia_contracts::{ConsoleOps,PlatformError,UartResource};
-use cyxia_control_model::native_v0199::SnapshotReplyV3;
-use cyxia_kernel_core::control_plane::{
+ use cyxia_kernel_core::control_plane::{
     Error,Identity,action_schema_v2::ActionV2,
     candidate_registry_v0199::{CatalogEntry,FrozenCandidates},
     d15_owner_v0199::{Clock,Owner,PumpEvidence},
+    snapshot_store_v3::{SnapshotStore,Target,DomainObservation},
     apply_report_v1::{ActionStatus,ApplyReportV1,BoundReport,ExecutorBindingV1,ReportOrigin,TrustedApplyScope,MAX_APPLY_REPORT_BYTES},
     registered_gate_v3::{RegisteredDecisionGate,Registration,Publication,TrustedRegistrationScope},
     rule_profile_v2::{Profile,Candidates},feedback_v0199::{FeedbackInbox,CausalLabel},
@@ -23,6 +23,7 @@ const TARGET:Identity=Identity{id:15,generation:1};
 const BASE_PAYLOAD:&[u8]=b"V0199_D15_BASELINE actual ordinary UART frame 0123456789abcdef\n";
 const APPLY_PAYLOAD:&[u8]=b"V0199_D15_APPLIED actual ordinary UART frame 0123456789abcdef\n";
 static mut OWNER:Owner=Owner::empty();
+static mut SNAPSHOTS:SnapshotStore=SnapshotStore::empty();
 static mut FEEDBACK:FeedbackInbox=match FeedbackInbox::new(SUP,LEARN){Ok(x)=>x,Err(_)=>panic!("fixture identity")};
 struct NativeClock;
 fn now()->u64{
@@ -90,7 +91,7 @@ fn retain_bytes(at:usize,bytes:&[u8]){
         SMP_EVIDENCE.words[at+i].store(u64::from_le_bytes(word),Ordering::Relaxed);
     }
 }
-pub(super) fn run(boot:u64){
+pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     assert_eq!(cpu::slot(),0);
     // Diagnostic owner has actual device access; no user cap issuance.
     let base=crate::UART.load(Ordering::Acquire);assert_ne!(base,0);
@@ -104,9 +105,18 @@ pub(super) fn run(boot:u64){
     assert_eq!(owner.written(),baseline as u64);assert!(baseline_max>0&&baseline_max<=8);
     let applied=crate::machine::enqueue_v0199(owner,APPLY_PAYLOAD,now()).unwrap();
     let sample=now();let fields=owner.observe(sample).unwrap();
-    let mut raw=[None;12];raw[8..].copy_from_slice(&fields);
-    let snap=SnapshotReplyV3{snapshot_seq:1,boot_epoch:boot,ledger_generation:1,core_generation:1,
-        target_id:TARGET.id,target_generation:TARGET.generation,sampled_ns:sample,domain:15,fields:raw};
+    // The same protected registry used by the current SnapshotReply v3
+    // reader now owns this actual HAL observation. The epoch disk caller
+    // supplies the confirmed boot from DurableEpochGate, not a model.
+    let snapshots=unsafe{&mut *core::ptr::addr_of_mut!(SNAPSHOTS)};
+    snapshots.bind_boot(boot,||if confirmed_boot==Some(boot){Ok(())}else{Err(Error::Denied)}).unwrap();
+    let target=Target{domain:15,object:TARGET,owner:Identity{id:1,generation:1}};
+    snapshots.register_target(target,|t|if t.object==owner.target(){Ok(())}else{Err(Error::Denied)}).unwrap();
+    let observation=DomainObservation{target,fields};
+    assert_eq!(snapshots.capture(1,1,sample,[None;8],&[observation],|o|
+        if o.target==target&&o.fields==owner.observe(sample)?{Ok(())}else{Err(Error::Denied)}),Ok(1));
+    let snap=snapshots.frozen_for_owner(target,1,1,now(),|t|
+        if t.object==owner.target(){Ok(())}else{Err(Error::Denied)}).unwrap();
     let values=ActionV2::values(15).unwrap();
     let catalog:[CatalogEntry;4]=core::array::from_fn(|i|CatalogEntry{ordinal:i as u16,value:values[i]});
     let catalog_digest=sha(b"CYX/D15-FIXTURE-ORDINALS/0=1,1=8,2=32,3=64");
