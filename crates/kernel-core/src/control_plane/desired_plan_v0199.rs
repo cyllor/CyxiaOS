@@ -17,6 +17,7 @@ fn report_digest(r:&ApplyReportV1<'_>)->Result<[u8;32],Error>{
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct PublishedAction{
     pub key:PlanKey,pub index:u16,pub binding:ExecutorBindingV1,
+    pub plan_digest:[u8;32],
     pub version:u64,pub prior_target_version:u64,pub until_ns:u64,
     pub value:ActionV2,pub published_ns:u64,pub accepted_ns:Option<u64>,
 }
@@ -99,6 +100,7 @@ impl DesiredBank{
         if scope.sampled_ns>scope.now_ns||scope.now_ns-scope.sampled_ns>=100_000_000{return Err(Error::Expired);}
         let next=self.version.checked_add(1).ok_or(Error::Exhausted)?;
         let count=usize::from(plan.header.action_count);
+        let plan_digest=Sha256::digest(wire).into();
         let mut slots=[0usize;MAX_ACTIONS];let mut stage=[None;MAX_ACTIONS];
         for i in 0..count{
             let a=plan.action(i)?;
@@ -113,7 +115,7 @@ impl DesiredBank{
             if slots[..i].contains(&slot){return Err(Error::Denied);}
             slots[i]=slot;
             stage[i]=Some(PublishedAction{key:PlanKey{boot_epoch:self.boot,controller_epoch:self.controller,
-                plan_seq:plan.header.plan_seq},index:i as u16,binding:row.binding,version:next,
+                plan_seq:plan.header.plan_seq},index:i as u16,binding:row.binding,plan_digest,version:next,
                 prior_target_version:row.accepted_version,until_ns:until,
                 value:ActionV2::decode(a.domain_id,a.action_kind,a.action_payload)?,
                 published_ns:scope.now_ns,accepted_ns:None});
@@ -124,6 +126,32 @@ impl DesiredBank{
         for i in 0..count{self.slots[slots[i]].as_mut().unwrap().pending=stage[i];}
         self.version=next;self.plan_hi=plan.header.plan_seq;self.last_ns=scope.now_ns;Ok(next)
     }
+    /// Read-only reconciliation of a committed plan whose publisher reply
+    /// was lost. All originally published target slots must still exist,
+    /// carry the exact complete plan digest, and have no accepted work.
+    /// No reconstructed reservation or new publication is performed.
+    pub fn verify_committed_publication(&self,plan:&PlanV2<'_>,digest:[u8;32],version:u64,
+        verify_reservations:impl FnOnce(&[Option<PublishedAction>])->Result<(),Error>,
+    )->Result<(),Error>{
+        if self.boot==0||self.fenced||plan.header.controller_epoch!=self.controller
+            ||version<=plan.header.base_plan_version||version>self.version
+            ||plan.header.plan_seq>self.plan_hi||digest==[0;32]{return Err(Error::Stale);}
+        let count=usize::from(plan.header.action_count);
+        let key=PlanKey{boot_epoch:self.boot,controller_epoch:self.controller,plan_seq:plan.header.plan_seq};
+        let mut stage=[None;MAX_ACTIONS];
+        for i in 0..count{
+            let a=plan.action(i)?;
+            let row=self.slots[self.index(a.domain_id,Identity{id:a.target_id,generation:a.target_generation})?].unwrap();
+            let p=row.pending.ok_or(Error::NotReady)?;
+            if p.key!=key||p.index!=i as u16||p.version!=version||p.plan_digest!=digest
+                ||p.binding!=row.binding||!row.binding.active||p.accepted_ns.is_some()||row.no_effect.is_some()
+                ||p.until_ns!=plan.header.active_until_local_ns
+                ||p.value!=ActionV2::decode(a.domain_id,a.action_kind,a.action_payload)?{return Err(Error::Denied);}
+            stage[i]=Some(p);
+        }
+        verify_reservations(&stage[..count])
+    }
+
     /// Invoke only inside the registered gate's exact ApplyWork acceptance
     /// callback. No version/lease supplied by the executor can replace the
     /// metadata frozen at publication. Owner must accept atomically or have
@@ -257,12 +285,16 @@ mod tests{
             assert_eq!(a.len(),2);assert!(a.iter().flatten().all(|a|a.version==1&&a.prior_target_version==0));
             Ok(())
         }),Ok(1));
+        let decoded=PlanV2::decode(&p[..n]).unwrap();let digest=Sha256::digest(&p[..n]).into();
+        assert_eq!(b.verify_committed_publication(&decoded,[3;32],1,|_|panic!()),Err(Error::Denied));
+        assert_eq!(b.verify_committed_publication(&decoded,digest,1,|a|{assert_eq!(a.len(),2);Ok(())}),Ok(()));
         let w=work(15,0);let other=work(16,1);let origin=ReportOrigin::Kernel;
         assert_eq!(b.accept(&ApplyWorkV1{plan_version:2,..w},origin,130,|_|panic!()),Err(Error::Denied));
         assert_eq!(b.accept(&w,origin,130,|_|Err(Error::Busy)),Err(Error::Busy));
         assert_eq!(b.pending(15,t0.target).unwrap().unwrap().accepted_ns,None);
         b.accept(&w,origin,130,|a|{assert_eq!(a.until_ns,10_000_000_100);Ok(())}).unwrap();
         assert_eq!(b.accept(&w,origin,131,|_|panic!()),Err(Error::Busy));
+        assert_eq!(b.verify_committed_publication(&decoded,digest,1,|_|panic!()),Err(Error::Denied));
         assert_eq!(b.finish(&report(other,ActionStatus::Applied),origin,140,|_|panic!()),Err(Error::Denied));
         let (p2,n2)=plan(2,1,false);
         assert_eq!(b.publish_registered(PUB,0,&p2[..n2],TrustedRegistrationScope{now_ns:140,..scope(1)},|_|panic!()),Err(Error::Busy));
