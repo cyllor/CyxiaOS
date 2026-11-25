@@ -394,7 +394,7 @@ class EpochFixture:
                 'D02 owner/proof outside reserved control pool')
         magic2,base_win,apply_win,base_count,apply_count,version2,sample2,accept2,completed2,rlen2,retained2,used2=w[379:391]
         require(magic2==0x4359443032465831 and base_win<apply_win
-                and (base_count,apply_count,version2,rlen2,retained2,used2)==(2,4,3,98,3,1718)
+                and (base_count,apply_count,version2,rlen2,retained2,used2)==(2,4,3,98,3,2006)
                 and sample2<=accept2<sample2+100_000_000 and accept2<=completed2,
                 'D02 token windows or report custody mismatch')
         require(w[395]%BLOCK==0 and 0x40000000<=w[395]<0x44000000
@@ -504,6 +504,22 @@ class EpochFixture:
                 'D02 actual execution not within original policy window')
         snap=proof[768:1032];rules=proof[1032:1120];plan=proof[1120:1332]
         decision=proof[1332:1588];report=proof[1588:1686];package=proof[1686:1718]
+        # Independent reconstruction of the exact CPU1 constructor ticket.
+        # Its acknowledgement must bind actual boot, request/package/group,
+        # original admission time/version and request digest, not just a
+        # sequential slot number echoed by CPU0.
+        for i,row in enumerate(rows,1):
+            at=1718+(i-1)*48
+            started,policy=struct.unpack_from('<2Q',proof,at)
+            require(policy==(0 if i<=2 else 3)
+                    and (0 if i==1 else rows[i-2][14])<=started<=row[13]
+                    and started//100_000_000==row[13]//100_000_000,
+                    'D02 asynchronous ticket timing or original policy mismatch')
+            rd=hashlib.sha256(b'CYX/D02-NATIVE-FIXTURE/v0199'
+                +struct.pack('<2Q',self.epoch,i)+package).digest()
+            ticket=struct.pack('<12Q',self.epoch,1,0xd0201,1,i,0xd0202,1,2,1,i,started,policy)+rd
+            require(hashlib.sha256(b'CYX/D02-STARTED/v0199'+ticket).digest()==proof[at+16:at+48],
+                    'D02 business worker exact ticket acknowledgement mismatch')
         require(struct.unpack_from('<IHH',snap)==(0x4359534e,3,72)
                 and struct.unpack_from('<7Q',snap,8)==(3,self.epoch,1,1,2,1,w[385])
                 and struct.unpack_from('<HHI',snap,64)==(2,12,0),'D02 exact observation scope mismatch')
@@ -556,7 +572,8 @@ class EpochFixture:
                     reclaimed_page_zero_verified=True,effect_owner_pool_dump_verified=True,
                     effect_owner_pool_sha256=hashlib.sha256(owner_raw).hexdigest(),
                     native_d02_effect_fixture_verified=True,d02_retired_pages_verified=True,
-                    d02_actual_cpu1_creations=6,d02_diagnostic_package_sha256=package.hex())
+                    d02_actual_cpu1_creations=6,d02_async_ticket_acknowledgements_verified=6,
+                    d02_diagnostic_package_sha256=package.hex())
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
