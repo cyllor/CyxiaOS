@@ -527,6 +527,34 @@ mod tests {
     }
 
     #[test]
+    fn overrun_settles_but_preserves_result() {
+        // Over budget by 1ns: settles (not an Err), classed as a work overrun.
+        let mut m = CriticalSectionMeter::new();
+        m.begin(SectionKind::EffectiveWork, 0).unwrap();
+        let s = m.end(WORK_BUDGET_NS + 1).unwrap();
+        assert_eq!(s.overrun_class, OverrunClass::Work);
+        assert_eq!(m.settled_count(), 1);
+        assert_eq!(m.overrun_count(), 1);
+        // Exactly at budget is not an overrun.
+        let mut m = CriticalSectionMeter::new();
+        m.begin(SectionKind::EffectiveWork, 0).unwrap();
+        let s = m.end(WORK_BUDGET_NS).unwrap();
+        assert_eq!(s.overrun_class, OverrunClass::None);
+        assert_eq!(m.overrun_count(), 0);
+        // End before begin: Clock error, and metering fails sticky-closed.
+        let mut m = CriticalSectionMeter::new();
+        m.begin(SectionKind::EffectiveWork, 100).unwrap();
+        assert_eq!(m.end(99), Err(Error::Clock));
+        // Scope stays open: a new begin is refused (Busy), no silent reset.
+        assert_eq!(m.begin(SectionKind::EffectiveWork, 200), Err(Error::Busy));
+        // An overrun latches the fault; later admission is denied.
+        let mut m = CriticalSectionMeter::new();
+        m.begin(SectionKind::EffectiveWork, 0).unwrap();
+        m.end(WORK_BUDGET_NS + 1).unwrap();
+        assert_eq!(m.begin(SectionKind::EffectiveWork, 99_999), Err(Error::Denied));
+    }
+
+    #[test]
     fn settlement_is_idempotent_and_counters_monotone() {
         let mut m = CriticalSectionMeter::new();
         m.begin(SectionKind::EffectiveWork, 10).unwrap();

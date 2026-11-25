@@ -100,6 +100,8 @@ use sha2::{Digest, Sha256};
 mod evidence;
 #[path = "production/frames.rs"]
 mod frames;
+#[path = "production/meter.rs"]
+mod meter;
 #[path = "production/recovery.rs"]
 pub(crate) mod recovery;
 
@@ -1006,7 +1008,9 @@ fn advice_dispatch(role_index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFra
                     publisher_cap: PUBLISHER_CAP,
                 };
                 let ledger = unsafe { &mut *ledger_ptr() };
-                match bridge.register_assisted_one(caller, args, &copy, frozen, scope, ledger) {
+                match meter::metered(|| {
+                    bridge.register_assisted_one(caller, args, &copy, frozen, scope, ledger)
+                }) {
                     Ok(Registration::Frozen) => 1,
                     Ok(Registration::ExactRetry) => 2,
                     Err(_) => 0,
@@ -1044,18 +1048,20 @@ fn advice_dispatch(role_index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFra
                     decision_endpoint_cap: DECISION_CAP,
                     publisher_cap: PUBLISHER_CAP,
                 };
-                match bridge.publish_assisted_one(
-                    caller,
-                    args,
-                    &plan_copy,
-                    core::slice::from_ref(&side_copy),
-                    frozen,
-                    scope,
-                    || {
-                        ACCEPT_COUNT.fetch_add(1, Ordering::Relaxed);
-                        Ok(())
-                    },
-                ) {
+                match meter::metered(|| {
+                    bridge.publish_assisted_one(
+                        caller,
+                        args,
+                        &plan_copy,
+                        core::slice::from_ref(&side_copy),
+                        frozen,
+                        scope,
+                        || {
+                            ACCEPT_COUNT.fetch_add(1, Ordering::Relaxed);
+                            Ok(())
+                        },
+                    )
+                }) {
                     Ok(Publication::AdapterAccepted) => 1,
                     Ok(Publication::ReplayNoEffect) => 2,
                     Err(_) => 0,
@@ -1848,6 +1854,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     evidence::put(evidence::W11_STAGED_BOOT_EPOCH, 1);
     frames::publish();
     recovery::publish();
+    meter::publish();
     words.words[2].store(1, Ordering::Release);
     // Framed UART payloads are capped at 96 bytes; keep the scope marker short.
     // in_vector_dispatch / staged_boot_epoch / fixture_executor are proven by the
