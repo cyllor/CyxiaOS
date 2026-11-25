@@ -11,6 +11,8 @@ on:
       - '.github/workflows/v20-protected-control-gates.yml'
       - 'tools/verify_v0199_verdicts.py'
       - 'tools/test_verify_v0199_verdicts.py'
+      - 'tools/test_v0199_action_vectors.py'
+      - 'tools/v0199-action-payload-vectors.tsv'
       - 'tools/verify_v0199_epoch_disk.py'
       - 'tools/test_v0199_mount_format.py'
       - 'tools/verify_smp.py'
@@ -39,6 +41,8 @@ jobs:
           rustup override set 1.95.0
           cargo fetch --locked
           cargo test --locked --offline -p cyxia-kernel-core --lib control_plane 2>&1 | tee artifacts/control-gates/control-plane.log
+          (cd tools; python3 -B -m unittest -v test_v0199_action_vectors) 2>&1 | tee artifacts/control-gates/action-vectors.log
+          sha256sum tools/v0199-action-payload-vectors.tsv > artifacts/control-gates/action-vectors.sha256
           cargo test --locked --offline -p cyxia-control-model native_v0199 2>&1 | tee artifacts/control-gates/model.log
           cargo test --locked --offline -p cyxia-control-model reward_v2 2>&1 | tee artifacts/control-gates/reward-v2.log
           cargo test --locked --offline -p cyxia-control-model sgd_v2 2>&1 | tee artifacts/control-gates/sgd-v2.log
