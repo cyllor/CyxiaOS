@@ -260,6 +260,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
     fn check_identity_and_context(&self, context: TrustedRegistrationScope)
         -> Result<(),Error>
     {
+        if context.base_plan_version==u64::MAX{return Err(Error::Exhausted);}
         if context.boot_epoch != self.boot_epoch
             || context.controller_epoch != self.controller_epoch
             || context.boot_epoch == 0 || context.controller_epoch == 0
@@ -884,10 +885,21 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         if plan.header.controller_epoch!=self.controller_epoch||scope.boot_epoch!=self.boot_epoch
             ||scope.now_ns==0{return Err(Error::Denied);}
         let boot=self.boot_epoch;
+        // A native publication must allocate a version strictly newer
+        // than the exact registered base. First accepted work is bound
+        // by the real native admission callback; every later action of
+        // that same plan must carry the same installed version.
+        if scope.plan_version<=plan.header.base_plan_version{return Err(Error::Stale);}
         let p=self.lookup_mut(plan.header.plan_seq).ok_or(Error::Stale)?;
         if p.status!=PendingStatus::AdapterAccepted{return Err(Error::NotReady);}
         if sha256(plan_wire)!=p.plan_digest||index>=p.count{return Err(Error::Denied);}
         if p.claimed[index].is_some(){return Err(Error::Busy);}
+        for claim in p.claimed.iter().flatten(){
+            let prior=super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
+            if prior.plan_version!=scope.plan_version||scope.now_ns<claim.accepted_ns{
+                return Err(Error::Stale);
+            }
+        }
         if plan.header.active_until_local_ns!=0&&scope.now_ns>=plan.header.active_until_local_ns{
             return Err(Error::Expired);
         }
@@ -1421,6 +1433,48 @@ mod tests {
         let scope=TrustedApplyScope{now_ns:150,..verified_scope()};
         gate.claim_apply_work(plan,0,scope,verified_binding(),
             apply_report_v1::ReportOrigin::Kernel,|_|Ok(())).unwrap();
+    }
+    #[test]
+    fn one_published_version_binds_all_targets_and_cannot_wrap(){
+        let mut rules=profile_bytes();
+        rules[40..48].copy_from_slice(&u64::MAX.to_le_bytes()); // wildcard target
+        let catalog=Profile::parse(&rules).unwrap();
+        let original=plan_bytes();let mut plan=[0u8;360];
+        plan[..212].copy_from_slice(&original);plan[212..].copy_from_slice(&original[64..]);
+        plan[8..12].copy_from_slice(&360u32.to_le_bytes());
+        plan[12..14].copy_from_slice(&2u16.to_le_bytes());
+        plan[24..32].copy_from_slice(&6u64.to_le_bytes());
+        plan[212+24..212+32].copy_from_slice(&5u64.to_le_bytes());
+        plan[212+40..212+48].copy_from_slice(&18u64.to_le_bytes());
+        let r0=decision(&plan,&rules);let mut r1=r0;
+        r1[24..32].copy_from_slice(&5u64.to_le_bytes());
+        r1[48..56].copy_from_slice(&18u64.to_le_bytes());
+        r1[92..94].copy_from_slice(&1u16.to_le_bytes());
+        let [a]=frozen(&[2,4],&[2,0]);
+        let [mut b]=frozen(&[2,4],&[2,0]);b.target.id=18;
+        let actions=[a,b];let records=[r0,r1];
+        let ctx=TrustedRegistrationScope{base_plan_version:6,..trusted(&rules)};
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
+        let mut overflow=plan;overflow[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(gate.register_rule_only(CONTROLLER,&overflow,&records,&catalog,&actions,
+            TrustedRegistrationScope{base_plan_version:u64::MAX,..ctx}),Err(Error::Exhausted));
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&actions,ctx).unwrap();
+        gate.publish_once(PUBLISHER,&plan,&records,&catalog,&actions,ctx,||Ok(())).unwrap();
+        let scope=TrustedApplyScope{now_ns:150,..verified_scope()};
+        let origin=apply_report_v1::ReportOrigin::Kernel;
+        let b0=verified_binding();let b1=ExecutorBindingV1{target:Identity{id:18,generation:1},..b0};
+        assert_eq!(gate.claim_apply_work(&plan,0,TrustedApplyScope{plan_version:6,..scope},b0,origin,|_|panic!()),Err(Error::Stale));
+        // A failed first native admission cannot freeze the installed version.
+        assert_eq!(gate.claim_apply_work(&plan,0,TrustedApplyScope{plan_version:8,..scope},b0,origin,|_|Err(Error::NotReady)),Err(Error::NotReady));
+        gate.claim_apply_work(&plan,0,scope,b0,origin,|w|{assert_eq!(w.plan_version,7);Ok(())}).unwrap();
+        assert_eq!(gate.claim_apply_work(&plan,1,TrustedApplyScope{plan_version:8,..scope},b1,origin,|_|panic!()),Err(Error::Stale));
+        assert_eq!(gate.claim_apply_work(&plan,1,TrustedApplyScope{now_ns:149,..scope},b1,origin,|_|panic!()),Err(Error::Stale));
+        gate.claim_apply_work(&plan,1,TrustedApplyScope{now_ns:151,..scope},b1,origin,|w|{assert_eq!(w.plan_version,7);Ok(())}).unwrap();
+        let first=executor_report(1);let mut second=first;
+        second[24..26].copy_from_slice(&1u16.to_le_bytes());
+        second[32..40].copy_from_slice(&18u64.to_le_bytes());
+        let reports=[BoundReport{bytes:&first,origin},BoundReport{bytes:&second,origin}];
+        assert_eq!(gate.settle_verified_apply_reports(SUPERVISOR,&plan,&reports,&[b0,b1],verified_scope(),|_,_|Ok(())).unwrap().action_count,2);
     }
     #[test]
     fn native_apply_reports_require_supervisor_and_real_completion_proof(){
