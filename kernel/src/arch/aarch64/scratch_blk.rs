@@ -20,8 +20,8 @@
 //!   window, like the SEC-N pools); it is NOT FrameMeta-registered (open item).
 //! * Transport::attach: MMIO window bounded to the virt board's virtio-mmio
 //!   range 0x0a000000..0x0a200000 through the high-half device alias.
-//! * LAST_ERROR_{CODE,SECTOR,SITE} / MAX_LATENCY_NS (atomics): diagnostic
-//!   only. Written by the CPU0 caller when a scratch request fails / completes,
+//! * LAST_ERROR_{CODE,SECTOR,SITE}, MAX_LATENCY_{NS,SECTOR}, SLOW (atomics):
+//!   diagnostic only. Written by the CPU0 caller when a scratch request fails / completes,
 //!   read by the same CPU0 caller afterwards (`last_error`, `max_latency_us`);
 //!   they never influence control flow or DMA.
 use super::*;
@@ -48,10 +48,21 @@ static LAST_ERROR_SITE: AtomicU64 = AtomicU64::new(0);
 /// Worst observed device completion latency per request kind (read, write,
 /// flush), against the driver's fixed 250 ms per-request deadline.
 static MAX_LATENCY_NS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// First sector of the request that set the worst latency, per kind.
+static MAX_LATENCY_SECTOR: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Completions at or above SLOW_NS (a fifth of the 250 ms deadline), per kind.
+static SLOW: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const SLOW_NS: u64 = 50_000_000;
 
-fn observe(kind: u64, latency_ns: u64) {
-    if let Some(slot) = MAX_LATENCY_NS.get(kind as usize - 1) {
-        slot.fetch_max(latency_ns, Ordering::Relaxed);
+fn observe(kind: u64, sector: u64, latency_ns: u64) {
+    let k = kind as usize - 1;
+    // CPU0 is the only writer (module header), so load/compare/store is exact.
+    if latency_ns > MAX_LATENCY_NS[k].load(Ordering::Relaxed) {
+        MAX_LATENCY_NS[k].store(latency_ns, Ordering::Relaxed);
+        MAX_LATENCY_SECTOR[k].store(sector, Ordering::Relaxed);
+    }
+    if latency_ns >= SLOW_NS {
+        SLOW[k].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -60,6 +71,14 @@ fn observe(kind: u64, latency_ns: u64) {
 pub(crate) fn max_latency_us() -> (u64, u64, u64) {
     let us = |k: usize| MAX_LATENCY_NS[k].load(Ordering::Relaxed) / 1_000;
     (us(0), us(1), us(2))
+}
+
+/// Per kind `(read, write, flush)`: sector of the worst request and the number
+/// of completions at or above 50 ms.
+#[cfg(feature = "v020-production-media-staging")]
+pub(crate) fn latency_detail() -> ([u64; 3], [u64; 3]) {
+    let at = |a: &[AtomicU64; 3]| core::array::from_fn(|k| a[k].load(Ordering::Relaxed));
+    (at(&MAX_LATENCY_SECTOR), at(&SLOW))
 }
 
 /// Request kind in the failure site code (`site = kind * 10 + phase`).
@@ -240,7 +259,7 @@ fn complete(
         if done[i] || c.operation != operation(first, i, write) {
             return Err(record(0, first + i as u64, kind, PHASE_MISMATCH));
         }
-        observe(kind, c.latency_ns);
+        observe(kind, first + i as u64, c.latency_ns);
         if !write {
             out[i * SECTOR_BYTES..(i + 1) * SECTOR_BYTES].copy_from_slice(&bytes);
         }
@@ -269,7 +288,7 @@ pub(crate) fn flush(device: &mut BatchedBlock) -> Result<(), SecurityError> {
                 if c.token != token || c.operation != Operation::Flush {
                     return Err(record(0, 0, KIND_FLUSH, PHASE_MISMATCH));
                 }
-                observe(KIND_FLUSH, c.latency_ns);
+                observe(KIND_FLUSH, 0, c.latency_ns);
                 device
                     .acknowledge(c.token)
                     .map_err(driver(0, KIND_FLUSH, PHASE_ACK))?;

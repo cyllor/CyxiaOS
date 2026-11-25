@@ -188,6 +188,14 @@ pub(super) fn stage(info: &BootInfo) -> StagingOutcome {
         write_us,
         flush_us,
     );
+    let (worst_sector, slow) = scratch_blk::latency_detail();
+    report(
+        "V020_W11_MEDIA_IO_WORST_SECTOR",
+        worst_sector[0],
+        worst_sector[1],
+        0,
+    );
+    report("V020_W11_MEDIA_IO_SLOW_50MS", slow[0], slow[1], slow[2]);
     if let Some((code, sector, site)) = scratch_blk::last_error() {
         report("V020_W11_MEDIA_IO_ERROR", code, sector, site);
     }
