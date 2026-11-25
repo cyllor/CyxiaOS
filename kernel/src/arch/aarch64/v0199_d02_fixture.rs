@@ -265,5 +265,9 @@ pub(super) fn run(boot:u64,gate:&mut RegisteredDecisionGate<'_>,snapshots:&mut S
         sample,scope.now_ns,r.completed_ns,n as u64,inbox.len() as u64,at as u64];
     for(i,v)in row.into_iter().enumerate(){SMP_EVIDENCE.words[379+i].store(v,Ordering::Relaxed);}
     for(i,p)in sha(proof).chunks_exact(8).enumerate(){SMP_EVIDENCE.words[391+i].store(u64::from_le_bytes(p.try_into().unwrap()),Ordering::Relaxed);}
+    let code=core::ptr::addr_of!(smp_user_start) as u64;
+    let end=core::ptr::addr_of!(smp_user_end) as u64;
+    SMP_EVIDENCE.words[395].store(phys(code),Ordering::Relaxed);
+    SMP_EVIDENCE.words[396].store(end-code,Ordering::Relaxed);
     report("V0199_D02_EFFECT",2,4,3);
 }
