@@ -304,17 +304,20 @@ def run(build_folder, output, qemu, qemu_source, formatter, timeout=120,
                 guests.append(guest)
                 err = stack.enter_context((folder / 'qemu-stderr.log').open('wb'))
                 guest['proc'] = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=err)
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                guest['sock'] = sock
                 handshake = time.monotonic() + 15
                 while True:
                     require(guest['proc'].poll() is None, f'node {node}: QEMU exited before QMP')
                     require(time.monotonic() < handshake, 'QMP startup deadline')
+                    # BSD/macOS leave a socket unusable after a refused connect
+                    # (the next connect fails with EINVAL), so use a fresh one.
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     try:
                         sock.connect(('127.0.0.1', qmp_ports[number - 1]))
                         break
                     except ConnectionRefusedError:
+                        sock.close()
                         time.sleep(.02)
+                guest['sock'] = sock
                 guest['qmp'] = Qmp(sock)
                 require('QMP' in guest['qmp'].receive(handshake), 'invalid QMP greeting')
                 guest['qmp'].execute('qmp_capabilities')

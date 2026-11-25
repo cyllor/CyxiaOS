@@ -311,17 +311,42 @@ impl<const C: usize> FileSystem<C> {
             if inode.kind != InodeKind::Directory {
                 return Err(Error::NotDirectory);
             }
+            // Read each directory page once and decode every scanned slot,
+            // but only read and verify the target inode of the matching name.
             let mut found = None;
+            let mut loaded_page = None;
             for index in 0..inode.size as usize / 128 {
-                if let Some(e) = self.snapshot_entry(key, id, inode, index, j, d, s)?
-                    && e.name[..usize::from(e.name_len)] == *part.as_bytes()
-                {
-                    found = Some(e.object.id as usize);
-                    break;
+                let page = index / 32;
+                if loaded_page != Some(page) {
+                    j.read_block(d, physical(&inode, page as u32)?, &mut self.tx[0], s)
+                        .map_err(journal_error)?;
+                    loaded_page = Some(page);
                 }
+                let matched = match DirectoryEntry::decode(
+                    &self.tx[0][index % 32 * 128..(index % 32 + 1) * 128],
+                ) {
+                    Ok(raw) if raw == DirectoryEntry::EMPTY => None,
+                    Ok(raw) if raw.name.as_bytes() == part.as_bytes() => {
+                        Some((raw.inode_id as usize, raw.inode_generation))
+                    }
+                    Ok(_) => None,
+                    Err(_) => return self.guard_integrity(Err(Error::Format), j, d, s),
+                };
+                let Some((target_id, generation)) = matched else {
+                    continue;
+                };
+                let target = self.snapshot_inode(key, target_id, j, d, s)?;
+                if target.kind == InodeKind::Free
+                    || target.generation != generation
+                    || target.parent_inode as usize != id
+                    || target.parent_generation != inode.generation
+                {
+                    return Err(Error::Stale);
+                }
+                found = Some((target_id, target));
+                break;
             }
-            id = found.ok_or(Error::NotFound)?;
-            inode = self.snapshot_inode(key, id, j, d, s)?;
+            (id, inode) = found.ok_or(Error::NotFound)?;
         }
         Ok((id, inode))
     }

@@ -176,6 +176,17 @@ fn own(block: u32, bitmap: &[u8; MAP_BYTES], owners: &mut [u8; MAP_BYTES]) -> Re
     Ok(())
 }
 
+/// One bit per business inode proven to reach the root in the current pass.
+const VERIFIED_WORDS: usize = (BUSINESS_INODE_COUNT as usize).div_ceil(64);
+
+fn is_verified(verified: &[u64; VERIFIED_WORDS], id: usize) -> bool {
+    verified[id / 64] & (1 << (id % 64)) != 0
+}
+
+fn mark_verified(verified: &mut [u64; VERIFIED_WORDS], id: usize) {
+    verified[id / 64] |= 1 << (id % 64);
+}
+
 /// Validate one business tree with no allocation proportional to inode count.
 /// Unique ownership is checked independently for each view; valid historical
 /// sharing is accumulated into the optional union mark. Allocated garbage is
@@ -196,6 +207,7 @@ pub(super) fn validate_disk_tree<D: BlockDevice>(
         owners[block as usize / 8] |= 1 << (block % 8);
     }
     let mut references = [0u16; BUSINESS_INODE_COUNT as usize];
+    let mut verified = [0u64; VERIFIED_WORDS];
     let mut cached_inode_page = None;
     for id in 0..BUSINESS_INODE_COUNT as usize {
         // Reuse one scan page until a directory needs the complete name bank.
@@ -245,9 +257,18 @@ pub(super) fn validate_disk_tree<D: BlockDevice>(
             }
         }
         if id != 0 {
+            // Every hop is still checked, but the walk stops at an ancestor
+            // already proven to reach the root in this tree. All inodes on a
+            // successful path are then proven too, so the pass reads each
+            // parent link O(1) times instead of O(depth) times.
             let mut child = inode;
+            let mut child_id = id;
+            let mut path = [0u8; BUSINESS_INODE_COUNT as usize];
+            let mut depth = 0;
             let mut reached_root = false;
             for _ in 0..BUSINESS_INODE_COUNT {
+                path[depth] = child_id as u8;
+                depth += 1;
                 let parent_id = child.parent_inode as usize;
                 if parent_id >= BUSINESS_INODE_COUNT as usize {
                     return Err(Error::Conflict);
@@ -258,7 +279,7 @@ pub(super) fn validate_disk_tree<D: BlockDevice>(
                 {
                     return Err(Error::Stale);
                 }
-                if parent_id == 0 {
+                if parent_id == 0 || is_verified(&verified, parent_id) {
                     reached_root = true;
                     break;
                 }
@@ -266,9 +287,13 @@ pub(super) fn validate_disk_tree<D: BlockDevice>(
                     return Err(Error::Conflict);
                 }
                 child = parent;
+                child_id = parent_id;
             }
             if !reached_root {
                 return Err(Error::Conflict);
+            }
+            for &walked in &path[..depth] {
+                mark_verified(&mut verified, usize::from(walked));
             }
         }
         if inode.kind != InodeKind::Directory || inode.size == 0 {
