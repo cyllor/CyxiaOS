@@ -32,3 +32,5 @@ pub mod service;
 pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;
+#[cfg(feature = "smoltcp")]
+pub mod virtio_custody;

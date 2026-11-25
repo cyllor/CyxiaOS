@@ -35,6 +35,7 @@ mod v0199_roles;
 pub fn build() {
     if env::var_os("CARGO_FEATURE_V0199_CONTROL_BRINGUP").is_some()
         || env::var_os("CARGO_FEATURE_V0199_EPOCH_DISK_SELFTEST").is_some()
+        || env::var_os("CARGO_FEATURE_V020_PRODUCTION").is_some()
     {
         v0199_roles::build();
     }

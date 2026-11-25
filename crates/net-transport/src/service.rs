@@ -73,12 +73,14 @@
 //!   error never auto-reconnects and never substitutes a timeout, a model
 //!   suggestion or a socket reset for device completion.
 //!
-//! # EL1 boot-dispatch integration contract (OPEN — nothing is wired here)
+//! # EL1 boot-dispatch integration contract (OPEN dispatch; T4 device skeleton provided)
 //!
-//! Deploying this core is a separate, still-open gate. The future EL1 boot
-//! dispatch must supply ALL of the following from protected kernel state;
-//! this adapter instantiates none of it and accepts none of it from a peer,
-//! a wire frame or AI advice:
+//! Deploying this core is a separate, still-open gate. The T4 device-wiring
+//! skeleton supplies the REAL VirtIO-net adapter chain (item 1 below) and a
+//! kernel init API, but the protected EL1 boot dispatch that deploys it is still
+//! unwired. The future EL1 boot dispatch must supply ALL of the following from
+//! protected kernel state; this adapter instantiates none of it and accepts none
+//! of it from a peer, a wire frame or AI advice:
 //!
 //! 1. **VirtIO net driver handle.** Ownership of the real
 //!    `driver-virtio::net::Net`/`BatchedNet` (`VirtioLink`) MMIO/IRQ/DMA
@@ -90,6 +92,15 @@
 //!    `Tcp::terminal_tx_quiescent` additionally requires TCP `State::Closed`
 //!    and an empty TCP send queue. The trait's fail-closed default `false`
 //!    must never be overridden by a mock, a timeout or a plain socket reset.
+//!    The T4 device-wiring skeleton now PROVIDES this real-device chain:
+//!    `virtio_custody::CustodyNet` (receipt custody over `BatchedNet`),
+//!    `virtio_custody::CustodyPort` (`Port`), and the `tls`-gated
+//!    `virtio_custody::VirtioNativeSocket` (`NativeSocket` with the real
+//!    `terminal_tx_quiescent` witness). The kernel-side bring-up is
+//!    `kernel/src/platform/virt/net_device.rs::init` (CPU0-only, pinned DMA,
+//!    `sec-n-native`-gated), returning the real `BatchedNet` for T1 to wrap.
+//!    T1 must still supply the protected dispatch that calls `init`, owns the
+//!    handle for the service lifetime, and drives the per-turn reconciliation.
 //! 2. **Identity material.** The provisioned local Ed25519 certificate,
 //!    PKCS#8 private key and peer NodeID pin, reconciled against the
 //!    protected shared page (`boot_identity`: kernel-local == `node_id(cert)`

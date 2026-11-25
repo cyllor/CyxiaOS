@@ -483,6 +483,75 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("pub const MAX_AUTH_PRINCIPALS: usize = 16;", context)
         self.assertIn("pub const ADMISSION_LEDGER_CAPACITY: usize = 16;", context)
 
+    # Wave 10 pin deferrals (2026-11-25, T6 sync time, HEAD defeae7): the
+    # v020-production feature declaration (kernel/Cargo.toml), the
+    # file_media_unified_v1 module, T1's production verifier (expected path
+    # tools/verify_v020_production.py), T3's FrameMeta allocator skeleton,
+    # T4's real VirtIO-net SEC-N adapter and T5's BootEpoch/Recovery native
+    # APIs are concurrent in-progress wave-10 outputs with no committed
+    # artifact in this checkout (verified by reading; T3/T5 edits appeared
+    # uncommitted during T6 execution). They are deliberately not pinned
+    # until they land; pin only the stable T6 skeleton lane below.
+
+    def test_v020_wave10_structural_pins_production_skeleton_lane(self):
+        # Wave 10 (T6, wired centrally after T1 landed): the production-wiring
+        # CI lane is an honest skeleton, NOT G4 acceptance. The v020-production
+        # profile build command and production-skeleton scope labels are pinned;
+        # the run step now invokes T1's frozen verifier CLI (pinned QEMU on PATH,
+        # provenance hash gates) and exits non-zero on FAIL. A skeleton-lane green
+        # is never production run evidence.
+        workflow_path = ROOT / ".github/workflows/v020-production.yml"
+        self.assertTrue(workflow_path.is_file())
+        workflow = source(workflow_path)
+        self.assertIn(
+            "cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production",
+            workflow,
+        )
+        self.assertIn("name: V0.20 production-wiring skeleton (NOT G4 acceptance)", workflow)
+        self.assertIn('"lane_scope": "production-skeleton"', workflow)
+        self.assertIn("branches: [CyxiaOS-V0.20]", workflow)
+        self.assertIn("- 'kernel/**'", workflow)
+        self.assertIn("RUSTUP_TOOLCHAIN: '1.95.0'", workflow)
+        self.assertIn("f8ed81651e61d9c2166df6121ce2af0f44f06b3e", workflow)
+        self.assertIn("tools/qemu/cyxia-per-vcpu-pmu.patch", workflow)
+        self.assertIn("python3 -B tools/verify_v020_production.py", workflow)
+        self.assertIn("--elf artifacts/v020-production/kernel.elf", workflow)
+
+    def test_v020_wave10_structural_pins_t1_production_skeleton(self):
+        # Wave 10 (T1): the production boot + in-vector SVC dispatch skeleton is
+        # an opt-in feature that elevates the proven advice-e2e SvcV3Bridge
+        # dispatch into the exception vector. It is a SKELETON, not full
+        # production authority: the scope marker must keep full_authority=false
+        # and real_models=false, and the default/fixture profiles stay intact.
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        self.assertIn('v020-production = ["smp-selftest", "dep:sha2"]', manifest)
+        boot = source(ROOT / "kernel/src/arch/aarch64/boot.rs")
+        self.assertIn('feature = "v020-production"))]\n    smp::production::run(&info);', boot)
+        exceptions = source(ROOT / "kernel/src/arch/aarch64/exceptions.rs")
+        self.assertIn("smp::production::exception(f, kind);", exceptions)
+        prod_path = ROOT / "kernel/src/arch/aarch64/production.rs"
+        self.assertTrue(prod_path.is_file())
+        prod = source(prod_path)
+        # Honest scope: skeleton only, never full authority or real models.
+        self.assertIn(
+            "V020_PROD_SCOPE production_skeleton=true full_authority=false real_models=false",
+            prod,
+        )
+        self.assertIn("production_skeleton=true, full_authority=false, real_models=false", prod)
+        # In-vector dispatch reuses the SAME kernel-core bridge APIs as the
+        # advice-e2e fixture (no reinvented chain).
+        self.assertIn("decode_aarch64_svc_v3(3, f.esr, &f.regs)", prod)
+        self.assertIn("bridge.register_assisted_one(", prod)
+        self.assertIn("bridge.publish_assisted_one(", prod)
+        self.assertIn(".claim_apply_work(", prod)
+        self.assertIn(".settle_verified_apply_reports_with_feedback(", prod)
+        # The production profile owns CPU0 and must not mix with other fixtures.
+        self.assertIn('compile_error!("v020-production requires the plain smp-selftest profile");', prod)
+        # The role catalog is built for the production feature too.
+        build = source(ROOT / "kernel/build/aarch64.rs")
+        self.assertIn('env::var_os("CARGO_FEATURE_V020_PRODUCTION").is_some()', build)
+        self.assertTrue((ROOT / "tools/verify_v020_production.py").is_file())
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

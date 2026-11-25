@@ -1,0 +1,208 @@
+# Wave-10 production-wiring SKELETON lane. Scope: production-skeleton only.
+# This is NOT G4 acceptance, NOT a production boot certification, and NOT a
+# claim that any production authority (mount, in-vector SVC dispatch, general
+# allocator, real device custody, recovery) is wired.
+#
+# Skeleton staging (T6 sync time, HEAD defeae7): T1's v020-production feature
+# and verifier have not landed yet. The scope job therefore records an honest
+# NOT_RUN skeleton state on every trigger; the build job activates itself once
+# the feature is declared in kernel/Cargo.toml, and the pinned-QEMU/run jobs
+# activate once the expected verifier tools/verify_v020_production.py exists.
+# The run step is a DOCUMENTED FAIL-CLOSED PLACEHOLDER: once the verifier
+# appears but its CLI contract is not yet wired here, the job refuses to report
+# success (NOT_RUN report + exit 1) instead of silently passing. Replace the
+# placeholder with the real invocation (mirror the verify_v0199_eight_packages
+# usage in v20-native-eight-role-bringup.yml) before claiming any run evidence.
+# If T1 lands the verifier under a different path, update the detection and
+# the paths filter here in the same change.
+name: V0.20 production-wiring skeleton (NOT G4 acceptance)
+on:
+  push:
+    branches: [CyxiaOS-V0.20]
+    paths:
+      - 'kernel/**'
+      - '.github/workflows/v020-production.yml'
+      - 'tools/verify_v020_production.py'
+  pull_request:
+    branches: [CyxiaOS-V0.20]
+    paths:
+      - 'kernel/**'
+      - '.github/workflows/v020-production.yml'
+      - 'tools/verify_v020_production.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: v020-production-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      feature_present: ${{ steps.detect.outputs.feature_present }}
+      verifier_present: ${{ steps.detect.outputs.verifier_present }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Detect production wiring state and record honest skeleton scope
+        id: detect
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/v020-production
+          git rev-parse HEAD > artifacts/v020-production/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/v020-production/tree.txt
+          feature_present=false
+          if grep -Eq '^v020-production[[:space:]]*=' kernel/Cargo.toml; then
+            feature_present=true
+          fi
+          verifier_present=false
+          if [ -f tools/verify_v020_production.py ]; then
+            verifier_present=true
+          fi
+          echo "feature_present=$feature_present" >> "$GITHUB_OUTPUT"
+          echo "verifier_present=$verifier_present" >> "$GITHUB_OUTPUT"
+          FEATURE_PRESENT="$feature_present" VERIFIER_PRESENT="$verifier_present" python3 - <<'PY'
+          import json, os
+          scope = {
+              "lane_scope": "production-skeleton",
+              "acceptance": "NOT G4",
+              "feature_present": os.environ["FEATURE_PRESENT"] == "true",
+              "verifier_present": os.environ["VERIFIER_PRESENT"] == "true",
+              "build_status": "NOT_RUN",
+              "run_status": "NOT_RUN",
+              "note": "Wave-10 skeleton: T1 v020-production feature/verifier not landed yet; no production authority is claimed.",
+          }
+          if scope["feature_present"]:
+              scope["build_status"] = "delegated-to-arm-build-job"
+          if scope["verifier_present"]:
+              scope["run_status"] = "delegated-to-fail-closed-placeholder"
+          with open("artifacts/v020-production/scope.json", "w", encoding="utf-8") as handle:
+              json.dump(scope, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          print(json.dumps(scope, indent=2, sort_keys=True))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-production-scope-${{ github.sha }}
+          path: artifacts/v020-production/
+          retention-days: 7
+  arm-build:
+    needs: scope
+    if: needs.scope.outputs.feature_present == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build v020-production profile (build evidence only, NOT a QEMU pass)
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/v020-production
+          git rev-parse HEAD > artifacts/v020-production/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/v020-production/tree.txt
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
+          rustup override set 1.95.0
+          cargo fetch --locked
+          rustc -vV > artifacts/v020-production/toolchain.txt
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production 2>&1 | tee artifacts/v020-production/build.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel.elf
+          readelf -h artifacts/v020-production/kernel.elf > artifacts/v020-production/elf.txt
+          (cd artifacts/v020-production && sha256sum kernel.elf > image.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-production-build-${{ github.sha }}
+          path: artifacts/v020-production/
+          retention-days: 7
+  qemu-pinned:
+    needs: scope
+    if: needs.scope.outputs.verifier_present == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      # Same pinned QEMU build as v20-native-eight-role-bringup.yml: exact
+      # upstream commit + per-vCPU accounting patch, built once per run and
+      # shared with the run job through the evidence artifact (repo convention;
+      # no actions/cache is used by any native lane).
+      - name: Build pinned QEMU with exact per-vCPU accounting patch
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev python3-venv
+          mkdir -p artifacts/v020-production-qemu
+          sha256sum tools/qemu/cyxia-per-vcpu-pmu.patch > artifacts/v020-production-qemu/patch.sha256
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu-source"
+          git -C "$RUNNER_TEMP/qemu-source" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          test "$(git -C "$RUNNER_TEMP/qemu-source" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$RUNNER_TEMP/qemu-source" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu-source" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu-source" diff --binary > artifacts/v020-production-qemu/applied.patch
+          git -C "$RUNNER_TEMP/qemu-source" rev-parse HEAD > artifacts/v020-production-qemu/upstream.txt
+          cd "$RUNNER_TEMP/qemu-source"
+          ./configure --target-list=aarch64-softmmu --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/v020-production-qemu/configure.log"
+          ninja -C build qemu-system-aarch64 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/v020-production-qemu/build.log"
+          mkdir -p "$GITHUB_WORKSPACE/artifacts/v020-production-qemu/bin"
+          cp build/qemu-system-aarch64 "$GITHUB_WORKSPACE/artifacts/v020-production-qemu/bin/"
+          cd "$GITHUB_WORKSPACE/artifacts/v020-production-qemu"
+          bin/qemu-system-aarch64 --version > version.txt
+          sha256sum bin/qemu-system-aarch64 > binary.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-production-qemu-${{ github.sha }}
+          path: artifacts/v020-production-qemu/
+          retention-days: 7
+  native-run:
+    needs: [scope, arm-build, qemu-pinned]
+    if: needs.scope.outputs.verifier_present == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-production-build-${{ github.sha }}
+          path: artifacts/v020-production
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-production-qemu-${{ github.sha }}
+          path: artifacts/v020-production-qemu
+      - name: Verify provenance, then run production-skeleton verifier (pinned QEMU)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0
+          test "$(cat artifacts/v020-production/commit.txt)" = "$(git rev-parse HEAD)"
+          (cd artifacts/v020-production; sha256sum -c image.sha256)
+          (cd artifacts/v020-production-qemu; sha256sum -c binary.sha256)
+          chmod +x artifacts/v020-production-qemu/bin/qemu-system-aarch64
+          sha256sum -c artifacts/v020-production-qemu/patch.sha256
+          # Real production-skeleton run (wave-10 T1 verifier; frozen CLI:
+          # --elf --output --timeout). Pinned per-vCPU-PMU QEMU on PATH; the
+          # verifier re-checks the QEMU version and binds the source manifest.
+          # Provenance (commit/image/binary/patch hashes) is gated above.
+          # Scope is production-skeleton (full_authority=false, real_models=false),
+          # NOT G4 acceptance; the verifier exits non-zero on any FAIL so set -e
+          # preserves honesty — a skeleton-lane green is never production acceptance.
+          export PATH="$PWD/artifacts/v020-production-qemu/bin:$PATH"
+          python3 -B tools/verify_v020_production.py \
+            --elf artifacts/v020-production/kernel.elf \
+            --output artifacts/v020-production/run \
+            --timeout 120
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-production-run-${{ github.sha }}
+          path: artifacts/v020-production/
+          retention-days: 7

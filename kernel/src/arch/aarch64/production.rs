@@ -1,0 +1,1839 @@
+//! V0.20 PRODUCTION boot + in-vector SVC dispatch SKELETON (wave 10 T1).
+//!
+//! This elevates the proven advice-e2e SvcV3Bridge dispatch OUT of the fixture
+//! turn loop and INTO the production exception-vector path. Under the opt-in
+//! `v020-production` feature, boot.rs routes here instead of smp::run's fixture
+//! dispatch; exceptions.rs routes EL0 sync ABI-v3 SVCs (0x40/0x41/0x50) to
+//! [`exception`], which dispatches them in-vector and returns straight to EL0.
+//!
+//! What is genuinely production-wired here:
+//! * The SMP bring-up reuses smp.rs's proven secondary-start path verbatim
+//!   (same statics, init_memory, cpu::start, GATES). No second mechanism.
+//! * The eight ABI3 PIE role packages are loaded through the existing build
+//!   catalog (kernel/build/v0199_roles.rs) and the kernel-core VerifiedRolePackage
+//!   loader, exactly like v0199_control_bringup. Their snapshot (0x40) and
+//!   supervisor audit (0x50 op1) SVCs are dispatched IN-VECTOR.
+//! * The advice causal chain (AdviceEnvelope v1 -> 0x50 intake -> RuleProfile
+//!   review -> DecisionRecord/Disposition -> 0x50 register -> 0x41 publish ->
+//!   claim_apply_work -> ApplyReport -> supervisor terminal) runs through the
+//!   SAME kernel-core bridge APIs the advice-e2e fixture uses, but every EL0
+//!   0x50/0x41 trap is serviced in the exception vector, not a turn loop.
+//!
+//! HONEST SCOPE / REMAINING GAPS (do NOT read this as full production authority):
+//! * production_skeleton=true, full_authority=false, real_models=false.
+//! * The boot epoch is STAGED (volatile BOOT=1). There is no durable BootEpoch
+//!   journal mount here; T5's durable BootEpoch contract is not yet landed, so
+//!   this skeleton deliberately does not claim a persistent epoch.
+//! * The executor is a bounded fixture target word (one EL1-owned page), NOT a
+//!   real driver/peripheral. The snapshot backend stays fail-closed (EAGAIN):
+//!   read_snapshot_rpc + SnapshotStore + live ViewGrant wiring is a later gate.
+//! * No real model is active; the decision artifacts are trusted EL1 fixtures.
+//! * Role budget metering (role_budget_v0199 PMU ledger) and service restart are
+//!   NOT reproduced here; turns are bounded by a fixed iteration cap + private
+//!   timer backstop, as in the smp mechanism.
+//!
+//! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
+//! Global invariant: run() asserts cpu::slot()==0 for the control plane; the
+//! whole advice chain and PIE role turns execute synchronously on CPU0. No IRQ
+//! handler, DMA or secondary CPU touches these statics or the advice spaces
+//! (index >= C*2). Secondary CPUs only run the smp business fixture.
+//! * LEDGER/GATE (static mut MaybeUninit) via ledger_ptr()/gate_ptr():
+//!   ptr::write-initialized once in init_control_guards() before any dispatch.
+//!   Every later &mut/&* is created and consumed within one synchronous CPU0
+//!   call (the in-vector dispatcher or the run() settlement), never aliasing.
+//! * TRUSTED_* byte artifacts + ADVICE_WIRE (static mut): written once by run()
+//!   before the first EL0 turn; the dispatcher reads them on CPU0 only.
+//! * MANIFEST_MEMBERS / PIE_MEMBERS (static mut): written once by run() before
+//!   dispatch; read volatile by the dispatcher at a bounded role index.
+//! * VECTOR_CALLER (per-CPU atomic): the turn loop publishes the registered
+//!   caller index BEFORE user::enter and clears it AFTER return; the in-vector
+//!   dispatcher reads it to authenticate the caller from EL1 state, never from
+//!   EL0 bytes. Only CPU0 enters production roles.
+//! * EXEC_TARGET (static mut): bounded fixture executor; apply writes word 0,
+//!   settlement re-reads it, both on CPU0 in the same synchronous loop.
+//! * copy_address()/read_bytes()/write_bytes(): bounded raw addr_of! arithmetic
+//!   over the advice spaces, re-checked against this profile's own tables and
+//!   mmu::checked_user_leaf_span before any high-half alias is dereferenced.
+//! * PIE backing/tables (static mut): CPU0 is the sole loader; seal_page does
+//!   real break-before-make on the high-half direct map before publishing the
+//!   low user mapping. No writable alias of executable code remains.
+
+use super::super::ExceptionFrame;
+use super::*;
+use core::mem::MaybeUninit;
+use cyxia_kernel_core::control_plane::{
+    Epochs, Error, Identity,
+    advice_disposition_v1::{AdviceDispositionV1, DISPOSITION_BYTES},
+    advice_envelope_v1::{ADVICE_BYTES, AdviceEnvelopeV1, TrustedAdviceScope},
+    advice_ledger_v0199::EvidenceLedger,
+    apply_report_v1::{
+        ActionStatus, ApplyReportV1, BoundReport, ExecutorBindingV1, ReportOrigin,
+        TrustedApplyScope,
+    },
+    apply_work_v1::ApplyWorkV1,
+    cpu0_v0199 as profile,
+    decision_record_v3::{DECISION_BYTES, DecisionRecordV3, DecisionSource},
+    feedback_v0199::CausalPair,
+    fixed::{ChoiceSource, Pair},
+    pie_image_v0199::{
+        ROLE_STACK_BYTES, RelativeRelocation, RolePackageInput, RolePackageSpec,
+        VerifiedRolePackage,
+    },
+    plan_wire_v2::PlanV2,
+    registered_gate_v3::{
+        AssistedScope, FrozenAction, Publication, RegisteredDecisionGate, Registration,
+        TrustedRegistrationScope,
+    },
+    role_manifest_v0199::{
+        DECISION_REGISTER, NativeRole, NativeRoleManifest, PUBLISH_PLAN, PrivateRegion, ROLE_COUNT,
+        ROLES, Role, SEND_ADVICE,
+    },
+    rule_profile_v2::Profile,
+    svc_bridge_v3::{FrozenNativePlan, SvcV3Bridge, VerifiedNativeCaller},
+};
+use cyxia_kernel_core::security::syscall_v3::decode_aarch64_svc_v3;
+use sha2::{Digest, Sha256};
+
+// The production skeleton owns the CPU0 EL0 turn loop and the in-vector dispatch
+// path; it must not be combined with another profile that also hijacks CPU0 or
+// rewrites dispatch/execute.
+#[cfg(any(
+    feature = "v0199-cpu0-role-selftest",
+    feature = "v0199-advice-e2e-selftest",
+    feature = "v0199-control-bringup",
+    feature = "v0199-epoch-disk-selftest",
+    feature = "v0199-format-selftest",
+    feature = "v0199-sec-n-selftest",
+    feature = "ai-control-selftest",
+    feature = "legacy-coreset",
+    feature = "prototype-runtime",
+    feature = "unified-runtime",
+    feature = "net-selftest",
+    feature = "model-v13-selftest",
+    feature = "storage-v13-selftest",
+    feature = "tcp-v13-selftest",
+))]
+compile_error!("v020-production requires the plain smp-selftest profile");
+
+// The advice EL0 advisor/carrier program is the SAME proven bounded program the
+// advice-e2e fixture uses (constructs the envelope at EL0, records the x0 return,
+// yields with SVC #4). Reusing it keeps the causal chain identical; only the
+// dispatch location (vector vs turn loop) differs.
+core::arch::global_asm!(include_str!("v0199_advice_user.S"));
+unsafe extern "C" {
+    static v0199_advice_user_start: u8;
+    static v0199_advice_user_end: u8;
+}
+
+const FIRST_ADVICE_SPACE: usize = C * 2;
+const ADVICE_SPACES: usize = ROLE_COUNT;
+// Fixture capability table (EL1-owned; never read from EL0 bytes).
+const ADVICE_CAP: u64 = 66;
+const DECISION_CAP: u64 = 77;
+const PUBLISHER_CAP: u64 = 88;
+const OPS: Identity = Identity {
+    id: 6,
+    generation: 1,
+};
+const SEC: Identity = Identity {
+    id: 7,
+    generation: 1,
+};
+const CTRL: Identity = Identity {
+    id: 2,
+    generation: 1,
+};
+const PUB: Identity = Identity {
+    id: 8,
+    generation: 1,
+};
+const SUPER: Identity = Identity {
+    id: 11,
+    generation: 1,
+};
+const TARGET: Identity = Identity {
+    id: 17,
+    generation: 1,
+};
+// STAGED boot epoch (volatile). NOT a durable BootEpoch; see module scope.
+const BOOT: u64 = 1;
+const CTRL_EPOCH: u64 = 2;
+const ADVISOR_EPOCH: u64 = 1;
+const RULES_GEN: u64 = 7;
+const MODEL_GEN: u64 = 9;
+const LEDGER_GEN: u64 = 5;
+const CORE_GEN: u64 = 6;
+const SNAPSHOT_SEQ: u64 = 3;
+const SAMPLED_NS: u64 = 100;
+const NOW_NS: u64 = 150;
+const EXPIRES_NS: u64 = 200;
+const PLAN_SEQ: u64 = 1;
+const DECISION_SEQ: u64 = 4;
+const PLAN_VERSION: u64 = 7;
+const EXEC_GEN: u64 = 9;
+const COMPLETED_NS: u64 = 180;
+const SETTLE_NS: u64 = 200;
+const INSTALLED_NS: u64 = SAMPLED_NS + 10_000_000_000;
+// Private DATA page layout (EL0 VA = DATA + offset), identical to advice-e2e.
+const ENVELOPE_OFF: u64 = 64;
+const OBSERVED_OFF: u64 = 768;
+const REG_OUT_OFF: u64 = 640;
+const PUB_SIDECAR_OFF: u64 = 320;
+// Distinct QMP evidence marker ("CYXPRD10").
+const MAGIC: u64 = 0x4359_5052_4431_3030;
+// In-vector syscall return codes for the fail-closed PIE bootstrap subset.
+const E_AUTH: i64 = -1;
+const E_FORMAT: i64 = -2;
+const EFAULT: i64 = -12;
+const EAGAIN: i64 = -13;
+// PIE loader layout (mirrors v0199_control_bringup).
+const PAGE: usize = 4096;
+const IMAGE: usize = 64 * 1024;
+const COPY: usize = 128 * 1024;
+const BASE: u64 = 0x10000;
+const STACK_BASE: u64 = 0x30000;
+const STACK_END: u64 = STACK_BASE + ROLE_STACK_BYTES as u64;
+// VECTOR_CALLER encoding: [0, ROLE_COUNT) = PIE role index;
+// [ROLE_COUNT, 2*ROLE_COUNT) = advice role index; NONE = no registered caller.
+const CALLER_NONE: u64 = u64::MAX;
+const ADVICE_CALLER_BASE: u64 = ROLE_COUNT as u64;
+
+// CPU0-only acceptance counter for the unique native publish callback.
+static ACCEPT_COUNT: AtomicU64 = AtomicU64::new(0);
+// Per-CPU registered in-vector caller (see VECTOR_CALLER boundary note).
+static VECTOR_CALLER: [AtomicU64; C] = [const { AtomicU64::new(CALLER_NONE) }; C];
+// In-vector dispatch evidence, recorded by the dispatcher for the run() seal.
+static SVC_ESR: [AtomicU64; 2 * ROLE_COUNT] = [const { AtomicU64::new(0) }; 2 * ROLE_COUNT];
+static SVC_X8: [AtomicU64; 2 * ROLE_COUNT] = [const { AtomicU64::new(0) }; 2 * ROLE_COUNT];
+static SVC_OUT: [AtomicU64; 2 * ROLE_COUNT] = [const { AtomicU64::new(0) }; 2 * ROLE_COUNT];
+// PIE role progress counters (clocks/yields in the turn loop; role_calls in-vector).
+static PIE_CLOCKS: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
+static PIE_YIELDS: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
+static PIE_ROLE_CALLS: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
+// Bounded fixture executor "device": one EL1-owned target word.
+#[repr(C, align(4096))]
+struct ExecTarget(Page);
+static mut EXEC_TARGET: ExecTarget = ExecTarget(Page::ZERO);
+// Large control-plane guards in static storage (never the bounded EL1 stack).
+static mut LEDGER: MaybeUninit<EvidenceLedger> = MaybeUninit::uninit();
+static mut GATE: MaybeUninit<RegisteredDecisionGate<'static>> = MaybeUninit::uninit();
+// Persistent operations/security intake pair (matches the advice-e2e Fixture.pair).
+static mut PAIR: MaybeUninit<Pair> = MaybeUninit::uninit();
+// Trusted EL1 decision artifacts (written once by run() before dispatch).
+static mut TRUSTED_RULES: [u8; 80] = [0; 80];
+static mut TRUSTED_PLAN: [u8; 212] = [0; 212];
+static mut TRUSTED_REC: [u8; DECISION_BYTES] = [0; DECISION_BYTES];
+static mut TRUSTED_DISP: [u8; DISPOSITION_BYTES] = [0; DISPOSITION_BYTES];
+// The actual EL0-constructed envelope, captured by the in-vector intake.
+static mut ADVICE_WIRE: [u8; ADVICE_BYTES] = [0; ADVICE_BYTES];
+static ADVICE_RECORDED: AtomicBool = AtomicBool::new(false);
+// Validated eight-role advice manifest snapshot (CPU0-only).
+static mut MANIFEST_MEMBERS: [NativeRole; ROLE_COUNT] = [NativeRole {
+    role: Role::Operations,
+    actor: Identity {
+        id: 0,
+        generation: 0,
+    },
+    ttbr0_root: 0,
+    private_rw: PrivateRegion { base: 0, bytes: 0 },
+    caps: 0,
+    control_ns_per_100ms: 0,
+    cpu_mask: 0,
+    thread_count: 0,
+    endpoint_id: 0,
+}; ROLE_COUNT];
+// PIE role manifest members + issued snapshot/audit cap selectors (CPU0-only).
+static mut PIE_MEMBERS: [NativeRole; ROLE_COUNT] = [NativeRole {
+    role: Role::Operations,
+    actor: Identity {
+        id: 0,
+        generation: 0,
+    },
+    ttbr0_root: 0,
+    private_rw: PrivateRegion { base: 0, bytes: 0 },
+    caps: 0,
+    control_ns_per_100ms: 0,
+    cpu_mask: 0,
+    thread_count: 0,
+    endpoint_id: 0,
+}; ROLE_COUNT];
+static PIE_CAP: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
+
+// ---- PIE role backing / page tables (CPU0 sole loader) ----
+struct BootPackage {
+    role_id: u16,
+    bytes: &'static [u8],
+    image_sha256: [u8; 32],
+    relative_sha256: [u8; 32],
+    relative: &'static [RelativeRelocation],
+}
+static CATALOG: [BootPackage; ROLE_COUNT] =
+    include!(concat!(env!("OUT_DIR"), "/v0199-role-catalog.rs"));
+#[repr(C, align(4096))]
+struct Backing {
+    image: [u8; IMAGE],
+    stack: [u8; ROLE_STACK_BYTES],
+}
+impl Backing {
+    const ZERO: Self = Self {
+        image: [0; IMAGE],
+        stack: [0; ROLE_STACK_BYTES],
+    };
+}
+#[repr(C, align(4096))]
+struct Tables {
+    root: Page,
+    mid: Page,
+    leaf: Page,
+}
+impl Tables {
+    const ZERO: Self = Self {
+        root: Page::ZERO,
+        mid: Page::ZERO,
+        leaf: Page::ZERO,
+    };
+}
+#[repr(align(4096))]
+struct CopyBuffer([u8; COPY]);
+static mut BACKING: [Backing; ROLE_COUNT] = [const { Backing::ZERO }; ROLE_COUNT];
+static mut TABLES: [Tables; ROLE_COUNT] = [const { Tables::ZERO }; ROLE_COUNT];
+static mut COPY_BUFFER: CopyBuffer = CopyBuffer([0; COPY]);
+const _: () = assert!(core::mem::size_of::<Backing>() == IMAGE + ROLE_STACK_BYTES);
+const _: () = assert!(core::mem::size_of::<Tables>() == 3 * PAGE);
+
+fn ledger_ptr() -> *mut EvidenceLedger {
+    core::ptr::addr_of_mut!(LEDGER).cast()
+}
+fn gate_ptr() -> *mut RegisteredDecisionGate<'static> {
+    core::ptr::addr_of_mut!(GATE).cast()
+}
+fn pair_ptr() -> *mut Pair {
+    core::ptr::addr_of_mut!(PAIR).cast()
+}
+fn now_ns() -> u64 {
+    let f = timer::frequency();
+    assert!(f != 0);
+    u64::try_from(u128::from(timer::ticks()) * 1_000_000_000 / u128::from(f)).expect("monotonic ns")
+}
+fn sha(bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().into()
+}
+fn lo(d: &[u8; 32]) -> u64 {
+    u64::from_le_bytes(d[..8].try_into().unwrap())
+}
+
+// ---- advice-space checked copyin/out (identical contract to advice-e2e) ----
+fn copy_address(space: usize, va: u64, bytes: usize, write: bool) -> Option<(u64, u64)> {
+    if space >= PRIVATE_SPACES {
+        return None;
+    }
+    let page = va & !4095;
+    let offset = va & 4095;
+    let (root, mid, leaf, base) = unsafe {
+        let root = core::ptr::addr_of!(ROOTS).cast::<Page>().add(space);
+        let mid = core::ptr::addr_of!(MIDDLES).cast::<Page>().add(space);
+        let leaf = core::ptr::addr_of!(LEAVES).cast::<Page>().add(space);
+        let base = match page {
+            CODE => core::ptr::addr_of!(v0199_advice_user_start) as u64,
+            DATA => core::ptr::addr_of!(DATA_PAGES).cast::<Page>().add(space) as u64,
+            STACK => core::ptr::addr_of!(USER_STACKS).cast::<Page>().add(space) as u64,
+            _ => return None,
+        };
+        (root, mid, leaf, base)
+    };
+    let root_desc = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*root).0[0])) };
+    let mid_desc = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*mid).0[0])) };
+    if root_desc != (phys(mid as u64) | 3) || mid_desc != (phys(leaf as u64) | 3) {
+        return None;
+    }
+    let desc =
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*leaf).0[(page / 4096) as usize])) };
+    let pa = mmu::checked_user_leaf_span(desc, PhysAddr(phys(base)), offset, bytes, write).ok()?;
+    Some((base.checked_add(offset)?, pa.0))
+}
+fn read_word(space: usize, off: u64) -> u64 {
+    let (src, _) = copy_address(space, DATA + off, 8, false).expect("production read span");
+    unsafe { core::ptr::read_volatile(src as *const u64) }
+}
+fn read_bytes(space: usize, off: u64, out: &mut [u8]) {
+    let (src, _) =
+        copy_address(space, DATA + off, out.len(), false).expect("production copyin span");
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = unsafe { core::ptr::read_volatile((src + i as u64) as *const u8) };
+    }
+}
+fn write_bytes(space: usize, off: u64, bytes: &[u8]) {
+    let (dst, _) =
+        copy_address(space, DATA + off, bytes.len(), true).expect("production copyout span");
+    for (i, b) in bytes.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((dst + i as u64) as *mut u8, *b) };
+    }
+}
+
+// ---- canonical wire builders (mirror the advice-e2e / kernel-core layouts) ----
+fn rule_bytes() -> [u8; 80] {
+    let mut b = [0u8; 80];
+    b[0..4].copy_from_slice(&0x4359_5255u32.to_le_bytes());
+    b[4..6].copy_from_slice(&2u16.to_le_bytes());
+    b[6..8].copy_from_slice(&32u16.to_le_bytes());
+    b[8..16].copy_from_slice(&RULES_GEN.to_le_bytes());
+    b[16..20].copy_from_slice(&1u32.to_le_bytes());
+    b[20..24].copy_from_slice(&80u32.to_le_bytes());
+    b[32..36].copy_from_slice(&1u32.to_le_bytes());
+    b[36..38].copy_from_slice(&1u16.to_le_bytes());
+    b[38..40].copy_from_slice(&1u16.to_le_bytes());
+    b[40..48].copy_from_slice(&TARGET.id.to_le_bytes());
+    b[48..50].copy_from_slice(&1u16.to_le_bytes());
+    b[52..54].copy_from_slice(&2u16.to_le_bytes());
+    b[56..60].copy_from_slice(&48u32.to_le_bytes());
+    b[64..66].copy_from_slice(&2u16.to_le_bytes());
+    b[72..74].copy_from_slice(&4u16.to_le_bytes());
+    b[74..76].copy_from_slice(&1u16.to_le_bytes());
+    b
+}
+fn advice_expected() -> [u8; ADVICE_BYTES] {
+    let mut a = [0u8; ADVICE_BYTES];
+    a[0..4].copy_from_slice(&0x4359_4131u32.to_le_bytes());
+    a[4..6].copy_from_slice(&1u16.to_le_bytes());
+    a[6..8].copy_from_slice(&(ADVICE_BYTES as u16).to_le_bytes());
+    for (at, v) in [
+        (8, ADVISOR_EPOCH),
+        (16, 1),
+        (24, SNAPSHOT_SEQ),
+        (32, TARGET.id),
+        (40, TARGET.generation),
+        (48, LEDGER_GEN),
+        (56, CORE_GEN),
+        (64, EXPIRES_NS),
+        (72, MODEL_GEN),
+    ] {
+        a[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    for (at, v) in [(80, 1u16), (82, 1), (84, 1), (86, 2)] {
+        a[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    a[88..120].fill(3);
+    a[120..152].fill(1);
+    a
+}
+fn plan_bytes() -> [u8; 212] {
+    let mut b = [0u8; 212];
+    b[0..4].copy_from_slice(&0x4359_4c31u32.to_le_bytes());
+    b[4..6].copy_from_slice(&2u16.to_le_bytes());
+    b[6..8].copy_from_slice(&64u16.to_le_bytes());
+    b[8..12].copy_from_slice(&212u32.to_le_bytes());
+    b[12..14].copy_from_slice(&1u16.to_le_bytes());
+    b[14..16].copy_from_slice(&1u16.to_le_bytes());
+    b[16..24].copy_from_slice(&PLAN_SEQ.to_le_bytes());
+    b[32..40].copy_from_slice(&MODEL_GEN.to_le_bytes());
+    b[40..48].copy_from_slice(&CTRL_EPOCH.to_le_bytes());
+    b[48..56].copy_from_slice(&SNAPSHOT_SEQ.to_le_bytes());
+    b[56..64].copy_from_slice(&INSTALLED_NS.to_le_bytes());
+    let h = 64;
+    b[h..h + 4].copy_from_slice(&0x4359_5031u32.to_le_bytes());
+    b[h + 4..h + 6].copy_from_slice(&2u16.to_le_bytes());
+    b[h + 6..h + 8].copy_from_slice(&144u16.to_le_bytes());
+    b[h + 8..h + 10].copy_from_slice(&1u16.to_le_bytes());
+    b[h + 10..h + 12].copy_from_slice(&1u16.to_le_bytes());
+    b[h + 12..h + 16].copy_from_slice(&4u32.to_le_bytes());
+    for (at, v) in [
+        (16, CTRL_EPOCH),
+        (24, DECISION_SEQ),
+        (32, SNAPSHOT_SEQ),
+        (40, TARGET.id),
+        (48, TARGET.generation),
+        (56, LEDGER_GEN),
+        (64, CORE_GEN),
+        (72, EXPIRES_NS),
+    ] {
+        b[h + at..h + at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    b[h + 80..h + 112].fill(3);
+    b[h + 112..h + 144].fill(1);
+    b[h + 144..h + 146].copy_from_slice(&1u16.to_le_bytes());
+    b[h + 146..h + 148].copy_from_slice(&[4u8, 0]);
+    b
+}
+fn decision_bytes(plan: &[u8], rules: &[u8]) -> [u8; DECISION_BYTES] {
+    let mut b = [0u8; DECISION_BYTES];
+    b[0..4].copy_from_slice(&0x4359_4431u32.to_le_bytes());
+    b[4..6].copy_from_slice(&3u16.to_le_bytes());
+    b[6..8].copy_from_slice(&(DECISION_BYTES as u16).to_le_bytes());
+    for (at, v) in [
+        (8, BOOT),
+        (16, CTRL_EPOCH),
+        (24, DECISION_SEQ),
+        (32, PLAN_SEQ),
+        (40, SNAPSHOT_SEQ),
+        (48, TARGET.id),
+        (56, TARGET.generation),
+        (64, LEDGER_GEN),
+        (72, CORE_GEN),
+        (80, RULES_GEN),
+        (144, EXPIRES_NS),
+    ] {
+        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    b[88..92].copy_from_slice(&1u32.to_le_bytes());
+    b[94..96].copy_from_slice(&1u16.to_le_bytes());
+    b[96..98].copy_from_slice(&1u16.to_le_bytes());
+    b[98] = 2;
+    b[99] = 1;
+    b[100] = 1;
+    b[101] = 1;
+    b[102..104].copy_from_slice(&1u16.to_le_bytes());
+    b[104..106].copy_from_slice(&1u16.to_le_bytes());
+    b[108..112].copy_from_slice(&8u32.to_le_bytes());
+    b[112..120].copy_from_slice(&ADVISOR_EPOCH.to_le_bytes());
+    b[120..128].copy_from_slice(&1u64.to_le_bytes());
+    b[128..136].copy_from_slice(&MODEL_GEN.to_le_bytes());
+    b[152..156].copy_from_slice(&3u32.to_le_bytes());
+    b[156..158].copy_from_slice(&0u16.to_le_bytes());
+    b[158..160].copy_from_slice(&1u16.to_le_bytes());
+    b[160..192].copy_from_slice(&sha(rules));
+    b[192..224].copy_from_slice(&sha(plan));
+    b[224..256].fill(1);
+    b
+}
+fn disposition_bytes(advice: &[u8], rec: &[u8], rules: &[u8]) -> [u8; DISPOSITION_BYTES] {
+    let mut b = [0u8; DISPOSITION_BYTES];
+    b[0..4].copy_from_slice(&0x4359_4144u32.to_le_bytes());
+    b[4..6].copy_from_slice(&1u16.to_le_bytes());
+    b[6..8].copy_from_slice(&(DISPOSITION_BYTES as u16).to_le_bytes());
+    for (at, v) in [
+        (8, BOOT),
+        (16, ADVISOR_EPOCH),
+        (24, 1),
+        (32, SNAPSHOT_SEQ),
+        (40, CTRL_EPOCH),
+        (48, DECISION_SEQ),
+        (56, TARGET.id),
+        (64, TARGET.generation),
+        (72, MODEL_GEN),
+        (80, NOW_NS),
+    ] {
+        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    for (at, v) in [
+        (88, 1u16),
+        (90, 1),
+        (92, 1),
+        (94, 0),
+        (100, 0),
+        (102, 1),
+        (104, 1),
+        (106, 1),
+    ] {
+        b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    b[96..100].copy_from_slice(&3u32.to_le_bytes());
+    b[112..144].fill(1);
+    b[144..176].copy_from_slice(&sha(advice));
+    b[176..208].copy_from_slice(&sha(rec));
+    b[208..240].copy_from_slice(&sha(rules));
+    b
+}
+fn report_bytes() -> [u8; 98] {
+    let mut b = [0u8; 98];
+    for (at, v) in [
+        (0, BOOT),
+        (8, CTRL_EPOCH),
+        (16, PLAN_SEQ),
+        (32, TARGET.id),
+        (40, TARGET.generation),
+        (48, EXEC_GEN),
+        (56, PLAN_VERSION),
+        (72, COMPLETED_NS),
+    ] {
+        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    b[26..28].copy_from_slice(&1u16.to_le_bytes());
+    b[28..30].copy_from_slice(&1u16.to_le_bytes());
+    b[68..72].copy_from_slice(&2u32.to_le_bytes());
+    b[96..98].copy_from_slice(&[4u8, 0]);
+    b
+}
+fn binding() -> ExecutorBindingV1 {
+    ExecutorBindingV1 {
+        domain: 1,
+        role: 1,
+        active: true,
+        target: TARGET,
+        executor_generation: EXEC_GEN,
+        holder: Identity {
+            id: 0,
+            generation: 0,
+        },
+        endpoint_cap_id: 0,
+    }
+}
+fn epochs() -> Epochs {
+    Epochs {
+        boot: BOOT,
+        controller: CTRL_EPOCH,
+        model: MODEL_GEN,
+        resources: LEDGER_GEN,
+        cores: CORE_GEN,
+    }
+}
+fn trusted_scope() -> TrustedAdviceScope<'static> {
+    TrustedAdviceScope {
+        epochs: epochs(),
+        advisor_epoch: ADVISOR_EPOCH,
+        snapshot_seq: SNAPSHOT_SEQ,
+        domain: 1,
+        target: TARGET,
+        sampled_ns: SAMPLED_NS,
+        now_ns: NOW_NS,
+        action_kind: 1,
+        candidates: &[2, 4],
+        model_hash: [3; 32],
+        candidate_set_hash: [1; 32],
+    }
+}
+fn init_control_guards() {
+    let ledger = EvidenceLedger::new(OPS, CTRL, SUPER, BOOT, ADVISOR_EPOCH).expect("causal ledger");
+    unsafe { core::ptr::write(ledger_ptr(), ledger) };
+    let gate = RegisteredDecisionGate::new_with_terminal_owner(CTRL, PUB, SUPER, BOOT, CTRL_EPOCH)
+        .expect("registered decision gate");
+    unsafe { core::ptr::write(gate_ptr(), gate) };
+    let pair = Pair::new(OPS, SEC).expect("distinct operations/security brains");
+    unsafe { core::ptr::write(pair_ptr(), pair) };
+}
+
+// ---- PIE loader (mirrors v0199_control_bringup::load, no PMU metering) ----
+fn backing(index: usize) -> *mut Backing {
+    assert!(index < ROLE_COUNT);
+    unsafe {
+        core::ptr::addr_of_mut!(BACKING)
+            .cast::<Backing>()
+            .add(index)
+    }
+}
+fn tables(index: usize) -> *mut Tables {
+    assert!(index < ROLE_COUNT);
+    unsafe { core::ptr::addr_of_mut!(TABLES).cast::<Tables>().add(index) }
+}
+fn root_pa(index: usize) -> u64 {
+    phys(tables(index) as u64)
+}
+fn role_asid(index: usize) -> u8 {
+    (0xA0 + index) as u8
+}
+fn high_leaf(pa: u64) -> *mut u64 {
+    assert!(pa.is_multiple_of(PAGE as u64) && pa >= cyxia_platform_virt::RAM_BASE);
+    let offset = (pa - cyxia_platform_virt::RAM_BASE) / PAGE as u64;
+    assert!(offset < (cyxia_platform_virt::RAM_MIB * 1024 * 1024 / PAGE as u64));
+    unsafe {
+        ((core::ptr::addr_of!(ram_l3) as u64 + super::super::HIGH) as *mut u64).add(offset as usize)
+    }
+}
+fn sync_code(addr: u64, bytes: usize) {
+    let ctr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+    }
+    let line = 4usize << ((ctr >> 16) & 15);
+    assert!(line.is_power_of_two() && line <= PAGE);
+    for off in (0..bytes).step_by(line) {
+        unsafe {
+            core::arch::asm!("dc cvau, {}", in(reg) addr + off as u64, options(nostack));
+        }
+    }
+    unsafe {
+        core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack));
+    }
+}
+fn tlbi() {
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack)
+        );
+    }
+}
+fn seal_page(pa: u64) {
+    let leaf = high_leaf(pa);
+    let old = unsafe { core::ptr::read_volatile(leaf) };
+    assert_eq!(old, pa | 0x0060_0000_0000_0703);
+    unsafe {
+        core::ptr::write_volatile(leaf, 0);
+    }
+    tlbi();
+    unsafe {
+        core::ptr::write_volatile(leaf, old | (1 << 7));
+    }
+    tlbi();
+}
+/// Snapshot/audit cap selector issued to a PIE role (diagnostic, EL1-owned).
+fn pie_cap_selector(index: usize) -> u64 {
+    match ROLES[index] {
+        Role::Operations | Role::Security | Role::DeterministicController | Role::Supervisor => {
+            0x1000 + index as u64 * 0x100 + 1
+        }
+        _ => 0,
+    }
+}
+fn load_role(index: usize) -> NativeRole {
+    let role = ROLES[index];
+    let pkg = &CATALOG[index];
+    assert_eq!(pkg.role_id, role.id());
+    assert!(pkg.bytes.len() <= COPY);
+    let actor = Identity {
+        id: u64::from(role.id()),
+        generation: 1,
+    };
+    let endpoint = 0xC000 + index as u64;
+    let b = backing(index);
+    let t = tables(index);
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(COPY_BUFFER.0) };
+    scratch[..pkg.bytes.len()].copy_from_slice(pkg.bytes);
+    let spec = RolePackageSpec {
+        role,
+        package_id: u64::from(role.id()),
+        abi: 3,
+        image_bytes: pkg.bytes.len(),
+        image_sha256: pkg.image_sha256,
+        relative_count: pkg.relative.len(),
+        relative_sha256: pkg.relative_sha256,
+        stack_bytes: ROLE_STACK_BYTES,
+    };
+    let verified = VerifiedRolePackage::verify_checkpointed(
+        spec,
+        RolePackageInput {
+            package_id: spec.package_id,
+            bytes: &scratch[..pkg.bytes.len()],
+            relative: pkg.relative,
+        },
+        &mut || {},
+    )
+    .expect("trusted ABI3 role package");
+    let relro = verified.relro();
+    let image = unsafe { &mut *core::ptr::addr_of_mut!((*b).image) };
+    let entry = verified
+        .stage(image, BASE, BASE, BASE + IMAGE as u64)
+        .expect("private PIE stage");
+    let stack = unsafe { &mut *core::ptr::addr_of_mut!((*b).stack) };
+    let cap_selector = pie_cap_selector(index);
+    let mut args = [0u8; 24];
+    args[..8].copy_from_slice(&cap_selector.to_le_bytes());
+    args[8..16].copy_from_slice(&0u64.to_le_bytes());
+    args[16..24].copy_from_slice(&actor.generation.to_le_bytes());
+    let startup =
+        cyxia_kernel_core::security::syscall_v3::stage_spawn_args(stack, STACK_BASE, &args)
+            .expect("private ABI3 startup arguments");
+    assert_eq!(startup.sp, STACK_END - 32);
+    let mut map = [0u8; IMAGE / PAGE];
+    for seg in verified.load_segments() {
+        let start = seg.virtual_address as usize / PAGE;
+        let end = (seg.virtual_address + seg.memory_bytes).div_ceil(PAGE as u64) as usize;
+        assert!(start < end && end <= map.len());
+        for page in &mut map[start..end] {
+            assert_eq!(*page, 0);
+            *page = seg.flags as u8;
+        }
+    }
+    if let Some((start, len)) = relro {
+        assert_eq!(start % PAGE as u64, 0);
+        let end = start.checked_add(len).unwrap().div_ceil(PAGE as u64);
+        assert!(end <= map.len() as u64);
+        for page in &mut map[start as usize / PAGE..end as usize] {
+            assert_eq!(*page, 6);
+            *page = 4;
+        }
+    }
+    scratch.fill(0);
+    let image_base = b as u64;
+    for (i, flags) in map.iter().copied().enumerate() {
+        if flags & 1 != 0 {
+            sync_code(image_base + i as u64 * PAGE as u64, PAGE);
+        }
+    }
+    unsafe {
+        (*t).root.0[0] = phys(core::ptr::addr_of!((*t).mid) as u64) | 3;
+        (*t).mid.0[0] = phys(core::ptr::addr_of!((*t).leaf) as u64) | 3;
+    }
+    for (i, flags) in map.into_iter().enumerate() {
+        if flags == 0 {
+            continue;
+        }
+        let pa = phys(image_base + i as u64 * PAGE as u64);
+        let write = flags & 2 != 0;
+        let execute = flags & 1 != 0;
+        if !write {
+            seal_page(pa);
+        }
+        let desc = mmu::encode_user_leaf(PhysAddr(pa), write, execute).unwrap();
+        unsafe {
+            (*t).leaf.0[BASE as usize / PAGE + i] = desc;
+        }
+    }
+    let stack_base = unsafe { core::ptr::addr_of!((*b).stack) as u64 };
+    for i in 0..ROLE_STACK_BYTES / PAGE {
+        let pa = phys(stack_base + i as u64 * PAGE as u64);
+        unsafe {
+            (*t).leaf.0[STACK_BASE as usize / PAGE + i] =
+                mmu::encode_user_leaf(PhysAddr(pa), true, false).unwrap();
+        }
+    }
+    assert_eq!(unsafe { (*t).leaf.0[STACK_BASE as usize / PAGE - 1] }, 0);
+    tlbi();
+    PIE_CAP[index].store(cap_selector, Ordering::Release);
+    // Stash the entry/SP for the turn loop in the member's private region base
+    // is not possible; keep a separate context array instead (see pie_context).
+    PIE_ENTRY[index].store(entry, Ordering::Release);
+    PIE_SP[index].store(startup.sp, Ordering::Release);
+    PIE_X0[index].store(startup.x0, Ordering::Release);
+    PIE_X1[index].store(startup.x1, Ordering::Release);
+    NativeRole {
+        role,
+        actor,
+        ttbr0_root: root_pa(index),
+        private_rw: PrivateRegion {
+            base: phys(b as u64),
+            bytes: core::mem::size_of::<Backing>() as u64,
+        },
+        caps: role.allowed_caps(),
+        control_ns_per_100ms: 2_000_000,
+        cpu_mask: profile::CONTROL_MASK,
+        thread_count: 1,
+        endpoint_id: endpoint,
+    }
+}
+static PIE_ENTRY: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
+static PIE_SP: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
+static PIE_X0: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
+static PIE_X1: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
+/// The sole accepted pointer range for a PIE role is its private stack.
+fn stack_span(index: usize, va: u64, n: usize, write: bool) -> Option<u64> {
+    if n == 0 {
+        return None;
+    }
+    let end = va.checked_add(n as u64)?;
+    if va < STACK_BASE || end > STACK_END {
+        return None;
+    }
+    let t = tables(index);
+    let b = backing(index);
+    let stack = unsafe { core::ptr::addr_of!((*b).stack) as u64 };
+    let root = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*t).root.0[0])) };
+    let mid = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*t).mid.0[0])) };
+    if root != (phys(unsafe { core::ptr::addr_of!((*t).mid) } as u64) | 3)
+        || mid != (phys(unsafe { core::ptr::addr_of!((*t).leaf) } as u64) | 3)
+    {
+        return None;
+    }
+    let mut cur = va;
+    while cur < end {
+        let page = cur & !4095;
+        let owned = PhysAddr(phys(stack + page - STACK_BASE));
+        let pte = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(
+                (*t).leaf.0[(page / PAGE as u64) as usize]
+            ))
+        };
+        let length = (end - cur).min(PAGE as u64 - (cur & 4095)) as usize;
+        mmu::checked_user_leaf_span(pte, owned, cur & 4095, length, write).ok()?;
+        cur += length as u64;
+    }
+    Some(stack + va - STACK_BASE)
+}
+
+// ---- in-vector production dispatch ----
+/// Authenticate the trapped caller from EL1 registered state (never EL0 bytes)
+/// and dispatch the ABI-v3 production subset. Returns Some(outcome) when the
+/// trap was serviced in-vector (EL0 resumes with x0=outcome); None lets the
+/// exception fall through to the proven smp capture path (clock/yield/sleep,
+/// timer IRQ, faults, secondary CPUs).
+fn svc_dispatch(f: &mut ExceptionFrame) -> Option<u64> {
+    let slot = cpu::slot();
+    if slot != 0 {
+        return None;
+    }
+    let caller = VECTOR_CALLER[slot].load(Ordering::Acquire);
+    if caller == CALLER_NONE {
+        return None;
+    }
+    let call = decode_aarch64_svc_v3(3, f.esr, &f.regs).ok()?;
+    let args = call.args;
+    let x8 = f.regs[8];
+    if !matches!(x8, 0x40 | 0x41 | 0x50) {
+        return None;
+    }
+    let outcome = if caller < ADVICE_CALLER_BASE {
+        pie_dispatch(caller as usize, x8, args, f)
+    } else {
+        advice_dispatch((caller - ADVICE_CALLER_BASE) as usize, x8, args, f)
+    };
+    let idx = caller as usize;
+    SVC_ESR[idx].store(f.esr, Ordering::Relaxed);
+    SVC_X8[idx].store(x8, Ordering::Relaxed);
+    SVC_OUT[idx].store(outcome, Ordering::Relaxed);
+    Some(outcome)
+}
+/// PIE role bootstrap subset: snapshot (0x40) and supervisor audit (0x50 op1)
+/// are authenticated and fail closed (EAGAIN) — no durable snapshot/audit source
+/// exists at boot. Clock/yield/sleep are NOT in the production set and fall
+/// through to the turn loop.
+fn pie_dispatch(index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u64 {
+    let member = unsafe {
+        core::ptr::read_volatile(
+            core::ptr::addr_of!(PIE_MEMBERS)
+                .cast::<NativeRole>()
+                .add(index),
+        )
+    };
+    let cap = PIE_CAP[index].load(Ordering::Acquire);
+    match x8 {
+        0x40 => {
+            // ReadSnapshot: cap + domain + writable reply span, then EAGAIN.
+            let domain_ok = match member.role {
+                Role::Security => args[1] == 12,
+                Role::Operations | Role::DeterministicController => args[1] == 1,
+                _ => false,
+            };
+            if cap == 0 || args[0] != cap || !domain_ok || args[4] < 264 {
+                return E_AUTH as u64;
+            }
+            if usize::try_from(args[4])
+                .ok()
+                .and_then(|len| stack_span(index, args[3], len, true))
+                .is_none()
+            {
+                return EFAULT as u64;
+            }
+            PIE_ROLE_CALLS[index].fetch_add(1, Ordering::Relaxed);
+            EAGAIN as u64
+        }
+        0x50 if args[2] == 64 => {
+            // Supervisor AUDIT_READ op1: only the supervisor role, cap + span.
+            if member.role != Role::Supervisor || cap == 0 || args[0] != cap || args[3] != 0 {
+                return E_AUTH as u64;
+            }
+            if stack_span(index, args[1], 64, false).is_none()
+                || usize::try_from(args[5])
+                    .ok()
+                    .and_then(|len| stack_span(index, args[4], len, true))
+                    .is_none()
+            {
+                return EFAULT as u64;
+            }
+            PIE_ROLE_CALLS[index].fetch_add(1, Ordering::Relaxed);
+            EAGAIN as u64
+        }
+        _ => E_FORMAT as u64,
+    }
+}
+/// Advice-chain bridge dispatch — the SAME kernel-core APIs the advice-e2e
+/// fixture calls, now serviced in the exception vector.
+fn advice_dispatch(role_index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u64 {
+    let space = FIRST_ADVICE_SPACE + role_index;
+    let member = unsafe {
+        core::ptr::read_volatile(
+            core::ptr::addr_of!(MANIFEST_MEMBERS)
+                .cast::<NativeRole>()
+                .add(role_index),
+        )
+    };
+    let cpu = cpu::slot();
+    match x8 {
+        0x50 if args[2] == ADVICE_BYTES as u64 => {
+            // Advice intake glue (no SvcV3Bridge submit entry exists).
+            if cpu != 0
+                || member.caps & SEND_ADVICE != SEND_ADVICE
+                || args[0] != ADVICE_CAP
+                || args[3] != 0
+            {
+                return 0;
+            }
+            let mut copy = [0u8; ADVICE_BYTES];
+            if copy_address(space, args[1], ADVICE_BYTES, false).is_none() {
+                return 0;
+            }
+            read_bytes(space, args[1] & 4095, &mut copy);
+            let trusted = trusted_scope();
+            let ledger = unsafe { &mut *ledger_ptr() };
+            let pair = unsafe { &mut *pair_ptr() };
+            let ok = pair
+                .submit_operations_wire(member.actor, &copy, &trusted)
+                .is_ok()
+                && ledger.record(OPS, &copy, &trusted).is_ok();
+            if ok {
+                unsafe {
+                    core::ptr::write_volatile(core::ptr::addr_of_mut!(ADVICE_WIRE), copy);
+                }
+                ADVICE_RECORDED.store(true, Ordering::Release);
+            }
+            u64::from(ok)
+        }
+        0x50 if args[2] == (DECISION_BYTES + DISPOSITION_BYTES) as u64 => {
+            // REGISTER via the real SvcV3Bridge 0x50 endpoint.
+            if cpu != 0
+                || member.caps & DECISION_REGISTER != DECISION_REGISTER
+                || args[0] != DECISION_CAP
+            {
+                return 0;
+            }
+            let mut copy = [0u8; DECISION_BYTES + DISPOSITION_BYTES];
+            if copy_address(space, args[1], copy.len(), false).is_none() {
+                return 0;
+            }
+            read_bytes(space, args[1] & 4095, &mut copy);
+            let caller = VerifiedNativeCaller {
+                identity: member.actor,
+                package_abi: 3,
+                endpoint_cap: DECISION_CAP,
+                cpu,
+            };
+            with_bundle(|frozen, scope| {
+                let mut bridge = SvcV3Bridge {
+                    gate: unsafe { &mut *gate_ptr() },
+                    decision_endpoint_cap: DECISION_CAP,
+                    publisher_cap: PUBLISHER_CAP,
+                };
+                let ledger = unsafe { &mut *ledger_ptr() };
+                match bridge.register_assisted_one(caller, args, &copy, frozen, scope, ledger) {
+                    Ok(Registration::Frozen) => 1,
+                    Ok(Registration::ExactRetry) => 2,
+                    Err(_) => 0,
+                }
+            })
+        }
+        0x41 => {
+            // PUBLISH via the real SvcV3Bridge 0x41 endpoint.
+            if cpu != 0 || member.caps & PUBLISH_PLAN != PUBLISH_PLAN {
+                return 0;
+            }
+            let plan_len = args[1] as usize;
+            let mut plan_copy = [0u8; 212];
+            let mut side_copy = [0u8; DECISION_BYTES];
+            if plan_len != plan_copy.len()
+                || copy_address(space, args[0], plan_len, false).is_none()
+                || copy_address(space, args[2], DECISION_BYTES, false).is_none()
+            {
+                return 0;
+            }
+            read_bytes(space, args[0] & 4095, &mut plan_copy);
+            read_bytes(space, args[2] & 4095, &mut side_copy);
+            let caller = VerifiedNativeCaller {
+                identity: member.actor,
+                package_abi: 3,
+                endpoint_cap: PUBLISHER_CAP,
+                cpu,
+            };
+            with_bundle(|frozen, scope| {
+                let mut bridge = SvcV3Bridge {
+                    gate: unsafe { &mut *gate_ptr() },
+                    decision_endpoint_cap: DECISION_CAP,
+                    publisher_cap: PUBLISHER_CAP,
+                };
+                match bridge.publish_assisted_one(
+                    caller,
+                    args,
+                    &plan_copy,
+                    core::slice::from_ref(&side_copy),
+                    frozen,
+                    scope,
+                    || {
+                        ACCEPT_COUNT.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    },
+                ) {
+                    Ok(Publication::AdapterAccepted) => 1,
+                    Ok(Publication::ReplayNoEffect) => 2,
+                    Err(_) => 0,
+                }
+            })
+        }
+        _ => 0,
+    }
+}
+/// Reconstruct the immutable trusted bundle from the EL1-owned static artifacts
+/// and invoke `f` synchronously within this frame. The byte artifacts are
+/// 'static (static storage); the parsed Profile/FrozenAction/scope are borrow
+/// locals that live exactly as long as the synchronous bridge call. No lifetime
+/// is extended past its frame (no transmute).
+fn with_bundle(f: impl FnOnce(&FrozenNativePlan<'_>, &AssistedScope<'_>) -> u64) -> u64 {
+    let rules = unsafe { &*core::ptr::addr_of!(TRUSTED_RULES) };
+    let plan = unsafe { &*core::ptr::addr_of!(TRUSTED_PLAN) };
+    let rec = unsafe { &*core::ptr::addr_of!(TRUSTED_REC) };
+    let profile = Profile::parse(rules).expect("RuleProfile v2");
+    let candidates: &[u16] = &[2, 4];
+    let payload: &[u8] = &[4, 0];
+    let local = FrozenAction {
+        domain_id: 1,
+        target: TARGET,
+        candidate_set_hash: [1; 32],
+        static_ordinals: candidates,
+        raw_fields: [None; 7],
+        action_payload: payload,
+    };
+    let trusted = trusted_scope();
+    let scope = AssistedScope {
+        advice: &trusted,
+        assisted_mode: true,
+        offline_model_authorized: true,
+    };
+    let ctx = TrustedRegistrationScope {
+        boot_epoch: BOOT,
+        controller_epoch: CTRL_EPOCH,
+        rules_generation: RULES_GEN,
+        rules_hash: sha(rules),
+        base_plan_version: 0,
+        ledger_generation: LEDGER_GEN,
+        core_generation: CORE_GEN,
+        snapshot_seq: SNAPSHOT_SEQ,
+        sampled_ns: SAMPLED_NS,
+        now_ns: NOW_NS,
+    };
+    let frozen = FrozenNativePlan {
+        bytes: plan,
+        sidecars: core::slice::from_ref(rec),
+        rules: &profile,
+        actions: core::slice::from_ref(&local),
+        context: ctx,
+    };
+    f(&frozen, &scope)
+}
+
+/// Production exception entry: dispatch the ABI-v3 production subset in-vector,
+/// fall through to the proven smp path for everything else.
+pub(crate) fn exception(f: &mut ExceptionFrame, kind: u64) {
+    if kind == 8 && f.esr >> 26 == 0x15
+        && let Some(outcome) = svc_dispatch(f) {
+            f.regs[0] = outcome;
+            // ELR_EL1 already points past the trapped SVC; SPSR stays EL0t.
+            return;
+        }
+    super::exception(f, kind);
+}
+
+// ---- bounded turn loops ----
+fn enter_advice(ctx: &mut user::Context, space: usize) {
+    let role_index = space - FIRST_ADVICE_SPACE;
+    VECTOR_CALLER[0].store(ADVICE_CALLER_BASE + role_index as u64, Ordering::Release);
+    execute(ctx, space);
+    VECTOR_CALLER[0].store(CALLER_NONE, Ordering::Release);
+}
+/// Advice turn: SVCs are serviced in-vector; the loop only observes the bounded
+/// yield (SVC #4) and private-timer preemptions.
+fn advice_turn(space: usize, mode: u64) {
+    let mut ctx = context(space);
+    ctx.regs[7] = mode;
+    for _ in 0..64 {
+        enter_advice(&mut ctx, space);
+        if ctx.kind == 9 {
+            continue;
+        }
+        if ctx.kind == 8 && ctx.esr >> 26 == 0x15 && ctx.esr & 0xffff == 4 {
+            return;
+        }
+        fatal(300);
+    }
+    fatal(330);
+}
+/// Carrier turn: EL1 pre-sets x8/x0..x5; EL0 traps the trusted payload in-vector.
+fn advice_carrier(space: usize, x8: u64, args: [u64; 6]) {
+    let mut ctx = context(space);
+    ctx.regs[8] = x8;
+    ctx.regs[..6].copy_from_slice(&args);
+    ctx.regs[7] = 4;
+    for _ in 0..64 {
+        enter_advice(&mut ctx, space);
+        if ctx.kind == 9 {
+            continue;
+        }
+        if ctx.kind == 8 && ctx.esr >> 26 == 0x15 && ctx.esr & 0xffff == 4 {
+            return;
+        }
+        fatal(300);
+    }
+    fatal(330);
+}
+/// One bounded PIE role turn. Clock/yield/sleep are handled here (capture path);
+/// snapshot/audit were already serviced in-vector.
+fn pie_turn(index: usize, ctx: &mut user::Context) {
+    VECTOR_CALLER[0].store(index as u64, Ordering::Release);
+    let quantum = (timer::frequency() / 1000).max(1);
+    unsafe {
+        timer::arm(timer::ticks().saturating_add(quantum));
+        user::enter_pinned_until_retired(ctx, root_pa(index), role_asid(index));
+        cpu::disable_timer();
+    }
+    VECTOR_CALLER[0].store(CALLER_NONE, Ordering::Release);
+    if ctx.kind == 9 {
+        return; // private PPI preemption; resume next turn
+    }
+    if ctx.kind != 8 || ctx.esr >> 26 != 0x15 {
+        fatal(600 + index as u64);
+    }
+    let call = decode_aarch64_svc_v3(3, ctx.esr, &ctx.regs).expect("actual ABI3 role trap");
+    let result = match call.operation {
+        cyxia_kernel_core::security::syscall::Syscall::Clock => {
+            PIE_CLOCKS[index].fetch_add(1, Ordering::Relaxed);
+            i64::try_from(now_ns()).unwrap_or(0)
+        }
+        cyxia_kernel_core::security::syscall::Syscall::Yield => {
+            PIE_YIELDS[index].fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        cyxia_kernel_core::security::syscall::Syscall::Sleep => {
+            PIE_YIELDS[index].fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        _ => fatal(601 + index as u64),
+    };
+    ctx.regs[0] = result as u64;
+}
+
+pub(crate) fn run(info: &BootInfo) -> ! {
+    assert_eq!(
+        cpu::slot(),
+        0,
+        "only boot CPU0 owns the production control plane"
+    );
+    // ---- SMP bring-up: mirrors smp::run's proven secondary-start path ----
+    if info.cpu_count != REQUIRED {
+        report(
+            "SMP_REJECT_CPU_COUNT",
+            info.cpu_count as u64,
+            REQUIRED as u64,
+            0,
+        );
+        panic!("unsupported CPU count for the production skeleton");
+    }
+    let topo = cyxia_platform_virt::cpu_topology(info, cpu::affinity()).expect("PSCI topology");
+    assert_eq!(topo.count, REQUIRED);
+    let mut resource = info.gic.unwrap();
+    resource.distributor.0 += super::super::HIGH;
+    resource.cpu.0 += super::super::HIGH;
+    let irq = info.timer_irq.unwrap();
+    assert!((16..32).contains(&irq));
+    TIMER_IRQ.store(irq as u64, Ordering::Relaxed);
+    unsafe {
+        *core::ptr::addr_of_mut!(RESOURCE) = Some(resource);
+        *core::ptr::addr_of_mut!(GICS).cast::<Option<Gic>>() = Some(Gic::new(resource).unwrap());
+        init_memory();
+    }
+    for (slot, affinity) in AFFINITIES.iter().enumerate().take(topo.count) {
+        affinity.store(topo.affinity[slot], Ordering::Release);
+    }
+    BOOT_READY.store(true, Ordering::Release);
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+    let entry = core::ptr::addr_of!(cyxia_secondary_start) as u64;
+    assert!((cyxia_platform_virt::ENTRY..cyxia_platform_virt::ENTRY + 4096).contains(&entry));
+    for slot in 1..topo.count {
+        let result = unsafe { cpu::start(topo.conduit, topo.affinity[slot], entry, slot as u64) };
+        report(
+            "SMP_CPU_ON",
+            slot as u64,
+            topo.affinity[slot],
+            result as u64,
+        );
+        assert_eq!(result, 0, "CPU_ON must report success");
+    }
+    wait(|| ONLINE.load(Ordering::Acquire) == 15);
+    report(
+        "SMP_BOOT_OK",
+        topo.count as u64,
+        ONLINE.load(Ordering::Acquire),
+        0,
+    );
+    for gate in GATES.iter().take(REQUIRED).skip(1) {
+        gate.open(Token {
+            generation: 1,
+            plane: Plane::Business,
+        })
+        .unwrap();
+    }
+    assert_eq!(PRIVATE_SPACES, FIRST_ADVICE_SPACE + ADVICE_SPACES);
+    report("V020_PROD_STAGE", 1, 0, 0);
+    init_control_guards();
+    gic()
+        .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
+        .expect("CPU0 timer PPI");
+
+    // ---- Phase 1: load + run the eight ABI3 PIE role packages ----
+    let pie_members: [NativeRole; ROLE_COUNT] = core::array::from_fn(load_role);
+    let pie_manifest = NativeRoleManifest {
+        online_mask: profile::ONLINE,
+        members: pie_members,
+        other_protected_pool_bytes: core::mem::size_of::<[Tables; ROLE_COUNT]>()
+            + COPY
+            + 1024 * 1024,
+        other_control_ns_per_100ms: 10_000_000,
+    };
+    pie_manifest
+        .validate()
+        .expect("eight distinct native PIE TTBR/role/cap entries");
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(PIE_MEMBERS), pie_members);
+    }
+    report(
+        "V020_PROD_PIE_LOAD",
+        ROLE_COUNT as u64,
+        pie_members[0].ttbr0_root,
+        0,
+    );
+    let mut pie_ctx: [user::Context; ROLE_COUNT] = core::array::from_fn(|i| {
+        let mut ctx = user::Context::empty();
+        ctx.pc = PIE_ENTRY[i].load(Ordering::Acquire);
+        ctx.sp = PIE_SP[i].load(Ordering::Acquire);
+        ctx.regs[0] = PIE_X0[i].load(Ordering::Acquire);
+        ctx.regs[1] = PIE_X1[i].load(Ordering::Acquire);
+        ctx
+    });
+    // Bounded round-robin: every role clocks; snapshot/audit roles service their
+    // role-specific SVC in-vector (EAGAIN), sleep roles yield.
+    let until = timer::ticks()
+        .checked_add(timer::frequency() * 5)
+        .expect("deadline");
+    loop {
+        let done = (0..ROLE_COUNT).all(|i| {
+            PIE_CLOCKS[i].load(Ordering::Acquire) >= 1
+                && (PIE_ROLE_CALLS[i].load(Ordering::Acquire) >= 1
+                    || PIE_YIELDS[i].load(Ordering::Acquire) >= 1)
+        });
+        if done {
+            break;
+        }
+        if timer::ticks() >= until {
+            fatal(650);
+        }
+        for (i, ctx) in pie_ctx.iter_mut().enumerate().take(ROLE_COUNT) {
+            pie_turn(i, ctx);
+        }
+    }
+    for i in 0..ROLE_COUNT {
+        report(
+            "V020_PROD_PIE_ROLE",
+            u64::from(ROLES[i].id()),
+            PIE_CLOCKS[i].load(Ordering::Acquire),
+            PIE_ROLE_CALLS[i].load(Ordering::Acquire),
+        );
+    }
+    report("V020_PROD_STAGE", 2, ROLE_COUNT as u64, 0);
+
+    // ---- Phase 2: in-vector advice causal chain ----
+    // Map the advisor/carrier EL0 program into each advice space's CODE leaf.
+    let code = core::ptr::addr_of!(v0199_advice_user_start) as u64;
+    let code_end = core::ptr::addr_of!(v0199_advice_user_end) as u64;
+    assert!(code.is_multiple_of(4096) && code_end - code <= 4096);
+    for index in 0..ADVICE_SPACES {
+        let space = FIRST_ADVICE_SPACE + index;
+        let leaf = unsafe { core::ptr::addr_of_mut!(LEAVES).cast::<Page>().add(space) };
+        unsafe {
+            (*leaf).0[(CODE / 4096) as usize] =
+                mmu::encode_user_leaf(PhysAddr(phys(code)), false, true).unwrap();
+        }
+    }
+    tlbi();
+    let members = core::array::from_fn(|index| {
+        let space = FIRST_ADVICE_SPACE + index;
+        let root = unsafe { core::ptr::addr_of!(ROOTS).cast::<Page>().add(space) as u64 };
+        let data = unsafe { core::ptr::addr_of!(DATA_PAGES).cast::<Page>().add(space) as u64 };
+        NativeRole {
+            role: ROLES[index],
+            actor: Identity {
+                id: ROLES[index].id() as u64,
+                generation: 1,
+            },
+            ttbr0_root: phys(root),
+            private_rw: PrivateRegion {
+                base: phys(data),
+                bytes: 4096,
+            },
+            caps: ROLES[index].allowed_caps(),
+            control_ns_per_100ms: 2_000_000,
+            cpu_mask: profile::CONTROL_MASK,
+            thread_count: 1,
+            endpoint_id: 0xC000 + index as u64,
+        }
+    });
+    let manifest = NativeRoleManifest {
+        online_mask: profile::ONLINE,
+        members,
+        other_protected_pool_bytes: 5 * 1024 * 1024,
+        other_control_ns_per_100ms: 45_000_000,
+    };
+    manifest
+        .validate()
+        .expect("eight distinct native advice TTBR/role/cap entries");
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(MANIFEST_MEMBERS), members);
+    }
+    // Trusted EL1 artifacts (written once before any dispatch).
+    let rules = rule_bytes();
+    let plan = plan_bytes();
+    let rec = decision_bytes(&plan, &rules);
+    let advice = advice_expected();
+    let disp = disposition_bytes(&advice, &rec, &rules);
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(TRUSTED_RULES), rules);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(TRUSTED_PLAN), plan);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(TRUSTED_REC), rec);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(TRUSTED_DISP), disp);
+    }
+    report(
+        "V020_PROD_STAGE",
+        3,
+        members[0].ttbr0_root,
+        members[0].private_rw.base,
+    );
+    wait(|| (1..REQUIRED).all(|slot| PROGRESS[slot * 2].load(Ordering::Acquire) >= 2));
+
+    let ops_space = FIRST_ADVICE_SPACE;
+    let sec_space = FIRST_ADVICE_SPACE + 1;
+    let ctrl_space = FIRST_ADVICE_SPACE + 2;
+    let pub_space = FIRST_ADVICE_SPACE + 3;
+
+    // (1) POSITIVE: EL0 operations advisor constructs + submits (in-vector 0x50).
+    advice_turn(ops_space, 1);
+    assert!(
+        ADVICE_RECORDED.load(Ordering::Acquire),
+        "advice submit must be recorded"
+    );
+    let advice_wire = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ADVICE_WIRE)) };
+    assert_eq!(
+        advice_wire, advice,
+        "EL0-constructed envelope must equal the trusted expectation"
+    );
+    assert_eq!(unsafe { (&*ledger_ptr()).pending() }, 1);
+    AdviceDispositionV1::decode(&disp)
+        .unwrap()
+        .matches_decision_pair(BOOT, &advice_wire, &rec)
+        .expect("disposition links real EL0 advice + decision");
+    assert_eq!(
+        read_word(ops_space, OBSERVED_OFF),
+        1,
+        "EL0 must observe the x0 return receipt"
+    );
+    let submit = (
+        SVC_ESR[ROLE_COUNT].load(Ordering::Relaxed),
+        SVC_X8[ROLE_COUNT].load(Ordering::Relaxed),
+        SVC_OUT[ROLE_COUNT].load(Ordering::Relaxed),
+    );
+    assert_eq!(
+        submit,
+        (0x5600_0000, 0x50, 1),
+        "in-vector advice submit evidence"
+    );
+    report("V020_PROD_SUBMIT", OPS.id, submit.0, submit.2);
+
+    // (2) Independent RuleProfile review adopts the advice candidate.
+    let pair = unsafe { &*pair_ptr() };
+    let profile = Profile::parse(&rules).expect("RuleProfile v2");
+    let candidates = [2u16, 4];
+    let trusted = trusted_scope();
+    let review = pair
+        .review_with_rule_profile(
+            &profile,
+            RULES_GEN,
+            trusted.review_scope(),
+            [None; 7],
+            &candidates,
+            true,
+        )
+        .expect("rule profile review");
+    assert_eq!(review.source, ChoiceSource::OperationsAdvice);
+    assert_eq!(review.candidate, 4);
+    report(
+        "V020_PROD_REVIEW",
+        review.candidate as u64,
+        review.source as u64,
+        0,
+    );
+
+    // (3) NEGATIVES: wrong identity, illegal domain, forged cap (all in-vector).
+    let pending_before = unsafe { (&*ledger_ptr()).pending() };
+    advice_turn(sec_space, 1);
+    let sec_out = SVC_OUT[ROLE_COUNT + 1].load(Ordering::Relaxed);
+    advice_turn(ops_space, 2);
+    let illegal_out = SVC_OUT[ROLE_COUNT].load(Ordering::Relaxed);
+    advice_turn(ops_space, 3);
+    let forged_out = SVC_OUT[ROLE_COUNT].load(Ordering::Relaxed);
+    assert_eq!(
+        (sec_out, illegal_out, forged_out),
+        (0, 0, 0),
+        "negatives must be rejected"
+    );
+    assert_eq!(
+        unsafe { (&*ledger_ptr()).pending() },
+        pending_before,
+        "no negative advice may enter the ledger"
+    );
+    assert_eq!(read_word(ops_space, OBSERVED_OFF), 0);
+    report("V020_PROD_NEG", sec_out, illegal_out, forged_out);
+
+    // (4) NEGATIVE: wrong CPU at the EL1 bridge boundary (every real trap is CPU0).
+    let mut recdisp = [0u8; DECISION_BYTES + DISPOSITION_BYTES];
+    recdisp[..DECISION_BYTES].copy_from_slice(&rec);
+    recdisp[DECISION_BYTES..].copy_from_slice(&disp);
+    {
+        let caller = VerifiedNativeCaller {
+            identity: CTRL,
+            package_abi: 3,
+            endpoint_cap: DECISION_CAP,
+            cpu: 1,
+        };
+        let args = [
+            DECISION_CAP,
+            DATA + ENVELOPE_OFF,
+            recdisp.len() as u64,
+            0,
+            DATA + REG_OUT_OFF,
+            8,
+        ];
+        let denied = with_bundle(|frozen, scope| {
+            let mut bridge = SvcV3Bridge {
+                gate: unsafe { &mut *gate_ptr() },
+                decision_endpoint_cap: DECISION_CAP,
+                publisher_cap: PUBLISHER_CAP,
+            };
+            let ledger = unsafe { &mut *ledger_ptr() };
+            u64::from(
+                bridge
+                    .register_assisted_one(caller, args, &recdisp, frozen, scope, ledger)
+                    .is_err(),
+            )
+        });
+        assert_eq!(denied, 1, "wrong CPU must be denied");
+    }
+    assert!(
+        !unsafe { (&*gate_ptr()).has_unpublished() },
+        "wrong-CPU register must not freeze a plan"
+    );
+    report("V020_PROD_WRONG_CPU", 1, 0, 0);
+
+    // (5) REGISTER via real in-vector EL0 SVC 0x50 (controller carrier).
+    write_bytes(ctrl_space, ENVELOPE_OFF, &recdisp);
+    let reg_args = [
+        DECISION_CAP,
+        DATA + ENVELOPE_OFF,
+        recdisp.len() as u64,
+        0,
+        DATA + REG_OUT_OFF,
+        8,
+    ];
+    advice_carrier(ctrl_space, 0x50, reg_args);
+    let reg = (
+        SVC_ESR[ROLE_COUNT + 2].load(Ordering::Relaxed),
+        SVC_X8[ROLE_COUNT + 2].load(Ordering::Relaxed),
+        SVC_OUT[ROLE_COUNT + 2].load(Ordering::Relaxed),
+    );
+    assert_eq!((reg.1, reg.2), (0x50, 1), "register must freeze");
+    assert!(unsafe { (&*gate_ptr()).has_unpublished() });
+    assert_eq!(read_word(ctrl_space, OBSERVED_OFF), 1);
+    report("V020_PROD_REGISTER", CTRL.id, reg.0, reg.2);
+    advice_carrier(ctrl_space, 0x50, reg_args);
+    let reg_retry = SVC_OUT[ROLE_COUNT + 2].load(Ordering::Relaxed);
+    assert_eq!(reg_retry, 2, "exact register retry");
+    report("V020_PROD_REGISTER_RETRY", CTRL.id, reg_retry, 0);
+
+    // (6) PUBLISH via real in-vector EL0 SVC 0x41 (publisher carrier).
+    write_bytes(pub_space, ENVELOPE_OFF, &plan);
+    write_bytes(pub_space, PUB_SIDECAR_OFF, &rec);
+    let pub_args = [
+        DATA + ENVELOPE_OFF,
+        plan.len() as u64,
+        DATA + PUB_SIDECAR_OFF,
+        1,
+        0,
+        0,
+    ];
+    advice_carrier(pub_space, 0x41, pub_args);
+    let pub_result = (
+        SVC_ESR[ROLE_COUNT + 3].load(Ordering::Relaxed),
+        SVC_X8[ROLE_COUNT + 3].load(Ordering::Relaxed),
+        SVC_OUT[ROLE_COUNT + 3].load(Ordering::Relaxed),
+    );
+    assert_eq!(
+        (pub_result.1, pub_result.2),
+        (0x41, 1),
+        "publish must be adapter-accepted"
+    );
+    assert_eq!(unsafe { (&*gate_ptr()).published_count() }, 1);
+    assert_eq!(
+        ACCEPT_COUNT.load(Ordering::Relaxed),
+        1,
+        "unique native accept"
+    );
+    report("V020_PROD_PUBLISH", PUB.id, pub_result.0, pub_result.2);
+    // NEGATIVE: operations role may not publish.
+    write_bytes(ops_space, ENVELOPE_OFF, &plan);
+    write_bytes(ops_space, PUB_SIDECAR_OFF, &rec);
+    advice_carrier(ops_space, 0x41, pub_args);
+    let bad_pub = SVC_OUT[ROLE_COUNT].load(Ordering::Relaxed);
+    assert_eq!(bad_pub, 0, "non-publisher must be denied");
+    assert_eq!(unsafe { (&*gate_ptr()).published_count() }, 1);
+    assert_eq!(ACCEPT_COUNT.load(Ordering::Relaxed), 1);
+    report("V020_PROD_BAD_PUBLISH", OPS.id, bad_pub, 0);
+    advice_carrier(pub_space, 0x41, pub_args);
+    let pub_replay = SVC_OUT[ROLE_COUNT + 3].load(Ordering::Relaxed);
+    assert_eq!(pub_replay, 2, "replay publish no effect");
+    assert_eq!(
+        ACCEPT_COUNT.load(Ordering::Relaxed),
+        1,
+        "replay must not re-accept"
+    );
+    report(
+        "V020_PROD_PUBLISH_REPLAY",
+        PUB.id,
+        pub_replay,
+        ACCEPT_COUNT.load(Ordering::Relaxed),
+    );
+
+    // (7) Executor: claim work, apply to the fixture target, ApplyReport.
+    let claim_scope = TrustedApplyScope {
+        boot_epoch: BOOT,
+        plan_version: PLAN_VERSION,
+        now_ns: NOW_NS,
+    };
+    let frame = unsafe { &mut *gate_ptr() }
+        .claim_apply_work(
+            &plan,
+            0,
+            claim_scope,
+            binding(),
+            ReportOrigin::Kernel,
+            |_| Ok(()),
+        )
+        .expect("claim apply work");
+    let work = ApplyWorkV1::decode(frame.bytes()).expect("apply work");
+    assert_eq!(work.payload, &[4, 0]);
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(EXEC_TARGET.0.0[0]), 4);
+    }
+    let report_wire = report_bytes();
+    let parsed_report = ApplyReportV1::decode(&report_wire).expect("apply report");
+    assert_eq!(parsed_report.state, ActionStatus::Applied);
+    assert!(work.matches_report(parsed_report));
+    report("V020_PROD_APPLY", PLAN_SEQ, COMPLETED_NS, 4);
+
+    // (8) Supervisor terminal settlement with the exact causal sidecar.
+    let bound = [BoundReport {
+        bytes: &report_wire,
+        origin: ReportOrigin::Kernel,
+    }];
+    let pair = CausalPair {
+        advice: &advice_wire,
+        disposition: &disp,
+    };
+    let settle_scope = TrustedApplyScope {
+        boot_epoch: BOOT,
+        plan_version: PLAN_VERSION,
+        now_ns: SETTLE_NS,
+    };
+    let summary = unsafe { &mut *gate_ptr() }
+        .settle_verified_apply_reports_with_feedback(
+            SUPER,
+            &plan,
+            &bound,
+            &[binding()],
+            settle_scope,
+            Some(pair),
+            |_, r| {
+                let actual =
+                    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(EXEC_TARGET.0.0[0])) };
+                if r.state == ActionStatus::Applied && actual == 4 {
+                    Ok(())
+                } else {
+                    Err(Error::Denied)
+                }
+            },
+            |_| Ok(()),
+        )
+        .expect("terminal settlement");
+    assert_eq!(summary.plan_seq, PLAN_SEQ);
+    assert_eq!(summary.action_count, 1);
+    assert_eq!(
+        unsafe { (&*gate_ptr()).published_count() },
+        0,
+        "terminal releases the obligation"
+    );
+    let terminal = unsafe { (&*gate_ptr()).terminal_summary(SUPER, PLAN_SEQ) }
+        .unwrap()
+        .expect("terminal summary");
+    assert_eq!(terminal.plan_seq, PLAN_SEQ);
+    let causal_label: u64 = if rec[102..104] == rec[156..158] { 1 } else { 2 };
+    assert_eq!(causal_label, 2, "adopted candidate differs from fallback");
+    report(
+        "V020_PROD_SETTLE",
+        summary.plan_seq,
+        summary.action_count as u64,
+        causal_label,
+    );
+
+    // (9) Full causal-chain linkage assertions.
+    let adv = AdviceEnvelopeV1::decode(&advice_wire).unwrap();
+    let d = AdviceDispositionV1::decode(&disp).unwrap();
+    let r = DecisionRecordV3::decode(&rec).unwrap();
+    let p = PlanV2::decode(&plan).unwrap();
+    assert_eq!(adv.advice_seq, d.advice_seq);
+    assert_eq!(d.advice_seq, r.advice_seq);
+    assert_eq!(d.decision_seq, r.decision_seq);
+    assert_eq!(r.plan_seq, p.header.plan_seq);
+    assert_eq!(p.header.plan_seq, parsed_report.key.plan_seq);
+    assert_eq!(parsed_report.key.plan_seq, summary.plan_seq);
+    assert_eq!(d.advice_digest, sha(&advice_wire));
+    assert_eq!(d.decision_digest, sha(&rec));
+    assert_eq!(r.plan_digest, sha(&plan));
+    assert_eq!(d.state, 1);
+    assert_eq!(r.source, DecisionSource::AiAssisted);
+    report(
+        "V020_PROD_CHAIN",
+        adv.advice_seq,
+        r.plan_seq,
+        summary.plan_seq,
+    );
+
+    // (10) Business CPUs kept running; deterministic cleanup.
+    for slot in 1..REQUIRED {
+        assert!(PROGRESS[slot * 2].load(Ordering::Acquire) >= 2);
+        assert_eq!(PROGRESS[slot * 2 + 1].load(Ordering::Acquire), 0);
+    }
+    for gate in GATES.iter().take(REQUIRED).skip(1) {
+        close_gate(gate);
+    }
+    wait(|| (1..REQUIRED).all(|slot| GATES[slot].quiescent()));
+    QUIT.store(true, Ordering::Release);
+    wait(|| STOPPED.load(Ordering::Acquire) == 14);
+    check_failures();
+    for slot in 1..REQUIRED {
+        report(
+            "V020_PROD_BUSINESS",
+            slot as u64,
+            PROGRESS[slot * 2].load(Ordering::Acquire),
+            IRQS[slot].load(Ordering::Acquire),
+        );
+    }
+
+    // (11) QMP-readable evidence page.
+    let words = unsafe { &*core::ptr::addr_of!(SMP_EVIDENCE) };
+    for w in words.words.iter() {
+        w.store(0, Ordering::Relaxed);
+    }
+    let summary_words = [
+        MAGIC,
+        1,
+        0,
+        15,
+        1,
+        14,
+        adv.advice_seq,
+        r.plan_seq,
+        r.decision_seq,
+        d.state as u64,
+        r.selected_index as u64,
+        r.fallback_index as u64,
+        causal_label,
+        ACCEPT_COUNT.load(Ordering::Relaxed),
+        summary.action_count as u64,
+        5,
+    ];
+    for (i, v) in summary_words.into_iter().enumerate() {
+        words.words[i].store(v, Ordering::Relaxed);
+    }
+    let rows: [[u64; 8]; 5] = [
+        [
+            OPS.id,
+            submit.0,
+            submit.1,
+            submit.2,
+            unsafe { (&*ledger_ptr()).pending() } as u64,
+            adv.advice_seq,
+            lo(&d.advice_digest),
+            0,
+        ],
+        [
+            CTRL.id,
+            reg.0,
+            reg.1,
+            reg.2,
+            1,
+            r.decision_seq,
+            lo(&d.decision_digest),
+            0,
+        ],
+        [
+            PUB.id,
+            pub_result.0,
+            pub_result.1,
+            pub_result.2,
+            1,
+            ACCEPT_COUNT.load(Ordering::Relaxed),
+            lo(&r.plan_digest),
+            0,
+        ],
+        [
+            summary.plan_seq,
+            summary.action_count as u64,
+            1,
+            causal_label,
+            parsed_report.state as u64,
+            COMPLETED_NS,
+            lo(&summary.evidence_digest),
+            0,
+        ],
+        [
+            sec_out,
+            illegal_out,
+            forged_out,
+            1,
+            bad_pub,
+            reg_retry,
+            pub_replay,
+            pending_before as u64,
+        ],
+    ];
+    for (r_i, row_data) in rows.into_iter().enumerate() {
+        for (c_i, v) in row_data.into_iter().enumerate() {
+            words.words[16 + r_i * 8 + c_i].store(v, Ordering::Relaxed);
+        }
+    }
+    for slot in 1..REQUIRED {
+        let at = 64 + (slot - 1) * 4;
+        for (off, v) in [
+            AFFINITIES[slot].load(Ordering::Acquire),
+            PROGRESS[slot * 2].load(Ordering::Acquire),
+            PROGRESS[slot * 2 + 1].load(Ordering::Acquire),
+            IRQS[slot].load(Ordering::Acquire),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            words.words[at + off].store(v, Ordering::Relaxed);
+        }
+    }
+    // PIE role evidence: distinct TTBR roots + image hashes + in-vector calls.
+    for i in 0..ROLE_COUNT {
+        let at = 80 + i * 6;
+        words.words[at].store(pie_members[i].ttbr0_root, Ordering::Relaxed);
+        words.words[at + 1].store(PIE_CLOCKS[i].load(Ordering::Acquire), Ordering::Relaxed);
+        words.words[at + 2].store(PIE_ROLE_CALLS[i].load(Ordering::Acquire), Ordering::Relaxed);
+        words.words[at + 3].store(PIE_YIELDS[i].load(Ordering::Acquire), Ordering::Relaxed);
+        words.words[at + 4].store(
+            u64::from_le_bytes(CATALOG[i].image_sha256[..8].try_into().unwrap()),
+            Ordering::Relaxed,
+        );
+        words.words[at + 5].store(SVC_OUT[i].load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+    words.words[2].store(1, Ordering::Release);
+    // Framed UART payloads are capped at 96 bytes; keep the scope marker short.
+    // in_vector_dispatch / staged_boot_epoch / fixture_executor are proven by the
+    // ESR evidence and the summary.json metadata respectively.
+    super::super::log(
+        b"V020_PROD_SCOPE production_skeleton=true full_authority=false real_models=false\n",
+    );
+    super::super::log(
+        b"V020_PRODUCTION_SKELETON_PASS cpus=4 roles=8 chain=advice-disposition-plan-receipt\n",
+    );
+    super::super::halt()
+}

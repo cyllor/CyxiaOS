@@ -49,6 +49,13 @@ pub(crate) mod prototype_runtime;
 #[cfg(feature = "v0199-advice-e2e-selftest")]
 #[path = "v0199_advice_e2e.rs"]
 mod v0199_advice_e2e;
+// V0.20 production boot + in-vector SVC dispatch skeleton (wave 10 T1). It is a
+// child of smp so it can reuse the proven secondary-start path, private spaces
+// and execute()/context() mechanism. boot.rs routes v020-production directly to
+// production::run(info); smp::run's fixture dispatch is never reached under it.
+#[cfg(feature = "v020-production")]
+#[path = "production.rs"]
+pub(crate) mod production;
 #[cfg(feature = "v0199-cpu0-role-selftest")]
 #[path = "v0199_role_selftest.rs"]
 mod v0199_role_selftest;
@@ -136,6 +143,11 @@ const PRIVATE_SPACES: usize = C * 2
         0
     }
     + if cfg!(feature = "v0199-advice-e2e-selftest") {
+        8
+    } else {
+        0
+    }
+    + if cfg!(feature = "v020-production") {
         8
     } else {
         0
@@ -895,6 +907,7 @@ fn limits() -> Limits {
         cooldown_ticks: 0,
     }
 }
+#[cfg_attr(feature = "v020-production", allow(dead_code))]
 fn plane(mask: u64, slot: usize) -> Plane {
     if mask & (1 << slot) != 0 {
         Plane::Control
@@ -994,6 +1007,10 @@ pub(crate) fn boot_progress() -> [u64; 5] {
         IRQS[3].load(Ordering::Acquire),
     ]
 }
+// Under v020-production boot.rs routes directly to production::run(info), so the
+// fixture dispatch below is intentionally bypassed (still live for every other
+// smp-selftest profile).
+#[cfg_attr(feature = "v020-production", allow(dead_code))]
 pub fn run(info: &BootInfo) -> ! {
     #[cfg(feature = "unified-runtime")]
     crate::boot_recovery::formal::el1();

@@ -220,6 +220,14 @@ impl<P: Port> Port for ObservedPort<P> {
     fn burst_capacity(&self) -> usize {
         self.inner.burst_capacity()
     }
+    /// Forward the real inner port's TX settle witness. The observation layer is
+    /// a transparent measurement wrapper; it must not collapse a real device's
+    /// verified quiescence to the fail-closed default (which would make
+    /// `Tcp::terminal_tx_quiescent` unreachable for every port). An unknown
+    /// innermost port still returns the fail-closed `false`.
+    fn tx_quiescent(&self) -> bool {
+        self.inner.tx_quiescent()
+    }
     fn send(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.inner.send(frame)?;
         // Count only packets actually accepted by the device, not socket

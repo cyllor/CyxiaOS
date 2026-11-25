@@ -5,7 +5,9 @@
 //! credentials merely because their CRC/FLUSH checks pass.
 use super::{
     Error,
-    durable_role_epoch_v0199::{Change, CommitEvidence, PreparedEpoch},
+    durable_role_epoch_v0199::{
+        Change, CommitEvidence, DurableEpochGate, Outcome, PreparedEpoch, SlotBinding,
+    },
     epoch_redo_v0199::EpochBlockIo,
     file_index_v0199::SecurityStateStoreV2,
     file_media_v0199::{
@@ -13,6 +15,7 @@ use super::{
         verify_state_redo_v1,
     },
 };
+use crate::control_plane::role_manifest_v0199::ROLE_COUNT;
 use sha2::{Digest, Sha256};
 fn p16(b: &mut [u8], i: usize, v: u16) {
     b[i..i + 2].copy_from_slice(&v.to_le_bytes());
@@ -357,6 +360,171 @@ impl BootPairCommit {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Production boot-epoch authority — native-owner skeleton for T1 integration.
+// ---------------------------------------------------------------------------
+
+/// Exclusive transaction space and authenticated layout for ONE boot-epoch
+/// allocation, supplied by the native file owner. This layer never invents
+/// log extents, home blocks or transaction ids; it only consumes facts the
+/// authenticated owner proves from real media.
+#[derive(Clone, Copy)]
+pub struct BootEpochTx<'a> {
+    /// Raw current superblock; must decode to a valid [`SuperblockV1`].
+    pub superblock_raw: &'a [u8],
+    /// First block of the reserved EMPTY six-block log extent.
+    pub first_log_block: u32,
+    /// Paired protected home blocks (state, boot): distinct, in the data range.
+    pub state_home: u32,
+    pub boot_home: u32,
+    /// Exclusive nonzero transaction id and commit LSN for this allocation.
+    pub txid: u64,
+    pub commit_lsn: u64,
+}
+
+/// A confirmed production boot epoch. Constructed ONLY after the paired
+/// state+boot transaction passed append, ordered FLUSH, independent device
+/// readback and `confirm_boot_from_redo`. Its trust is no stronger than the
+/// protected [`EpochBlockIo`] adapter; a host test double is not native
+/// persistence evidence. It is not, by itself, a capability grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootEpochGrant {
+    epoch: u64,
+    receipt: CommitEvidence,
+    boot_digest: [u8; 32],
+}
+impl BootEpochGrant {
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub fn receipt(&self) -> CommitEvidence {
+        self.receipt
+    }
+    pub fn boot_digest(&self) -> [u8; 32] {
+        self.boot_digest
+    }
+}
+
+/// Durable monotonic boot-epoch authority for the production boot path.
+/// Wraps the paired-home [`DurableEpochGate`] custody and the atomic
+/// [`BootPairRedo`] transaction so the production boot owner can allocate and
+/// commit a boot epoch with a single call instead of orchestrating six wide
+/// entry points. Serialized EL1 owner only; not a mount, not a capability
+/// issuer, and it never writes a raw home block (the journal owner's
+/// checkpoint/replay does that).
+///
+/// # Integration contract — how T1's production boot calls this
+/// 1. Independently verify both superblocks, the committed redo chain, the
+///    signed offline config and the mounted-volume identity (native owner;
+///    never EL0 or a model). Recover/replay to the latest committed pair.
+/// 2. Read the two committed protected home images (state, boot).
+/// 3. [`BootEpochAuthority::open`]`(state_raw, boot_raw, slots, real_verify)`.
+///    `real_verify` MUST perform the full startup verification (the duties
+///    `DurableEpochGate::recovered_for_startup` enforces); a scratch/diagnostic
+///    callback is not production authority.
+/// 4. Reserve an EMPTY six-block log extent and an exclusive nonzero
+///    txid/commit_lsn; build a [`BootEpochTx`] from the authenticated layout.
+/// 5. Place a [`BootPairRedo`] workspace in the preallocated progress pool.
+/// 6. [`BootEpochAuthority::allocate`]`(&mut io, &mut pair, tx)` returns a
+///    [`BootEpochGrant`] ONLY on full durable evidence. Use `grant.epoch()` as
+///    the durable boot epoch. Issuing actual control roots additionally
+///    requires the signed-config `confirmed_config_boot` path on the gate.
+/// 7. Fail-closed: on `Error::Unknown` do NOT retry under this authority — the
+///    pending transition is preserved, no epoch is published, and the dirty
+///    extent fences retries with `Error::Conflict`. Cold-recover from durable
+///    evidence instead; generation continuity then allocates the next epoch
+///    exactly once. One boot epoch per boot: a second `allocate` after a
+///    confirmed grant returns `Error::Conflict`.
+///
+/// Honest scope: this is the native-authority API skeleton. Actual disk
+/// persistence is exercised by T1's QEMU production boot (or a later wave);
+/// the host tests below use an [`EpochBlockIo`] double, not native media.
+pub struct BootEpochAuthority {
+    gate: DurableEpochGate,
+}
+impl BootEpochAuthority {
+    /// Reopen from the two committed protected home images. `verify_recovered`
+    /// must be the native owner's real startup verification; see the type-level
+    /// integration contract. A mismatched state/boot pair is rejected.
+    pub fn open(
+        state_raw: &[u8],
+        boot_raw: &[u8],
+        slots: [SlotBinding; ROLE_COUNT],
+        verify_recovered: impl FnOnce(&SecurityStateStoreV2) -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            gate: DurableEpochGate::recovered_pair(state_raw, boot_raw, slots, verify_recovered)?,
+        })
+    }
+
+    /// The confirmed boot epoch, if a paired transaction was fully confirmed
+    /// and no newer transition fences it. `None` before confirmation and while
+    /// an uncertain commit is pending.
+    pub fn confirmed_epoch(&self) -> Option<u64> {
+        self.gate.boot_epoch()
+    }
+
+    /// Allocate and durably commit the next monotonic boot epoch in one call:
+    /// prepare → exact after-image → paired BEGIN/REDO/COMMIT append with
+    /// ordered FLUSH + independent readback → `confirm_boot_from_redo`.
+    /// Returns a grant ONLY on full evidence; see the type-level fail-closed /
+    /// no-retry rule for `Error::Unknown`.
+    pub fn allocate(
+        &mut self,
+        io: &mut impl EpochBlockIo,
+        pair: &mut BootPairRedo,
+        tx: BootEpochTx<'_>,
+    ) -> Result<BootEpochGrant, Error> {
+        // One boot epoch per boot: once this boot has a confirmed epoch, a
+        // further allocation is a conflict, never a second monotonic bump.
+        if self.gate.boot_epoch().is_some() {
+            return Err(Error::Conflict);
+        }
+        let sb = SuperblockV1::decode(tx.superblock_raw)?;
+        // Boot allocation never authorizes a service stop/restart.
+        let ticket = self
+            .gate
+            .prepare(Change::AllocateBoot, |_| Err(Error::Unauthorized))?;
+        let image = self.gate.after_image(ticket)?;
+        let proof = pair.append(
+            io,
+            sb,
+            tx.first_log_block,
+            tx.state_home,
+            tx.boot_home,
+            tx.txid,
+            tx.commit_lsn,
+            ticket,
+            &image,
+        )?;
+        let receipt = proof.receipt();
+        let outcome = self.gate.confirm_boot_from_redo(
+            ticket,
+            receipt,
+            pair.state_image(),
+            pair.boot_image(),
+            tx.superblock_raw,
+            tx.first_log_block,
+            tx.state_home,
+            tx.boot_home,
+            &pair.begin,
+            &[&pair.state_redo, &pair.boot_redo],
+            &pair.commit,
+            |t, r, b| proof.verifies(t, r, b),
+        )?;
+        let epoch = match outcome {
+            Outcome::Boot { epoch } => epoch,
+            _ => return Err(Error::Conflict),
+        };
+        Ok(BootEpochGrant {
+            epoch,
+            receipt,
+            boot_digest: hash(pair.boot_image()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +702,228 @@ mod tests {
         let c = crc32c_zeroed(&bad, 32).unwrap();
         p32(&mut bad, 32, c);
         assert!(BootEpochStoreV1::decode(&bad).is_err());
+    }
+
+    // ---- Production boot-epoch authority (native-owner skeleton) ----
+    // These host tests use an EpochBlockIo double, NOT native media. Actual
+    // disk persistence is exercised by T1's QEMU production boot / later wave.
+    use crate::control_plane::role_manifest_v0199::ROLES;
+
+    struct ProdDisk {
+        blocks: [[u8; BLOCK]; 16],
+        flushes: u32,
+        fail_second_flush: bool,
+    }
+    impl EpochBlockIo for ProdDisk {
+        fn read(&mut self, b: u32, out: &mut [u8; BLOCK]) -> Result<(), Error> {
+            *out = self.blocks[b as usize];
+            Ok(())
+        }
+        fn write(&mut self, b: u32, data: &[u8; BLOCK]) -> Result<(), Error> {
+            self.blocks[b as usize] = *data;
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), Error> {
+            self.flushes += 1;
+            if self.fail_second_flush && self.flushes == 2 {
+                return Err(Error::Unknown);
+            }
+            Ok(())
+        }
+    }
+    fn prod_disk(fail: bool) -> ProdDisk {
+        ProdDisk {
+            blocks: [[0; BLOCK]; 16],
+            flushes: 0,
+            fail_second_flush: fail,
+        }
+    }
+    fn prod_slots() -> [SlotBinding; ROLE_COUNT] {
+        core::array::from_fn(|i| SlotBinding {
+            role: ROLES[i],
+            slot: i as u8,
+        })
+    }
+    fn prod_state(uuid: [u8; 16], generation: u64, epoch: u64) -> [u8; BLOCK] {
+        SecurityStateStoreV2 {
+            fs_uuid: uuid,
+            state_generation: generation,
+            rule_min_generation: 1,
+            security_min_generation: 1,
+            key_generation: 1,
+            isolated_service_bitmap: 0,
+            last_boot_epoch: epoch,
+            offline_config_generation: 1,
+            offline_config_hash: [2; 32],
+            service_generations: [1; 16],
+        }
+        .encode()
+        .unwrap()
+    }
+    fn prod_boot(uuid: [u8; 16], epoch: u64) -> [u8; BLOCK] {
+        BootEpochStoreV1 {
+            fs_uuid: uuid,
+            boot_epoch: epoch,
+        }
+        .encode()
+        .unwrap()
+    }
+    fn prod_sb_raw(uuid: [u8; 16]) -> [u8; BLOCK] {
+        let mut b = [0; BLOCK];
+        p32(&mut b, 0, 0x43594653);
+        p16(&mut b, 4, 1);
+        p16(&mut b, 6, 80);
+        p32(&mut b, 8, 4096);
+        p32(&mut b, 12, 131072);
+        b[16..32].copy_from_slice(&uuid);
+        p64(&mut b, 32, 1);
+        p64(&mut b, 40, 0);
+        p64(&mut b, 48, 1);
+        p32(&mut b, 56, 4098);
+        p32(&mut b, 60, 4102);
+        p32(&mut b, 64, 4118);
+        p32(&mut b, 68, 256);
+        let crc = crc32c_zeroed(&b, 76).unwrap();
+        p32(&mut b, 76, crc);
+        b
+    }
+    fn prod_tx(sb_raw: &[u8], first: u32, txid: u64, lsn: u64) -> BootEpochTx<'_> {
+        BootEpochTx {
+            superblock_raw: sb_raw,
+            first_log_block: first,
+            state_home: 7000,
+            boot_home: 7002,
+            txid,
+            commit_lsn: lsn,
+        }
+    }
+
+    #[test]
+    fn production_boot_epoch_monotonic_across_simulated_reboots() {
+        let uuid = [1; 16];
+        let state_raw = prod_state(uuid, 7, 5);
+        let boot_raw = prod_boot(uuid, 5);
+        let sb_raw = prod_sb_raw(uuid);
+        let sb = SuperblockV1::decode(&sb_raw).unwrap();
+        let mut disk = prod_disk(false);
+        let mut auth =
+            BootEpochAuthority::open(&state_raw, &boot_raw, prod_slots(), |_| Ok(())).unwrap();
+        assert_eq!(auth.confirmed_epoch(), None);
+        let mut pair = BootPairRedo::new();
+        let g1 = auth
+            .allocate(&mut disk, &mut pair, prod_tx(&sb_raw, 2, 1, 4))
+            .unwrap();
+        assert_eq!(g1.epoch(), 6);
+        assert_eq!(auth.confirmed_epoch(), Some(6));
+        assert_eq!(g1.receipt().txid, 1);
+        assert_eq!(g1.receipt().commit_lsn, 4);
+        assert_eq!(g1.boot_digest(), hash(pair.boot_image()));
+        // One boot epoch per boot: a second allocation is refused.
+        let mut pair_b = BootPairRedo::new();
+        assert_eq!(
+            auth.allocate(&mut disk, &mut pair_b, prod_tx(&sb_raw, 8, 3, 11)),
+            Err(Error::Conflict)
+        );
+
+        // Simulate a cold reboot: recover the committed pair from durable log
+        // evidence (the committed after-image IS the recovered state), then
+        // reopen a fresh authority and allocate the next epoch exactly once.
+        let mut rec = BootPairRedo::new();
+        rec.read(&mut disk, 2).unwrap();
+        let recovered = rec.verify(sb, 2, 7000, 7002, 1, 4).unwrap();
+        assert_eq!(recovered.last_boot_epoch, 6);
+        assert_eq!(recovered.state_generation, 8);
+        let mut next = BootEpochAuthority::open(
+            rec.state_image(),
+            rec.boot_image(),
+            prod_slots(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let mut pair2 = BootPairRedo::new();
+        let g2 = next
+            .allocate(&mut disk, &mut pair2, prod_tx(&sb_raw, 8, 3, 11))
+            .unwrap();
+        assert_eq!(g2.epoch(), 7);
+        assert!(g2.epoch() > g1.epoch());
+        // Generation continuity: state_generation advances, never rolls back.
+        let mut rec2 = BootPairRedo::new();
+        rec2.read(&mut disk, 8).unwrap();
+        let recovered2 = rec2.verify(sb, 8, 7000, 7002, 3, 11).unwrap();
+        assert_eq!(recovered2.last_boot_epoch, 7);
+        assert_eq!(recovered2.state_generation, 9);
+    }
+
+    #[test]
+    fn production_boot_epoch_fail_closed_on_uncertain_commit() {
+        let uuid = [1; 16];
+        let state_raw = prod_state(uuid, 7, 5);
+        let boot_raw = prod_boot(uuid, 5);
+        let sb_raw = prod_sb_raw(uuid);
+        let mut disk = prod_disk(true);
+        let mut auth =
+            BootEpochAuthority::open(&state_raw, &boot_raw, prod_slots(), |_| Ok(())).unwrap();
+        let mut pair = BootPairRedo::new();
+        let tx = prod_tx(&sb_raw, 2, 1, 4);
+        assert_eq!(auth.allocate(&mut disk, &mut pair, tx), Err(Error::Unknown));
+        assert_eq!(auth.confirmed_epoch(), None);
+        // Fenced: the dirty extent refuses a retry under the same authority.
+        assert_eq!(
+            auth.allocate(&mut disk, &mut pair, tx),
+            Err(Error::Conflict)
+        );
+        assert_eq!(auth.confirmed_epoch(), None);
+        // The uncertain commit did not burn the epoch globally: a clean cold
+        // recovery from the original committed image allocates epoch 6 once.
+        let mut clean = prod_disk(false);
+        let mut fresh =
+            BootEpochAuthority::open(&state_raw, &boot_raw, prod_slots(), |_| Ok(())).unwrap();
+        let mut p = BootPairRedo::new();
+        let g = fresh.allocate(&mut clean, &mut p, tx).unwrap();
+        assert_eq!(g.epoch(), 6);
+    }
+
+    #[test]
+    fn production_boot_epoch_rejects_bad_layout_and_identity() {
+        let uuid = [1; 16];
+        let state_raw = prod_state(uuid, 7, 5);
+        let boot_raw = prod_boot(uuid, 5);
+        let sb_raw = prod_sb_raw(uuid);
+        // Same home for state and boot is not a paired transaction.
+        let mut disk = prod_disk(false);
+        let mut auth =
+            BootEpochAuthority::open(&state_raw, &boot_raw, prod_slots(), |_| Ok(())).unwrap();
+        let mut pair = BootPairRedo::new();
+        let same_home = BootEpochTx {
+            state_home: 7000,
+            boot_home: 7000,
+            ..prod_tx(&sb_raw, 2, 1, 4)
+        };
+        assert!(auth.allocate(&mut disk, &mut pair, same_home).is_err());
+        // Mismatched superblock UUID is a conflict, before any write.
+        let mut auth =
+            BootEpochAuthority::open(&state_raw, &boot_raw, prod_slots(), |_| Ok(())).unwrap();
+        let other_sb = prod_sb_raw([9; 16]);
+        assert!(
+            auth.allocate(&mut disk, &mut pair, prod_tx(&other_sb, 2, 1, 4))
+                .is_err()
+        );
+        // A non-empty (dirty) log extent is refused.
+        let mut dirty = prod_disk(false);
+        dirty.blocks[2][0] = 1;
+        let mut auth =
+            BootEpochAuthority::open(&state_raw, &boot_raw, prod_slots(), |_| Ok(())).unwrap();
+        assert_eq!(
+            auth.allocate(&mut dirty, &mut pair, prod_tx(&sb_raw, 2, 1, 4)),
+            Err(Error::Conflict)
+        );
+        // Boot home outside the data range is rejected.
+        let mut auth =
+            BootEpochAuthority::open(&state_raw, &boot_raw, prod_slots(), |_| Ok(())).unwrap();
+        let bad_home = BootEpochTx {
+            boot_home: 100,
+            ..prod_tx(&sb_raw, 2, 1, 4)
+        };
+        assert!(auth.allocate(&mut disk, &mut pair, bad_home).is_err());
     }
 }

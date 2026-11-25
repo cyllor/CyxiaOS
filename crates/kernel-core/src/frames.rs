@@ -4,11 +4,12 @@
 //! external frame-accounting ledger (the V0.19.9 FrameMeta bridge in
 //! [`crate::frame_meta_v0199`]). With no recorder attached every operation
 //! behaves exactly as it historically has. The desktop full-OS pool
-//! attaches the bridge only under the explicit `full-os` +
-//! `v0199-local-native` gate; default, host and formal OS builds stay
-//! unattached and bit-identical. The general-allocator native cutover to
-//! the V0.19.9 ledger (and native boot verification of the gated desktop
-//! attachment) remains a later gate.
+//! attaches the bridge under its own `full-os` gate (the former
+//! `full-os + v0199-local-native` conjunction was never satisfiable in any
+//! build); default, host and non-full-os builds stay unattached and
+//! bit-identical. The general-allocator native cutover to the V0.19.9
+//! ledger (and native boot verification of the desktop attachment)
+//! remains a later gate.
 use cyxia_contracts::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameError {
@@ -134,8 +135,8 @@ pub struct FramePool<'a> {
     // lower it; cleaning advances it without changing first-fit ordering.
     next_dirty: usize,
     // Optional accounting mirror. None preserves the historical behavior
-    // bit-identically; the desktop pool attaches it only behind the
-    // explicit full-os + v0199-local-native gate.
+    // bit-identically; the desktop pool attaches it behind its own
+    // full-os gate.
     recorder: Option<&'a dyn FrameRecorder>,
 }
 impl<'a> FramePool<'a> {

@@ -1,23 +1,33 @@
 //! CPU0-only physical backing shared in capacity, never in user ownership.
 //!
-//! V0.19.9 authoritative accounting (bounded native attachment): under the
-//! explicit `full-os` + `v0199-local-native` gate, init attaches a pool-mode
-//! FrameMeta ledger (`frame_meta_v0199::PoolBridge`) and every allocation /
-//! revocation is mirrored fail-closed into the authoritative frame
-//! accounting, with conservation checks at attach time and in the
-//! diagnostic status line. The gate is OFF in every default, host and
-//! formal OS build (formal x86 OS builds select --no-default-features), so
-//! their behavior stays bit-identical and desktop boot is unchanged.
+//! V0.19.9 authoritative accounting (bounded native attachment): this module
+//! is compiled only under `full-os` (the desktop production pool), and init
+//! attaches a pool-mode FrameMeta ledger (`frame_meta_v0199::PoolBridge`)
+//! whenever that pool initializes. Every allocation / revocation is mirrored
+//! fail-closed into the authoritative frame accounting, with conservation
+//! checks at attach time and in the diagnostic status line. The attachment
+//! gate is exactly the pool's own `full-os` gate: the former
+//! `full-os + v0199-local-native` conjunction was never satisfiable in any
+//! build (full-os is x86-only, and formal x86 builds select
+//! --no-default-features, dropping v0199-local-native), which left the mirror
+//! as unverified dead code. Default, host and non-full-os builds never
+//! compile this module and stay bit-identical; an unattached FramePool
+//! (recorder = None) is unchanged.
 //!
-//! VERIFICATION GAP (open): the gated path compiles only in the x86 full-OS
-//! profile, whose build requires the ported sysroot catalog; neither that
-//! build nor a native desktop boot receipt has been produced locally this
-//! wave. Host tests in cyxia-kernel-core (frame_meta_v0199) prove the
+//! VERIFICATION: host tests in cyxia-kernel-core (frame_meta_v0199) prove the
 //! mirrored accounting, the conservation predicate and the exact static
-//! attachment pattern used below. Native cutover verification remains a
-//! later gate; do not enable this gate in a production image before then.
+//! attachment pattern used below, including the production init geometry
+//! (a static row table sliced to the admitted window). The attachment is
+//! compiled by the x86 full-OS production build:
+//! `cargo build -p cyxia-kernel --target x86_64-unknown-none
+//! --no-default-features --features full-os`. Producing that image locally
+//! additionally requires the ported sysroot catalog (a separate, pre-existing
+//! gap), and a native desktop boot receipt of the attached mirror remains
+//! open. This is an accounting-mirror skeleton, NOT the general-allocator
+//! cutover: replacing FramePool with the V0.19.9 ledger as the allocator
+//! remains a later wave.
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind, TaskId};
-#[cfg(all(feature = "full-os", feature = "v0199-local-native"))]
+#[cfg(feature = "full-os")]
 use cyxia_kernel_core::frame_meta_v0199::{self as fm, PoolBridge};
 use cyxia_kernel_core::frames::{
     FrameError, FrameHandle, FrameMeta, FramePool, FrameSnapshot, PageZeroer, RevokeComplete,
@@ -29,12 +39,12 @@ pub const BYTES: u64 = PAGES as u64 * 4096;
 static mut METADATA: [FrameMeta; PAGES] = [FrameMeta::EMPTY; PAGES];
 static mut POOL: Option<FramePool<'static>> = None;
 static mut PEAK: usize = 0;
-/// Gated authoritative mirror: one 40-byte row per pool page (2.5 MiB BSS,
-/// compiled only with the attachment gate) and the bridge slot published
+/// Authoritative mirror: one 40-byte row per pool page (2.5 MiB BSS,
+/// compiled with this full-os module) and the bridge slot published
 /// together with POOL. Rows beyond the admitted window stay untouched.
-#[cfg(all(feature = "full-os", feature = "v0199-local-native"))]
+#[cfg(feature = "full-os")]
 static mut LEDGER_ROWS: [fm::FrameMeta; PAGES] = [fm::FrameMeta::ZERO; PAGES];
-#[cfg(all(feature = "full-os", feature = "v0199-local-native"))]
+#[cfg(feature = "full-os")]
 static mut BRIDGE: Option<PoolBridge<'static>> = None;
 
 fn error(value: FrameError) -> Errno {
@@ -71,12 +81,10 @@ pub fn init(base: u64, bytes: u64) -> Result<(), Errno> {
         kind: RegionKind::Ram,
     };
     let metadata = unsafe { &mut *core::ptr::addr_of_mut!(METADATA) };
-    let new_pool = FramePool::from_memory(&[region], &[], metadata).map_err(error)?;
-    // The mirror attachment is the only mutable use; keep the ungated
-    // binding immutable so default builds stay warning-free.
-    #[cfg(all(feature = "full-os", feature = "v0199-local-native"))]
-    let mut new_pool = new_pool;
-    #[cfg(all(feature = "full-os", feature = "v0199-local-native"))]
+    let mut new_pool = FramePool::from_memory(&[region], &[], metadata).map_err(error)?;
+    // The attachment gate is the module's own full-os gate: whenever this
+    // desktop pool is built, the authoritative mirror is attached.
+    #[cfg(feature = "full-os")]
     {
         // SAFETY: foreground CPU0 only, before POOL is published; no other
         // CPU, interrupt or DMA agent can reach these statics. The ledger
@@ -142,7 +150,7 @@ pub fn status(out: &mut impl core::fmt::Write) {
         let peak = unsafe { *core::ptr::addr_of!(PEAK) };
         writeln!(out, "ANON_POOL capacity={} free={} used={} peak={} virtual_pages={} backing=BOOTSTRAP ownership=PRIVATE commit=MMAP\r",
                  s.capacity, s.free, s.used, peak, cyxia_posix::vm::PAGE_COUNT).unwrap();
-        #[cfg(all(feature = "full-os", feature = "v0199-local-native"))]
+        #[cfg(feature = "full-os")]
         {
             // SAFETY: CPU0-only diagnostic read. init publishes BRIDGE
             // together with POOL and never replaces it afterwards; the

@@ -17,7 +17,14 @@ pub struct ExceptionFrame {
 }
 #[unsafe(no_mangle)]
 extern "C" fn exception_dispatch(f: &mut ExceptionFrame, kind: u64) {
-    #[cfg(feature = "smp-selftest")]
+    // V0.20 production skeleton: EL0 sync ABI-v3 SVCs (0x40/0x41/0x50) are
+    // dispatched IN-VECTOR by the production dispatcher and return straight to
+    // EL0; all other exceptions fall through to the proven smp capture path.
+    #[cfg(feature = "v020-production")]
+    {
+        smp::production::exception(f, kind);
+    }
+    #[cfg(all(feature = "smp-selftest", not(feature = "v020-production")))]
     {
         smp::exception(f, kind);
     }

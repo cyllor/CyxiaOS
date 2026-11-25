@@ -21,10 +21,11 @@
 //! generation exhaustion -> PERMANENT). This is an accounting mirror, not a
 //! replacement allocator: the general-allocator native cutover remains a
 //! later gate. Unattached pools keep their historical behavior
-//! bit-identically; the desktop full-OS pool attaches a mirror only under
-//! the explicit `full-os` + `v0199-local-native` gate (default, host and
-//! formal OS builds stay unattached). Native boot verification of that
-//! gated desktop attachment remains open.
+//! bit-identically; the desktop full-OS pool attaches a mirror under its
+//! own `full-os` gate (the former `full-os + v0199-local-native`
+//! conjunction was never satisfiable in any build; default, host and
+//! non-full-os builds stay unattached). Native boot verification of the
+//! desktop attachment remains open.
 use crate::frames::{FrameError, FrameRecorder, FrameSnapshot};
 use crate::security::Error;
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind, TaskId};
@@ -787,10 +788,11 @@ impl<'a> Ledger<'a> {
 /// Scope: this is an accounting mirror for the historical <=256MiB pool,
 /// not a replacement allocator. The general-allocator native cutover to the
 /// V0.19.9 ledger remains a later gate. The desktop full-OS pool attaches
-/// this bridge only under the explicit `full-os` + `v0199-local-native`
-/// gate; default, host and formal OS builds keep the unattached pool and
-/// are bit-identical to before. Native boot verification of the gated
-/// desktop attachment remains open.
+/// this bridge under its own `full-os` gate (the former
+/// `full-os + v0199-local-native` conjunction was never satisfiable in any
+/// build); default, host and non-full-os builds keep the unattached pool
+/// and are bit-identical to before. Native boot verification of the desktop
+/// attachment remains open.
 pub struct PoolBridge<'a> {
     ledger: core::cell::RefCell<Ledger<'a>>,
 }
@@ -1870,5 +1872,87 @@ mod tests {
             slot.as_ref().unwrap().ledger.borrow().rows[0].frame_generation,
             2
         );
+    }
+    #[test]
+    fn desktop_init_partial_window_mirrors_and_conserves() {
+        // Production init geometry (desktop pool.rs): the static ledger table
+        // is sized for the maximum pool, but init admits only the reserved
+        // window `bytes / 4096` by slicing `rows[..pages]`. Rows beyond the
+        // admitted window must stay untouched, and conservation must be
+        // measured against the admitted window, not the whole static table.
+        const TABLE: usize = 8;
+        const PAGES: usize = 3;
+        static mut ROWS: [FrameMeta; TABLE] = [FrameMeta::ZERO; TABLE];
+        static mut BRIDGE: Option<PoolBridge<'static>> = None;
+        static mut META: [crate::frames::FrameMeta; TABLE] =
+            [crate::frames::FrameMeta::EMPTY; TABLE];
+        static mut POOL: Option<FramePool<'static>> = None;
+        let base = 0x40000000u64;
+        let ram = [pool_ram(base, PAGES as u64)];
+        // SAFETY: single-threaded test; no aliasing access to these statics.
+        let metadata: &'static mut [crate::frames::FrameMeta] =
+            unsafe { &mut *core::ptr::addr_of_mut!(META) };
+        let mut new_pool = FramePool::from_memory(&ram, &[], metadata).unwrap();
+        let rows: &'static mut [FrameMeta] = unsafe { &mut *core::ptr::addr_of_mut!(ROWS) };
+        let ledger = Ledger::initialize_pool(&mut rows[..PAGES], base, &ram, &[]).unwrap();
+        let bridge = PoolBridge::new(ledger).unwrap();
+        // Fail closed before publishing, exactly like the desktop init.
+        assert!(bridge.conservation(new_pool.snapshot()).is_ok());
+        let slot: &'static mut Option<PoolBridge<'static>> =
+            unsafe { &mut *core::ptr::addr_of_mut!(BRIDGE) };
+        *slot = Some(bridge);
+        new_pool.attach_recorder(slot.as_ref().unwrap());
+        let pool_slot: &'static mut Option<FramePool<'static>> =
+            unsafe { &mut *core::ptr::addr_of_mut!(POOL) };
+        *pool_slot = Some(new_pool);
+        let pool = pool_slot.as_mut().unwrap();
+        // The mirror describes only the admitted window; the static tail is
+        // never touched (read through a fresh shared borrow of the raw static).
+        let tail: &[FrameMeta] = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::addr_of!(ROWS).cast::<FrameMeta>().add(PAGES),
+                TABLE - PAGES,
+            )
+        };
+        assert!(tail.iter().all(|r| *r == FrameMeta::ZERO));
+        let owner = TaskId::new(7).unwrap();
+        let mut handles = std::vec::Vec::new();
+        for _ in 0..PAGES {
+            handles.push(pool.alloc_zeroed(owner, &mut OkZero).unwrap());
+            assert!(slot.as_ref().unwrap().conservation(pool.snapshot()).is_ok());
+        }
+        assert_eq!(
+            pool.alloc_zeroed(owner, &mut OkZero),
+            Err(FrameError::Exhausted)
+        );
+        assert_eq!(
+            slot.as_ref().unwrap().inventory().unwrap().allocated,
+            PAGES as u32
+        );
+        // Desktop release ordering: begin_revoke, zero, finish_revoke.
+        for h in handles {
+            pool.begin_revoke(h, owner).unwrap();
+            OkZero.zero(h.address()).unwrap();
+            pool.finish_revoke(h, unsafe { RevokeComplete::after_unmap(h) })
+                .unwrap();
+            assert!(slot.as_ref().unwrap().conservation(pool.snapshot()).is_ok());
+        }
+        assert_eq!(pool.snapshot().free, PAGES);
+        // Re-allocation re-zeroes the dirty page and stays in generation lockstep.
+        let again = pool.alloc_zeroed(owner, &mut OkZero).unwrap();
+        assert_eq!(again.index(), 0);
+        assert!(slot.as_ref().unwrap().conservation(pool.snapshot()).is_ok());
+        assert_eq!(
+            slot.as_ref().unwrap().ledger.borrow().rows[0].frame_generation,
+            2
+        );
+        // The un-admitted tail of the static table is still untouched.
+        let tail: &[FrameMeta] = unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::addr_of!(ROWS).cast::<FrameMeta>().add(PAGES),
+                TABLE - PAGES,
+            )
+        };
+        assert!(tail.iter().all(|r| *r == FrameMeta::ZERO));
     }
 }

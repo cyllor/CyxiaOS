@@ -668,6 +668,174 @@ impl RecoveryGate {
     }
 }
 
+// ---------------------------------------------------------------------------
+// (d) Production recovery decision authority — native-owner skeleton for T1.
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the protected recovery decision for the production path.
+/// `may_write` and `allocate_boot_epoch_allowed` are recovery-gate allowance
+/// only; ordinary admission/capability checks still apply on top. A non-Verified
+/// state surfaces to ordinary callers as the frozen EIO, never a new errno.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryDecision {
+    pub state: RecoveryState,
+    pub may_write: bool,
+    pub refusal_errno: Option<i32>,
+    pub allocate_boot_epoch_allowed: bool,
+}
+
+/// Production recovery decision surface: the monotonic write gate plus the
+/// four preallocated per-CPU degraded-audit accumulators (the 1 KiB
+/// accumulator portion of the 9 KiB SecurityAudit+RecoveryProof protected
+/// pool). Serialized EL1 recovery owner only. Never mounts a volume, never
+/// allocates a BootEpoch, never authorizes a write by itself.
+///
+/// # Integration contract — how T1's production recovery path calls this
+/// 1. Independently verify both superblocks (format/UUID/CRC) and the pair
+///    relation; build [`CheckpointPairFacts`] from real media, never a model.
+/// 2. [`RecoveryAuthority::new`]`(boot_epoch, protection_generation,
+///    reopen_authority, &facts)` — the initial state is the deterministic §9.5
+///    classification. `reopen_authority` is the EL1-verified independent
+///    recovery identity, never the failed service or an ordinary FileCap.
+/// 3. [`RecoveryAuthority::decision`] gives the production allowance snapshot;
+///    on RECOVERY_REQUIRED/UNKNOWN deny ordinary ops with `refusal_errno`
+///    (EIO) and allow only protected read-only diagnostics/mirror export.
+/// 4. Feed later verified pair facts via [`RecoveryAuthority::observe_pair`]
+///    (monotonic latch) and uncertain completion via `observe_unknown`.
+/// 5. While audit slots are unavailable, record verified degraded events with
+///    [`RecoveryAuthority::record_degraded`] (AUDIT_DEGRADED). Their summaries
+///    (`degraded_proof`) are audit evidence ONLY and can never reopen writes.
+/// 6. The ONLY return to Verified is [`RecoveryAuthority::reopen`] with the
+///    independent authority + `CompletionAuthority::CommitChain` + full real
+///    [`ReopenEvidence`] (rebuilt re-accepted pair, committed chain, FLUSH,
+///    readback, nonzero operation digest, non-rollback protection generation).
+///    Without evidence the gate stays closed and an error is returned.
+///
+/// Skeleton model: the accumulators are owned here and routed by CPU index
+/// (0..ACCUMULATOR_COUNT). Native wiring must place them in the protected pool,
+/// pin each to its CPU single writer, and use them only after the authorization
+/// gate was atomically closed and group/recovery slots were tried first.
+///
+/// Honest scope: native-authority API skeleton. Actual audit-slot fallback,
+/// per-CPU preallocation and mount integration are exercised by T1's QEMU
+/// production boot / a later wave; host tests below are not native evidence.
+#[derive(Debug)]
+pub struct RecoveryAuthority {
+    gate: RecoveryGate,
+    degraded: [RecoveryAccumulator; ACCUMULATOR_COUNT],
+}
+const _: () = assert!(ACCUMULATOR_COUNT == 4);
+impl RecoveryAuthority {
+    /// Mount preflight: initial state is the deterministic §9.5 classification
+    /// of the verified pair facts. Also constructs the four initial per-CPU
+    /// degraded accumulators bound to this boot epoch (writer generation 1).
+    pub fn new(
+        boot_epoch: u64,
+        protection_generation: u64,
+        reopen_authority: Identity,
+        initial: &CheckpointPairFacts,
+    ) -> Result<Self, Error> {
+        let gate = RecoveryGate::new(boot_epoch, protection_generation, reopen_authority, initial)?;
+        // gate::new already rejected boot_epoch == 0; writer generation 1 is
+        // nonzero, so these constructions cannot fail.
+        let degraded = [
+            RecoveryAccumulator::new(boot_epoch, 0, 1)?,
+            RecoveryAccumulator::new(boot_epoch, 1, 1)?,
+            RecoveryAccumulator::new(boot_epoch, 2, 1)?,
+            RecoveryAccumulator::new(boot_epoch, 3, 1)?,
+        ];
+        Ok(Self { gate, degraded })
+    }
+
+    pub fn state(&self) -> RecoveryState {
+        self.gate.state()
+    }
+    pub fn boot_epoch(&self) -> u64 {
+        self.gate.boot_epoch()
+    }
+    pub fn protection_generation(&self) -> u64 {
+        self.gate.protection_generation()
+    }
+
+    /// Classify a freshly verified checkpoint pair and latch the gate.
+    /// Monotonic: once RECOVERY_REQUIRED, later "good facts" never return the
+    /// gate to Verified online. Returns the resulting state.
+    pub fn observe_pair(&mut self, facts: &CheckpointPairFacts) -> RecoveryState {
+        self.gate.raise(facts)
+    }
+
+    /// Uncertain completion (timeout/reset/power loss): Verified → Unknown.
+    /// Never downgrades RECOVERY_REQUIRED and never claims success.
+    pub fn observe_unknown(&mut self) -> RecoveryState {
+        self.gate.mark_unknown()
+    }
+
+    /// The current production decision snapshot.
+    pub fn decision(&self) -> RecoveryDecision {
+        let state = self.gate.state();
+        RecoveryDecision {
+            state,
+            may_write: self.gate.may_write(),
+            refusal_errno: refusal_errno(state),
+            allocate_boot_epoch_allowed: recovery_operation_allowed(
+                state,
+                RecoveryOperation::AllocateBootEpoch,
+            ),
+        }
+    }
+
+    /// Confirming a persistent request result does NOT lift a remaining
+    /// protection gate (V0.19.10 §5). Returns the unchanged state.
+    pub fn ack_persistent_request(&self) -> RecoveryState {
+        self.gate.ack_persistent_request()
+    }
+
+    /// The only deterministic open-writes path. Delegates to the gate:
+    /// independent authority + CommitChain + full real evidence + non-rollback
+    /// protection generation. Returns the new state on success; on any
+    /// missing/invalid evidence the gate stays closed and an error is returned.
+    pub fn reopen(
+        &mut self,
+        actor: Identity,
+        completion: CompletionAuthority,
+        evidence: &ReopenEvidence,
+    ) -> Result<RecoveryState, Error> {
+        self.gate.reopen(actor, completion, evidence)?;
+        Ok(self.gate.state())
+    }
+
+    fn slot(&self, cpu: u32) -> Result<usize, Error> {
+        let i = cpu as usize;
+        if i >= ACCUMULATOR_COUNT {
+            return Err(Error::Invalid);
+        }
+        Ok(i)
+    }
+
+    /// Record one verified degraded-audit event into the CPU's emergency
+    /// accumulator (AUDIT_DEGRADED fallback). Audit-seq discipline and
+    /// saturating sticky counters apply. This is audit evidence only.
+    pub fn record_degraded(&mut self, cpu: u32, ev: &DegradedEvent) -> Result<(), Error> {
+        let i = self.slot(cpu)?;
+        self.degraded[i].record(ev)
+    }
+
+    /// The CPU's current audit-degraded summary. Never completion evidence and
+    /// never a write-reopen authority (安§0.9 / 安§7.1).
+    pub fn degraded_proof(&self, cpu: u32) -> Result<RecoveryProofV2, Error> {
+        let i = self.slot(cpu)?;
+        Ok(*self.degraded[i].proof())
+    }
+
+    /// Issue a successor writer generation for one CPU accumulator after the
+    /// native takeover verified the old generation. Accumulated unconfirmed
+    /// evidence is retained; generations strictly increase and never wrap.
+    pub fn takeover_degraded(&mut self, cpu: u32, new_cpu_generation: u64) -> Result<(), Error> {
+        let i = self.slot(cpu)?;
+        self.degraded[i].takeover(new_cpu_generation)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -1389,5 +1557,172 @@ mod tests {
         )
         .unwrap();
         assert!(g.may_write());
+    }
+
+    // ---- Production recovery decision authority (native-owner skeleton) ----
+    // Host tests only; actual audit-slot fallback / per-CPU preallocation /
+    // mount integration are exercised by T1's QEMU boot or a later wave.
+
+    #[test]
+    fn production_recovery_decision_fail_closed_without_evidence() {
+        let mut ra = RecoveryAuthority::new(7, 3, authority(), &good_pair()).unwrap();
+        let d = ra.decision();
+        assert_eq!(d.state, RecoveryState::Verified);
+        assert!(d.may_write);
+        assert_eq!(d.refusal_errno, None);
+        assert!(d.allocate_boot_epoch_allowed);
+        // Classify a bad pair -> RECOVERY_REQUIRED latch.
+        let bad = CheckpointPairFacts {
+            higher_generation_log: true,
+            ..good_pair()
+        };
+        assert_eq!(ra.observe_pair(&bad), RECOVERY_REQUIRED);
+        let d = ra.decision();
+        assert_eq!(d.state, RECOVERY_REQUIRED);
+        assert!(!d.may_write);
+        assert_eq!(d.refusal_errno, Some(EIO));
+        assert!(!d.allocate_boot_epoch_allowed);
+        // No evidence -> stays closed, no success claim.
+        assert_eq!(
+            ra.reopen(
+                authority(),
+                CompletionAuthority::CommitChain,
+                &ReopenEvidence::default()
+            ),
+            Err(Error::Unknown)
+        );
+        assert_eq!(ra.state(), RECOVERY_REQUIRED);
+        // Later "good facts" never recover online.
+        assert_eq!(ra.observe_pair(&good_pair()), RECOVERY_REQUIRED);
+        // Only full real evidence reopens.
+        assert_eq!(
+            ra.reopen(
+                authority(),
+                CompletionAuthority::CommitChain,
+                &full_evidence(4)
+            ),
+            Ok(RecoveryState::Verified)
+        );
+        assert!(ra.decision().may_write);
+        assert_eq!(ra.protection_generation(), 4);
+        assert_eq!(ra.boot_epoch(), 7);
+    }
+
+    #[test]
+    fn production_recovery_degraded_summary_never_reopens() {
+        let mut ra = RecoveryAuthority::new(7, 3, authority(), &good_pair()).unwrap();
+        ra.observe_pair(&CheckpointPairFacts {
+            first_valid: false,
+            ..good_pair()
+        });
+        assert_eq!(ra.state(), RECOVERY_REQUIRED);
+        // Record degraded audit events on CPU0 and CPU3.
+        ra.record_degraded(0, &event(1, DegradedEventKind::CapRevoke, 0xAB))
+            .unwrap();
+        ra.record_degraded(3, &event(1, DegradedEventKind::Recovery, 0xCD))
+            .unwrap();
+        let p0 = ra.degraded_proof(0).unwrap();
+        assert_eq!(p0.flags & FLAG_DEGRADED, FLAG_DEGRADED);
+        assert_eq!(p0.total_count, 1);
+        assert_eq!(p0.revoke_count, 1);
+        assert!(p0.verify_chain_from(&[0; 32]));
+        assert_eq!(p0.boot_epoch, 7);
+        assert_eq!(p0.cpu_id, 0);
+        // Out-of-range CPU index is rejected.
+        assert_eq!(
+            ra.record_degraded(
+                ACCUMULATOR_COUNT as u32,
+                &event(2, DegradedEventKind::Unknown, 1)
+            ),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            ra.degraded_proof(ACCUMULATOR_COUNT as u32),
+            Err(Error::Invalid)
+        );
+        // The audit-degraded summary is NOT completion evidence: reopen refused.
+        assert_eq!(
+            ra.reopen(
+                authority(),
+                CompletionAuthority::RecoveryProofV2,
+                &full_evidence(3)
+            ),
+            Err(Error::Invalid)
+        );
+        assert_eq!(ra.state(), RECOVERY_REQUIRED);
+        assert!(!may_substitute_completion(
+            CompletionAuthority::RecoveryProofV2
+        ));
+        // Only real CommitChain evidence opens.
+        ra.reopen(
+            authority(),
+            CompletionAuthority::CommitChain,
+            &full_evidence(3),
+        )
+        .unwrap();
+        assert!(ra.decision().may_write);
+    }
+
+    #[test]
+    fn production_recovery_unknown_latch_and_degraded_takeover() {
+        let mut ra = RecoveryAuthority::new(7, 3, authority(), &good_pair()).unwrap();
+        assert_eq!(ra.observe_unknown(), RecoveryState::Unknown);
+        let d = ra.decision();
+        assert!(!d.may_write);
+        assert_eq!(d.refusal_errno, Some(EIO));
+        assert!(!d.allocate_boot_epoch_allowed);
+        // Acknowledging a persistent request never opens the gate.
+        assert_eq!(ra.ack_persistent_request(), RecoveryState::Unknown);
+        // Degraded takeover retains evidence; strictly newer generation only.
+        ra.record_degraded(1, &event(1, DegradedEventKind::CapRevoke, 1))
+            .unwrap();
+        let before = ra.degraded_proof(1).unwrap();
+        assert_eq!(ra.takeover_degraded(1, 1), Err(Error::Stale));
+        ra.takeover_degraded(1, 2).unwrap();
+        let after = ra.degraded_proof(1).unwrap();
+        assert_eq!(after.cpu_generation, 2);
+        assert_eq!(after.total_count, before.total_count);
+        assert_eq!(after.chain_digest, before.chain_digest);
+        // Reopen from Unknown with real evidence.
+        ra.reopen(
+            authority(),
+            CompletionAuthority::CommitChain,
+            &full_evidence(3),
+        )
+        .unwrap();
+        assert_eq!(ra.state(), RecoveryState::Verified);
+    }
+
+    #[test]
+    fn production_recovery_authority_validates_bindings() {
+        assert_eq!(
+            RecoveryAuthority::new(0, 3, authority(), &good_pair()).unwrap_err(),
+            Error::Invalid
+        );
+        assert_eq!(
+            RecoveryAuthority::new(7, 0, authority(), &good_pair()).unwrap_err(),
+            Error::Invalid
+        );
+        assert_eq!(
+            RecoveryAuthority::new(
+                7,
+                3,
+                Identity {
+                    id: 0,
+                    generation: 1
+                },
+                &good_pair()
+            )
+            .unwrap_err(),
+            Error::Invalid
+        );
+        // Initial degraded accumulators are initial and bound to the boot epoch.
+        let ra = RecoveryAuthority::new(7, 3, authority(), &good_pair()).unwrap();
+        for cpu in 0..ACCUMULATOR_COUNT as u32 {
+            let p = ra.degraded_proof(cpu).unwrap();
+            assert!(p.is_initial());
+            assert_eq!(p.boot_epoch, 7);
+            assert_eq!(p.cpu_id, cpu);
+        }
     }
 }

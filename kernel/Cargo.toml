@@ -54,6 +54,16 @@ v0199-cpu0-role-selftest = ["smp-selftest"]
 # SVC 0x41 publish via SvcV3Bridge -> executor ApplyReport -> supervisor terminal.
 # Fixture scope only; production in-vector syscall wiring is NOT established.
 v0199-advice-e2e-selftest = ["smp-selftest", "dep:sha2"]
+# V0.20 production boot + in-vector SVC dispatch SKELETON (wave 10 T1). Elevates
+# the proven advice-e2e SvcV3Bridge dispatch (0x50 intake/register, 0x41 publish)
+# out of the fixture turn loop and into the production exception-vector path, and
+# loads the eight ABI3 PIE role packages through the existing build catalog.
+# Opt-in only: the default build and every existing fixture profile are unchanged.
+# HONEST SCOPE: this is a skeleton, NOT full production authority. The boot epoch
+# is staged (volatile), the executor is a bounded fixture target, no real model is
+# active, and the snapshot backend stays fail-closed (EAGAIN). See production.rs
+# scope markers (production_skeleton=true full_authority=false real_models=false).
+v020-production = ["smp-selftest", "dep:sha2"]
 # Explicit native ABI3 role bootstrap. Never a production G0/BootEpoch claim.
 v0199-control-bringup = ["v0199-cpu0-role-selftest"]
 # Same diagnostic program inventory with the normative RAM topology; not G0.

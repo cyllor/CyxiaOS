@@ -56,4 +56,5 @@ pub mod recovery_v1;
 pub mod boot_epoch_v1;
 
 pub mod file_format_v1;
+pub mod file_media_unified_v1;
 pub mod file_mount_v1;
