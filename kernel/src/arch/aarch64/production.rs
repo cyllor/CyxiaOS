@@ -1604,6 +1604,9 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         ACCEPT_COUNT.load(Ordering::Relaxed),
     );
 
+    // RECOVERY probe while the plan is published (count 1), before settlement.
+    recovery::publish_probe(pub_space, pub_args);
+
     // (7) Executor: claim work, apply to the fixture target, ApplyReport.
     let claim_scope = TrustedApplyScope {
         boot_epoch: BOOT,
@@ -1707,8 +1710,6 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         r.plan_seq,
         summary.plan_seq,
     );
-
-    recovery::publish_probe(pub_space, pub_args);
 
     // (10) Business CPUs kept running; deterministic cleanup.
     for slot in 1..REQUIRED {

@@ -26,7 +26,8 @@
 //! * INIT_CLAIMED / READY (atomics): INIT_CLAIMED makes `init` one-shot; READY
 //!   is set with Release after both inits, and `record_fault` / the gate refuse
 //!   until they observe it with Acquire.
-//! * EVENTS / REJECTED ([AtomicU64; 4]): each written only by its own CPU with
+//! * EVENTS / REJECTED ([AtomicU64; 4]): index i is written only by CPU i
+//!   (`record_fault` indexes both by `cpu::slot()`, never by its argument), with
 //!   Release; CPU0 reads them with Acquire at the evidence seal, after the
 //!   business CPUs stopped.
 //! * PUBLISH_REJECTED (atomic): CPU0 only (set by `publish_probe`).
@@ -129,12 +130,13 @@ fn event_digest(cpu: u32, esr: u64, far: u64) -> [u8; 32] {
 /// Record one EL0 fault into the faulting CPU's own accumulator. Runs in that
 /// CPU's exception context; `cpu` must be the current CPU slot.
 pub(crate) fn record_fault(cpu: u32, esr: u64, far: u64) {
-    let i = cpu as usize;
+    let i = cyxia_arch_aarch64::cpu::slot();
     if i >= ACCUMULATOR_COUNT {
         // No accumulator exists for this CPU; never drop the event silently.
         fatal(FATAL_NO_SLOT);
     }
-    if cpu as usize != cyxia_arch_aarch64::cpu::slot() || !READY.load(Ordering::Acquire) {
+    // REJECTED/EVENTS are indexed by the CURRENT CPU only, never by `cpu`.
+    if cpu as usize != i || !READY.load(Ordering::Acquire) {
         REJECTED[i].fetch_add(1, Ordering::Release);
         return;
     }
@@ -158,35 +160,43 @@ pub(crate) fn record_fault(cpu: u32, esr: u64, far: u64) {
     }
 }
 
-fn gate() -> Option<&'static mut RecoveryGate> {
+/// Scoped access to the recovery gate: `None` before init or off CPU0. The
+/// `&mut` never escapes `f`, so no caller can hold an aliasing reference.
+fn with_gate<R>(f: impl FnOnce(&mut RecoveryGate) -> R) -> Option<R> {
     if !READY.load(Ordering::Acquire) || cyxia_arch_aarch64::cpu::slot() != 0 {
         return None;
     }
-    // SAFETY: initialized before READY; only CPU0 (checked) references GATE and
-    // each caller consumes the reference within one synchronous call.
-    Some(unsafe { (*addr_of_mut!(GATE)).assume_init_mut() })
+    // SAFETY: GATE was initialized before READY (Acquire above). Only CPU0
+    // (checked) reaches here, CPU0 code is synchronous, and `with_gate` is
+    // never called re-entrantly from inside `f`, so this is the only live
+    // reference for the duration of `f`.
+    let gate = unsafe { (*addr_of_mut!(GATE)).assume_init_mut() };
+    Some(f(gate))
 }
 
 /// The 0x41 publish gate: true only while the recovery state is Verified.
 pub(super) fn publish_allowed() -> bool {
-    gate().is_some_and(|g| g.state() == RecoveryState::Verified)
+    with_gate(|g| g.state() == RecoveryState::Verified).unwrap_or(false)
 }
 
 /// Uncertain completion: Verified -> Unknown (never back online).
 fn observe_unknown() -> RecoveryState {
-    match gate() {
-        Some(g) => g.mark_unknown(),
+    match with_gate(|g| g.mark_unknown()) {
+        Some(state) => state,
         None => fatal(FATAL_GATE),
     }
 }
 
-/// After terminal settlement: an uncertain completion closes the gate, and a
-/// fresh 0x41 through the existing publisher carrier is refused with E_AUTH
-/// before the bridge runs. Nothing is published or natively accepted.
+/// After publish + replay, BEFORE executor/settlement (published_count == 1):
+/// an uncertain completion closes the gate, and a fresh 0x41 through the
+/// existing publisher carrier is refused with E_AUTH before the bridge runs.
+/// published_count stays 1 and nothing is natively accepted. Word 133 is set
+/// only after all of these hold.
 pub(super) fn publish_probe(pub_space: usize, pub_args: [u64; 6]) {
     // SAFETY: CPU0 control plane; the gate reference is consumed immediately
     // and no in-vector dispatch is running between these synchronous calls.
     let published = unsafe { (&*gate_ptr()).published_count() };
+    assert_eq!(published, 1, "probe must run while the plan is published");
     if observe_unknown() != RecoveryState::Unknown {
         fatal(FATAL_PROBE);
     }
@@ -195,7 +205,7 @@ pub(super) fn publish_probe(pub_space: usize, pub_args: [u64; 6]) {
     assert_eq!(out, E_AUTH as u64, "publish must be refused after UNKNOWN");
     // SAFETY: as above; the refused SVC already returned to this CPU0 loop.
     let after = unsafe { (&*gate_ptr()).published_count() };
-    assert_eq!(after, published, "refused publish must not publish");
+    assert_eq!(after, 1, "refused publish must leave published_count at 1");
     assert_eq!(ACCEPT_COUNT.load(Ordering::Relaxed), 1, "no new native accept");
     PUBLISH_REJECTED.store(true, Ordering::Relaxed);
     report("V020_PROD_RECOVERY_REJECT", PUB.id, out, after as u64);
