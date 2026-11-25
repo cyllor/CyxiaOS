@@ -18,7 +18,9 @@ pub struct ViewGrant{
 #[derive(Clone,Copy)]
 pub struct DomainObservation{pub target:Target,pub fields:[Option<u64>;4]}
 #[derive(Clone,Copy)]
-struct Row{target:Target,snapshot:Option<SnapshotReplyV3>}
+// Retired object IDs retain their highest generation within this boot.
+// Same-ID replacement can reuse the slot, never the old generation.
+struct Row{target:Target,snapshot:Option<SnapshotReplyV3>,active:bool}
 pub struct SnapshotStore{
     boot:u64,sequence:u64,last_sample_ns:u64,targets:[Option<Row>;TARGETS],grants:[Option<ViewGrant>;VIEWS],
 }
@@ -37,18 +39,25 @@ impl SnapshotStore{
     pub fn register_target(&mut self,target:Target,
         verify_native_owner:impl FnOnce(Target)->Result<(),Error>)->Result<(),Error>{
         if self.boot==0{return Err(Error::NotReady);}
-        if !(1..=15).contains(&target.domain)||!target.object.valid()||!target.owner.valid()
-            ||self.targets.iter().flatten().any(|r|r.target.domain==target.domain&&r.target.object.id==target.object.id){
+        if !(1..=15).contains(&target.domain)||!target.object.valid()||!target.owner.valid(){
             return Err(Error::Denied);
         }
-        let slot=self.targets.iter_mut().find(|r|r.is_none()).ok_or(Error::Exhausted)?;
-        verify_native_owner(target)?;*slot=Some(Row{target,snapshot:None});Ok(())
+        let old=self.targets.iter().position(|r|r.is_some_and(|r|
+            r.target.domain==target.domain&&r.target.object.id==target.object.id));
+        let index=if let Some(i)=old{
+            let r=self.targets[i].unwrap();
+            if r.active{return Err(Error::Busy);}
+            if target.object.generation<=r.target.object.generation{return Err(Error::Stale);}
+            i
+        }else{self.targets.iter().position(Option::is_none).ok_or(Error::Exhausted)?};
+        verify_native_owner(target)?;
+        self.targets[index]=Some(Row{target,snapshot:None,active:true});Ok(())
     }
     pub fn register_view(&mut self,manifest:&NativeRoleManifest,g:ViewGrant,
         verify_actual_cap:impl FnOnce(ViewGrant)->Result<(),Error>)->Result<(),Error>{
         if self.boot==0{return Err(Error::NotReady);}
         if g.cap==0||g.selector==0||g.allowed_fields==0||g.allowed_fields&!FIELD_MASK!=0
-            ||!self.targets.iter().flatten().any(|r|r.target.domain==g.domain&&r.target.object==g.target)
+            ||!self.targets.iter().flatten().any(|r|r.active&&r.target.domain==g.domain&&r.target.object==g.target)
             ||self.grants.iter().flatten().any(|v|v.cap==g.cap&&v.selector==g.selector){
             return Err(Error::Denied);
         }
@@ -80,7 +89,7 @@ impl SnapshotStore{
         };
         for (i,o) in observations.iter().enumerate(){
             if observations[..i].iter().any(|v|v.target==o.target)
-                ||!self.targets.iter().flatten().any(|r|r.target==o.target){
+                ||!self.targets.iter().flatten().any(|r|r.active&&r.target==o.target){
                 return Err(Error::Denied);
             }
             make(o).encode().map_err(|_|Error::Invalid)?;
@@ -90,7 +99,7 @@ impl SnapshotStore{
         // selected in this round. Never mix snapshots across sequences.
         for r in self.targets.iter_mut().flatten(){r.snapshot=None;}
         for o in observations{
-            self.targets.iter_mut().flatten().find(|r|r.target==o.target)
+            self.targets.iter_mut().flatten().find(|r|r.active&&r.target==o.target)
                 .expect("immutable capture preflight").snapshot=Some(make(o));
         }
         self.sequence=seq;self.last_sample_ns=sampled_ns;Ok(seq)
@@ -102,7 +111,7 @@ impl SnapshotStore{
     pub fn frozen_for_owner(&self,target:Target,ledger:u64,cores:u64,now_ns:u64,
         verify_owner:impl FnOnce(Target)->Result<(),Error>)->Result<SnapshotReplyV3,Error>{
         if self.boot==0{return Err(Error::NotReady);}
-        let r=self.targets.iter().flatten().find(|r|r.target==target).ok_or(Error::Stale)?;
+        let r=self.targets.iter().flatten().find(|r|r.active&&r.target==target).ok_or(Error::Stale)?;
         let snap=r.snapshot.ok_or(Error::NotReady)?;
         if snap.snapshot_seq!=self.sequence||snap.ledger_generation!=ledger||snap.core_generation!=cores
             ||now_ns<snap.sampled_ns||now_ns-snap.sampled_ns>=MAX_AGE_NS{return Err(Error::Stale);}
@@ -116,7 +125,7 @@ impl SnapshotStore{
             &&g.selector==selector&&g.domain==domain).ok_or(Error::Denied)?;
         manifest.check_snapshot_view(actor,grant.endpoint,cpu,grant.view)?;
         verify_live_cap(grant)?;
-        let r=self.targets.iter().flatten().find(|r|r.target.domain==domain&&r.target.object==grant.target)
+        let r=self.targets.iter().flatten().find(|r|r.active&&r.target.domain==domain&&r.target.object==grant.target)
             .ok_or(Error::Stale)?;
         let mut snap=r.snapshot.ok_or(Error::NotReady)?;
         if snap.snapshot_seq!=self.sequence||snap.ledger_generation!=ledger||snap.core_generation!=cores
@@ -136,9 +145,9 @@ impl SnapshotStore{
     }
     pub fn retire_target(&mut self,target:Target,
         verify_native_stop:impl FnOnce(Target)->Result<(),Error>)->Result<(),Error>{
-        let slot=self.targets.iter_mut().find(|v|v.as_ref().is_some_and(|r|r.target==target)).ok_or(Error::Stale)?;
+        let row=self.targets.iter_mut().flatten().find(|r|r.active&&r.target==target).ok_or(Error::Stale)?;
         verify_native_stop(target)?;
-        *slot=None;
+        row.active=false;row.snapshot=None;
         for grant in &mut self.grants{
             if grant.as_ref().is_some_and(|g|g.domain==target.domain&&g.target==target.object){*grant=None;}
         }
@@ -177,6 +186,15 @@ mod tests{
         assert!(matches!(s.frozen_for_owner(target,2,3,101,|_|Err(Error::Denied)),Err(Error::Denied)));
         s.retire_target(target,|_|Ok(())).unwrap();
         assert!(matches!(s.frozen_for_owner(target,2,3,101,|_|panic!()),Err(Error::Stale)));
+        assert_eq!(s.register_target(target,|_|panic!()),Err(Error::Stale));
+        assert_eq!(s.register_target(bad,|_|panic!()),Err(Error::Stale));
+        let next=Target{object:Identity{generation:2,..target.object},owner:bad.owner,..target};
+        s.register_target(next,|_|Ok(())).unwrap();
+        assert!(matches!(s.frozen_for_owner(next,2,3,102,|_|panic!()),Err(Error::NotReady)));
+        assert_eq!(s.capture(2,3,102,[None;8],&[o],|_|panic!()),Err(Error::Denied));
+        assert_eq!(s.capture(2,3,102,[None;8],&[DomainObservation{target:next,..o}],|_|Ok(())),Ok(2));
+        assert_eq!(s.frozen_for_owner(next,2,3,103,|_|Ok(())).unwrap().target_generation,2);
+        assert!(matches!(s.frozen_for_owner(target,2,3,103,|_|panic!()),Err(Error::Stale)));
     }
     #[test]
     fn snapshot_scope_redaction_age_and_retirement(){
