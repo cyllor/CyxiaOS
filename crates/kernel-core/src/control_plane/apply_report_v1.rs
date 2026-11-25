@@ -109,7 +109,15 @@ impl<'a> ApplyReportV1<'a>{
         out[64..68].copy_from_slice(&self.result.to_le_bytes());
         out[68..72].copy_from_slice(&(self.action.len() as u32).to_le_bytes());
         out[96..n].copy_from_slice(self.action);
-        if Self::decode(&out[..n])?!=self{return Err(Error::Invalid);}
+        // Decode with the output's own short borrow; Self::decode would
+        // require the caller's output to live as long as the input action.
+        let decoded=ApplyReportV1::decode(&out[..n])?;
+        if decoded.key!=self.key||decoded.action_index!=self.action_index
+            ||decoded.domain_id!=self.domain_id||decoded.state!=self.state
+            ||decoded.target!=self.target||decoded.executor_generation!=self.executor_generation
+            ||decoded.plan_version!=self.plan_version||decoded.result!=self.result
+            ||decoded.completed_ns!=self.completed_ns||decoded.action!=self.action
+        {return Err(Error::Invalid);}
         Ok(n)
     }
 
@@ -362,6 +370,24 @@ mod tests{
             authorized_executor:Identity{id:12,generation:9},
             executor_generation:9,boot_epoch:1,plan_version:7,now_ns:1200,
         }
+    }
+    #[test]
+    fn encode_roundtrip_accepts_independent_short_output_borrow(){
+        let raw=report();
+        let input=ApplyReportV1::decode(&raw).unwrap();
+        {
+            let mut out=[0xa5;MAX_APPLY_REPORT_BYTES];
+            let n=input.encode(&mut out).unwrap();
+            assert_eq!(n,raw.len());
+            assert_eq!(&out[..n],&raw);
+            assert!(out[n..].iter().all(|&x|x==0));
+            assert_eq!(ApplyReportV1::decode(&out[..n]).unwrap().action,input.action);
+            let bad=ApplyReportV1{plan_version:0,..input};
+            assert_eq!(bad.encode(&mut out),Err(Error::Invalid));
+            let bad=ApplyReportV1{result:-1,..input};
+            assert_eq!(bad.encode(&mut out),Err(Error::Invalid));
+        }
+        assert_eq!(input.action,&[2,0]);
     }
     #[test]
     fn authentic_executor_and_real_effect_callback_are_both_required(){
