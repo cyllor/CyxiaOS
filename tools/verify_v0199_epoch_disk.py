@@ -299,7 +299,69 @@ class EpochFixture:
         require(struct.unpack_from('<QQQHHHHQQQQiIQ',report)==(e,1,1,0,15,1,0,15,1,1,1,0,2,finished)
                 and report[80:96]==bytes(16) and report[96:]==struct.pack('<H',32),
                 'D15 ApplyReport does not match actual retained effect')
-        require(all(v==0 for v in w[220:]),'nonzero reserved evidence')
+        # D07 uses the next sequence in the same protected registry and
+        # gate. Independently recompute the timer grid and verify the real
+        # comparator values, status-confirmed wakeups and exact report.
+        (magic7,freq,b_req,b_prog,b_cmp,b_wake,h_req,h_prog,h_cmp,h_wake,
+         s_req,s_prog,s_cmp,s_wake,s_start,s_done,s_sample,s_accept,s_version,
+         s_rlen,s_retained,slack,coalesce,serial7)=w[220:244]
+        require(magic7==0x4359443037465831 and freq>0 and 1_000_000_000%freq==0,
+                'missing actual D07 timer evidence')
+        tick=1_000_000_000//freq
+        require((slack,coalesce,s_version,s_rlen,s_retained,serial7)==(80_000,200,2,98,2,2),
+                'D07 policy or effect identity mismatch')
+        q=coalesce*1000
+        expected_soft=min(((s_req+q-1)//q)*q,s_req+slack)
+        require(b_req==b_prog==b_cmp*tick and h_req==h_prog==h_cmp*tick
+                and s_prog==s_cmp*tick==expected_soft and s_req<s_prog<=s_req+slack
+                and b_wake>=b_prog and h_wake>=h_prog and s_wake>=s_prog
+                and b_wake<=s_sample<=s_accept<=h_wake<=s_start<=s_done<=s_wake
+                and s_accept<=s_sample+100_000_000 and s_start<s_sample+10_000_000_000,
+                'D07 actual comparator, slack, hard deadline or wake evidence mismatch')
+        require(serial.count(f'V0199_D07_EFFECT a={s_req} b={s_prog} c={s_wake}\n'.encode())==1,
+                'D07 UART and stopped-memory evidence mismatch')
+        ss=page[244*8:277*8];rr=page[277*8:288*8]
+        pp=page[288*8:288*8+212];dd=page[315*8:347*8]
+        ar=page[347*8:347*8+s_rlen]
+        require(page[288*8+212:315*8]==bytes(4) and page[347*8+s_rlen:360*8]==bytes(6),
+                'nonzero D07 evidence padding')
+        require(struct.unpack_from('<IHH',ss)==(0x4359534e,3,72)
+                and struct.unpack_from('<7Q',ss,8)==(2,e,1,1,7,1,s_sample)
+                and struct.unpack_from('<HHI',ss,64)==(7,12,0),'wrong D07 snapshot scope')
+        sf=[]
+        for i in range(12):
+            fid,present,value=struct.unpack_from('<HB5xQ',ss,72+i*16)
+            require(fid==16+i and present in (0,1) and (present or value==0)
+                    and ss[72+i*16+3:72+i*16+8]==bytes(5),'noncanonical D07 snapshot')
+            sf.append(value if present else None)
+        require(sf==[None]*8+[1,None,80,None],'D07 actual registered timer/slack or missing sample changed')
+        expected7=bytearray(88)
+        put(expected7,0,'IHHQIIQ',0x43595255,2,32,2,1,88,0)
+        put(expected7,32,'IHHQHHHHII',2,7,1,7,0,1,1,0,56,0)
+        put(expected7,64,'HB5xQ',1,3,1)
+        put(expected7,80,'HHI',2,0,0)
+        require(rr==bytes(expected7),'D07 diagnostic rule bytes differ')
+        dh=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
+        dh.update(hashlib.sha256(b'CYX/D07-FIXTURE-ORDINALS/0=0,1=50,2=200,3=1000').digest())
+        dh.update(ss);dh.update(bytes(1))
+        for v in sf[8:12]+[0,1,1]:
+            dh.update(bytes([v is not None]));dh.update(struct.pack('<Q',0 if v is None else v))
+        dh.update(struct.pack('<H',4))
+        for i,v in enumerate((0,50,200,1000)):dh.update(struct.pack('<HBH',i,2,v))
+        d7hash=dh.digest()
+        require(pp[176:208]==d7hash and pp[208:212]==struct.pack('<HH',2,200)
+                and struct.unpack_from('<IHHIHH6Q',pp)==(0x43594c31,2,64,212,1,0,2,1,0,1,2,s_sample+10_000_000_000)
+                and struct.unpack_from('<IHHHHI8Q',pp,64)==(0x43595031,2,144,7,1,4,1,2,2,7,1,1,1,s_sample+100_000_000)
+                and pp[144:176]==bytes(32),'D07 plan differs from exact current rule/snapshot')
+        require(dd[160:192]==hashlib.sha256(rr).digest() and dd[192:224]==hashlib.sha256(pp).digest()
+                and dd[224:256]==d7hash and struct.unpack_from('<10Q',dd,8)==(e,1,2,2,2,7,1,1,1,2)
+                and struct.unpack_from('<IHHH',dd,88)==(2,0,7,1) and dd[98:102]==bytes(4)
+                and struct.unpack_from('<HH',dd,102)==(2,65535)
+                and struct.unpack_from('<IHH',dd,152)==(4,2,0),'D07 decision not exact RULE_ONLY')
+        require(struct.unpack_from('<QQQHHHHQQQQiIQ',ar)==(e,1,2,0,7,1,0,7,1,1,2,0,2,s_done)
+                and ar[80:96]==bytes(16) and ar[96:]==struct.pack('<H',200),
+                'D07 ApplyReport differs from actual retained comparator effect')
+        require(all(v==0 for v in w[360:]),'nonzero reserved evidence')
         expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c={flushes}\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
         return dict(previous_boot_epoch=e-1,boot_epoch=e,state_generation=txid+1,txid=txid,
@@ -311,7 +373,11 @@ class EpochFixture:
                     native_checkpoint_flush_verified=True,
                     native_d15_effect_fixture_verified=True,d15_baseline_max_chars=bmax,d15_approved_max_chars=amax,
                     d15_baseline_pump_cpu_ns=bcpu,d15_approved_pump_cpu_ns=acpu,d15_feedback_records=retained,
-                    production_d15_el0_control_verified=False,frame_count=frame_count,frame_meta_bytes=meta_bytes,frame_meta_pa=meta,
+                    production_d15_el0_control_verified=False,
+                    native_d07_effect_fixture_verified=True,d07_soft_deferral_ns=s_prog-s_req,
+                    d07_hard_deferral_ns=h_prog-h_req,d07_soft_actual_wake_ns=s_wake,
+                    d07_feedback_records=s_retained,production_d07_business_scheduler_verified=False,
+                    frame_count=frame_count,frame_meta_bytes=meta_bytes,frame_meta_pa=meta,
                     control_pool_pa=control,progress_pool_pa=progress,ordinary_free_frames=free,
                     permanent_frames=permanent,frame_meta_physical_dump_verified=False,
                     paired_boot_epoch_redo_verified=True,
@@ -388,6 +454,7 @@ def main():
         result['cross_process_paired_boot_epoch_fixture_verified']=True
         result['cross_process_formatted_mount_checkpoint_verified']=True
         result['native_d15_actual_effect_fixture_verified']=True
+        result['native_d07_actual_effect_fixture_verified']=True
     except (OSError,ValueError,RuntimeError) as e:
         result['error']=str(e)
     (out/'summary.json').write_text(json.dumps(result,indent=2)+'\n')
