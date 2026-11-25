@@ -24,6 +24,23 @@ class VerdictTests(unittest.TestCase):
         record[288:]=hashlib.sha256(b"CYX/VERDICT/v4"+record[:288]).digest()
         p=root/"verdicts"/f"{stem}.bin";p.write_bytes(record)
         return manifest,p
+    def test_duplicate_keys_and_noncanonical_constants_fail_closed(self):
+        for raw in (b'{"run_id":1,"run_id":2}', b'{"nested":{"x":1,"x":2}}', b'{"n":NaN}', b'{"n":Infinity}'):
+            with self.assertRaises(ValueError):v.strict_json(raw)
+        with tempfile.TemporaryDirectory() as d:
+            r=Path(d);m,p=self.setup_run(r)
+            duplicate=m.replace(b'"run_id": 1',b'"run_id": 1,"run_id": 1')
+            self.assertNotEqual(duplicate,m)
+            with self.assertRaises(ValueError):v.aggregate(duplicate,v.digest(duplicate),r)
+            stem=p.stem
+            f=r/"evidence"/(stem+".json")
+            ambiguous=b'{"files":[],"files":'+json.dumps(json.loads(f.read_bytes())["files"]).encode()+b'}'
+            f.write_bytes(ambiguous)
+            rec=bytearray(p.read_bytes())
+            rec[256:288]=hashlib.sha256(ambiguous).digest()
+            rec[288:]=hashlib.sha256(b"CYX/VERDICT/v4"+rec[:288]).digest()
+            p.write_bytes(rec)
+            self.assertEqual(v.aggregate(m,v.digest(m),r)["G4_QEMU"]["status"],"BLOCKED_INVALID_EVIDENCE")
     def test_missing_proofs_never_pass_and_failure_dominates(self):
         with tempfile.TemporaryDirectory() as d:
             r=Path(d);m,p=self.setup_run(r)
