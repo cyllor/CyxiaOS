@@ -247,7 +247,7 @@ pub(super) fn run(info:&BootInfo)->!{
     let new=super::v0199_control_bringup::disk_security_run(new_generation,1,false);
     assert_ne!(new.root,old.root);assert_eq!(old.image_sha256,new.image_sha256);
     report("V0199_EPOCH_CLIENT_RELOADED",new_generation,new.root,boot);
-    super::v0199_d15_fixture::run(boot);
+    super::v0199_d15_fixture::run(boot,gate.boot_epoch());
     assert_eq!((disk.writes,disk.flushes),(11+12*reset,6+reset));
     let final_txid=recovered+2;
     let final_state=scratch.verify(sb,8,HOME,final_txid,7*(final_txid/2)).unwrap();
