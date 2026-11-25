@@ -1373,23 +1373,42 @@ mod tests {
     }
     #[test]
     fn ambiguous_publication_recovered_only_by_independent_exact_bank_proof(){
+        use super::super::desired_plan_v0199::DesiredBank;
         let rules=profile_bytes();let catalog=Profile::parse(&rules).unwrap();
         let plan=plan_bytes();let records=[decision(&plan,&rules)];
         let actions=frozen(&[2,4],&[2,0]);let ctx=trusted(&rules);
-        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
+        let mut bank=DesiredBank::empty();
+        bank.bind_boot(ctx.boot_epoch,ctx.controller_epoch,PUBLISHER,||Ok(())).unwrap();
+        let binding=verified_binding();bank.register_target(binding,|_|Ok(())).unwrap();
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,SUPERVISOR,ctx.boot_epoch,ctx.controller_epoch).unwrap();
         gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&actions,ctx).unwrap();
-        assert_eq!(gate.publish_once(PUBLISHER,&plan,&records,&catalog,&actions,ctx,||Err(Error::NotReady)),Err(Error::NotReady));
-        assert_eq!(gate.reconcile_published(PUBLISHER,&plan,7,|_,_,_|panic!()),Err(Error::Denied));
-        assert_eq!(gate.reconcile_published(SUPERVISOR,&plan,7,|_,_,_|Err(Error::NotReady)),Err(Error::NotReady));
-        gate.reconcile_published(SUPERVISOR,&plan,7,|p,h,v|{
-            assert_eq!(p.header.plan_seq,1);assert_eq!(h,sha256(&plan));assert_eq!(v,7);Ok(())
-        }).unwrap();
-        assert_eq!(gate.reconcile_published(SUPERVISOR,&plan,7,|_,_,_|panic!()),Ok(()));
+        // The real bank component commits; only the diagnostic adapter
+        // response is lost. Do not rerun this writer during recovery.
+        assert_eq!(gate.publish_once(PUBLISHER,&plan,&records,&catalog,&actions,ctx,||{
+            assert_eq!(bank.publish_registered(PUBLISHER,0,&plan,ctx,|_|Ok(())),Ok(1));
+            Err(Error::NotReady)
+        }),Err(Error::NotReady));
+        assert_eq!(gate.reconcile_published(PUBLISHER,&plan,1,|_,_,_|panic!()),Err(Error::Denied));
+        assert_eq!(gate.reconcile_published(SUPERVISOR,&plan,2,|p,h,v|
+            bank.verify_committed_publication(p,h,v,|_|panic!())),Err(Error::Stale));
+        assert_eq!(gate.reconcile_published(SUPERVISOR,&plan,1,|p,h,v|
+            bank.verify_committed_publication(p,h,v,|_|Err(Error::NotReady))),Err(Error::NotReady));
+        gate.reconcile_published(SUPERVISOR,&plan,1,|p,h,v|
+            bank.verify_committed_publication(p,h,v,|slots|{
+                assert_eq!(slots.len(),1);assert_eq!(slots[0].unwrap().version,1);Ok(())
+            })).unwrap();
+        assert_eq!(gate.reconcile_published(SUPERVISOR,&plan,1,|_,_,_|panic!()),Ok(()));
         assert_eq!(gate.publish_once(PUBLISHER,&plan,&records,&catalog,&actions,ctx,||panic!("never retry writer")),Ok(Publication::ReplayNoEffect));
-        assert_eq!(gate.claim_apply_work(&plan,0,TrustedApplyScope{plan_version:8,..verified_scope()},verified_binding(),
+        let scope=TrustedApplyScope{boot_epoch:ctx.boot_epoch,plan_version:1,now_ns:ctx.now_ns+1};
+        assert_eq!(gate.claim_apply_work(&plan,0,TrustedApplyScope{plan_version:2,..scope},binding,
             apply_report_v1::ReportOrigin::Kernel,|_|panic!()),Err(Error::Stale));
-        claim_test_work(&mut gate,&plan);
+        gate.claim_apply_work(&plan,0,scope,binding,apply_report_v1::ReportOrigin::Kernel,|w|
+            bank.accept(w,apply_report_v1::ReportOrigin::Kernel,scope.now_ns,|a|{
+                assert_eq!(a.plan_digest,sha256(&plan));assert_eq!(a.version,1);Ok(())
+            })).unwrap();
+        assert_eq!(bank.pending(binding.domain,binding.target).unwrap().unwrap().accepted_ns,Some(scope.now_ns));
     }
+
     #[test]
     fn unknown_adapter_result_keeps_key_consumed_and_blocks_reexecution() {
         let bytes=profile_bytes();
