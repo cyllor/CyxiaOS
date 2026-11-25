@@ -42,6 +42,7 @@ pub mod offline_config_v1;
 pub mod cap_record_v3;
 
 pub mod snapshot_restore_gate;
+pub mod snapshot_gc_gate;
 
 pub mod ipc_receive_v3;
 
