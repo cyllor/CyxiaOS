@@ -1,6 +1,9 @@
 //! Current D07 soft-timer policy and native effect custody. EL1 serialized
 //! owner; no model, user or old generation may arm via this control interface.
 //! The backend is the actual timer scheduler/compare owner, not an EL0 receipt.
+//! Only ordinary soft timers enter this owner. Hard deadlines, lease and
+//! recovery timers keep independent deterministic scheduling and never wait
+//! for a policy, an uncertain ordinary arm, or an AI report.
 use super::{Error,Identity,action_schema_v2::ActionV2,apply_work_v1::ApplyWorkV1,
     apply_report_v1::{ActionStatus,ApplyReportV1,PlanKey,MAX_APPLY_REPORT_BYTES}};
 
@@ -54,7 +57,7 @@ impl Owner{
     pub fn current(&self,now:u64)->u16{if now<self.until{self.value}else{0}}
     fn ready(&self,now:u64)->Result<(),Error>{
         if self.boot==0||self.poisoned{return Err(Error::NotReady);}
-        if now<self.last_clock{return Err(Error::Clock);}
+        if now==0||now<self.last_clock{return Err(Error::Clock);}
         Ok(())
     }
     fn index(&self,id:Identity)->Result<usize,Error>{
@@ -62,7 +65,7 @@ impl Owner{
     }
     pub fn register(&mut self,id:Identity,class:TimerClass,slack_ns:u64,verify:impl FnOnce()->Result<(),Error>)->Result<(),Error>{
         if self.boot==0||self.poisoned{return Err(Error::NotReady);}
-        if !id.valid()||class!=TimerClass::Soft&&slack_ns!=0{return Err(Error::Denied);}
+        if !id.valid()||class!=TimerClass::Soft{return Err(Error::Denied);}
         if self.entries.iter().flatten().any(|e|e.timer.id==id.id){return Err(Error::Busy);}
         let slot=self.entries.iter_mut().find(|v|v.is_none()).ok_or(Error::Exhausted)?;
         verify()?;*slot=Some(Entry{timer:id,class,slack_ns,active:None,pending:None});Ok(())
@@ -187,11 +190,10 @@ mod tests{
     use super::*;
     const TARGET:Identity=Identity{id:7,generation:1};
     const SOFT:Identity=Identity{id:101,generation:1};
-    const HARD:Identity=Identity{id:102,generation:1};
     fn owner()->Owner{
         let mut o=Owner::empty();o.bind(1,TARGET,1,||Ok(())).unwrap();
         o.register(SOFT,TimerClass::Soft,80_000,||Ok(())).unwrap();
-        o.register(HARD,TimerClass::Hard,0,||Ok(())).unwrap();o
+        assert_eq!(o.register(Identity{id:102,generation:1},TimerClass::Hard,0,||panic!()),Err(Error::Denied));o
     }
     fn work()->ApplyWorkV1<'static>{ApplyWorkV1{key:PlanKey{boot_epoch:1,controller_epoch:1,plan_seq:1},
         action_index:0,domain:DOMAIN,target:TARGET,executor_generation:1,plan_version:1,payload:&[200,0]}}
@@ -214,8 +216,7 @@ mod tests{
         assert_eq!(o.complete(old,999,||panic!()),Err(Error::NotReady));
         o.complete(old,1000,||Ok(())).unwrap();
         o.accept(&work(),0,10_000_000,1100,||Ok(())).unwrap();
-        let hard=o.arm(HARD,2000,1100,|_|Ok(1101)).unwrap();
-        assert_eq!((hard.programmed_ns,hard.policy_version),(2000,0));
+        assert_eq!(programmed_ns(TimerClass::Hard,0,2000,1100,o.current(1100)),Ok(2000));
         assert_eq!(o.report(1101,&mut out),Err(Error::NotReady));
         let a=o.arm(SOFT,1_016_000,1200,|v|{assert_eq!(v.programmed_ns,1_096_000);Ok(1201)}).unwrap();
         let n=o.report(1201,&mut out).unwrap();let r=ApplyReportV1::decode(&out[..n]).unwrap();
