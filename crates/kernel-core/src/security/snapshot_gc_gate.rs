@@ -94,18 +94,18 @@ impl Gate{
     /// Never reset this mask merely because the process restarted.
     /// A missing or ambiguous handoff history must keep allocation closed.
     pub fn recover_committed(owner:Identity,supervisor:Identity,census:Census,before:&Maps<'_>,
-        candidates:&[u32],receipt:Commit,after:&Maps<'_>,handed_off:u128,
-        verify_history:impl FnOnce(&Batch,Commit,u128)->Result<(),Error>,
+        candidates:&[u32],receipt:Commit,after:&Maps<'_>,handed_off:u128,handoff_unknown:u128,
+        verify_history:impl FnOnce(&Batch,Commit,u128,u128)->Result<(),Error>,
     )->Result<Self,Error>{
         if candidates.is_empty()||candidates.len()>BATCH{return Err(Error::Invalid);}
         let allowed=if candidates.len()==128{u128::MAX}else{(1u128<<candidates.len())-1};
-        if handed_off&!allowed!=0{return Err(Error::Conflict);}
+        if (handed_off|handoff_unknown)&!allowed!=0||handed_off&handoff_unknown!=0{return Err(Error::Conflict);}
         // This local constructor performs structural checks only. No
         // capability escapes until the complete independent history proof.
         let mut g=Self::recover_unknown(owner,supervisor,census,before,candidates,|_,_,_|Ok(()))?;
         let batch=g.batch();
-        g.confirm(supervisor,batch,receipt,before,after,|b,c|verify_history(b,c,handed_off))?;
-        g.handed_off=handed_off;Ok(g)
+        g.confirm(supervisor,batch,receipt,before,after,|b,c|verify_history(b,c,handed_off,handoff_unknown))?;
+        g.handed_off=handed_off;g.handoff_unknown=handoff_unknown;Ok(g)
     }
     pub fn phase(&self)->Phase{self.phase}
     pub fn batch(&self)->Batch{self.batch}
@@ -200,19 +200,7 @@ impl Gate{
         if transferred{self.handed_off|=bit;}
         self.handoff_unknown&=!bit;Ok(())
     }
-    /// A complete recovered handoff census must resolve or preserve every
-    /// ambiguous bit before any new transfer. Masks are internal custody,
-    /// not a new persistent format.
-    pub fn recover_handoff_unknown(&mut self,actor:Identity,mask:u128,
-        verify_retained:impl FnOnce(&Batch,Commit,u128,u128)->Result<(),Error>)->Result<(),Error>{
-        if actor!=self.supervisor{return Err(Error::Unauthorized);}
-        if self.phase!=Phase::Committed||self.handoff_unknown!=0{return Err(Error::Busy);}
-        let n=self.batch.blocks().len();
-        let allowed=if n==128{u128::MAX}else{(1u128<<n)-1};
-        if mask&!allowed!=0||mask&self.handed_off!=0{return Err(Error::Conflict);}
-        verify_retained(&self.batch,self.commit.ok_or(Error::Unknown)?,self.handed_off,mask)?;
-        self.handoff_unknown=mask;Ok(())
-    }
+
 }
 const _:()=assert!(core::mem::size_of::<Gate>()<2048);
 
@@ -271,12 +259,12 @@ mod tests{
         assert_eq!(g.handoff_once(OWNER,7003,|_,_|panic!()),Err(Error::Unauthorized));
         let owner2=Identity{generation:2,..OWNER};
         let sup2=Identity{generation:2,..SUP};
-        assert!(matches!(Gate::recover_committed(owner2,sup2,c,&before,batch.blocks(),commit,&after,4,
-            |_,_,_|panic!()),Err(Error::Conflict)));
-        assert!(matches!(Gate::recover_committed(owner2,sup2,c,&before,batch.blocks(),commit,&after,1,
-            |_,_,_|Err(Error::Unknown)),Err(Error::Unknown)));
-        let mut recovered=Gate::recover_committed(owner2,sup2,c,&before,batch.blocks(),commit,&after,1,
-            |b,r,mask|{assert_eq!(*b,batch);assert_eq!(r,commit);assert_eq!(mask,1);Ok(())}).unwrap();
+        assert!(matches!(Gate::recover_committed(owner2,sup2,c,&before,batch.blocks(),commit,&after,4,0,
+            |_,_,_,_|panic!()),Err(Error::Conflict)));
+        assert!(matches!(Gate::recover_committed(owner2,sup2,c,&before,batch.blocks(),commit,&after,1,0,
+            |_,_,_,_|Err(Error::Unknown)),Err(Error::Unknown)));
+        let mut recovered=Gate::recover_committed(owner2,sup2,c,&before,batch.blocks(),commit,&after,1,0,
+            |b,r,mask,unknown|{assert_eq!(*b,batch);assert_eq!(r,commit);assert_eq!((mask,unknown),(1,0));Ok(())}).unwrap();
         assert!(!recovered.reusable(7000));assert!(recovered.reusable(7003));
         assert_eq!(recovered.handoff_once(SUP,7003,|_,_|panic!()),Err(Error::Unauthorized));
         assert_eq!(recovered.handoff_once(sup2,7000,|_,_|panic!()),Err(Error::Stale));
@@ -284,12 +272,10 @@ mod tests{
         assert!(!recovered.reusable(7003));
         assert_eq!(recovered.handoff_once(sup2,7003,|_,_|panic!()),Err(Error::Unknown));
         assert_eq!(recovered.reconcile_handoff(sup2,7003,true,|_,_,_|Err(Error::Unknown)),Err(Error::Unknown));
-        let mut rebooted=Gate::recover_committed(owner2,sup2,c,&before,batch.blocks(),commit,&after,1,
-            |_,_,_|Ok(())).unwrap();
-        assert_eq!(rebooted.recover_handoff_unknown(sup2,1,|_,_,_,_|panic!()),Err(Error::Conflict));
-        rebooted.recover_handoff_unknown(sup2,2,|_,_,done,unknown|{
-            assert_eq!((done,unknown),(1,2));Ok(())
-        }).unwrap();
+        assert!(matches!(Gate::recover_committed(owner2,sup2,c,&before,batch.blocks(),commit,&after,1,1,
+            |_,_,_,_|panic!()),Err(Error::Conflict)));
+        let mut rebooted=Gate::recover_committed(owner2,sup2,c,&before,batch.blocks(),commit,&after,1,2,
+            |_,_,done,unknown|{assert_eq!((done,unknown),(1,2));Ok(())}).unwrap();
         assert!(!rebooted.reusable(7003));
         rebooted.reconcile_handoff(sup2,7003,true,|block,receipt,transferred|{
             assert_eq!((block,receipt,transferred),(7003,commit,true));Ok(())
