@@ -4,8 +4,8 @@
 //! wire field nor a model's estimate is evidence by itself.
 use super::{Error,Identity,action_schema_v2::ActionV2,
     apply_report_v1::{ActionStatus,ApplyReportV1},
-    candidate_registry_v0199::FrozenCandidates,decision_record_v3::DecisionRecordV3,
-    feedback_v0199::FeedbackRecord};
+    candidate_registry_v0199::FrozenCandidates,decision_record_v3::{DecisionRecordV3,DecisionSource},
+    feedback_v0199::{FeedbackRecord,CausalLabel},advice_disposition_v1::AdviceDispositionV1};
 use cyxia_control_model::{native_v0199::{Candidate,operations_features,integer_model::{Model,MODEL_BYTES}},
     reward_v2::{self,Trace,Reward,Workspace,softfloat::F64},sgd_v2::{self,LastLayer}};
 use sha2::{Digest,Sha256};
@@ -25,30 +25,30 @@ pub struct Sample{
 }
 impl Sample{
     pub fn capture(group:ReplayGroup,schemas:SchemaBinding,candidates:&FrozenCandidates,
+        baseline_candidates:&FrozenCandidates,
         feedback:&FeedbackRecord,baseline:&FeedbackRecord,actual:Trace<'_>,reference:Trace<'_>,
         cpu:[Option<u64>;4],workspace:&mut Workspace,
-        verify_archived_pair:impl FnOnce(&ReplayGroup,&SchemaBinding,&FrozenCandidates,
+        verify_archived_pair:impl FnOnce(&ReplayGroup,&SchemaBinding,&FrozenCandidates,&FrozenCandidates,
             &FeedbackRecord,&FeedbackRecord,&Trace<'_>,&Trace<'_>,[Option<u64>;4])->Result<[u8;32],Error>)
         ->Result<Self,Error>{
         if !schemas.valid()||group.workload==[0;32]||group.initial_image==[0;32]{return Err(Error::Invalid);}
-        let (decision,report)=checked_feedback(feedback)?;
-        let (base,base_report)=checked_feedback(baseline)?;
+        let (decision,report)=checked_feedback(feedback,candidates)?;
+        let (base,base_report)=checked_feedback(baseline,baseline_candidates)?;
         let snap=candidates.snapshot();
-        if decision.boot_epoch!=snap.boot_epoch||decision.snapshot_seq!=snap.snapshot_seq
-            ||decision.target_id!=snap.target_id||decision.target_generation!=snap.target_generation
-            ||decision.ledger_generation!=snap.ledger_generation||decision.core_generation!=snap.core_generation
-            ||decision.domain_id!=snap.domain||decision.candidate_set_hash!=candidates.digest()
-            ||base.domain_id!=decision.domain_id||base.rules_hash!=decision.rules_hash
+        if base.domain_id!=decision.domain_id||base.rules_hash!=decision.rules_hash
+            ||base.rules_generation!=decision.rules_generation
+            // For an assisted comparison the no-advice side must actually
+            // follow its own frozen rule fallback, not a second assisted
+            // or trial-selected action. Authorized trial pairs still
+            // require their independent archive/permit verifier.
+            ||decision.source==DecisionSource::AiAssisted
+                &&(base.source!=DecisionSource::RuleOnly||baseline.advice.is_some())
             ||actual.domain!=snap.domain||reference.domain!=snap.domain
             ||report.completed_ns<actual.first_ns||report.completed_ns>actual.closing_ns
             ||base_report.completed_ns<reference.first_ns||base_report.completed_ns>reference.closing_ns{
             return Err(Error::Denied);
         }
-        let view=candidates.view();
-        let selected=view.selected(decision.selected_index)?;
-        if selected.action_payload!=report.action{return Err(Error::Denied);}
         let action=ActionV2::decode(snap.domain,1,report.action)?;
-        ActionV2::decode(snap.domain,1,base_report.action)?;
         let mut bytes=[0;6];let n=action.encode(snap.domain,&mut bytes)?;
         // Current ActionSchema v2 canonical payload lengths, not historical features.
         let (a1,a2)=match snap.domain{
@@ -64,20 +64,47 @@ impl Sample{
         let input=operations_features(&snap,Candidate{a1,a2,cpu}).map_err(|_|Error::Invalid)?.values;
         let candidate_receipt=feedback.evidence_digest();let baseline_receipt=baseline.evidence_digest();
         if candidate_receipt==baseline_receipt{return Err(Error::Denied);}
-        let pair=verify_archived_pair(&group,&schemas,candidates,feedback,baseline,&actual,&reference,cpu)?;
+        let pair=verify_archived_pair(&group,&schemas,candidates,baseline_candidates,feedback,baseline,&actual,&reference,cpu)?;
         if pair==[0;32]{return Err(Error::Denied);}
         let reward=reward_v2::compute(actual,reference,workspace).map_err(|_|Error::Denied)?;
         Ok(Self{group,schemas,domain:snap.domain,input,reward,candidate_receipt,baseline_receipt,pair})
     }
     pub fn reward(&self)->Reward{self.reward}
 }
-fn checked_feedback(f:&FeedbackRecord)->Result<(DecisionRecordV3,ApplyReportV1<'_>),Error>{
-    if usize::from(f.report_len)>super::apply_report_v1::MAX_APPLY_REPORT_BYTES{return Err(Error::Invalid);}
+/// Both sides of a paired replay must be checked against their own
+/// immutable candidate table and exact causal envelope, before asking the
+/// independent archive verifier to authenticate the native trace.
+fn checked_feedback<'a>(f:&'a FeedbackRecord,candidates:&FrozenCandidates)
+    ->Result<(DecisionRecordV3,ApplyReportV1<'a>),Error>{
+    let n=usize::from(f.report_len);
+    if n>super::apply_report_v1::MAX_APPLY_REPORT_BYTES
+        ||f.report[n..].iter().any(|&v|v!=0){return Err(Error::Invalid);}
     let d=DecisionRecordV3::decode(&f.decision)?;
     let r=ApplyReportV1::decode(f.report_bytes())?;
     if r.state!=ActionStatus::Applied||r.key.boot_epoch!=d.boot_epoch||r.key.controller_epoch!=d.controller_epoch
         ||r.key.plan_seq!=d.plan_seq||r.action_index!=d.action_index||r.domain_id!=d.domain_id
         ||r.target!=(Identity{id:d.target_id,generation:d.target_generation}){return Err(Error::Denied);}
+    let snap=candidates.snapshot();
+    if d.boot_epoch!=snap.boot_epoch||d.snapshot_seq!=snap.snapshot_seq
+        ||d.target_id!=snap.target_id||d.target_generation!=snap.target_generation
+        ||d.ledger_generation!=snap.ledger_generation||d.core_generation!=snap.core_generation
+        ||d.domain_id!=snap.domain||d.candidate_set_hash!=candidates.digest()
+        ||!d.matches_candidate_count(candidates.ordinals().len()){return Err(Error::Denied);}
+    let view=candidates.view();
+    if view.selected(d.selected_index)?.action_payload!=r.action{return Err(Error::Denied);}
+    let needs_pair=d.source==DecisionSource::AiAssisted||d.reason_code==7;
+    match &f.advice{
+        Some((a,disp)) if needs_pair=>{
+            AdviceDispositionV1::decode(disp)?.matches_decision_pair(d.boot_epoch,a,&f.decision)?;
+        }
+        None if !needs_pair=>{},
+        _=>return Err(Error::Denied),
+    }
+    let label=if d.source==DecisionSource::AiAssisted{
+        if d.selected_index==d.fallback_index{CausalLabel::AdoptedSameFallback}
+        else{CausalLabel::AdoptedDifferentFallback}
+    }else{CausalLabel::NoAdoption};
+    if f.causal_label!=label{return Err(Error::Denied);}
     Ok((d,r))
 }
 fn split_ok(samples:&[Sample],schemas:SchemaBinding,minimum:usize)->Result<(),Error>{
@@ -252,6 +279,52 @@ mod tests{
             reward:Reward{candidate:metrics,baseline:metrics,delta_x:F64::ZERO,delta_l:F64::ZERO,
                 raw_cost:F64::ZERO,clipped_cost:F64::ZERO,value:F64::ZERO},
             candidate_receipt:id(key*3),baseline_receipt:id(key*3+1),pair:id(key*3+2)}
+    }
+    #[test]
+    fn both_replay_sides_require_exact_frozen_action_and_causal_evidence(){
+        use cyxia_control_model::native_v0199::SnapshotReplyV3;
+        use crate::control_plane::{candidate_registry_v0199::CatalogEntry,
+            apply_report_v1::{PlanKey,MAX_APPLY_REPORT_BYTES}};
+        let snapshot=SnapshotReplyV3{snapshot_seq:1,boot_epoch:1,ledger_generation:2,
+            core_generation:3,target_id:15,target_generation:1,sampled_ns:10,domain:15,
+            fields:[None,None,None,None,None,None,None,None,Some(20),Some(0),Some(1),Some(1)]};
+        let values=ActionV2::values(15).unwrap();
+        let catalog:[CatalogEntry;4]=core::array::from_fn(|i|CatalogEntry{ordinal:i as u16,value:values[i]});
+        let capture=|snap|FrozenCandidates::capture(snap,&catalog,[1;32],values[1],Some(20),Some(true),
+            false,|_,_|Ok(()),|_|Ok(true)).unwrap();
+        let cand=capture(snapshot);
+        let baseline=capture(SnapshotReplyV3{boot_epoch:2,..snapshot});
+        let make=|c:&FrozenCandidates|{
+            let snap=c.snapshot();let mut d=[0u8;256];
+            d[..4].copy_from_slice(&0x43594431u32.to_le_bytes());
+            d[4..6].copy_from_slice(&3u16.to_le_bytes());d[6..8].copy_from_slice(&256u16.to_le_bytes());
+            for (at,v) in [(8,snap.boot_epoch),(16,1),(24,1),(32,1),(40,1),(48,15),
+                (56,1),(64,2),(72,3),(80,1),(144,100)]{
+                d[at..at+8].copy_from_slice(&v.to_le_bytes());
+            }
+            d[88..92].copy_from_slice(&1u32.to_le_bytes());
+            d[94..96].copy_from_slice(&15u16.to_le_bytes());d[96..98].copy_from_slice(&1u16.to_le_bytes());
+            d[102..104].copy_from_slice(&1u16.to_le_bytes());d[104..106].copy_from_slice(&u16::MAX.to_le_bytes());
+            d[108..112].copy_from_slice(&2u32.to_le_bytes());d[152..156].copy_from_slice(&2u32.to_le_bytes());
+            d[156..158].copy_from_slice(&1u16.to_le_bytes());
+            d[160..192].fill(2);d[192..224].fill(3);d[224..].copy_from_slice(&c.digest());
+            let mut report=[0;MAX_APPLY_REPORT_BYTES];
+            let n=ApplyReportV1{key:PlanKey{boot_epoch:snap.boot_epoch,controller_epoch:1,plan_seq:1},
+                action_index:0,domain_id:15,state:ActionStatus::Applied,target:Identity{id:15,generation:1},
+                executor_generation:1,plan_version:1,result:0,completed_ns:50,action:&[8,0]}.encode(&mut report).unwrap();
+            FeedbackRecord{decision:d,report,report_len:n as u16,causal_label:CausalLabel::NoAdoption,advice:None}
+        };
+        let good=make(&cand);let base=make(&baseline);
+        assert!(checked_feedback(&good,&cand).is_ok());assert!(checked_feedback(&base,&baseline).is_ok());
+        assert!(matches!(checked_feedback(&base,&cand),Err(Error::Denied)));
+        let mut bad=base;bad.report[96]=32;
+        assert!(matches!(checked_feedback(&bad,&baseline),Err(Error::Denied)));
+        let mut bad=base;bad.causal_label=CausalLabel::AdoptedDifferentFallback;
+        assert!(matches!(checked_feedback(&bad,&baseline),Err(Error::Denied)));
+        let mut bad=base;bad.report[351]=1;
+        assert!(matches!(checked_feedback(&bad,&baseline),Err(Error::Invalid)));
+        let mut bad=base;bad.decision[108..112].copy_from_slice(&7u32.to_le_bytes());
+        assert!(matches!(checked_feedback(&bad,&baseline),Err(Error::Denied)));
     }
     #[test]
     fn per_domain_minimum_and_duplicate_evidence(){
