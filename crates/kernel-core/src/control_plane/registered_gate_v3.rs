@@ -137,6 +137,7 @@ struct Pending {
     count: usize,
     decision_bytes: [[u8;DECISION_BYTES];MAX_ACTIONS],
     status: PendingStatus,
+    recovered_version:Option<u64>,
     expires_ns: u64,
     assisted:Option<AssistedProof>,
     claimed:[Option<ClaimedWork>;MAX_ACTIONS],
@@ -349,7 +350,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             plan_digest:sha256(plan_wire),
             count:records.len(),
             decision_bytes:copied,
-            status:PendingStatus::Frozen,
+            status:PendingStatus::Frozen,recovered_version:None,
             expires_ns:expires,
             assisted:None,claimed:[None;MAX_ACTIONS],trial:None,
         });
@@ -538,7 +539,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         if plan.header.plan_seq<=self.last_plan_seq||rec.decision_seq<=self.last_decision_seq{return Err(Error::Stale);}
         let mut copied=[[0;DECISION_BYTES];MAX_ACTIONS];copied[0]=*record;
         self.insert_frozen(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),count:1,
-            decision_bytes:copied,status:PendingStatus::Frozen,expires_ns:plan.action(0)?.expires_local_ns,
+            decision_bytes:copied,status:PendingStatus::Frozen,recovered_version:None,expires_ns:plan.action(0)?.expires_local_ns,
             assisted:None,claimed:[None;MAX_ACTIONS],
             trial:Some(TrialProof{permit_id:permit.permit_id,permit_hash:sha256(&permit.encode()?),
                 hold:None,cost_settled:false})});
@@ -700,7 +701,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         let mut copied=[[0;DECISION_BYTES];MAX_ACTIONS];copied[0]=*record;
         ledger.finalize_registered_adoption(actor,disposition,record,context.now_ns)?;
         self.insert_frozen(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),
-            count:1,decision_bytes:copied,status:PendingStatus::Frozen,expires_ns:expiry,
+            count:1,decision_bytes:copied,status:PendingStatus::Frozen,recovered_version:None,expires_ns:expiry,
             assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)}),claimed:[None;MAX_ACTIONS],trial:None});
         self.last_plan_seq=plan.header.plan_seq;self.last_decision_seq=rec.decision_seq;
         Ok(Registration::Frozen)
@@ -774,7 +775,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         // No fallible mutation after the causal ledger is finalized.
         ledger.finalize_registered_fallback(actor,disposition,record,context.now_ns)?;
         self.insert_frozen(Pending{plan_seq:plan.header.plan_seq,plan_digest:sha256(plan_wire),
-            count:1,decision_bytes:copied,status:PendingStatus::Frozen,expires_ns:expiry,
+            count:1,decision_bytes:copied,status:PendingStatus::Frozen,recovered_version:None,expires_ns:expiry,
             assisted:Some(AssistedProof{advice:advice_wire,disposition_digest:sha256(disposition)}),
             claimed:[None;MAX_ACTIONS],trial:None});
         self.last_plan_seq=plan.header.plan_seq;self.last_decision_seq=rec.decision_seq;
@@ -880,6 +881,32 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         Ok(summary)
     }
 
+    /// Recover a publication that may have succeeded before the adapter
+    /// reply was lost. Never invoke the writer again. The independent
+    /// terminal owner must prove the complete exact committed plan at the
+    /// native bank, all reservations, original admission and its allocated
+    /// version. Current expiry is NOT permission to invent a new publish.
+    /// Trials require separate permit/acceptance reconciliation and are
+    /// deliberately not reopened by this restricted path.
+    pub fn reconcile_published(&mut self,supervisor:Identity,plan_wire:&[u8],version:u64,
+        verify_native:impl FnOnce(&PlanV2<'_>,[u8;32],u64)->Result<(),Error>,
+    )->Result<(),Error>{
+        if !supervisor.valid()||self.terminal_owner!=Some(supervisor){return Err(Error::Denied);}
+        let plan=PlanV2::decode(plan_wire)?;
+        if plan.header.controller_epoch!=self.controller_epoch||version<=plan.header.base_plan_version{return Err(Error::Stale);}
+        let digest=sha256(plan_wire);
+        let p=self.lookup_mut(plan.header.plan_seq).ok_or(Error::Stale)?;
+        if p.plan_digest!=digest{return Err(Error::Denied);}
+        if p.status==PendingStatus::AdapterAccepted{
+            return if p.recovered_version==Some(version){Ok(())}else{Err(Error::Busy)};
+        }
+        if p.status!=PendingStatus::AdapterUnknown||p.trial.is_some()||p.claimed.iter().any(Option::is_some){
+            return Err(Error::NotReady);
+        }
+        verify_native(&plan,digest,version)?;
+        p.recovered_version=Some(version);p.status=PendingStatus::AdapterAccepted;Ok(())
+    }
+
     /// Native EXECUTOR_FETCH/EL1 acceptance linearization boundary.
     /// Before a returned WorkFrame can execute, the real resource owner
     /// must atomically check desired/current version, object generation,
@@ -904,6 +931,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         if p.status!=PendingStatus::AdapterAccepted{return Err(Error::NotReady);}
         if sha256(plan_wire)!=p.plan_digest||index>=p.count{return Err(Error::Denied);}
         if p.claimed[index].is_some(){return Err(Error::Busy);}
+        if p.recovered_version.is_some_and(|v|v!=scope.plan_version){return Err(Error::Stale);}
         for claim in p.claimed.iter().flatten(){
             let prior=super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
             if prior.plan_version!=scope.plan_version||scope.now_ns<claim.recorded_ns{
@@ -950,6 +978,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         // independently before trying this narrower no-effect path.
         if p.status!=PendingStatus::AdapterAccepted{return Err(Error::NotReady);}
         if sha256(plan_wire)!=p.plan_digest||index>=p.count{return Err(Error::Denied);}
+        if p.recovered_version.is_some_and(|v|v!=scope.plan_version){return Err(Error::Stale);}
         let frame=super::apply_work_v1::WorkFrame::from_plan(&plan,index,boot,scope.plan_version,binding,copied.origin)?;
         let work=super::apply_work_v1::ApplyWorkV1::decode(frame.bytes())?;
         if !work.matches_report(r){return Err(Error::Denied);}
@@ -1341,6 +1370,25 @@ mod tests {
         assert_eq!(gate.register_rule_only(
             CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx
         ),Err(Error::Stale));
+    }
+    #[test]
+    fn ambiguous_publication_recovered_only_by_independent_exact_bank_proof(){
+        let rules=profile_bytes();let catalog=Profile::parse(&rules).unwrap();
+        let plan=plan_bytes();let records=[decision(&plan,&rules)];
+        let actions=frozen(&[2,4],&[2,0]);let ctx=trusted(&rules);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&catalog,&actions,ctx).unwrap();
+        assert_eq!(gate.publish_once(PUBLISHER,&plan,&records,&catalog,&actions,ctx,||Err(Error::NotReady)),Err(Error::NotReady));
+        assert_eq!(gate.reconcile_published(PUBLISHER,&plan,7,|_,_,_|panic!()),Err(Error::Denied));
+        assert_eq!(gate.reconcile_published(SUPERVISOR,&plan,7,|_,_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        gate.reconcile_published(SUPERVISOR,&plan,7,|p,h,v|{
+            assert_eq!(p.header.plan_seq,1);assert_eq!(h,sha256(&plan));assert_eq!(v,7);Ok(())
+        }).unwrap();
+        assert_eq!(gate.reconcile_published(SUPERVISOR,&plan,7,|_,_,_|panic!()),Ok(()));
+        assert_eq!(gate.publish_once(PUBLISHER,&plan,&records,&catalog,&actions,ctx,||panic!("never retry writer")),Ok(Publication::ReplayNoEffect));
+        assert_eq!(gate.claim_apply_work(&plan,0,TrustedApplyScope{plan_version:8,..verified_scope()},verified_binding(),
+            apply_report_v1::ReportOrigin::Kernel,|_|panic!()),Err(Error::Stale));
+        claim_test_work(&mut gate,&plan);
     }
     #[test]
     fn unknown_adapter_result_keeps_key_consumed_and_blocks_reexecution() {
