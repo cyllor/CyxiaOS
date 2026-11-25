@@ -167,6 +167,15 @@ impl RpcTable{
     fn slot(&mut self,caller:Caller)->Result<&mut Slot,Error>{
         self.slots.iter_mut().find(|s|s.caller==Some(caller)).ok_or(Error::Auth)
     }
+    /// Native admission additionally authenticates the current endpoint
+    /// and task for *every* call, including ACK and read-only replay.
+    /// The operation verifier is still invoked only on new execution.
+    pub fn admit_live(&mut self,caller:Caller,wire:&[u8],reply_cap:usize,now:u64,parent_deadline:u64,
+        observed_generation:u64,verify_live:impl FnOnce(Caller)->Result<(),Error>,
+        authorize_operation:impl FnOnce(&Request<'_>)->Result<(),Error>)->Result<Admission,Error>{
+        verify_live(caller)?;
+        self.admit(caller,wire,reply_cap,now,parent_deadline,observed_generation,authorize_operation)
+    }
     /// Input is a stable copied request; output span and real completion
     /// resource reservation are independently checked by the caller. On
     /// new admission, authorize_operation must check the actual cap label,
@@ -264,6 +273,9 @@ impl RpcTable{
         verify_stop_and_custody:impl FnOnce(Option<(&[u8],Frame)>)->Result<(),Error>)->Result<(),Error>{
         let slot=self.slot(caller)?;
         if !slot.closed{return Err(Error::Busy);}
+        // A repeated retirement is query-only. Never invoke a native
+        // custody writer twice after the previous terminal was retained.
+        if slot.rebind_ready{return Ok(());}
         if slot.entry.as_ref().is_some_and(|e|e.reply.state()!=State::Done){return Err(Error::Busy);}
         verify_stop_and_custody(slot.entry.as_ref().map(|e|(&e.request[..usize::from(e.len)],e.reply)))?;
         slot.entry=None;slot.rebind_ready=true;Ok(())
@@ -296,6 +308,19 @@ mod tests{
         put64(&mut b,32,7);put64(&mut b,40,1000);
         if op==Op::AuditRead{put64(&mut b,48,7);}
         (b,n)
+    }
+    #[test]
+    fn stale_live_cap_cannot_read_or_ack_retained_reply(){
+        let mut t=RpcTable::new();let c=caller();t.bind(c,false).unwrap();
+        let (r,n)=req(Op::AuditRead,1,0);
+        let Admission::Execute(k)=t.admit_live(c,&r[..n],192,10,1000,7,|a|{assert_eq!(a,c);Ok(())},|_|Ok(())).unwrap()else{panic!()};
+        let f=t.complete(k,State::Done,0,7,&[0;144],||Ok(())).unwrap();
+        let (ack,m)=req(Op::Ack,1,1);
+        assert_eq!(t.admit_live(c,&r[..n],192,20,1000,7,|_|Err(Error::Auth),|_|panic!()),Err(Error::Auth));
+        assert_eq!(t.admit_live(c,&ack[..m],48,20,1000,7,|_|Err(Error::Auth),|_|panic!()),Err(Error::Auth));
+        assert_eq!(t.admit_live(c,&r[..n],192,20,1000,7,|_|Ok(()),|_|panic!()),Ok(Admission::Replay(f)));
+        t.close(c).unwrap();t.retire_closed(c,|e|{assert!(e.is_some());Ok(())}).unwrap();
+        t.retire_closed(c,|_|panic!()).unwrap();
     }
     #[test]
     fn exactly_once_lost_reply_ack_and_next_sequence(){
