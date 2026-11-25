@@ -115,9 +115,12 @@ fn append_restart(disk:&mut Disk,scratch:&mut OneStateRedo,gate:&mut DurableEpoc
     let ticket=gate.prepare(change,|v|{
         if stop==Some(v){Ok(())}else{Err(SecurityError::Unauthorized)}
     }).unwrap();
-    let image=gate.after_image(ticket).unwrap();
     assert_eq!(txid%2,0);let first=8;let lsn=7*(txid/2);
-    let proof=scratch.append(disk,sb,first,HOME,txid,lsn,ticket,&image).unwrap();
+    let proof=scratch.append_once(disk,gate,sb,first,HOME,txid,lsn,ticket,|p|{
+        if p.fs_uuid==UUID&&p.first==8&&p.state_home==HOME&&p.boot_home.is_none()
+            &&p.log_epoch==sb.log_epoch&&p.txid==txid&&p.commit_lsn==lsn{Ok(())}
+        else{Err(SecurityError::Conflict)}
+    }).unwrap();
     let receipt=proof.receipt();
     gate.confirm_from_redo(ticket,receipt,scratch.image(),sb_raw,first,u64::from(HOME),
         &scratch.begin,&[&scratch.redo],&scratch.commit,|t,r|proof.verifies(t,r)).unwrap()
@@ -126,9 +129,12 @@ fn append_boot(disk:&mut Disk,pair:&mut BootPairRedo,gate:&mut DurableEpochGate,
     sb_raw:&[u8],txid:u64)->Outcome{
     assert_eq!(txid%2,1);
     let ticket=gate.prepare(Change::AllocateBoot,|_|panic!("boot does not authorize restart")).unwrap();
-    let image=gate.after_image(ticket).unwrap();
     let first=2;let lsn=7*(txid/2)+4;
-    let proof=pair.append(disk,sb,first,HOME,BOOT_HOME,txid,lsn,ticket,&image).unwrap();
+    let proof=pair.append_once(disk,gate,sb,first,HOME,BOOT_HOME,txid,lsn,ticket,|p|{
+        if p.fs_uuid==UUID&&p.first==2&&p.state_home==HOME&&p.boot_home==Some(BOOT_HOME)
+            &&p.log_epoch==sb.log_epoch&&p.txid==txid&&p.commit_lsn==lsn{Ok(())}
+        else{Err(SecurityError::Conflict)}
+    }).unwrap();
     let receipt=proof.receipt();
     gate.confirm_boot_from_redo(ticket,receipt,pair.state_image(),pair.boot_image(),sb_raw,
         first,HOME,BOOT_HOME,&pair.begin,&[&pair.state_redo,&pair.boot_redo],&pair.commit,
