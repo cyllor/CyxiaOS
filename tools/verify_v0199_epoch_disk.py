@@ -376,7 +376,20 @@ class EpochFixture:
             require(off%8==0 and last<=off and 0<size<=cap and off+size<=owner_bytes,
                     'overlapping or out-of-pool native owner table')
             last=off+size
-        require(all(v==0 for v in w[374:]),'nonzero reserved evidence')
+        task_off,task_size,proof_off,proof_size,unused=w[374:379]
+        require(task_off%8==0 and last<=task_off and 0<task_size<=65536
+                and task_off+task_size<=proof_off and proof_size==2048
+                and proof_off+proof_size<=owner_bytes and unused==0,
+                'D02 owner/proof outside reserved control pool')
+        magic2,base_win,apply_win,base_count,apply_count,version2,sample2,accept2,completed2,rlen2,retained2,used2=w[379:391]
+        require(magic2==0x4359443032465831 and base_win<apply_win
+                and (base_count,apply_count,version2,rlen2,retained2,used2)==(2,4,3,98,3,1718)
+                and sample2<=accept2<sample2+100_000_000 and accept2<=completed2,
+                'D02 token windows or report custody mismatch')
+        require(w[395]%BLOCK==0 and 0x40000000<=w[395]<0x44000000
+                and 0<w[396]<=BLOCK,'invalid D02 diagnostic package extent')
+        require(serial.count(b'V0199_D02_EFFECT a=2 b=4 c=3\n')==1,'missing actual D02 UART evidence')
+        require(all(v==0 for v in w[397:]),'nonzero reserved evidence')
         expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c={flushes}\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
         return dict(previous_boot_epoch=e-1,boot_epoch=e,state_generation=txid+1,txid=txid,
@@ -392,6 +405,9 @@ class EpochFixture:
                     native_d07_effect_fixture_verified=True,d07_soft_deferral_ns=s_prog-s_req,
                     d07_hard_deferral_ns=h_prog-h_req,d07_soft_actual_wake_ns=s_wake,
                     d07_feedback_records=s_retained,production_d07_business_scheduler_verified=False,
+                    d02_baseline_creations=base_count,d02_approved_creations=apply_count,
+                    d02_fixture_feedback_records=retained2,native_d02_effect_fixture_verified=False,
+                    production_d02_task_loader_verified=False,
                     frame_count=frame_count,frame_meta_bytes=meta_bytes,frame_meta_pa=meta,
                     control_pool_pa=control,progress_pool_pa=progress,ordinary_free_frames=free,
                     effect_owner_pool_pa=owners,effect_owner_pool_bytes=owner_bytes,
@@ -449,9 +465,85 @@ class EpochFixture:
                     (page[315*8:347*8],page[347*8:347*8+w[239]])):
             require(len(d)==256 and len(r)==98 and custody.count(d)==1 and custody.count(r)==1,
                     'actual feedback table missing or duplicating exact retained effect bytes')
+        # D02 actual business-core context proof: six completed creations,
+        # ABI3 EXIT and private EL0 writes, original policy versions, exact
+        # raw snapshot/decision/report, and actual post-retirement pages.
+        proof_off,proof_size=w[376:378]
+        proof=owner_raw[proof_off:proof_off+proof_size]
+        require(hashlib.sha256(proof).digest()==page[391*8:395*8]
+                and proof[w[390]:]==bytes(proof_size-w[390]),'D02 proof digest/padding mismatch')
+        rows=list(struct.iter_unpack('<16Q',proof[:768]))
+        require(len(rows)==6,'missing native D02 creation rows')
+        previous=0
+        pages=rows[0][3:8]
+        require(len(set(pages))==5 and all(p%BLOCK==0 and 0x40000000<=p<0x44000000 for p in pages)
+                and w[395] not in pages,'invalid private diagnostic pages')
+        for i,row in enumerate(rows,1):
+            serial,task,cpu,*_=row
+            marker,count,kind,esr,syscall,began,done,cost=row[8:16]
+            window=w[380] if i<=2 else w[381]
+            require((serial,task,cpu)==(i,0xd0203,1) and row[3:8]==pages
+                    and (marker,count,kind,esr,syscall)==(0xd0200000+i,16,8,0x56000000,1)
+                    and previous<=began<=done and began//100_000_000==done//100_000_000==window
+                    and cost>0,'D02 actual CPU1 task/trap/completion evidence mismatch')
+            previous=done
+        require(rows[1][14]<=w[385]<=w[386]<=rows[2][13]
+                and rows[2][14]==w[387] and rows[-1][14]<w[385]+10_000_000_000,
+                'D02 actual execution not within original policy window')
+        snap=proof[768:1032];rules=proof[1032:1120];plan=proof[1120:1332]
+        decision=proof[1332:1588];report=proof[1588:1686];package=proof[1686:1718]
+        require(struct.unpack_from('<IHH',snap)==(0x4359534e,3,72)
+                and struct.unpack_from('<7Q',snap,8)==(3,self.epoch,1,1,2,1,w[385])
+                and struct.unpack_from('<HHI',snap,64)==(2,12,0),'D02 exact observation scope mismatch')
+        fields=[]
+        for i in range(12):
+            at=72+i*16
+            fid,present,value=struct.unpack_from('<HB5xQ',snap,at)
+            require(fid==16+i and present in (0,1) and (present or value==0)
+                    and snap[at+3:at+8]==bytes(5),'D02 snapshot field format')
+            fields.append(value if present else None)
+        require(fields==[None]*8+[None,3,None,5],'D02 actual thread/queued observation mismatch')
+        expected=bytearray(88)
+        put(expected,0,'IHHQIIQ',0x43595255,2,32,3,1,88,0)
+        put(expected,32,'IHHQHHHHII',3,2,1,2,0,1,1,0,56,0)
+        put(expected,64,'HB5xQ',4,3,1)
+        put(expected,80,'HHI',2,0,0)
+        require(rules==bytes(expected),'D02 diagnostic rules mismatch')
+        h=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
+        h.update(hashlib.sha256(b'CYX/D02-FIXTURE-ORDINALS/0=1,1=2,2=4,3=8').digest())
+        h.update(snap);h.update(bytes(1))
+        for v in fields[8:12]+[1,5,1]:
+            h.update(bytes([v is not None]));h.update(struct.pack('<Q',0 if v is None else v))
+        h.update(struct.pack('<H',4))
+        for i,v in enumerate((1,2,4,8)):h.update(struct.pack('<HBH',i,2,v))
+        digest=h.digest()
+        sample=w[385]
+        require(struct.unpack_from('<IHHIHH6Q',plan)==(0x43594c31,2,64,212,1,0,3,2,0,1,3,sample+10_000_000_000)
+                and struct.unpack_from('<IHHHHI8Q',plan,64)==(0x43595031,2,144,2,1,4,1,3,3,2,1,1,1,sample+100_000_000)
+                and plan[144:176]==bytes(32) and plan[176:208]==digest
+                and plan[208:]==struct.pack('<HH',2,4),'D02 published plan differs from exact rule/snapshot')
+        require(struct.unpack_from('<10Q',decision,8)==(self.epoch,1,3,3,3,2,1,1,1,3)
+                and struct.unpack_from('<IHHH',decision,88)==(3,0,2,1)
+                and decision[98:102]==bytes(4) and struct.unpack_from('<HH',decision,102)==(2,65535)
+                and struct.unpack_from('<IHH',decision,152)==(4,2,0)
+                and decision[160:192]==hashlib.sha256(rules).digest()
+                and decision[192:224]==hashlib.sha256(plan).digest() and decision[224:256]==digest,
+                'D02 decision/causal policy mismatch')
+        require(struct.unpack_from('<QQQHHHHQQQQiIQ',report)==(self.epoch,1,3,0,2,1,0,2,1,1,3,0,2,rows[2][14])
+                and report[80:96]==bytes(16) and report[96:]==struct.pack('<H',4)
+                and custody.count(decision)==custody.count(report)==1,'D02 actual report/feedback mismatch')
+        code_path=out/'d02-package.bin'
+        qmp.execute('pmemsave',{'val':w[395],'size':w[396],'filename':str(code_path)})
+        require(hashlib.sha256(code_path.read_bytes()).digest()==package,'D02 actual package hash mismatch')
+        for i,pa in enumerate(pages):
+            path=out/f'd02-retired-page-{i}.bin'
+            qmp.execute('pmemsave',{'val':pa,'size':BLOCK,'filename':str(path)})
+            require(path.read_bytes()==bytes(BLOCK),'D02 retired mapping/data/stack was not scrubbed')
         return dict(frame_meta_physical_dump_verified=True,frame_meta_sha256=hashlib.sha256(raw).hexdigest(),
                     reclaimed_page_zero_verified=True,effect_owner_pool_dump_verified=True,
-                    effect_owner_pool_sha256=hashlib.sha256(owner_raw).hexdigest())
+                    effect_owner_pool_sha256=hashlib.sha256(owner_raw).hexdigest(),
+                    native_d02_effect_fixture_verified=True,d02_retired_pages_verified=True,
+                    d02_actual_cpu1_creations=6,d02_diagnostic_package_sha256=package.hex())
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -487,6 +579,8 @@ def main():
         result['cross_process_formatted_mount_checkpoint_verified']=True
         result['native_d15_actual_effect_fixture_verified']=True
         result['native_d07_actual_effect_fixture_verified']=True
+        result['native_d02_actual_effect_fixture_verified']=all(b.get('native_d02_effect_fixture_verified') for b in result['boots'])
+        verify_smp.require(result['native_d02_actual_effect_fixture_verified'],'missing D02 actual physical proof')
     except (OSError,ValueError,RuntimeError) as e:
         result['error']=str(e)
     (out/'summary.json').write_text(json.dumps(result,indent=2)+'\n')
