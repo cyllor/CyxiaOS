@@ -194,7 +194,20 @@ impl Cpu0BudgetLedger {
     {
         if wall_ns==0 || wall_ns>50_000_000{return Err(Error::Invalid);}
         if cpu!=CONTROL_CPU{return Err(Error::Denied);}
-        let (index,member)=manifest.manifest().members.iter().enumerate().find(|(_,m)|m.actor==actor).ok_or(Error::Denied)?;
+        let index=manifest.manifest().members.iter().position(|m|m.actor==actor).ok_or(Error::Denied)?;
+        self.reserve_indexed_role_with_wall(manifest,index,actor,cpu,class,domain,requested,wall_ns,now)
+    }
+    /// A trusted scheduler already has the selected live manifest index.
+    /// Recheck the exact actor (including generation) and CPU at that index,
+    /// then use the identical admission/settlement ledger. No second
+    /// eight-entry scan and no authority derived from the index alone.
+    #[inline]
+    pub fn reserve_indexed_role_with_wall(&mut self,manifest:&ValidatedRoleManifest<'_>,index:usize,
+        actor:Identity,cpu:usize,class:Class,domain:u16,requested:u64,wall_ns:u64,now:u64)->Result<Turn,Error>{
+        if wall_ns==0||wall_ns>50_000_000{return Err(Error::Invalid);}
+        if cpu!=CONTROL_CPU{return Err(Error::Denied);}
+        let member=manifest.manifest().members.get(index).ok_or(Error::Denied)?;
+        if member.actor!=actor{return Err(Error::Denied);}
         let allowed=matches!((member.role,class),
             (Role::Operations,Class::Operations|Class::Optional)
             |(Role::Security,Class::Security)
@@ -216,6 +229,7 @@ impl Cpu0BudgetLedger {
         if wall_ns==0||wall_ns>50_000_000{return Err(Error::Invalid);}
         self.reserve(None,None,class,0,requested,wall_ns,now)
     }
+    #[inline]
     fn reserve(&mut self,actor:Option<Identity>,role:Option<(usize,u64)>,class:Class,domain:u16,
         requested:u64,wall_ns:u64,now:u64)->Result<Turn,Error>{
         self.time(now)?;
@@ -412,6 +426,23 @@ mod tests{
         assert_eq!(q.lifetime_total(),Ok(3_001_001));
         assert!(q.ordinary_closed());
         assert_eq!(q.reserve_kernel(0,Class::Coordination,1,2*WINDOW_NS+10),Err(Error::Denied));
+    }
+    #[test]
+    fn indexed_dispatch_preserves_identity_generation_and_all_shared_limits(){
+        let m=manifest();let checked=m.validated().unwrap();let actor=m.members[2].actor;
+        let mut indexed=Cpu0BudgetLedger::new();let mut generic=Cpu0BudgetLedger::new();
+        for (i,a,cpu,class) in [(3,actor,0,Class::Decision),(8,actor,0,Class::Decision),
+            (2,Identity{generation:2,..actor},0,Class::Decision),(2,actor,1,Class::Decision),
+            (2,actor,0,Class::Recovery)]{
+            assert_eq!(indexed.reserve_indexed_role_with_wall(&checked,i,a,cpu,class,1,250_000,50_000_000,0),Err(Error::Denied));
+        }
+        assert_eq!(indexed.lifetime_total(),Ok(0));
+        let a=indexed.reserve_indexed_role_with_wall(&checked,2,actor,0,Class::Decision,1,250_000,50_000_000,0).unwrap();
+        let b=generic.reserve_validated_role_with_wall(&checked,actor,0,Class::Decision,1,250_000,50_000_000,0).unwrap();
+        assert_eq!(a,b);
+        assert_eq!(indexed.settle(0,a,240_000,300_000),generic.settle(0,b,240_000,300_000));
+        assert_eq!(indexed.reserve_indexed_role_with_wall(&checked,3,m.members[3].actor,0,Class::Decision,1,260_001,50_000_000,300_000),Err(Error::Exhausted));
+        assert_eq!(indexed.lifetime_total(),Ok(240_000));
     }
     #[test]
     fn cpu_quota_and_wall_deadline_are_independently_enforced(){
