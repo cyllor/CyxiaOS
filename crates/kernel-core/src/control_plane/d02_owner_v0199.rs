@@ -20,6 +20,10 @@ pub struct Request{
 pub enum State{Queued,Unknown,Created(Identity),Rejected}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Outcome{Created(Identity),NoEffect,Unknown}
+/// Actual constructor completion, independently sampled by the native
+/// owner after its effect; the service invocation time is not completion.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct Completion{pub outcome:Outcome,pub completed_ns:u64}
 #[derive(Clone,Copy)]
 struct Row{req:Request,state:State,sequence:u64,occupied:bool}
 #[derive(Clone,Copy)]
@@ -68,6 +72,13 @@ impl Owner{
         self.rows[i]=Some(Row{req,state:State::Queued,sequence:seq,occupied:false});
         self.seq=seq;self.last=now;Ok(State::Queued)
     }
+    /// Independent native observation: known created and UNKNOWN occupied
+    /// slots are distinct. No guessed request-rate or blocked ratio.
+    pub fn counts(&self)->(usize,usize,usize){
+        (self.rows.iter().flatten().filter(|r|r.state==State::Queued).count(),
+         self.rows.iter().flatten().filter(|r|r.occupied&&matches!(r.state,State::Created(_))).count(),
+         self.rows.iter().flatten().filter(|r|r.state==State::Unknown).count())
+    }
     pub fn query(&self,caller:Identity,id:u64)->Result<State,Error>{
         Ok(self.rows[self.row(caller,id)?].unwrap().state)
     }
@@ -102,7 +113,7 @@ impl Owner{
     /// proves the global live inventory (including tasks created elsewhere).
     pub fn service_one(&mut self,now:u64,other_live:usize,
         authorize:impl FnOnce(&Request)->Result<(),Error>,
-        create:impl FnOnce(&Request)->Outcome)->Result<Option<State>,Error>{
+        create:impl FnOnce(&Request)->Completion)->Result<Option<State>,Error>{
         self.ready(now)?;
         let occupied=self.rows.iter().flatten().filter(|r|r.occupied).count();
         if other_live.checked_add(occupied).ok_or(Error::Exhausted)?>=MAX_THREADS{return Ok(None);}
@@ -122,12 +133,16 @@ impl Owner{
         if g.window!=now/WINDOW{g.window=now/WINDOW;g.used=0;}
         g.used+=1; // a real construction attempt, never refund on uncertainty
         let r=self.rows[i].as_mut().unwrap();r.state=State::Unknown;r.occupied=true;
-        let outcome=create(&req);
-        let result=self.finish(i,outcome)?;
+        let completion=create(&req);
+        if completion.completed_ns<now{return Err(Error::Clock);}
+        self.last=completion.completed_ns;
+        let result=self.finish(i,completion.outcome)?;
         if matches!(result,State::Created(_)){
             let g=self.groups[gi].as_mut().unwrap();
             if let Some(w)=g.work.as_mut(){
-                if w.effect.is_none()&&now>=w.accepted&&now<w.until{w.effect=Some((ActionStatus::Applied,now));}
+                if w.effect.is_none()&&now>=w.accepted&&now<w.until{
+                    w.effect=Some((ActionStatus::Applied,completion.completed_ns));
+                }
             }
         }
         Ok(Some(result))
@@ -135,7 +150,7 @@ impl Owner{
     fn finish(&mut self,i:usize,outcome:Outcome)->Result<State,Error>{
         let state=match outcome{
             Outcome::Created(task) if task.valid()&&!self.rows.iter().enumerate().any(|(j,r)|j!=i&&r.is_some_and(|r|
-                matches!(r.state,State::Created(old) if old.id==task.id)&&r.occupied))=>State::Created(task),
+                matches!(r.state,State::Created(old) if old.id==task.id&&(r.occupied||old.generation>=task.generation))))=>State::Created(task),
             Outcome::NoEffect=>State::Rejected,
             _=>State::Unknown,
         };
@@ -192,8 +207,8 @@ mod tests{
         let mut o=Owner::empty();o.bind(1,1,||Ok(())).unwrap();o.register_group(GROUP,||Ok(())).unwrap();
         for id in 1..=4{o.submit(req(id),100,|_|Ok(())).unwrap();}
         let task=Identity{id:100,generation:1};
-        assert_eq!(o.service_one(101,62,|_|Ok(()),|_|Outcome::Created(task)),Ok(Some(State::Created(task))));
-        assert_eq!(o.service_one(102,62,|_|Ok(()),|_|Outcome::Unknown),Ok(Some(State::Unknown)));
+        assert_eq!(o.service_one(101,62,|_|Ok(()),|_|Completion{outcome:Outcome::Created(task),completed_ns:101}),Ok(Some(State::Created(task))));
+        assert_eq!(o.service_one(102,62,|_|Ok(()),|_|Completion{outcome:Outcome::Unknown,completed_ns:102}),Ok(Some(State::Unknown)));
         assert_eq!(o.service_one(103,62,|_|panic!(),|_|panic!()),Ok(None));
         assert_eq!(o.submit(req(2),104,|_|Ok(())),Ok(State::Unknown));
         assert_eq!(o.submit(Request{digest:[2;32],..req(2)},104,|_|Ok(())),Err(Error::Denied));
@@ -204,12 +219,12 @@ mod tests{
         assert_eq!(o.service_one(106,62,|_|panic!(),|_|panic!()),Ok(None));
         o.reconcile(CALLER,2,Outcome::NoEffect,107,|_,_|Ok(())).unwrap();
         let other=Identity{id:101,generation:1};
-        assert_eq!(o.service_one(108,62,|_|Ok(()),|_|Outcome::Created(other)),Ok(Some(State::Created(other))));
+        assert_eq!(o.service_one(108,62,|_|Ok(()),|_|Completion{outcome:Outcome::Created(other),completed_ns:108}),Ok(Some(State::Created(other))));
         let n=o.report(GROUP,&mut out).unwrap();let r=ApplyReportV1::decode(&out[..n]).unwrap();
         assert_eq!(r.state,ActionStatus::Applied);assert_eq!(r.plan_version,1);
         o.retire(GROUP,&out[..n],||Ok(())).unwrap();
         o.exited(task,109,||Ok(())).unwrap();
-        assert_eq!(o.service_one(110,62,|_|Ok(()),|_|Outcome::NoEffect),Ok(Some(State::Rejected)));
+        assert_eq!(o.service_one(110,62,|_|Ok(()),|_|Completion{outcome:Outcome::NoEffect,completed_ns:110}),Ok(Some(State::Rejected)));
         assert_eq!(o.query(CALLER,1),Ok(State::Created(task)));
     }
 }
