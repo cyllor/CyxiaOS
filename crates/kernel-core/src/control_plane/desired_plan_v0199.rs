@@ -8,6 +8,12 @@ use super::{Error,Identity,action_schema_v2::ActionV2,
     apply_report_v1::{ActionStatus,ApplyReportV1,ExecutorBindingV1,PlanKey,ReportOrigin,MAX_BINDINGS},
     apply_work_v1::ApplyWorkV1,plan_wire_v2::{PlanV2,MAX_ACTIONS},
     registered_gate_v3::TrustedRegistrationScope};
+use sha2::{Digest,Sha256};
+fn report_digest(r:&ApplyReportV1<'_>)->Result<[u8;32],Error>{
+    let mut wire=[0;super::apply_report_v1::MAX_APPLY_REPORT_BYTES];
+    let n=r.encode(&mut wire)?;
+    Ok(Sha256::digest(&wire[..n]).into())
+}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct PublishedAction{
     pub key:PlanKey,pub index:u16,pub binding:ExecutorBindingV1,
@@ -19,6 +25,7 @@ struct TargetSlot{
     binding:ExecutorBindingV1,
     // Version accepted by the executor, not proof of actual APPLIED effect.
     accepted_version:u64,pending:Option<PublishedAction>,
+    no_effect:Option<[u8;32]>,
 }
 pub struct DesiredBank{
     boot:u64,controller:u64,publisher:Identity,version:u64,plan_hi:u64,last_ns:u64,
@@ -64,7 +71,7 @@ impl DesiredBank{
             i
         }else{self.slots.iter().position(Option::is_none).ok_or(Error::Exhausted)?};
         verify_live(binding)?;
-        self.slots[i]=Some(TargetSlot{binding,accepted_version:0,pending:None});Ok(())
+        self.slots[i]=Some(TargetSlot{binding,accepted_version:0,pending:None,no_effect:None});Ok(())
     }
     pub fn retire_target(&mut self,domain:u16,id:Identity,
         verify_stopped:impl FnOnce(ExecutorBindingV1)->Result<(),Error>)->Result<(),Error>{
@@ -102,7 +109,7 @@ impl DesiredBank{
             let slot=self.index(a.domain_id,Identity{id:a.target_id,generation:a.target_generation})?;
             let row=self.slots[slot].unwrap();
             if !row.binding.active{return Err(Error::Stale);}
-            if row.pending.is_some(){return Err(Error::Busy);}
+            if row.pending.is_some()||row.no_effect.is_some(){return Err(Error::Busy);}
             if slots[..i].contains(&slot){return Err(Error::Denied);}
             slots[i]=slot;
             stage[i]=Some(PublishedAction{key:PlanKey{boot_epoch:self.boot,controller_epoch:self.controller,
@@ -131,12 +138,36 @@ impl DesiredBank{
             ||a.index!=w.action_index||a.version!=w.plan_version
             ||w.executor_generation!=a.binding.executor_generation
             ||a.value!=ActionV2::decode(w.domain,1,w.payload)?{return Err(Error::Denied);}
-        if a.accepted_ns.is_some(){return Err(Error::Busy);}
+        if a.accepted_ns.is_some()||row.no_effect.is_some(){return Err(Error::Busy);}
         if now<a.published_ns{return Err(Error::Clock);}
         if a.until_ns!=0&&now>=a.until_ns{return Err(Error::Expired);}
         accept_native(a)?;
         a.accepted_ns=Some(now);row.accepted_version=a.version;row.pending=Some(a);
         self.last_ns=now;Ok(())
+    }
+    /// Seal an unaccepted action against later admission, keeping its
+    /// reservation and exact terminal digest until registered-plan feedback
+    /// custody is independently verified. Call from the terminal owner's
+    /// seal_unaccepted_terminal callback under the same serializer.
+    /// verify_no_effect is a read-only proof of no accepted native obligation,
+    /// or an atomic fence with no state change on error.
+    pub fn seal_unaccepted(&mut self,r:&ApplyReportV1<'_>,actual_origin:ReportOrigin,now:u64,
+        verify_no_effect:impl FnOnce(PublishedAction)->Result<(),Error>)->Result<(),Error>{
+        self.clock(now)?;
+        let i=self.index(r.domain_id,r.target)?;let row=self.slots[i].as_mut().unwrap();
+        let a=row.pending.ok_or(Error::Stale)?;
+        if a.accepted_ns.is_some(){return Err(Error::Busy);}
+        if !a.binding.permits(actual_origin)||a.key!=r.key||a.index!=r.action_index
+            ||a.version!=r.plan_version||a.binding.executor_generation!=r.executor_generation
+            ||a.value!=ActionV2::decode(r.domain_id,1,r.action)?
+            ||!matches!(r.state,ActionStatus::Rejected|ActionStatus::Cancelled)
+            ||r.result>=0||r.completed_ns<a.published_ns||r.completed_ns>now{return Err(Error::Denied);}
+        let digest=report_digest(r)?;
+        if let Some(old)=row.no_effect{
+            return if old==digest{Ok(())}else{Err(Error::Denied)};
+        }
+        verify_no_effect(a)?;
+        row.no_effect=Some(digest);self.last_ns=now;Ok(())
     }
     /// Close only an exact independently verified terminal. Accepted and
     /// unaccepted obligations survive expiry and fencing; neither releases
@@ -155,8 +186,11 @@ impl DesiredBank{
         if r.completed_ns<a.accepted_ns.unwrap_or(a.published_ns)||r.completed_ns>now
             ||a.accepted_ns.is_none()&&r.state==ActionStatus::Applied
             ||r.state==ActionStatus::Applied&&r.result!=0{return Err(Error::Denied);}
+        if a.accepted_ns.is_none(){
+            if row.no_effect!=Some(report_digest(r)?){return Err(Error::NotReady);}
+        }
         verify_custody(a)?;
-        row.pending=None;self.last_ns=now;Ok(())
+        row.pending=None;row.no_effect=None;self.last_ns=now;Ok(())
     }
     pub fn pending(&self,domain:u16,id:Identity)->Result<Option<PublishedAction>,Error>{
         Ok(self.slots[self.index(domain,id)?].unwrap().pending)
@@ -239,9 +273,17 @@ mod tests{
             assert_eq!(a[0].unwrap().prior_target_version,1);Ok(())
         }),Ok(2));
         assert_eq!(b.pending(15,t1.target).unwrap().unwrap().version,1);
+        let cancelled=report(other,ActionStatus::Cancelled);
+        assert_eq!(b.finish(&cancelled,origin,142,|_|panic!()),Err(Error::NotReady));
+        assert_eq!(b.seal_unaccepted(&cancelled,origin,142,|_|Err(Error::NotReady)),Err(Error::NotReady));
+        b.seal_unaccepted(&cancelled,origin,142,|a|{assert_eq!(a.accepted_ns,None);Ok(())}).unwrap();
+        assert_eq!(b.accept(&other,origin,142,|_|panic!("sealed action cannot execute")),Err(Error::Busy));
         b.fence_publications();
         assert_eq!(b.accept(&other,origin,142,|_|panic!()),Err(Error::NotReady));
-        b.finish(&report(other,ActionStatus::Cancelled),origin,142,|_|Ok(())).unwrap();
+        let altered=ApplyReportV1{result:-8,..cancelled};
+        assert_eq!(b.finish(&altered,origin,142,|_|panic!()),Err(Error::NotReady));
+        assert_eq!(b.finish(&cancelled,origin,142,|_|Err(Error::NotReady)),Err(Error::NotReady));
+        b.finish(&cancelled,origin,142,|_|Ok(())).unwrap();
         b.retire_target(15,t1.target,|_|Ok(())).unwrap();
         assert_eq!(b.register_target(t1,|_|panic!()),Err(Error::NotReady));
     }
