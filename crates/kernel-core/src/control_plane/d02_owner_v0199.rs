@@ -24,6 +24,10 @@ pub enum Outcome{Created(Identity),NoEffect,Unknown}
 /// owner after its effect; the service invocation time is not completion.
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct Completion{pub outcome:Outcome,pub completed_ns:u64}
+/// Boot-scoped, immutable constructor obligation; never a second grant.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct Started{pub boot:u64,pub executor:u64,pub request:Request,
+    pub sequence:u64,pub started_ns:u64,pub policy_version:u64}
 #[derive(Clone,Copy)]
 struct Row{req:Request,state:State,sequence:u64,occupied:bool,started:u64,policy_version:u64}
 #[derive(Clone,Copy)]
@@ -132,9 +136,8 @@ impl Owner{
     /// returns Created only after authoritative admission; Unknown owns a
     /// thread credit until independent reconciliation. The caller separately
     /// proves the global live inventory (including tasks created elsewhere).
-    pub fn service_one(&mut self,now:u64,other_live:usize,
-        authorize:impl FnOnce(&Request)->Result<(),Error>,
-        create:impl FnOnce(&Request)->Completion)->Result<Option<State>,Error>{
+    pub fn start_one(&mut self,now:u64,other_live:usize,
+        authorize:impl FnOnce(&Request)->Result<(),Error>)->Result<Option<Started>,Error>{
         self.ready(now)?;
         let occupied=self.rows.iter().flatten().filter(|r|r.occupied).count();
         if other_live.checked_add(occupied).ok_or(Error::Exhausted)?>=MAX_THREADS{return Ok(None);}
@@ -149,19 +152,40 @@ impl Owner{
         let Some(i)=best else{return Ok(None);};
         let req=self.rows[i].unwrap().req;let gi=self.group(req.group)?;
         self.last=now;
-        if authorize(&req).is_err(){self.rows[i].as_mut().unwrap().state=State::Rejected;return Ok(Some(State::Rejected));}
+        if let Err(e)=authorize(&req){self.rows[i].as_mut().unwrap().state=State::Rejected;return Err(e);}
         let g=self.groups[gi].as_mut().unwrap();
         if g.window!=now/WINDOW{g.window=now/WINDOW;g.used=0;}
         g.used+=1; // a real construction attempt, never refund on uncertainty
         let policy_version=if now<g.until{g.version}else{0};
         let r=self.rows[i].as_mut().unwrap();r.state=State::Unknown;r.occupied=true;
         r.started=now;r.policy_version=policy_version;
-        let completion=create(&req);
-        if completion.completed_ns<now{return Err(Error::Clock);}
-        self.last=completion.completed_ns;
-        let result=self.finish(i,completion.outcome)?;
-        self.record_created(i,result,completion.completed_ns)?;
-        Ok(Some(result))
+        Ok(Some(Started{boot:self.boot,executor:self.executor,request:req,sequence:r.sequence,
+            started_ns:now,policy_version}))
+    }
+    /// Called by the asynchronous native constructor after exact ownership
+    /// and completion proof. The ticket is bound to the original request,
+    /// executor generation and policy version even after later admissions.
+    pub fn complete_started(&mut self,t:Started,c:Completion,now:u64,
+        verify:impl FnOnce(Started,Completion)->Result<(),Error>)->Result<State,Error>{
+        self.ready(now)?;
+        if t.boot!=self.boot||t.executor!=self.executor{return Err(Error::Stale);}
+        let i=self.row(t.request.caller,t.request.request_id)?;
+        let r=self.rows[i].unwrap();
+        if r.req!=t.request||r.sequence!=t.sequence||r.started!=t.started_ns
+            ||r.policy_version!=t.policy_version||r.state!=State::Unknown{return Err(Error::Stale);}
+        if c.completed_ns<r.started||c.completed_ns>now{return Err(Error::Clock);}
+        verify(t,c)?;
+        self.last=now;let state=self.finish(i,c.outcome)?;
+        self.record_created(i,state,c.completed_ns)?;Ok(state)
+    }
+    /// Synchronous diagnostic compatibility wrapper. Production users
+    /// use start_one and complete_started across a bounded native queue.
+    pub fn service_one(&mut self,now:u64,other_live:usize,
+        authorize:impl FnOnce(&Request)->Result<(),Error>,
+        create:impl FnOnce(&Request)->Completion)->Result<Option<State>,Error>{
+        let Some(t)=self.start_one(now,other_live,authorize)? else{return Ok(None);};
+        let completion=create(&t.request);
+        Ok(Some(self.complete_started(t,completion,completion.completed_ns,|_,_|Ok(()))?))
     }
     fn finish(&mut self,i:usize,outcome:Outcome)->Result<State,Error>{
         let state=match outcome{
@@ -235,6 +259,21 @@ mod tests{
     const GROUP:Identity=Identity{id:20,generation:1};
     const CALLER:Identity=Identity{id:21,generation:1};
     fn req(id:u64)->Request{Request{caller:CALLER,request_id:id,package:Identity{id:1,generation:1},group:GROUP,digest:[1;32]}}
+    #[test]
+    fn asynchronous_constructor_ticket_keeps_credit_and_exact_completion(){
+        let mut o=Owner::empty();o.bind(1,1,||Ok(())).unwrap();o.register_group(GROUP,||Ok(())).unwrap();
+        o.submit(req(1),100,|_|Ok(())).unwrap();o.submit(req(2),100,|_|Ok(())).unwrap();
+        let t=o.start_one(101,63,|_|Ok(())).unwrap().unwrap();
+        assert_eq!(o.counts(),(1,0,1));
+        assert_eq!(o.start_one(102,63,|_|panic!()),Ok(None));
+        let done=Completion{outcome:Outcome::Created(Identity{id:100,generation:1}),completed_ns:103};
+        assert_eq!(o.complete_started(Started{sequence:t.sequence+1,..t},done,104,|_,_|panic!()),Err(Error::Stale));
+        assert_eq!(o.complete_started(t,done,104,|_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        assert_eq!(o.counts(),(1,0,1));
+        o.complete_started(t,done,104,|actual,c|{assert_eq!(actual,t);assert_eq!(c,done);Ok(())}).unwrap();
+        assert_eq!(o.complete_started(t,done,105,|_,_|panic!()),Err(Error::Stale));
+        assert_eq!(o.counts(),(1,1,0));
+    }
     #[test]
     fn recovered_creation_is_bound_to_original_policy_and_completion(){
         let mut o=Owner::empty();o.bind(1,1,||Ok(())).unwrap();o.register_group(GROUP,||Ok(())).unwrap();
