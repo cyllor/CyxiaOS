@@ -55,6 +55,8 @@ pub struct TrustedTerminal {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalSummary {
+    pub boot_epoch:u64,
+    pub controller_epoch:u64,
     pub plan_seq: u64,
     pub plan_digest: [u8; 32],
     pub action_count: u16,
@@ -170,6 +172,7 @@ pub struct RegisteredDecisionGate<'pool> {
     publisher: Identity,
     boot_epoch: u64,
     controller_epoch: u64,
+    fenced:bool,
     last_plan_seq: u64,
     last_decision_seq: u64,
     pending: Option<Pending>, // legacy single-plan component profile
@@ -189,7 +192,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         {return Err(Error::Invalid);}
         Ok(Self {
             controller, publisher, boot_epoch:boot, controller_epoch:epoch,
-            last_plan_seq:0,last_decision_seq:0,pending:None,pool:None,
+            fenced:false,last_plan_seq:0,last_decision_seq:0,pending:None,pool:None,
             terminal_owner:None,history:[None;TERMINAL_HISTORY],history_next:0,
         })
     }
@@ -233,6 +236,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         }else{self.pending.as_ref()}
     }
     fn check_registration_slot(&self)->Result<(),Error>{
+        if self.fenced{return Err(Error::NotReady);}
         if self.frozen_or_legacy_busy().is_some(){return Err(Error::Busy);}
         if self.pool.as_deref().is_some_and(|p|p.slots.iter().all(Option::is_some)){
             return Err(Error::Busy);
@@ -247,6 +251,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         }else{assert!(self.pending.is_none());self.pending=Some(pending);}
     }
     fn begin_publish(&mut self,seq:u64)->Result<(),Error>{
+        if self.fenced{return Err(Error::NotReady);}
         if self.published_count()>=MAX_PUBLISHED_PLANS{return Err(Error::Busy);}
         let p=self.lookup_mut(seq).ok_or(Error::Stale)?;
         if p.status!=PendingStatus::Frozen{return Err(Error::Busy);}
@@ -268,9 +273,34 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         self.frozen_or_legacy_busy().is_some_and(|p|p.status==PendingStatus::Frozen)
     }
 
+    /// Stop new registrations, publications and execution claims. The
+    /// exact old terminal/recovery obligations remain accessible.
+    pub fn fence(&mut self,supervisor:Identity)->Result<(),Error>{
+        if self.terminal_owner!=Some(supervisor)||!supervisor.valid(){return Err(Error::Denied);}
+        self.fenced=true;Ok(())
+    }
+    /// Same serialized EL1 handoff as DesiredBank::replace_controller.
+    /// The callback must prove the complete old safe fallback and commit
+    /// the matching bank epoch atomically (no effect on error). Do not
+    /// construct a fresh gate to evade occupied slots or history.
+    pub fn replace_epoch(&mut self,supervisor:Identity,next_epoch:u64,controller:Identity,publisher:Identity,
+        commit_native_handoff:impl FnOnce(u64,u64,Identity,Identity)->Result<(),Error>)->Result<(),Error>{
+        if self.terminal_owner!=Some(supervisor)||!supervisor.valid(){return Err(Error::Denied);}
+        if !self.fenced{return Err(Error::NotReady);}
+        if self.published_count()!=0||self.has_unpublished(){return Err(Error::Busy);}
+        if self.controller_epoch.checked_add(1)!=Some(next_epoch)
+            ||controller.id!=self.controller.id||publisher.id!=self.publisher.id
+            ||controller.generation<self.controller.generation||publisher.generation<self.publisher.generation
+            ||controller==self.controller&&publisher==self.publisher{return Err(Error::Stale);}
+        commit_native_handoff(self.controller_epoch,next_epoch,controller,publisher)?;
+        self.controller=controller;self.publisher=publisher;self.controller_epoch=next_epoch;
+        self.last_plan_seq=0;self.last_decision_seq=0;self.fenced=false;Ok(())
+    }
+
     fn check_identity_and_context(&self, context: TrustedRegistrationScope)
         -> Result<(),Error>
     {
+        if self.fenced{return Err(Error::NotReady);}
         if context.base_plan_version==u64::MAX{return Err(Error::Exhausted);}
         if context.boot_epoch != self.boot_epoch
             || context.controller_epoch != self.controller_epoch
@@ -870,6 +900,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         // Independent authority check executes before modifying any state.
         verify_native(&terminal)?;
         let summary=TerminalSummary {
+            boot_epoch:self.boot_epoch,controller_epoch:self.controller_epoch,
             plan_seq:pending.plan_seq,
             plan_digest:pending.plan_digest,
             action_count:terminal.action_count,
@@ -918,6 +949,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         origin:apply_report_v1::ReportOrigin,
         verify_and_accept:impl FnOnce(&super::apply_work_v1::ApplyWorkV1<'_>)->Result<(),Error>,
     )->Result<super::apply_work_v1::WorkFrame,Error>{
+        if self.fenced{return Err(Error::NotReady);}
         let plan=PlanV2::decode(plan_wire)?;
         if plan.header.controller_epoch!=self.controller_epoch||scope.boot_epoch!=self.boot_epoch
             ||scope.now_ns==0{return Err(Error::Denied);}
@@ -1035,7 +1067,15 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         {return Err(Error::Denied);}
         if !actor.valid() {return Err(Error::Denied);}
         Ok(self.history.iter().flatten().copied()
-            .find(|item|item.plan_seq==plan_seq))
+            .find(|item|item.controller_epoch==self.controller_epoch&&item.plan_seq==plan_seq))
+    }
+    /// Only independent supervisor may query a historical controller
+    /// epoch. The complete key prevents sequence reuse from aliasing it.
+    pub fn historical_terminal(&self,actor:Identity,boot:u64,epoch:u64,seq:u64)->Result<Option<TerminalSummary>,Error>{
+        if self.terminal_owner!=Some(actor)||!actor.valid(){return Err(Error::Denied);}
+        if boot!=self.boot_epoch||epoch==0||epoch>self.controller_epoch||seq==0{return Err(Error::Stale);}
+        Ok(self.history.iter().flatten().copied().find(|r|
+            (r.boot_epoch,r.controller_epoch,r.plan_seq)==(boot,epoch,seq)))
     }
 
     /// Terminal integration from exact copied 0x43 ApplyReport v1 bytes.
@@ -1370,6 +1410,32 @@ mod tests {
         assert_eq!(gate.register_rule_only(
             CONTROLLER,&plan,&[rec],&catalog,&frozen,ctx
         ),Err(Error::Stale));
+    }
+    #[test]
+    fn fenced_gate_handoff_preserves_old_epoch_history(){
+        let rules=profile_bytes();let profile=Profile::parse(&rules).unwrap();
+        let plan=plan_bytes();let records=[decision(&plan,&rules)];
+        let actions=frozen(&[2,4],&[2,0]);let ctx=trusted(&rules);
+        let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
+        gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&actions,ctx).unwrap();
+        gate.publish_once(PUBLISHER,&plan,&records,&profile,&actions,ctx,||Ok(())).unwrap();
+        assert_eq!(gate.fence(PUBLISHER),Err(Error::Denied));
+        gate.fence(SUPERVISOR).unwrap();
+        let next=Identity{generation:2,..CONTROLLER};
+        assert_eq!(gate.replace_epoch(SUPERVISOR,3,next,PUBLISHER,|_,_,_,_|panic!()),Err(Error::Busy));
+        assert_eq!(gate.claim_apply_work(&plan,0,verified_scope(),verified_binding(),
+            apply_report_v1::ReportOrigin::Kernel,|_|panic!()),Err(Error::NotReady));
+        let terminal=TrustedTerminal{boot_epoch:1,controller_epoch:2,plan_seq:1,plan_digest:sha256(&plan),
+            action_count:1,terminal_mask:1,unknown_mask:0,evidence_digest:[7;32]};
+        let old=gate.settle_with_native_proof(SUPERVISOR,terminal,|_|Ok(())).unwrap();
+        assert_eq!(gate.replace_epoch(SUPERVISOR,3,next,PUBLISHER,|_,_,_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        gate.replace_epoch(SUPERVISOR,3,next,PUBLISHER,|a,b,c,p|{
+            assert_eq!((a,b,c,p),(2,3,next,PUBLISHER));Ok(())
+        }).unwrap();
+        assert_eq!(gate.terminal_summary(PUBLISHER,1),Ok(None));
+        assert_eq!(gate.historical_terminal(SUPERVISOR,1,2,1),Ok(Some(old)));
+        assert_eq!(gate.historical_terminal(PUBLISHER,1,2,1),Err(Error::Denied));
+        assert_eq!(gate.register_rule_only(CONTROLLER,&plan,&records,&profile,&actions,ctx),Err(Error::Denied));
     }
     #[test]
     fn ambiguous_publication_recovered_only_by_independent_exact_bank_proof(){
