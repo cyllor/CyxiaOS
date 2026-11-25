@@ -122,7 +122,7 @@ pub fn executor_fetch_rpc(
     // EL0 roles it is not forced to CPU0. The protected owner authenticates
     // its actual scheduling/affinity before this serialized adapter.
     let origin=ReportOrigin::User{holder:native.identity,cap_id:native.endpoint_cap};
-    if native.cpu>=4||caller.role!=12||caller.boot_epoch!=scope.boot_epoch
+    if !(1..=3).contains(&native.cpu)||caller.role!=12||caller.boot_epoch!=scope.boot_epoch
         ||caller.holder!=native.identity||caller.cap!=native.endpoint_cap||args[0]!=caller.cap
         ||args[3]!=0||binding.domain!=4||!binding.permits(origin){return Err(RpcError::Auth);}
     if args[2]!=copied.len() as u64{return Err(RpcError::Format);}
