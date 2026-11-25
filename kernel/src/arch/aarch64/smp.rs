@@ -42,6 +42,9 @@ mod v0199_d15_fixture;
 #[path = "v0199_d07_fixture.rs"]
 mod v0199_d07_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_d02_fixture.rs"]
+mod v0199_d02_fixture;
+#[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_epoch_disk.rs"]
 mod v0199_epoch_disk;
 #[cfg(all(feature = "v0199-control-bringup", feature = "v0199-epoch-disk-selftest"))]
@@ -620,7 +623,7 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
     if cpu::affinity() != AFFINITIES[slot].load(Ordering::Acquire) {
         fatal(2);
     }
-    #[cfg(feature = "unified-runtime")]
+    #[cfg(any(feature = "unified-runtime", feature = "v0199-epoch-disk-selftest"))]
     unsafe {
         timer::init_cpu_accounting();
     }
@@ -678,6 +681,14 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         let Ok(permit) = GATES[slot].try_enter(token) else {
             continue;
         };
+        // The native D02 diagnostic worker is admitted only under the
+        // ordinary fixed business gate. It exclusively reuses the dormant
+        // private slot 3 after actual architectural stop/TLBI/scrub.
+        #[cfg(feature = "v0199-epoch-disk-selftest")]
+        if slot == 1 && token.plane == Plane::Business && v0199_d02_fixture::worker_step() {
+            drop(permit);
+            continue;
+        }
         let role = usize::from(token.plane == Plane::Control);
         let i = index(slot, token.plane);
         #[cfg(feature = "model-v13-selftest")]
