@@ -20,9 +20,10 @@
 //!   window, like the SEC-N pools); it is NOT FrameMeta-registered (open item).
 //! * Transport::attach: MMIO window bounded to the virt board's virtio-mmio
 //!   range 0x0a000000..0x0a200000 through the high-half device alias.
-//! * LAST_ERROR_{CODE,SECTOR,SITE} (atomics): diagnostic only. Written by the
-//!   CPU0 caller when a scratch request fails, read by the same CPU0 caller
-//!   afterwards (`last_error`); they never influence control flow or DMA.
+//! * LAST_ERROR_{CODE,SECTOR,SITE} / MAX_LATENCY_NS (atomics): diagnostic
+//!   only. Written by the CPU0 caller when a scratch request fails / completes,
+//!   read by the same CPU0 caller afterwards (`last_error`, `max_latency_us`);
+//!   they never influence control flow or DMA.
 use super::*;
 use crate::virtio_platform::Board;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -43,6 +44,23 @@ static mut QUEUE: BatchMemory = BatchMemory::zeroed();
 static LAST_ERROR_CODE: AtomicU64 = AtomicU64::new(0);
 static LAST_ERROR_SECTOR: AtomicU64 = AtomicU64::new(0);
 static LAST_ERROR_SITE: AtomicU64 = AtomicU64::new(0);
+
+/// Worst observed device completion latency per request kind (read, write,
+/// flush), against the driver's fixed 250 ms per-request deadline.
+static MAX_LATENCY_NS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn observe(kind: u64, latency_ns: u64) {
+    if let Some(slot) = MAX_LATENCY_NS.get(kind as usize - 1) {
+        slot.fetch_max(latency_ns, Ordering::Relaxed);
+    }
+}
+
+/// Worst completion latency in microseconds as `(read, write, flush)`.
+#[cfg(feature = "v020-production-media-staging")]
+pub(crate) fn max_latency_us() -> (u64, u64, u64) {
+    let us = |k: usize| MAX_LATENCY_NS[k].load(Ordering::Relaxed) / 1_000;
+    (us(0), us(1), us(2))
+}
 
 /// Request kind in the failure site code (`site = kind * 10 + phase`).
 const KIND_READ: u64 = 1;
@@ -222,6 +240,7 @@ fn complete(
         if done[i] || c.operation != operation(first, i, write) {
             return Err(record(0, first + i as u64, kind, PHASE_MISMATCH));
         }
+        observe(kind, c.latency_ns);
         if !write {
             out[i * SECTOR_BYTES..(i + 1) * SECTOR_BYTES].copy_from_slice(&bytes);
         }
@@ -250,6 +269,7 @@ pub(crate) fn flush(device: &mut BatchedBlock) -> Result<(), SecurityError> {
                 if c.token != token || c.operation != Operation::Flush {
                     return Err(record(0, 0, KIND_FLUSH, PHASE_MISMATCH));
                 }
+                observe(KIND_FLUSH, c.latency_ns);
                 device
                     .acknowledge(c.token)
                     .map_err(driver(0, KIND_FLUSH, PHASE_ACK))?;

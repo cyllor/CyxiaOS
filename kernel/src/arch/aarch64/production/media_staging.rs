@@ -181,6 +181,13 @@ pub(super) fn stage(info: &BootInfo) -> StagingOutcome {
     };
     let _ = run_chain(&mut disk, &mut out);
     report("V020_W11_MEDIA_IO", disk.reads, disk.writes, disk.flushes);
+    let (read_us, write_us, flush_us) = scratch_blk::max_latency_us();
+    report(
+        "V020_W11_MEDIA_IO_MAX_LATENCY_US",
+        read_us,
+        write_us,
+        flush_us,
+    );
     if let Some((code, sector, site)) = scratch_blk::last_error() {
         report("V020_W11_MEDIA_IO_ERROR", code, sector, site);
     }
