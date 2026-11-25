@@ -171,20 +171,44 @@ impl<'a> Trainer<'a>{
 /// authenticate the entire recovered history before validation opens.
 /// An ambiguous consume write blocks the ledger until independently restored.
 /// This is internal custody, NOT a new on-disk ABI or a FLUSH implementation.
-pub struct Holdouts{used:[Option<ReplayGroup>;MAX_SAMPLES],len:usize,blocked:bool}
+pub struct Holdouts{used:[Option<ReplayGroup>;MAX_SAMPLES],len:usize,blocked:bool,
+    history_digest:[u8;32],claims:u64}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct ValidationEvidence{pub candidate:[u8;32],pub parent:[u8;32],pub training:[u8;32],pub holdout:[u8;32]}
 pub struct HoldoutClaim<'a>{
+    pub sequence:u64,
+    pub prior_history:[u8;32],
+    pub next_history:[u8;32],
     pub binding:ValidationEvidence,
     pub learner:Identity,
     pub validator:Identity,
     pub groups:&'a[Option<ReplayGroup>],
 }
+/// An authenticated archive supplies ordered claim metadata and its
+/// complete group ranges. This is an internal projection, not a new media
+/// encoding. Each claim consumes its groups even when evaluation fails.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct RecoveredClaim{
+    pub sequence:u64,pub binding:ValidationEvidence,pub learner:Identity,pub validator:Identity,
+    pub first:usize,pub count:usize,pub history_digest:[u8;32],
+}
+fn genesis()->[u8;32]{Sha256::digest(b"CYX/HOLDOUT-HISTORY/v0199").into()}
+fn claim_digest(prior:[u8;32],sequence:u64,binding:ValidationEvidence,learner:Identity,
+    validator:Identity,count:usize,groups:impl Iterator<Item=ReplayGroup>)->[u8;32]{
+    let mut h=Sha256::new();h.update(b"CYX/HOLDOUT-CLAIM/v0199");h.update(prior);
+    h.update(sequence.to_le_bytes());
+    for b in [binding.candidate,binding.parent,binding.training,binding.holdout]{h.update(b);}
+    for a in [learner,validator]{h.update(a.id.to_le_bytes());h.update(a.generation.to_le_bytes());}
+    h.update((count as u64).to_le_bytes());
+    for g in groups{h.update(g.seed.to_le_bytes());h.update(g.workload);h.update(g.initial_image);}
+    h.finalize().into()
+}
 impl Holdouts{
     /// Verify the complete append-only recovered group history, including
     /// a legitimate empty genesis. Caller must authenticate recovery and
     /// prove no consumed group was omitted; a bare empty slice is not proof.
-    pub fn restore(groups:&[ReplayGroup],verify_history:impl FnOnce(&[ReplayGroup])->Result<(),Error>)
+    #[cfg(test)]
+    fn restore(groups:&[ReplayGroup],verify_history:impl FnOnce(&[ReplayGroup])->Result<(),Error>)
         ->Result<Self,Error>{
         if groups.len()>MAX_SAMPLES{return Err(Error::Exhausted);}
         for(i,g)in groups.iter().enumerate(){
@@ -193,12 +217,43 @@ impl Holdouts{
             }
         }
         verify_history(groups)?;
-        let mut out=Self{used:[None;MAX_SAMPLES],len:groups.len(),blocked:false};
+        let mut out=Self{used:[None;MAX_SAMPLES],len:groups.len(),blocked:false,history_digest:genesis(),claims:0};
         for(i,g)in groups.iter().enumerate(){out.used[i]=Some(*g);}
         Ok(out)
     }
+    /// Recover the complete claim chain, not just spent group IDs. Refuse
+    /// gaps, overlaps, altered ordering, same-principal validation, or a
+    /// claimed suffix without its authenticated prefix. The native callback
+    /// must verify actual persistent archive custody and terminal head.
+    pub fn restore_claims(groups:&[ReplayGroup],claims:&[RecoveredClaim],expected_head:[u8;32],
+        verify_history:impl FnOnce(&[ReplayGroup],&[RecoveredClaim],[u8;32])->Result<(),Error>,
+    )->Result<Self,Error>{
+        if groups.len()>MAX_SAMPLES||claims.len()>groups.len(){return Err(Error::Exhausted);}
+        for(i,g)in groups.iter().enumerate(){
+            if g.workload==[0;32]||g.initial_image==[0;32]||groups[..i].contains(g){return Err(Error::Denied);}
+        }
+        let mut cursor=0usize;let mut head=genesis();
+        for (i,c) in claims.iter().enumerate(){
+            if c.sequence!=i as u64+1||c.first!=cursor||c.count==0
+                ||!c.learner.valid()||!c.validator.valid()||c.learner.id==c.validator.id
+                ||[c.binding.candidate,c.binding.parent,c.binding.training,c.binding.holdout].contains(&[0;32]){
+                return Err(Error::Denied);
+            }
+            let end=cursor.checked_add(c.count).ok_or(Error::Exhausted)?;
+            let range=groups.get(cursor..end).ok_or(Error::Denied)?;
+            head=claim_digest(head,c.sequence,c.binding,c.learner,c.validator,c.count,range.iter().copied());
+            if head!=c.history_digest{return Err(Error::Denied);}
+            cursor=end;
+        }
+        if cursor!=groups.len()||head!=expected_head{return Err(Error::Denied);}
+        verify_history(groups,claims,head)?;
+        let mut out=Self{used:[None;MAX_SAMPLES],len:groups.len(),blocked:false,history_digest:head,claims:claims.len() as u64};
+        for(i,g)in groups.iter().enumerate(){out.used[i]=Some(*g);}
+        Ok(out)
+    }
+    pub fn history(&self)->(u64,[u8;32]){(self.claims,self.history_digest)}
     #[cfg(test)]
-    fn new()->Self{Self::restore(&[],|_|Ok(())).unwrap()}
+    fn new()->Self{Self::restore_claims(&[],&[],genesis(),|_,_,_|Ok(())).unwrap()}
     pub fn validate(&mut self,validator:Identity,active:&[u8;MODEL_BYTES],model:&CandidateModel,
         training:&TrainingData<'_>,holdout:&[Sample],
         commit_consumption:impl FnOnce(&HoldoutClaim<'_>)->Result<(),Error>,
@@ -231,9 +286,14 @@ impl Holdouts{
         // Consume BEFORE exposing the holdout to evaluation. The native
         // owner must commit the exact candidate/group binding and verify
         // durable completion. Any error is conservatively ambiguous.
+        let sequence=self.claims.checked_add(1).ok_or(Error::Exhausted)?;
+        let prior_history=self.history_digest;
+        let next_history=claim_digest(prior_history,sequence,binding,model.learner,validator,n,
+            self.used[first..self.len].iter().flatten().copied());
         self.blocked=true;
-        commit_consumption(&HoldoutClaim{binding,learner:model.learner,validator,
+        commit_consumption(&HoldoutClaim{sequence,prior_history,next_history,binding,learner:model.learner,validator,
             groups:&self.used[first..self.len]})?;
+        self.claims=sequence;self.history_digest=next_history;
         self.blocked=false;
         verify_native(validator,active,model,holdout)?;
         sgd_v2::operator_selftest().map_err(|_|Error::Denied)?;
@@ -325,6 +385,23 @@ mod tests{
         assert!(matches!(checked_feedback(&bad,&baseline),Err(Error::Invalid)));
         let mut bad=base;bad.decision[108..112].copy_from_slice(&7u32.to_le_bytes());
         assert!(matches!(checked_feedback(&bad,&baseline),Err(Error::Denied)));
+    }
+    #[test]
+    fn complete_claim_history_cannot_lose_identity_or_consumed_prefix(){
+        let groups:[ReplayGroup;2]=core::array::from_fn(|i|sample(i,1,1000).group);
+        let learner=Identity{id:10,generation:1};let validator=Identity{id:9,generation:1};
+        let binding=ValidationEvidence{candidate:[1;32],parent:[2;32],training:[3;32],holdout:[4;32]};
+        let head=claim_digest(genesis(),1,binding,learner,validator,2,groups.iter().copied());
+        let claim=RecoveredClaim{sequence:1,binding,learner,validator,first:0,count:2,history_digest:head};
+        let ledger=Holdouts::restore_claims(&groups,&[claim],head,|g,c,h|{
+            assert_eq!(g,&groups);assert_eq!(c,&[claim]);assert_eq!(h,head);Ok(())
+        }).unwrap();
+        assert_eq!(ledger.history(),(1,head));assert_eq!(ledger.len,2);
+        assert!(matches!(Holdouts::restore_claims(&groups,&[],head,|_,_,_|panic!()),Err(Error::Denied)));
+        assert!(matches!(Holdouts::restore_claims(&groups,&[RecoveredClaim{validator:Identity{generation:2,..learner},..claim}],head,
+            |_,_,_|panic!()),Err(Error::Denied)));
+        assert!(matches!(Holdouts::restore_claims(&[groups[1],groups[0]],&[claim],head,|_,_,_|panic!()),Err(Error::Denied)));
+        assert!(matches!(Holdouts::restore_claims(&groups,&[claim],head,|_,_,_|Err(Error::NotReady)),Err(Error::NotReady)));
     }
     #[test]
     fn per_domain_minimum_and_duplicate_evidence(){
