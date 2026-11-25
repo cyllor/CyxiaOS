@@ -254,7 +254,9 @@ mod tests{
         let mut disk=Disk{blocks:[[0;B];4],writes:0,flushes:0};
         let sb=SuperblockV1{fs_uuid:old.fs_uuid,generation:1,checkpoint_lsn:0,log_epoch:1};
         let mut redo=OneStateRedo::zeroed();
-        let proof=redo.append(&mut disk,sb,2,7000,1,3,ticket,&after).unwrap();
+        let proof=redo.append_once(&mut disk,&mut gate,sb,2,7000,1,3,ticket,|place|{
+            assert_eq!(place.state_home,7000);assert_eq!(place.txid,1);Ok(())
+        }).unwrap();
         let receipt=proof.receipt();
         assert_eq!((disk.writes,disk.flushes),(4,2));
         assert_eq!(gate.confirm(ticket,receipt,&after,|_,_|panic!()),Err(Error::Unauthorized));
