@@ -65,6 +65,20 @@ impl SnapshotStore{
         let slot=self.grants.iter_mut().find(|v|v.is_none()).ok_or(Error::Exhausted)?;
         verify_actual_cap(g)?;*slot=Some(g);Ok(())
     }
+    /// A resource owner can revoke an entire capture at the actual
+    /// generation transition, even if no new observation is available.
+    /// Older snapshots are not kept readable while waiting for sampling.
+    pub fn advance_resources(&mut self,ledger:u64,cores:u64,
+        verify_transition:impl FnOnce(u64,u64)->Result<(),Error>)->Result<(),Error>{
+        if self.boot==0{return Err(Error::NotReady);}
+        if ledger==0||cores==0||ledger<self.last_ledger||cores<self.last_cores{
+            return Err(Error::Stale);
+        }
+        if (ledger,cores)==(self.last_ledger,self.last_cores){return Ok(());}
+        verify_transition(ledger,cores)?;
+        for r in self.targets.iter_mut().flatten(){r.snapshot=None;}
+        self.last_ledger=ledger;self.last_cores=cores;Ok(())
+    }
     /// One frozen common accounting sample plus exact domain-owner
     /// observations. The native caller captures these under the proper
     /// ledger/object lock order; independently verifies live owner and
@@ -179,6 +193,11 @@ mod tests{
         assert_eq!(s.capture(1,4,101,[None;8],&[o],|_|panic!()),Err(Error::Stale));
         assert_eq!(s.capture(3,2,101,[None;8],&[o],|_|panic!()),Err(Error::Stale));
         assert_eq!(s.frozen_for_owner(target,2,3,101,|_|Ok(())).unwrap().snapshot_seq,1);
+        assert_eq!(s.advance_resources(3,4,|_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        assert_eq!(s.frozen_for_owner(target,2,3,102,|_|Ok(())).unwrap().snapshot_seq,1);
+        s.advance_resources(3,4,|l,c|{assert_eq!((l,c),(3,4));Ok(())}).unwrap();
+        assert!(matches!(s.frozen_for_owner(target,2,3,102,|_|panic!()),Err(Error::NotReady)));
+        assert_eq!(s.capture(2,3,102,[None;8],&[o],|_|panic!()),Err(Error::Stale));
         assert_eq!(s.capture(3,4,102,[None;8],&[o],|_|Ok(())),Ok(2));
     }
     #[test]
