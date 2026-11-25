@@ -22,7 +22,6 @@ const LEARN:Identity=Identity{id:10,generation:1};
 const TARGET:Identity=Identity{id:7,generation:1};
 const SOFT:Identity=Identity{id:701,generation:1};
 const SLACK:u64=80_000;
-static mut OWNER:Owner=Owner::empty();
 fn now()->u64{
     (u128::from(timer::ticks())*1_000_000_000/u128::from(timer::frequency())).try_into().unwrap()
 }
@@ -71,9 +70,8 @@ fn retain_bytes(at:usize,bytes:&[u8]){
         SMP_EVIDENCE.words[at+i].store(u64::from_le_bytes(word),Ordering::Relaxed);
     }
 }
-pub(super) fn run(boot:u64,gate:&mut RegisteredDecisionGate<'_>,snapshots:&mut SnapshotStore,inbox:&mut FeedbackInbox,desired:&mut DesiredBank){
+pub(super) fn run(boot:u64,gate:&mut RegisteredDecisionGate<'_>,snapshots:&mut SnapshotStore,inbox:&mut FeedbackInbox,desired:&mut DesiredBank,owner:&mut Owner){
     assert_eq!(cpu::slot(),0);
-    let owner=unsafe{&mut *core::ptr::addr_of_mut!(OWNER)};
     owner.bind(boot,TARGET,1,||if cpu::slot()==0&&timer::frequency()!=0{Ok(())}else{Err(Error::Denied)}).unwrap();
     owner.register(SOFT,TimerClass::Soft,SLACK,||Ok(())).unwrap();
     let requested=future();let mut base_cmp=0;
