@@ -219,8 +219,9 @@ impl RpcTable{
         slot.entry=Some(Entry{ticket,request,len:wire.len() as u16,op:r.op,reply});
         Ok(Admission::Execute(ticket))
     }
-    /// The native backend reports actual completion. UNKNOWN is sticky
-    /// until independent recovery, never a reason to execute a retry.
+    /// The ordinary native backend reports actual completion for a live
+    /// pending request. Once UNKNOWN or fenced, only independent recovery
+    /// can establish a new terminal result. Exact terminal replay is read-only.
     pub fn complete(&mut self,ticket:Ticket,state:State,result:i32,observed:u64,payload:&[u8],
         verify_native:impl FnOnce()->Result<(),Error>)->Result<Frame,Error>{
         let slot=self.slot(ticket.caller)?;
@@ -230,8 +231,29 @@ impl RpcTable{
         if e.reply.state()==State::Done{
             return if e.reply==next{Ok(e.reply)}else{Err(Error::Conflict)};
         }
+        if slot.closed||e.reply.state()==State::Unknown{
+            return Err(Error::Busy);
+        }
         if state==State::Pending{return Err(Error::Busy);}
         verify_native()?;
+        e.reply=next;Ok(next)
+    }
+    /// Serialized protected recovery entry, not reachable through a user's
+    /// retry or ACK. Verify exact original request, old retained reply and
+    /// proposed terminal bytes against independent current native evidence.
+    /// A failed verifier leaves the original obligation unchanged.
+    pub fn reconcile(&mut self,ticket:Ticket,result:i32,observed:u64,payload:&[u8],
+        verify_independent:impl FnOnce(Caller,&[u8],&Frame,&Frame)->Result<(),Error>,
+    )->Result<Frame,Error>{
+        let slot=self.slot(ticket.caller)?;
+        let e=slot.entry.as_mut().ok_or(Error::Stale)?;
+        if e.ticket!=ticket{return Err(Error::Stale);}
+        let next=Frame::reply(ticket.caller,e.op,ticket.seq,State::Done,result,observed,payload)?;
+        if e.reply.state()==State::Done{
+            return if e.reply==next{Ok(e.reply)}else{Err(Error::Conflict)};
+        }
+        if !slot.closed&&e.reply.state()!=State::Unknown{return Err(Error::Busy);}
+        verify_independent(ticket.caller,&e.request[..usize::from(e.len)],&e.reply,&next)?;
         e.reply=next;Ok(next)
     }
     /// Old caller cannot submit or ACK once fenced. Its accepted
@@ -307,14 +329,38 @@ mod tests{
         assert_eq!(t.bind(replacement,false),Err(Error::Auth));
         assert_eq!(t.admit(c,&r[..n],192,10,1000,7,|_|panic!()),Err(Error::Stale));
         assert_eq!(t.retire_closed(c,|_|panic!()),Err(Error::Busy));
-        assert_eq!(t.complete(k,State::Done,-16,7,&[],||Err(Error::Io)),Err(Error::Io));
-        t.complete(k,State::Done,-16,7,&[],||Ok(())).unwrap();
+        assert_eq!(t.complete(k,State::Done,-16,7,&[],||panic!()),Err(Error::Busy));
+        assert_eq!(t.reconcile(k,-16,7,&[],|_,_,_,_|Err(Error::Io)),Err(Error::Io));
+        let done=t.reconcile(k,-16,7,&[],|actor,request,prior,proposed|{
+            assert_eq!(actor,c);assert_eq!(request,&r[..n]);assert_eq!(*prior,unknown);
+            assert_eq!(proposed.state(),State::Done);Ok(())
+        }).unwrap();
+        assert_eq!(t.reconcile(k,-16,7,&[],|_,_,_,_|panic!()),Ok(done));
         assert_eq!(t.retire_closed(c,|_|Err(Error::Io)),Err(Error::Io));
         t.retire_closed(c,|e|{assert!(e.is_some());Ok(())}).unwrap();
         assert_eq!(t.bind(c,false),Err(Error::Auth));
         assert_eq!(t.replace_closed(c,replacement,||Err(Error::Io)),Err(Error::Io));
         t.replace_closed(c,replacement,||Ok(())).unwrap();
         assert_eq!(t.admit(c,&r[..n],192,10,1000,7,|_|panic!()),Err(Error::Auth));
+    }
+    #[test]
+    fn live_unknown_and_stopped_pending_require_independent_reconciliation(){
+        for close in [false,true]{
+            let mut t=RpcTable::new();let c=caller();t.bind(c,false).unwrap();
+            let (r,n)=req(Op::AuditRead,1,0);
+            let Admission::Execute(k)=t.admit(c,&r[..n],192,10,1000,7,|_|Ok(())).unwrap()else{panic!()};
+            assert_eq!(t.reconcile(k,-16,7,&[],|_,_,_,_|panic!()),Err(Error::Busy));
+            if close{t.close(c).unwrap();}
+            else{t.complete(k,State::Unknown,-16,7,&[],||Ok(())).unwrap();}
+            assert_eq!(t.complete(k,State::Done,0,7,&[0;144],||panic!()),Err(Error::Busy));
+            let done=t.reconcile(k,0,7,&[0;144],|actor,wire,prior,next|{
+                assert_eq!(actor,c);assert_eq!(wire,&r[..n]);
+                assert_eq!(prior.state(),if close{State::Pending}else{State::Unknown});
+                assert_eq!(next.state(),State::Done);Ok(())
+            }).unwrap();
+            assert_eq!(t.reconcile(k,-16,7,&[],|_,_,_,_|panic!()),Err(Error::Conflict));
+            assert_eq!(t.complete(k,State::Done,0,7,&[0;144],||panic!()),Ok(done));
+        }
     }
     #[test]
     fn ordinary_role_slots_and_executor_capacity_do_not_borrow_recovery(){
