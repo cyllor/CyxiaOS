@@ -623,6 +623,8 @@ class NativeSecurityWiring(unittest.TestCase):
         workflow = source(ROOT / ".github/workflows/v020-production.yml")
         self.assertIn("s.build_guest()", workflow)
         self.assertIn("--no-nic; then", workflow)
+        self.assertIn("grep -q 'V020_W11_NET_ABSENT' artifacts/v020-production/run-no-nic/serial.txt",
+                      workflow)
         self.assertIn("--timeout 240 --media-staging", workflow)
         self.assertIn("tools/test_verify_v020_production.py", workflow)
         evidence = source(ROOT / "kernel/src/arch/aarch64/production/evidence.rs")
@@ -630,6 +632,50 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("pub fn log_completion()", evidence)
         prod = source(ROOT / "kernel/src/arch/aarch64/production.rs")
         self.assertIn("evidence::log_completion();", prod)
+
+    def test_v020_wave11_ga_call_sites_pinned(self):
+        # Spec §5 (final-review I4): every G-A item keeps a live production call
+        # site, so none can silently regress to dead code.
+        arm = ROOT / "kernel/src/arch/aarch64"
+        prod = source(arm / "production.rs")
+        run = prod.split("pub(crate) fn run(info: &BootInfo) -> ! {", 1)[1]
+        # FrameMeta registration and recovery init run first in run(), in order.
+        self.assertIn("frames::register_or_fatal();", run)
+        self.assertLess(run.index("frames::register_or_fatal();"),
+                        run.index("recovery::init_or_fatal();"))
+        self.assertIn("recovery::publish_probe(", run)
+        # SEC-N serve runs in run() and its outcome is sealed.
+        self.assertIn("let net_outcome = net::serve(info);", run)
+        self.assertIn("net::publish(&net_outcome);", run)
+        # 0x41: the recovery gate refuses BEFORE the metered bridge call.
+        arm41 = prod.split("        0x41 => {", 1)[1].split("\n        _ => 0,", 1)[0]
+        self.assertIn("if !recovery::publish_allowed() {", arm41)
+        self.assertIn("return E_AUTH as u64;", arm41)
+        self.assertLess(arm41.index("recovery::publish_allowed()"),
+                        arm41.index("meter::metered("))
+        self.assertLess(arm41.index("meter::metered("),
+                        arm41.index("bridge.publish_assisted_one("))
+        # 0x50 register: the bridge call is metered too; exactly these two.
+        arm50 = prod.split("        0x50 if args[2] == (DECISION_BYTES", 1)[1].split(
+            "        0x41 => {", 1)[0]
+        self.assertLess(arm50.index("meter::metered("),
+                        arm50.index("bridge.register_assisted_one("))
+        self.assertEqual(prod.count("meter::metered("), 2)
+        # EL0 aborts feed the faulting CPU's accumulator in the vector.
+        exc = source(arm / "exceptions.rs")
+        prod_block = exc.split('#[cfg(feature = "v020-production")]', 1)[1].split(
+            "smp::production::exception(f, kind);", 1)[0]
+        self.assertIn("smp::production::recovery::record_fault(", prod_block)
+        # The callees are the real implementations, not stubs.
+        frames = source(arm / "production/frames.rs")
+        self.assertRegex(frames, r"fn register_or_fatal\(\) \{\s*match register_production_statics\(\)")
+        recovery = source(arm / "production/recovery.rs")
+        self.assertIn("with_gate(|g| g.state() == RecoveryState::Verified)", recovery)
+        self.assertIn("acc.record(&ev)", recovery)
+        meter = source(arm / "production/meter.rs")
+        self.assertIn("m.begin(SectionKind::EffectiveWork, now_ns())", meter)
+        net = source(arm / "production/net.rs")
+        self.assertIn("pub(super) fn serve(info: &BootInfo) -> NetOutcome", net)
 
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")

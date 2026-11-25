@@ -230,6 +230,9 @@ jobs:
             exit 1
           fi
           grep -q '"negative_control"' artifacts/v020-production/run-no-nic/summary.json
+          # It must fail for the RIGHT reason: the guest reported the missing
+          # NIC. A NIC-less hang or an unrelated failure must not stay green.
+          grep -q 'V020_W11_NET_ABSENT' artifacts/v020-production/run-no-nic/serial.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
