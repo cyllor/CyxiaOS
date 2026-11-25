@@ -36,7 +36,9 @@
 //! Global invariant: run() asserts cpu::slot()==0 for the control plane; the
 //! whole advice chain and PIE role turns execute synchronously on CPU0. No IRQ
 //! handler, DMA or secondary CPU touches these statics or the advice spaces
-//! (index >= C*2). Secondary CPUs only run the smp business fixture.
+//! (index >= C*2). Secondary CPUs only run the smp business fixture; their EL0
+//! faults write only their own per-CPU recovery accumulator in recovery.rs
+//! (registered there), never any static listed here.
 //! * LEDGER/GATE (static mut MaybeUninit) via ledger_ptr()/gate_ptr():
 //!   ptr::write-initialized once in init_control_guards() before any dispatch.
 //!   Every later &mut/&* is created and consumed within one synchronous CPU0
@@ -98,6 +100,8 @@ use sha2::{Digest, Sha256};
 mod evidence;
 #[path = "production/frames.rs"]
 mod frames;
+#[path = "production/recovery.rs"]
+pub(crate) mod recovery;
 
 // The production skeleton owns the CPU0 EL0 turn loop and the in-vector dispatch
 // path; it must not be combined with another profile that also hijacks CPU0 or
@@ -1014,6 +1018,9 @@ fn advice_dispatch(role_index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFra
             if cpu != 0 || member.caps & PUBLISH_PLAN != PUBLISH_PLAN {
                 return 0;
             }
+            if !recovery::publish_allowed() {
+                return E_AUTH as u64;
+            }
             let plan_len = args[1] as usize;
             let mut plan_copy = [0u8; 212];
             let mut side_copy = [0u8; DECISION_BYTES];
@@ -1203,6 +1210,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         "only boot CPU0 owns the production control plane"
     );
     frames::register_or_fatal();
+    recovery::init_or_fatal();
     // ---- SMP bring-up: mirrors smp::run's proven secondary-start path ----
     if info.cpu_count != REQUIRED {
         report(
@@ -1700,6 +1708,8 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         summary.plan_seq,
     );
 
+    recovery::publish_probe(pub_space, pub_args);
+
     // (10) Business CPUs kept running; deterministic cleanup.
     for slot in 1..REQUIRED {
         assert!(PROGRESS[slot * 2].load(Ordering::Acquire) >= 2);
@@ -1836,6 +1846,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     evidence::put(evidence::W11_BASE, evidence::W11_MAGIC);
     evidence::put(evidence::W11_STAGED_BOOT_EPOCH, 1);
     frames::publish();
+    recovery::publish();
     words.words[2].store(1, Ordering::Release);
     // Framed UART payloads are capped at 96 bytes; keep the scope marker short.
     // in_vector_dispatch / staged_boot_epoch / fixture_executor are proven by the

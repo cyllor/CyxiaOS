@@ -1725,4 +1725,46 @@ mod tests {
             assert_eq!(p.cpu_id, cpu);
         }
     }
+
+    /// Wave-11 production gate contract: an uncertain completion closes the
+    /// publish gate for good (no online return via good pair facts), and a
+    /// degraded event on one CPU leaves every other CPU's proof byte-identical.
+    #[test]
+    fn publish_rejected_after_unknown() {
+        let clean = CheckpointPairFacts {
+            identical_initial_pair: true,
+            ..good_pair()
+        };
+        let mut ra = RecoveryAuthority::new(1, 1, authority(), &clean).unwrap();
+        assert_eq!(ra.state(), RecoveryState::Verified);
+        assert_eq!(ra.observe_unknown(), RecoveryState::Unknown);
+        assert_eq!(ra.observe_pair(&clean), RecoveryState::Unknown);
+        assert_ne!(ra.state(), RecoveryState::Verified);
+        assert!(!ra.decision().may_write);
+
+        let encode = |ra: &RecoveryAuthority, cpu: u32| {
+            let mut out = [0u8; RECOVERY_PROOF_BYTES];
+            ra.degraded_proof(cpu).unwrap().encode(&mut out);
+            out
+        };
+        let before: std::vec::Vec<_> = (0..4).map(|c| encode(&ra, c)).collect();
+        let ev = DegradedEvent {
+            kind: DegradedEventKind::OtherCritical,
+            event_id: 1,
+            event_digest: [0x24; 32],
+            object_id: 0,
+            object_generation: 1,
+            failure_code: 0x24,
+        };
+        ra.record_degraded(2, &ev).unwrap();
+        for cpu in 0..4u32 {
+            let after = encode(&ra, cpu);
+            if cpu == 2 {
+                assert_ne!(after, before[2]);
+                assert_eq!(ra.degraded_proof(2).unwrap().total_count, 1);
+            } else {
+                assert_eq!(after, before[cpu as usize]);
+            }
+        }
+    }
 }

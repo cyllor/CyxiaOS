@@ -22,6 +22,15 @@ extern "C" fn exception_dispatch(f: &mut ExceptionFrame, kind: u64) {
     // EL0; all other exceptions fall through to the proven smp capture path.
     #[cfg(feature = "v020-production")]
     {
+        // EL0 data/instruction aborts feed the faulting CPU's own RecoveryProof
+        // v2 accumulator before the proven capture path handles them.
+        if kind == 8 && matches!(f.esr >> 26, 0x20 | 0x24) {
+            smp::production::recovery::record_fault(
+                cyxia_arch_aarch64::cpu::slot() as u32,
+                f.esr,
+                f.far,
+            );
+        }
         smp::production::exception(f, kind);
     }
     #[cfg(all(feature = "smp-selftest", not(feature = "v020-production")))]
