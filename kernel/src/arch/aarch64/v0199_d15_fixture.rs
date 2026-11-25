@@ -10,6 +10,7 @@ use cyxia_contracts::{ConsoleOps,PlatformError,UartResource};
     candidate_registry_v0199::{CatalogEntry,FrozenCandidates},
     d15_owner_v0199::{Clock,Owner,PumpEvidence},
     snapshot_store_v3::{SnapshotStore,Target,DomainObservation},
+    desired_plan_v0199::DesiredBank,
     apply_report_v1::{ActionStatus,ApplyReportV1,BoundReport,ExecutorBindingV1,ReportOrigin,TrustedApplyScope,MAX_APPLY_REPORT_BYTES},
     registered_gate_v3::{RegisteredDecisionGate,Registration,Publication,TrustedRegistrationScope},
     rule_profile_v2::{Profile,Candidates},feedback_v0199::{FeedbackInbox,CausalLabel},
@@ -24,6 +25,7 @@ const BASE_PAYLOAD:&[u8]=b"V0199_D15_BASELINE actual ordinary UART frame 0123456
 const APPLY_PAYLOAD:&[u8]=b"V0199_D15_APPLIED actual ordinary UART frame 0123456789abcdef\n";
 static mut OWNER:Owner=Owner::empty();
 static mut SNAPSHOTS:SnapshotStore=SnapshotStore::empty();
+static mut DESIRED:DesiredBank=DesiredBank::empty();
 static mut FEEDBACK:FeedbackInbox=match FeedbackInbox::new(SUP,LEARN){Ok(x)=>x,Err(_)=>panic!("fixture identity")};
 struct NativeClock;
 fn now()->u64{
@@ -156,17 +158,25 @@ pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CTL,PUB,SUP,boot,1).unwrap();
     let actions=[local];let records=[record];
     assert_eq!(gate.register_rule_only(CTL,&plan,&records,&profile,&actions,ctx),Ok(Registration::Frozen));
-    let mut desired=None;let pubctx=TrustedRegistrationScope{now_ns:now(),..ctx};
-    assert_eq!(gate.publish_once(PUB,&plan,&records,&profile,&actions,pubctx,||{
-        if !owner.legal(32,pubctx.now_ns){return Err(Error::Denied);}
-        desired=Some((sha(&plan),1u64));Ok(())
-    }),Ok(Publication::AdapterAccepted));
+    let desired=unsafe{&mut *core::ptr::addr_of_mut!(DESIRED)};
+    desired.bind_boot(boot,1,PUB,||if confirmed_boot==Some(boot){Ok(())}else{Err(Error::Denied)}).unwrap();
     let binding=ExecutorBindingV1{domain:15,role:1,active:true,target:TARGET,
         executor_generation:1,holder:Identity{id:0,generation:0},endpoint_cap_id:0};
-    let scope=TrustedApplyScope{boot_epoch:boot,plan_version:1,now_ns:now()};
+    desired.register_target(binding,|b|if b.target==owner.target(){Ok(())}else{Err(Error::Denied)}).unwrap();
+    let pubctx=TrustedRegistrationScope{now_ns:now(),..ctx};
+    assert_eq!(gate.publish_once(PUB,&plan,&records,&profile,&actions,pubctx,||{
+        desired.publish_registered(PUB,cpu::slot(),&plan,pubctx,|stage|{
+            let a=stage[0].ok_or(Error::Denied)?;
+            if stage.len()==1&&a.value==ActionV2::ConsolePump(32)&&a.binding==binding
+                &&a.prior_target_version==owner.installed_version()&&owner.legal(32,pubctx.now_ns){Ok(())}
+            else{Err(Error::Denied)}
+        }).map(|_|())
+    }),Ok(Publication::AdapterAccepted));
+    assert_eq!(desired.version(),1);
+    let scope=TrustedApplyScope{boot_epoch:boot,plan_version:desired.version(),now_ns:now()};
     let _=gate.claim_apply_work(&plan,0,scope,binding,ReportOrigin::Kernel,|w|{
-        owner.accept(w,ctx.base_plan_version,until,scope.now_ns,||
-            if desired==Some((sha(&plan),w.plan_version)){Ok(())}else{Err(Error::Denied)})
+        desired.accept(w,ReportOrigin::Kernel,scope.now_ns,|a|
+            owner.accept(w,a.prior_target_version,a.until_ns,scope.now_ns,||Ok(())))
     }).unwrap();
     let mut report_bytes=[0;MAX_APPLY_REPORT_BYTES];
     assert_eq!(owner.report(now(),&mut report_bytes),Err(Error::NotReady));
@@ -182,6 +192,9 @@ pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     let feedback=inbox.read(LEARN,0).unwrap().unwrap();
     assert_eq!(feedback.report_bytes(),&report_bytes[..n]);assert_eq!(feedback.decision,record);
     assert_eq!(feedback.causal_label,CausalLabel::NoAdoption);
+    desired.finish(&r,ReportOrigin::Kernel,now(),|a|{
+        if a.key.plan_seq==summary.plan_seq&&inbox.len()==1{owner.verify_report(&r)}else{Err(Error::NotReady)}
+    }).unwrap();
     owner.retire(&r,||if summary.plan_seq==1&&inbox.len()==1{Ok(())}else{Err(Error::NotReady)}).unwrap();
     let row=[0x4359443135465831,baseline as u64,baseline_calls,baseline_max,baseline_cpu,
         applied as u64,applied_calls,applied_max,applied_cpu,u64::from(first.limit),u64::from(first.chars),
@@ -193,5 +206,5 @@ pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     report("V0199_D15_EFFECT",baseline_max,applied_max,first.version);
     // Use the same protected snapshot/decision sequences and feedback
     // custody; never duplicate the boot-scoped key for a second domain.
-    super::v0199_d07_fixture::run(boot,&mut gate,snapshots,inbox);
+    super::v0199_d07_fixture::run(boot,&mut gate,snapshots,inbox,desired);
 }
