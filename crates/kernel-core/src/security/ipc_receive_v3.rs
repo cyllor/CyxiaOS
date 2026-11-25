@@ -66,6 +66,13 @@ impl<const N:usize> DirectionalEndpoint<N>{
     /// A native owner may supply additional protected outstanding custody
     /// before calling. Restrict this channel to a single producer.
     pub fn send(&mut self,actor:Identity,generation:u64,request:u64,payload:&[u8])->Result<(),Error>{
+        self.send_limited(actor,generation,request,payload,N)
+    }
+    /// Ordinary policy may only restrict NEW messages, never discard
+    /// existing messages or turn a retained exact replay into a new send.
+    /// Static control/recovery users continue through send() with N.
+    pub(crate) fn send_limited(&mut self,actor:Identity,generation:u64,request:u64,payload:&[u8],limit:usize)->Result<(),Error>{
+        if limit==0||limit>N{return Err(Error::Format);}
         if actor.id!=self.sender.id{return Err(Error::Auth);}
         if actor!=self.sender||generation!=self.identity.generation||self.closed{return Err(Error::Stale);}
         let message=Message::copied(actor,request,generation,payload)?;
@@ -79,7 +86,7 @@ impl<const N:usize> DirectionalEndpoint<N>{
             return if self.last_send==Some(message){Ok(())}else{Err(Error::Conflict)};
         }
         if request<self.send_hi{return Err(Error::Stale);}
-        if self.len==N{return Err(Error::Again);}
+        if self.len>=limit{return Err(Error::Again);}
         self.queue[(self.head+self.len)%N]=Some(message);self.len+=1;
         self.send_hi=request;self.last_send=Some(message);Ok(())
     }
