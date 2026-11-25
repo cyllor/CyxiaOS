@@ -166,6 +166,43 @@ fn scan_receipts_inner(
     Ok(summary)
 }
 
+/// Exact bounded single-receipt retirement projection. A successful
+/// structural check does not itself ACK a request or prove media FLUSH.
+/// The serialized native file owner must authenticate the actual principal,
+/// the exact terminal receipt, current mounted transaction and durable
+/// after-images of all required homes. No unrelated receipt/index mutation
+/// is admitted by this deliberately narrow retirement path.
+pub fn verify_single_ack_transition(
+    before:&[u8],after:&[u8],old_index:&[u8],new_index:&[u8],
+    uuid:[u8;16],slot:usize,principal:u64,
+    actual_receipt_homes:&[usize],includes_index:bool,
+    verify_commit:impl FnOnce(&FileReceiptV4,HomeClosure)->Result<(),Error>,
+)->Result<(),Error>{
+    let closure=home_closure(slot).ok_or(Error::Invalid)?;
+    if !includes_index||actual_receipt_homes.len()!=closure.receipt_block_count
+        ||actual_receipt_homes.first()!=Some(&closure.receipt.first)
+        ||closure.receipt.second.is_some_and(|h|actual_receipt_homes.get(1)!=Some(&h)){
+        return Err(Error::Conflict);
+    }
+    scan_receipts_with_index(before,old_index,uuid)?;
+    scan_receipts_with_index(after,new_index,uuid)?;
+    let at=slot*RECEIPT_BYTES;
+    let r=FileReceiptV4::decode(&before[at..at+RECEIPT_BYTES])?;
+    if principal==0||r.owner_principal_id!=principal{return Err(Error::Unauthorized);}
+    if !matches!(r.status,3|4|6){return Err(Error::Busy);}
+    if after[at..at+RECEIPT_BYTES].iter().any(|&v|v!=0)
+        ||before[..at]!=after[..at]||before[at+RECEIPT_BYTES..]!=after[at+RECEIPT_BYTES..]{
+        return Err(Error::Conflict);
+    }
+    let mut expected=FileStreamIndexV4::decode(old_index)?;
+    let stream=&mut expected.streams[r.group_id as usize*STREAMS_PER_GROUP+r.stream_slot as usize];
+    if stream.retired_through.checked_add(1)!=Some(r.request_seq){return Err(Error::Conflict);}
+    stream.retired_through=r.request_seq;
+    expected.generation=expected.generation.checked_add(1).ok_or(Error::Exhausted)?;
+    if FileStreamIndexV4::decode(new_index)?!=expected{return Err(Error::Conflict);}
+    verify_commit(&r,closure)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +302,30 @@ mod tests {
     fn reseal(raw: &mut [u8]) {
         let crc=crc32c_zeroed(raw,188).unwrap();
         raw[188..192].copy_from_slice(&crc.to_le_bytes());
+    }
+    #[test]
+    fn exact_cross_home_ack_requires_terminal_principal_and_only_one_watermark(){
+        use super::super::file_index_v0199::CRC_OFFSET;
+        let mut before=[0u8;RECEIPT_STORE_BYTES];
+        let at=21*RECEIPT_BYTES;
+        let mut raw=receipt((1u64<<56)|2,2);
+        raw[96..98].copy_from_slice(&3u16.to_le_bytes());
+        raw[108]=1;reseal(&mut raw);before[at..at+RECEIPT_BYTES].copy_from_slice(&raw);
+        let old=strict_index(2,1);
+        let mut new=strict_index(2,2);
+        new[32..40].copy_from_slice(&2u64.to_le_bytes());
+        let crc=crc32c_zeroed(&new,CRC_OFFSET).unwrap();
+        new[CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+        let after=[0u8;RECEIPT_STORE_BYTES];
+        assert_eq!(verify_single_ack_transition(&before,&after,&old,&new,[1;16],21,2,&[0],true,|_,_|panic!()),Err(Error::Conflict));
+        assert_eq!(verify_single_ack_transition(&before,&after,&old,&new,[1;16],21,3,&[0,1],true,|_,_|panic!()),Err(Error::Unauthorized));
+        assert_eq!(verify_single_ack_transition(&before,&after,&old,&new,[1;16],21,2,&[0,1],true,|_,_|Err(Error::Unknown)),Err(Error::Unknown));
+        verify_single_ack_transition(&before,&after,&old,&new,[1;16],21,2,&[0,1],true,|r,c|{
+            assert_eq!(r.request_seq,2);assert_eq!(c.receipt_block_count,2);Ok(())
+        }).unwrap();
+        raw[96..98].copy_from_slice(&5u16.to_le_bytes());reseal(&mut raw);
+        before[at..at+RECEIPT_BYTES].copy_from_slice(&raw);
+        assert_eq!(verify_single_ack_transition(&before,&after,&old,&new,[1;16],21,2,&[0,1],true,|_,_|panic!()),Err(Error::Busy));
     }
     #[test]
     fn joint_receipt_index_rejects_gap_retired_or_forged_identity() {
