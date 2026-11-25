@@ -97,11 +97,22 @@ struct Running {
     fault_esr:u64,
     fault_far:u64,
 }
+// Read CNTFRQ once on the serialized CPU0 diagnostic owner. The
+// architectural frequency is fixed for this boot; a second profile entry
+// rechecks it rather than silently reusing a different scale.
+static TIMER_FREQUENCY:AtomicU64=AtomicU64::new(0);
+fn init_timer_frequency(){
+    let f=timer::frequency();assert!(f!=0);
+    let old=TIMER_FREQUENCY.swap(f,Ordering::Relaxed);
+    assert!(old==0||old==f);
+}
 #[inline]
-fn now_ns()->u64{
-    let f=timer::frequency();
-    assert!(f!=0);
-    let t=timer::ticks();
+fn timer_frequency()->u64{
+    let f=TIMER_FREQUENCY.load(Ordering::Relaxed);assert!(f!=0);f
+}
+#[inline]
+fn ns_from_ticks(t:u64)->u64{
+    let f=timer_frequency();
     // Exact integer conversion. For the pinned 62.5 MHz generic timer
     // this is t*16, not a soft-float 128-bit division on each dispatch.
     // Retain the checked wide fallback for other non-divisor frequencies.
@@ -111,8 +122,10 @@ fn now_ns()->u64{
     u64::try_from(u128::from(t)*1_000_000_000/u128::from(f)).expect("monotonic ns")
 }
 #[inline]
+fn now_ns()->u64{ns_from_ticks(timer::ticks())}
+#[inline]
 fn ticks_for(ns:u64)->u64{
-    let f=timer::frequency();assert!(f!=0);
+    let f=timer_frequency();
     if 1_000_000_000%f==0{
         return ns.div_ceil(1_000_000_000/f).max(1);
     }
@@ -563,24 +576,34 @@ fn turn(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running,budget:&mut Budg
     // included in final settlement. Zero means the phase was not reached.
     let mut before_enter=0;let mut after_exit=0;let mut after_dispatch=0;
     for _ in 0..trap_limit{
+        // Prepare immutable root identity BEFORE the final admission
+        // sample. The same PMU sample drives the guard and diagnostics;
+        // the old path checked an earlier sample, then measured 109384ns
+        // before entering despite only 100000ns of entry headroom.
+        let root=member.ttbr0_root;
+        assert_eq!(root,root_pa(index,r.bank));
+        let asid=role_asid(index,r.bank);
+        let wall_ticks=timer::ticks();
+        let wall=ns_from_ticks(wall_ticks);
         let actual=timer::cpu_elapsed_ns(began);
-        let wall=now_ns();
         let cpu_left=quota.saturating_sub(actual);
         let wall_left=token.deadline_ns().saturating_sub(wall);
         if cpu_left<=exit_guard||wall_left<=exit_guard{break;}
         let mut interval=(cpu_left-exit_guard).min(wall_left-exit_guard);
         if class==Class::Decision{
             interval=interval.min(DECISION_SLICE_NS);
-            before_enter=timer::cpu_elapsed_ns(began);
+            before_enter=actual;
         }
         unsafe{
-            timer::arm(timer::ticks().checked_add(ticks_for(interval)).unwrap());
-            let root=member.ttbr0_root;
-            assert_eq!(root,root_pa(index,r.bank));
+            // Anchor to the sampled physical timer, not a later reading
+            // that would silently extend the original wall allowance.
+            timer::arm(wall_ticks.checked_add(ticks_for(interval)).unwrap());
             // Each live root is immutable, private, and all leaves are nG.
             // Retire_root disconnects it and completes TLBI before reclaim.
-            user::enter_pinned_until_retired(&mut r.context,root,role_asid(index,r.bank));
-            cpu::disable_timer();
+            user::enter_pinned_until_retired(&mut r.context,root,asid);
+            // The dedicated SMP timer IRQ handler has already disabled
+            // CNT(P)_CTL before returning kind9. Sync traps still need it.
+            if r.context.kind!=9{cpu::disable_timer();}
         }
         if class==Class::Decision{after_exit=timer::cpu_elapsed_ns(began);}
         // Settle immediately after a timer exit instead of re-entering in
@@ -772,6 +795,7 @@ pub(super) struct DiskSecurityRun{
 #[cfg(feature="v0199-epoch-disk-selftest")]
 pub(super) fn disk_security_run(generation:u64,bank:usize,stop:bool)->DiskSecurityRun{
     assert_eq!(cpu::slot(),0);
+    init_timer_frequency();
     let i=1usize;
     let (m,mut r)=load(i,generation,bank);
     assert_eq!(m.role,Role::Security);assert_eq!(m.actor.generation,generation);
@@ -834,6 +858,7 @@ pub(super) fn run()->!{
     assert_eq!(cpu::slot(),0);assert_eq!(ONLINE.load(Ordering::Acquire),15);
     gic().enable(TIMER_IRQ.load(Ordering::Acquire) as u32).unwrap();
     unsafe{timer::init_cpu_accounting();}
+    init_timer_frequency();
     let mut budget=BudgetMeter::new();
     let pairs:[(NativeRole,Running);ROLE_COUNT]=core::array::from_fn(|i|budget.load_initial(i));
     let members=core::array::from_fn(|i|pairs[i].0);
