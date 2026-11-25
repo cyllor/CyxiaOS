@@ -97,13 +97,26 @@ struct Running {
     fault_esr:u64,
     fault_far:u64,
 }
+#[inline]
 fn now_ns()->u64{
     let f=timer::frequency();
     assert!(f!=0);
-    u64::try_from(u128::from(timer::ticks())*1_000_000_000/u128::from(f)).expect("monotonic ns")
+    let t=timer::ticks();
+    // Exact integer conversion. For the pinned 62.5 MHz generic timer
+    // this is t*16, not a soft-float 128-bit division on each dispatch.
+    // Retain the checked wide fallback for other non-divisor frequencies.
+    if 1_000_000_000%f==0{
+        return t.checked_mul(1_000_000_000/f).expect("monotonic ns");
+    }
+    u64::try_from(u128::from(t)*1_000_000_000/u128::from(f)).expect("monotonic ns")
 }
+#[inline]
 fn ticks_for(ns:u64)->u64{
-    u64::try_from((u128::from(ns)*u128::from(timer::frequency())).div_ceil(1_000_000_000))
+    let f=timer::frequency();assert!(f!=0);
+    if 1_000_000_000%f==0{
+        return ns.div_ceil(1_000_000_000/f).max(1);
+    }
+    u64::try_from((u128::from(ns)*u128::from(f)).div_ceil(1_000_000_000))
         .expect("timer ticks").max(1)
 }
 /// Continuous attribution from BEFORE the first role package load through
@@ -532,7 +545,7 @@ fn turn(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running,budget:&mut Budg
     let (now,began)=budget.sample_gap();if now<r.wake_ns{return false;}
     let member=m.manifest().members[index];
     let (class,domain,quota)=class(member.role);
-    let token=match budget.ledger.reserve_validated_role_with_wall(m,member.actor,cpu::slot(),class,domain,quota,50_000_000,now){
+    let token=match budget.ledger.reserve_indexed_role_with_wall(m,index,member.actor,cpu::slot(),class,domain,quota,50_000_000,now){
         Ok(t)=>t,
         Err(Error::Exhausted|Error::Busy)=>return false,
         Err(e)=>panic!("native control budget refused: {e:?}"),
