@@ -25,8 +25,10 @@ impl<'a> View<'a>{
     }
 }
 impl FrozenCandidates{
-    /// Each static value is considered exactly once, in the actual signed
-    /// catalog order. A hard-gate error aborts the whole capture, rather
+    /// Each static value is considered exactly once, in the authenticated
+    /// numeric/tier order required by main §6.1 and §8. A signed catalog
+    /// may bind static ordinals but cannot reorder the canonical tiers.
+    /// A hard-gate error aborts the whole capture, rather
     /// than pretending that an unavailable owner rejected that candidate.
     /// Ordinary admission forbids trial-only values.
     pub fn capture(snapshot:SnapshotReplyV3,catalog:&[CatalogEntry],catalog_digest:[u8;32],
@@ -39,7 +41,7 @@ impl FrozenCandidates{
             return Err(Error::Invalid);
         }
         for (i,r) in catalog.iter().enumerate(){
-            if r.ordinal==u16::MAX||!all.contains(&r.value)
+            if r.ordinal==u16::MAX||r.value!=all[i]
                 ||catalog[..i].iter().any(|old|old.ordinal==r.ordinal||old.value==r.value){
                 return Err(Error::Denied);
             }
@@ -94,6 +96,9 @@ mod tests{
         assert_eq!(s.rule_fields(),[Some(20),Some(0),Some(1),Some(1),Some(11),Some(20),Some(1)]);
         let view=s.view();let f=view.selected(1).unwrap();assert_eq!(f.action_payload,&[32,0]);
         assert!(view.selected(3).is_err());
+        let mut reordered=c;reordered.swap(0,3);
+        assert!(matches!(FrozenCandidates::capture(snapshot(),&reordered,[1;32],values[1],None,None,false,
+            |_,_|panic!("noncanonical tier order"),|_|panic!()),Err(Error::Denied)));
         let mut invalid=c;invalid[1]=c[0];
         assert!(matches!(FrozenCandidates::capture(snapshot(),&invalid,[1;32],values[1],None,None,false,
             |_,_|panic!(),|_|panic!()),Err(Error::Denied)));
