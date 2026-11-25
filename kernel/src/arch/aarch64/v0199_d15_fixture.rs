@@ -23,10 +23,44 @@ const LEARN:Identity=Identity{id:10,generation:1};
 const TARGET:Identity=Identity{id:15,generation:1};
 const BASE_PAYLOAD:&[u8]=b"V0199_D15_BASELINE actual ordinary UART frame 0123456789abcdef\n";
 const APPLY_PAYLOAD:&[u8]=b"V0199_D15_APPLIED actual ordinary UART frame 0123456789abcdef\n";
-static mut OWNER:Owner=Owner::empty();
-static mut SNAPSHOTS:SnapshotStore=SnapshotStore::empty();
-static mut DESIRED:DesiredBank=DesiredBank::empty();
-static mut FEEDBACK:FeedbackInbox=match FeedbackInbox::new(SUP,LEARN){Ok(x)=>x,Err(_)=>panic!("fixture identity")};
+// One exclusive writable arena in the real preallocated control pool.
+// The immutable initialization image is part of the measured kernel
+// image, not another writable metadata pool. Copy it directly, avoiding
+// a large intermediate stack object or assumptions about enum layouts.
+#[repr(C,align(4096))]
+struct FixtureOwners{
+    console:Owner,timers:cyxia_kernel_core::control_plane::d07_owner_v0199::Owner,
+    snapshots:SnapshotStore,desired:DesiredBank,feedback:FeedbackInbox,
+}
+static INITIAL:FixtureOwners=FixtureOwners{
+    console:Owner::empty(),
+    timers:cyxia_kernel_core::control_plane::d07_owner_v0199::Owner::empty(),
+    snapshots:SnapshotStore::empty(),desired:DesiredBank::empty(),
+    feedback:match FeedbackInbox::new(SUP,LEARN){Ok(x)=>x,Err(_)=>panic!("fixture identity")},
+};
+static INITIALIZED:AtomicBool=AtomicBool::new(false);
+const _:()=assert!(core::mem::size_of::<FixtureOwners>()<=1024*1024);
+fn fixture_owners()->&'static mut FixtureOwners{
+    assert_eq!(cpu::slot(),0);
+    assert!(!INITIALIZED.swap(true,Ordering::AcqRel));
+    let bytes=core::mem::size_of::<FixtureOwners>();
+    let (va,offset)=super::v0199_control_bringup::disk_fixture_metadata(bytes);
+    let ptr=va as *mut FixtureOwners;
+    // The native pool owner exclusively reserved this page-aligned tail
+    // before loading any role. No user mapping or DMA owns these pages.
+    let all=unsafe{
+        core::ptr::copy_nonoverlapping(core::ptr::addr_of!(INITIAL),ptr,1);
+        &mut *ptr
+    };
+    let row=[0x435944504f4f4c31,phys(va),bytes as u64,offset as u64,
+        core::mem::offset_of!(FixtureOwners,console) as u64,core::mem::size_of_val(&all.console) as u64,
+        core::mem::offset_of!(FixtureOwners,timers) as u64,core::mem::size_of_val(&all.timers) as u64,
+        core::mem::offset_of!(FixtureOwners,snapshots) as u64,core::mem::size_of_val(&all.snapshots) as u64,
+        core::mem::offset_of!(FixtureOwners,desired) as u64,core::mem::size_of_val(&all.desired) as u64,
+        core::mem::offset_of!(FixtureOwners,feedback) as u64,core::mem::size_of_val(&all.feedback) as u64];
+    for(i,v)in row.into_iter().enumerate(){SMP_EVIDENCE.words[360+i].store(v,Ordering::Relaxed);}
+    all
+}
 struct NativeClock;
 fn now()->u64{
     (u128::from(timer::ticks())*1_000_000_000/u128::from(timer::frequency())).try_into().unwrap()
@@ -100,7 +134,7 @@ pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     let mut tx=Tx(unsafe{cyxia_driver_pl011::Pl011::attach(UartResource{base:PhysAddr(base),len:4096})}.unwrap());
     unsafe{timer::init_cpu_accounting();}
     let mut clock=NativeClock;
-    let owner=unsafe{&mut *core::ptr::addr_of_mut!(OWNER)};
+    let FixtureOwners{console:owner,timers,snapshots,desired,feedback:inbox}=fixture_owners();
     owner.bind(boot,TARGET,1,||if base==super::super::HIGH+0x09000000{Ok(())}else{Err(Error::Denied)}).unwrap();
     let baseline=crate::machine::enqueue_v0199(owner,BASE_PAYLOAD,now()).unwrap();
     let (_,baseline_calls,baseline_max,baseline_cpu)=drain(owner,&mut tx,&mut clock);
@@ -110,7 +144,6 @@ pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     // The same protected registry used by the current SnapshotReply v3
     // reader now owns this actual HAL observation. The epoch disk caller
     // supplies the confirmed boot from DurableEpochGate, not a model.
-    let snapshots=unsafe{&mut *core::ptr::addr_of_mut!(SNAPSHOTS)};
     snapshots.bind_boot(boot,||if confirmed_boot==Some(boot){Ok(())}else{Err(Error::Denied)}).unwrap();
     let target=Target{domain:15,object:TARGET,owner:Identity{id:1,generation:1}};
     snapshots.register_target(target,|t|if t.object==owner.target(){Ok(())}else{Err(Error::Denied)}).unwrap();
@@ -158,7 +191,6 @@ pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CTL,PUB,SUP,boot,1).unwrap();
     let actions=[local];let records=[record];
     assert_eq!(gate.register_rule_only(CTL,&plan,&records,&profile,&actions,ctx),Ok(Registration::Frozen));
-    let desired=unsafe{&mut *core::ptr::addr_of_mut!(DESIRED)};
     desired.bind_boot(boot,1,PUB,||if confirmed_boot==Some(boot){Ok(())}else{Err(Error::Denied)}).unwrap();
     let binding=ExecutorBindingV1{domain:15,role:1,active:true,target:TARGET,
         executor_generation:1,holder:Identity{id:0,generation:0},endpoint_cap_id:0};
@@ -185,7 +217,6 @@ pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     assert_eq!(first.limit,32);assert!(applied_max>8&&applied_max<=32,"actual batch effect");
     let n=owner.report(now(),&mut report_bytes).unwrap();
     let r=ApplyReportV1::decode(&report_bytes[..n]).unwrap();assert_eq!(r.state,ActionStatus::Applied);
-    let inbox=unsafe{&mut *core::ptr::addr_of_mut!(FEEDBACK)};
     let frames=[BoundReport{bytes:&report_bytes[..n],origin:ReportOrigin::Kernel}];
     let summary=gate.settle_verified_apply_reports_with_feedback(SUP,&plan,&frames,&[binding],
         TrustedApplyScope{now_ns:now(),..scope},None,|_,r|owner.verify_report(r),|batch|inbox.retain(SUP,batch)).unwrap();
@@ -206,5 +237,5 @@ pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     report("V0199_D15_EFFECT",baseline_max,applied_max,first.version);
     // Use the same protected snapshot/decision sequences and feedback
     // custody; never duplicate the boot-scoped key for a second domain.
-    super::v0199_d07_fixture::run(boot,&mut gate,snapshots,inbox,desired);
+    super::v0199_d07_fixture::run(boot,&mut gate,snapshots,inbox,desired,timers);
 }
