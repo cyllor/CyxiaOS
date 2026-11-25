@@ -528,6 +528,10 @@ mod tests{
         }
         request[48..50].copy_from_slice(&4u16.to_le_bytes());
         let args=[99,4096,72,0,8192,384];
+        for cpu in [0,4]{
+            let wrong=VerifiedNativeCaller{cpu,..native};
+            assert_eq!(executor_fetch_rpc(&mut gate,&mut table,caller,wrong,args,&request,&plan,0,binding,scope,200,|_|panic!()),Err(RpcError::Auth));
+        }
         let wrong=VerifiedNativeCaller{endpoint_cap:100,..native};
         assert_eq!(executor_fetch_rpc(&mut gate,&mut table,caller,wrong,args,&request,&plan,0,binding,scope,200,|_|panic!()),Err(RpcError::Auth));
         let reply=executor_fetch_rpc(&mut gate,&mut table,caller,native,args,&request,&plan,0,binding,scope,200,|w|{
