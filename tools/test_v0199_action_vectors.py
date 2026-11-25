@@ -28,6 +28,24 @@ def decode(domain,kind,raw):
     return v
 
 class ActionVectors(unittest.TestCase):
+    def test_complete_apply_wires_are_independent_little_endian_frames(self):
+        rows=[]
+        source=VECTORS.with_name("v0199-apply-wire-vectors.tsv")
+        for line in source.read_text(encoding="ascii").splitlines():
+            if line.startswith("#"):continue
+            d,t,w,r=line.split("\t")
+            domain,tier=int(d),int(t)
+            value=VALUES[domain-1][tier]
+            params=value if isinstance(value,tuple) else (value,)
+            action=struct.pack(FORMATS.get(domain,"<H"),*params)
+            work=struct.pack("<IHH3Q4H4Q2I",0x43594157,1,80,1,2,3,tier,domain,1,0,17,5,6,7,len(action),0)
+            report=struct.pack("<3Q4H4QiIQ16s",1,2,3,tier,domain,1,0,17,5,6,7,0,len(action),1000,bytes(16))
+            self.assertEqual((len(work),len(report)),(80,96))
+            self.assertEqual(w,(work+action).hex())
+            self.assertEqual(r,(report+action).hex())
+            rows.append((domain,tier))
+        self.assertEqual(rows,[(d,i) for d,v in enumerate(VALUES,1) for i in range(len(v))])
+        self.assertEqual(len(rows),58)
     def test_literal_reference_and_rejections(self):
         rows=[]
         for line in VECTORS.read_text(encoding="ascii").splitlines():
