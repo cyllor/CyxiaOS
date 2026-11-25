@@ -584,7 +584,9 @@ def main():
             check_disk(disk,epoch,capture)
             previous=verify_smp.sha(disk)
             verify_smp.require(summary.get('scratch_disk_after_sha256')==previous,'disk changed after capture')
-        result['status']='PASS'
+        verify_smp.require(len(result['boots'])==2 and all(
+            b.get('observations',{}).get('native_d02_effect_fixture_verified') is True
+            for b in result['boots']),'missing D02 actual physical proof')
         result['cross_process_boot_epoch_fixture_verified']=True
         result['cross_process_service_generation_fixture_verified']=True
         result['cross_process_merged_home_replay_fixture_verified']=True
@@ -592,9 +594,10 @@ def main():
         result['cross_process_formatted_mount_checkpoint_verified']=True
         result['native_d15_actual_effect_fixture_verified']=True
         result['native_d07_actual_effect_fixture_verified']=True
-        result['native_d02_actual_effect_fixture_verified']=all(b.get('observations',{}).get('native_d02_effect_fixture_verified') for b in result['boots'])
-        verify_smp.require(result['native_d02_actual_effect_fixture_verified'],'missing D02 actual physical proof')
+        result['native_d02_actual_effect_fixture_verified']=True
+        result['status']='PASS'
     except (OSError,ValueError,RuntimeError) as e:
+        result['status']='FAIL'
         result['error']=str(e)
     (out/'summary.json').write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps(result,indent=2))
