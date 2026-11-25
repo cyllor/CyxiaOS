@@ -152,7 +152,9 @@ impl DesiredBank{
     pub fn verify_committed_publication(&self,plan:&PlanV2<'_>,digest:[u8;32],version:u64,
         verify_reservations:impl FnOnce(&[Option<PublishedAction>])->Result<(),Error>,
     )->Result<(),Error>{
-        if self.boot==0||self.fenced||plan.header.controller_epoch!=self.controller
+        // Read-only recovery must remain available after fencing, so an
+        // ambiguous old publication can be resolved and its actions sealed.
+        if self.boot==0||plan.header.controller_epoch!=self.controller
             ||version<=plan.header.base_plan_version||version>self.version
             ||plan.header.plan_seq>self.plan_hi||digest==[0;32]{return Err(Error::Stale);}
         let count=usize::from(plan.header.action_count);
