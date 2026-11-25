@@ -124,8 +124,7 @@ dependencies = [
 name = "cyxia-cluster-transport"
 version = "0.1.0"
 dependencies = [
- "cyxia-driver-virtio",
- "smoltcp",
+ "cyxia-net-transport",
 ]
 
 [[package]]
@@ -169,6 +168,7 @@ dependencies = [
  "cyxia-driver-pl011",
  "cyxia-driver-virtio",
  "cyxia-kernel-core",
+ "cyxia-net-transport",
  "cyxia-peer-billing",
  "cyxia-platform-pc",
  "cyxia-platform-virt",
@@ -203,9 +203,11 @@ dependencies = [
 name = "cyxia-net-transport"
 version = "0.1.0"
 dependencies = [
+ "cyxia-driver-virtio",
  "getrandom",
  "ring",
  "rustls",
+ "smoltcp",
 ]
 
 [[package]]

@@ -1268,7 +1268,9 @@ pub(super) fn allow_mandatory(worker: &Worker, required: u64, now: u64) -> bool 
     } else {
         0
     };
-    spent.checked_add(required).is_some_and(|n| n <= cyxia_prototype::learning::governance::MANDATORY_NS)
+    spent
+        .checked_add(required)
+        .is_some_and(|n| n <= cyxia_prototype::learning::governance::MANDATORY_NS)
 }
 pub(super) fn mandatory(worker: &mut Worker, started: u64, actual: u64) {
     if cpu::slot() != 1 {
@@ -1837,9 +1839,7 @@ fn turn(worker: &mut Worker, credit: ControlCredit, begin: u64) -> Result<(), Do
             // its compact input, one result page and guarded stack; the other
             // private pages stay inaccessible and need no per-score clearing.
             for _ in 0..16 {
-                if timer::cpu_elapsed_ns(begin).saturating_add(1_000_000)
-                    > credit.reserved_ns
-                {
+                if timer::cpu_elapsed_ns(begin).saturating_add(1_000_000) > credit.reserved_ns {
                     break;
                 }
                 clear_page(worker)?;

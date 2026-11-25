@@ -1,5 +1,17 @@
-//! Bounded, prepaid boot self-test on the bootstrap C owner (CPU1).
+//! Bounded, prepaid boot self-test hosted on business CPU1 (historical
+//! unified-runtime fixture; the fixed control authority is CPU0).
 //! No DecisionKey, candidate set, policy root or cluster identity is created.
+//!
+//! RETIRED (V0.20 CPU0 cutover): this worker fundamentally requires the
+//! pre-cutover CPU1 control host. Its EL0 image is mapped into CPU1's user root
+//! by prototype_runtime::init, and the fixed authority admits control credit
+//! only on CONTROL_CPU (CPU0), so begin_control below rejects this CPU1 host
+//! with Auth and no model turn can ever be prepaid. The native boot path is
+//! already fail-closed: boot_model_test() bounds the wait, cancels, and the
+//! unified boot falls into boot_recovery SAFE_EXEC rather than proceeding. This
+//! file is retained unchanged for the host ordering harness
+//! (tests/host/boot_model_harness.rs), which replays the CPU1 interleavings with
+//! a mocked scheduler; it is not a live control topology.
 use super::*;
 use cyxia_prototype::domains::{Error, tasks::ControlCredit};
 
@@ -128,6 +140,9 @@ impl Check {
         true
     }
     pub(super) fn step(&mut self) -> bool {
+        // Pre-cutover CPU1 control host (retired; see module note). Kept at 1 for
+        // the host ordering harness; the fixed CPU0 authority never grants a CPU1
+        // worker control credit, so this body is inert in the native build.
         if cpu::slot() != 1 {
             return false;
         }
@@ -151,6 +166,10 @@ impl Check {
         if self.last_window == Some(window) {
             return true;
         }
+        // Under the fixed CPU0 authority begin_control requires CONTROL_CPU and
+        // rejects this CPU1 host with Auth, so no recovery credit is ever granted
+        // natively; the bounded boot_model_test deadline then fails closed into
+        // SAFE_EXEC. The retry-on-error shape is retained for the host harness.
         let credit = match crate::domain_tasks::begin_control(RECOVERY_NS, false) {
             Ok(Some(credit)) => credit,
             Ok(None) => {

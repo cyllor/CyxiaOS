@@ -15,6 +15,10 @@ use crate::{
     },
 };
 pub type VolumeScratch = [[u8; 4096]; 16];
+/// Legacy media identity: these exact names are written into system-root
+/// directory entries on formatted media. Renaming them would break existing
+/// disks, so the historical cluster wording is retained even though the
+/// single-machine profile has no cluster runtime. Do not rename.
 pub const NAMES: [&str; 2] = [".cyxia-cluster-a", ".cyxia-cluster-b"];
 pub const FILE_BLOCKS: u32 = storage::CLUSTER_FILE_BLOCKS;
 pub const START: u32 = storage::CLUSTER_START;

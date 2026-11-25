@@ -1,5 +1,5 @@
 //! CPU0 final execution authority for a single bounded pure-task slot. TLS and
-//! protocol validation are supplied by the protected cluster service; this
+//! protocol validation are supplied by the protected authenticated service; this
 //! ledger binds those facts to the active transport epoch and frozen resources.
 use super::Error;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,7 +46,12 @@ pub struct StartRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CustodyKey {
     pub owner_boot: u64,
-    pub cluster: [u8; 32],
+    /// Legacy remote-task scope identity (bytes 8..40 of the positional
+    /// 120-byte custody key). Retained for custody-key ABI compatibility with
+    /// the retired remote-task service; the single-machine native profile has
+    /// no cluster runtime. The field name is source-only: the wire codec is
+    /// positional, so no media or hash identity depends on it.
+    pub legacy_remote_scope: [u8; 32],
     pub requester: [u8; 32],
     pub contract: [u8; 16],
     pub request_hash: [u8; 32],
@@ -185,7 +190,7 @@ impl Authority {
         now: u64,
     ) -> Result<u64, Error> {
         if key.owner_boot == 0
-            || key.cluster == [0; 32]
+            || key.legacy_remote_scope == [0; 32]
             || key.requester == [0; 32]
             || key.contract != terms.contract
             || key.request_hash == [0; 32]

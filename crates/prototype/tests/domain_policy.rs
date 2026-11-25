@@ -647,7 +647,9 @@ fn wire_round_trips_every_family_and_rejects_trailing_bytes() {
         Action::BackgroundBudget(400),
         Action::RecoveryRecipe(2),
         Action::ConsoleBatch(64),
+        #[cfg(feature = "legacy-d16-decode")]
         Action::OfferCpu(1000),
+        #[cfg(feature = "legacy-d16-decode")]
         Action::Placement(2),
     ];
     for action in actions {
@@ -660,6 +662,17 @@ fn wire_round_trips_every_family_and_rejects_trailing_bytes() {
         assert_eq!(
             decode_payload(action.domain(), action.kind(), &bytes[..n + 1]),
             Err(Error::Format)
+        );
+    }
+    // V0.20 T5: the default decode rejects the legacy D16 remote families
+    // cleanly; the compat round trip above is opt-in via legacy-d16-decode.
+    #[cfg(not(feature = "legacy-d16-decode"))]
+    for action in [Action::OfferCpu(1000), Action::Placement(2)] {
+        let mut bytes = [0; 32];
+        let n = encode_payload(action, 31, &mut bytes).unwrap();
+        assert_eq!(
+            decode_payload(action.domain(), action.kind(), &bytes[..n]),
+            Err(Error::Unsupported)
         );
     }
     let mut bytes = frame(&candidates(), 1, 0);

@@ -5,12 +5,18 @@ edition = "2024"
 
 [features]
 default = []
-tls = ["dep:rustls", "dep:ring", "dep:getrandom", "dep:cyxia-net-transport", "cyxia-net-transport/tls"]
+tls = ["dep:rustls", "dep:ring", "dep:getrandom", "cyxia-net-transport/tls"]
 
 [dependencies]
-cyxia-net-transport = { path = "../net-transport", default-features = false, optional = true }
-cyxia-driver-virtio = { path = "../driver-virtio" }
-smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
+cyxia-net-transport = { path = "../net-transport", default-features = false, features = ["smoltcp"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring"], optional = true }
 ring = { version = "=0.17.14", default-features = false, features = ["alloc", "less-safe-getrandom-custom-or-rdrand"], optional = true }
 getrandom = { version = "=0.2.17", default-features = false, features = ["custom"], optional = true }
+
+# Standalone legacy diagnostics mirror the workspace's audited ring patch so
+# `cargo test --manifest-path ... --locked --offline` resolves the same crypto
+# source. Ignored when this crate is built inside the main workspace.
+# Mirrors the root patch's neutral repo-root vendor/ring location (rationale
+# in root Cargo.toml); ring version and content are unchanged.
+[patch.crates-io]
+ring = { path = "../../vendor/ring" }

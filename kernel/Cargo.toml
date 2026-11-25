@@ -49,6 +49,11 @@ smp-selftest = ["selftest"]
 # Dedicated V0.19.9 4-vCPU native CPU0 EL0 role/TTBR isolation fixture.
 # Not a certification of the 8 real control services or G4.
 v0199-cpu0-role-selftest = ["smp-selftest"]
+# Native advice-chain E2E fixture: real EL0 AdviceEnvelope v1 -> SVC 0x50 intake
+# -> RuleProfile review -> DecisionRecord/Disposition -> SVC 0x50 register and
+# SVC 0x41 publish via SvcV3Bridge -> executor ApplyReport -> supervisor terminal.
+# Fixture scope only; production in-vector syscall wiring is NOT established.
+v0199-advice-e2e-selftest = ["smp-selftest", "dep:sha2"]
 # Explicit native ABI3 role bootstrap. Never a production G0/BootEpoch claim.
 v0199-control-bringup = ["v0199-cpu0-role-selftest"]
 # Same diagnostic program inventory with the normative RAM topology; not G0.
@@ -62,6 +67,18 @@ ai-control-selftest = ["smp-selftest"]
 legacy-coreset = []
 # Four-core EL1 Ethernet driver bring-up only; no TLS/cluster certification.
 net-selftest = ["smp-selftest", "prototype-memory"]
+# SEC-N single-machine native deployment PREP (dependency + glue + guest
+# readiness), not the boot-chain dispatch. Pulls the relocated native smoltcp
+# Ethernet/IPv4/TCP stack and its VirtIO port boundary (device/tcp) that the
+# future EL1 Echo broker owns. It deliberately does NOT enable the `tls`
+# feature: rustls/ring require AArch64 NEON, and the EL1 kernel stays
+# aarch64-unknown-none-softfloat (six-tracks record forbids adding NEON to the
+# soft-float ABI). The pinned TLS session generation + Admission-bound service
+# glue (net-transport::service) therefore compiles for the EL0 guest target
+# aarch64-unknown-none and host tests, never for this soft-float closure.
+# Default builds never compile cyxia-net-transport. The smp.rs dispatch that
+# actually deploys user/local-echo is a separate, still-open gate.
+sec-n-native = ["dep:cyxia-net-transport", "cyxia-net-transport/smoltcp"]
 model-v13-selftest = ["smp-selftest", "prototype-memory"]
 storage-v13-selftest = ["smp-selftest", "prototype-memory"]
 tcp-v13-selftest = ["smp-selftest", "prototype-memory", "dep:cyxia-cluster-transport"]
@@ -110,6 +127,10 @@ cyxia-driver-virtio = { path = "../crates/driver-virtio" }
 cyxia-peer-billing = { path = "../crates/peer-billing", optional = true }
 sha2 = { version = "=0.10.9", default-features = false, optional = true }
 cyxia-cluster-transport = { path = "../crates/cluster-transport", optional = true }
+# Single-machine native transport (relocated smoltcp stack). Optional; only the
+# sec-n-native feature activates it, and only with the `smoltcp` feature so the
+# EL1 soft-float closure never pulls rustls/ring. See sec-n-native above.
+cyxia-net-transport = { path = "../crates/net-transport", optional = true }
 cyxia-prototype = { path = "../crates/prototype", features = ["hardware-sha256"] }
 cyxia-arch-aarch64 = { path = "../crates/arch-aarch64" }
 cyxia-platform-virt = { path = "../crates/platform-virt" }

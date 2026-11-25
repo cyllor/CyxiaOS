@@ -90,6 +90,7 @@ pub mod service_restart;
 pub mod role_manifest_v0199;
 pub mod task_admission;
 
+pub mod policy_lock_v0199;
 pub mod role_budget_v0199;
 
 pub mod feedback_v0199;

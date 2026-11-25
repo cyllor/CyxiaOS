@@ -67,7 +67,7 @@ class NetworkPieceTrace(unittest.TestCase):
     def test_real_tcp_stages_keep_original_idle_and_clock_error_boundaries(self):
         source = (ROOT / 'crates/cluster-transport/tests/network.rs').read_text()
         source = source.replace('struct Link {', 'struct Link {\n    trace: Vec<u64>,', 1)
-        if 'fn diagnostic_stage(' in (ROOT / 'crates/cluster-transport/src/device.rs').read_text():
+        if 'fn diagnostic_stage(' in (ROOT / 'crates/net-transport/src/device.rs').read_text():
             source = source.replace('impl Port for TestPort {', 'impl Port for TestPort {\nfn diagnostic_stage(&self,n:u64){self.link.borrow_mut().trace.push(n);}', 1)
         source += '''
 #[test]fn trace_fixed_tcp_stages_do_not_schedule_extra_pieces(){

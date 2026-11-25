@@ -12,6 +12,11 @@ cyxia-arch = { path = "../arch", optional = true }
 legacy-cluster = []
 # The engine consumes the wire codec, so it implies legacy-cluster.
 cluster-engine = ["legacy-cluster"]
+# Legacy D16 (OfferCpu/Placement) wire decode, offline evidence and old-media
+# inspection only. Without it the default decode rejects domain 16 cleanly.
+# Even with it, the native authorization gate (permitted_v0199_local) still
+# rejects D16 effects before any prepare/apply/publish.
+legacy-d16-decode = []
 hardware-sha256 = ["dep:cyxia-arch"]
 
 [[test]]

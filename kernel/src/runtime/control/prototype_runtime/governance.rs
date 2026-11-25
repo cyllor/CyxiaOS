@@ -1,11 +1,21 @@
 //! Immutable image identity and bounded address-space installation for the
 //! independent EL0 learning-governance coordinator.
 //!
-//! The boot self-test enters that image on the actual CPU1 C owner, verifies
-//! mapping faults and timer preemption, then revalidates a canonical `Wait`
-//! command in EL1. It grants no publication authority and shares the existing
-//! mandatory 61 ms / total 70 ms control budget rather than allocating another
-//! surplus.
+//! The boot self-test enters that image on the historical CPU1 fixture host,
+//! verifies mapping faults and timer preemption, then revalidates a canonical
+//! `Wait` command in EL1. It grants no publication authority and shares the
+//! existing mandatory 61 ms / total 70 ms control budget rather than allocating
+//! another surplus.
+//!
+//! RETIRED (V0.20 CPU0 cutover): the runtime self-test fundamentally requires the
+//! pre-cutover CPU1 control host. settle/step/quiescent gate on cpu::slot()==1,
+//! perform_runtime_turn binds credit.cpu==1 and control_owner_context(1), and the
+//! fixed authority admits control credit only on CONTROL_CPU (CPU0). begin_control
+//! therefore rejects this CPU1 host with Auth and control_owner_context(1) reports
+//! NotReady (CPU1 is now business), so the self-test is fail-closed, never silently
+//! promoted. The CPU1 bodies are retained unchanged because host harnesses
+//! (governance_turn, governance_billing_priority) replay them against a mocked CPU1
+//! scheduler; they are not a live control topology.
 use super::*;
 use crate::control_pool::{self as pool, Allocation, Lease};
 use core::cell::UnsafeCell;
@@ -513,6 +523,8 @@ fn runtime_resources() -> Result<&'static Resources, Error> {
     unsafe { (&*RESOURCES.0.get()).as_ref().ok_or(Error::NotReady) }
 }
 fn runtime_state() -> &'static mut Runtime {
+    // Pre-cutover CPU1 single-owner invariant (retired; see module note). The
+    // fixed CPU0 authority never grants this CPU1-hosted self-test control credit.
     debug_assert_eq!(cpu::slot(), 1);
     unsafe { &mut *RUNTIME.0.get() }
 }
@@ -801,6 +813,10 @@ fn prepare_runtime_snapshot(
     if runtime.context.is_some() || runtime.pins.iter().any(Option::is_some) {
         return Err(Error::Busy);
     }
+    // Pre-cutover CPU1 control-owner binding (retired). control_owner_context(1)
+    // reports NotReady now that CPU1 is business, and a CONTROL_CPU credit can
+    // never equal cpu==1, so this snapshot preparation fails closed under the
+    // fixed CPU0 authority. Retained for the host governance-turn harness.
     let (core_generation, ledger_generation) = crate::domain_tasks::control_owner_context(1)?;
     if credit.cpu != 1 || credit.core_generation != core_generation {
         return Err(Error::Stale);
@@ -935,6 +951,9 @@ fn settle_runtime_bill(runtime: &mut Runtime) -> bool {
 /// settlement succeeds. Mandatory input becoming ready must not bypass that
 /// old bill: it would otherwise keep the same control CPU permanently busy.
 pub(super) fn settle() -> bool {
+    // Pre-cutover CPU1 control host (retired; see module note). Kept at 1 for the
+    // host billing-priority harness; the fixed CPU0 authority never grants a CPU1
+    // worker control credit, so this settlement is inert in the native build.
     if cpu::slot() != 1 || !INITIALIZED.load(Ordering::Acquire) {
         return true;
     }
@@ -980,6 +999,9 @@ fn perform_runtime_turn(
 /// this role still owns the current idle scheduling opportunity; no Shadow,
 /// Canary or training work may borrow the same turn.
 pub(super) fn step(extra: &mut super::learning::Worker) -> bool {
+    // Pre-cutover CPU1 control host (retired; see module note). Kept at 1 for the
+    // host harnesses; the fixed CPU0 authority never grants a CPU1 worker control
+    // credit, so this self-test step is inert in the native build.
     if cpu::slot() != 1 || !INITIALIZED.load(Ordering::Acquire) {
         return false;
     }
@@ -1004,6 +1026,9 @@ pub(super) fn step(extra: &mut super::learning::Worker) -> bool {
         publish_runtime(runtime);
         return true;
     }
+    // Under the fixed CPU0 authority begin_control requires CONTROL_CPU and
+    // rejects this CPU1 host with Auth, so no self-test credit is ever granted
+    // natively; the role stays fail-closed. Retained for the host harness.
     let Ok(Some(credit)) = crate::domain_tasks::begin_control(RUNTIME_PREPAY_NS, false) else {
         publish_runtime(runtime);
         return true;
@@ -1045,6 +1070,8 @@ pub(super) fn step(extra: &mut super::learning::Worker) -> bool {
 /// may discard only a returned, unpinned self-test context; its physical bill
 /// must still settle first.
 pub(super) fn quiescent() -> bool {
+    // Pre-cutover CPU1 control host (retired; see module note). Kept at 1 for the
+    // host harnesses; inert under the fixed CPU0 authority.
     if cpu::slot() != 1 || !INITIALIZED.load(Ordering::Acquire) {
         return true;
     }

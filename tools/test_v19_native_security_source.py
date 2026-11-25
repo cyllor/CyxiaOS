@@ -204,7 +204,7 @@ class NativeSecurityWiring(unittest.TestCase):
         echo=source(ROOT / "crates/net-transport/src/echo.rs")
         tls=source(ROOT / "crates/net-transport/src/tls.rs")
         ingress=source(ROOT / "crates/net-transport/src/native_tcp.rs")
-        device=source(ROOT / "crates/cluster-transport/src/local_echo_tcp.rs")
+        device=source(ROOT / "crates/net-transport/src/local_echo_tcp.rs")
         admission=source(ROOT / "crates/net-transport/src/admission.rs")
         self.assertIn("pub(crate) fn next_frame_len(",echo)
         self.assertIn("next_frame_len(tls.plaintext())",admission)
@@ -227,9 +227,9 @@ class NativeSecurityWiring(unittest.TestCase):
     def test_sec_n_d_native_device_evidence_gates_connection_retirement(self):
         driver=source(ROOT / "crates/driver-virtio/src/net/batched.rs")
         single=source(ROOT / "crates/driver-virtio/src/net.rs")
-        port=source(ROOT / "crates/cluster-transport/src/device.rs")
-        tcp=source(ROOT / "crates/cluster-transport/src/tcp.rs")
-        adapter=source(ROOT / "crates/cluster-transport/src/local_echo_tcp.rs")
+        port=source(ROOT / "crates/net-transport/src/device.rs")
+        tcp=source(ROOT / "crates/net-transport/src/tcp.rs")
+        adapter=source(ROOT / "crates/net-transport/src/local_echo_tcp.rs")
         native=source(ROOT / "crates/net-transport/src/native_tcp.rs")
         ledger=source(ROOT / "crates/net-transport/src/admission.rs")
         self.assertIn("self.completed_tx.is_none() && self.tx.is_quiescent()",driver)
@@ -272,7 +272,7 @@ class NativeSecurityWiring(unittest.TestCase):
     def test_v019_freestanding_ring_uses_existing_native_crypto_patch(self):
         manifest = source(ROOT / "Cargo.toml")
         lock = source(ROOT / "Cargo.lock")
-        self.assertIn('ring = { path = "user/prototype-cluster/vendor/ring" }', manifest)
+        self.assertIn('ring = { path = "vendor/ring" }', manifest)
         self.assertIn('name = "ring"\nversion = "0.17.14"\ndependencies', lock)
         self.assertNotIn('name = "ring"\nversion = "0.17.14"\nsource = "registry+', lock)
 
@@ -368,6 +368,78 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("pub const IRQ_MAINTENANCE_RESERVE_NS: u64 = WINDOW_NS / 10;", scheduler)
         self.assertIn("pub const CPU_BUDGET_NS: u64 = WINDOW_NS - IRQ_MAINTENANCE_RESERVE_NS;", scheduler)
         self.assertIn("const _: () = assert!(CPU_BUDGET_NS + IRQ_MAINTENANCE_RESERVE_NS == WINDOW_NS);", scheduler)
+
+    def test_v020_wave6_structural_pins_policy_lock_budget_baseline(self):
+        # Wave 6: the G1 lock-chain scaffold keeps the frozen baseline budget
+        # split (45us effective work + 5us acquisition <= 50us IRQ-off total).
+        # Only the baseline constants are pinned; the metering counters are
+        # still being hardened this wave and are deliberately not pinned.
+        lock_path = ROOT / "crates/kernel-core/src/control_plane/policy_lock_v0199.rs"
+        self.assertTrue(lock_path.is_file())
+        lock = source(lock_path)
+        self.assertIn("pub mod policy_lock_v0199;", source(ROOT / "crates/kernel-core/src/control_plane/mod.rs"))
+        self.assertIn("pub const WORK_BUDGET_NS: u64 = 45_000;", lock)
+        self.assertIn("pub const IRQ_OFF_BUDGET_NS: u64 = 50_000;", lock)
+        self.assertIn("pub const ACQUISITION_BUDGET_NS: u64 = 5_000;", lock)
+
+    def test_v020_wave6_structural_pins_frame_meta_static_region_path(self):
+        # Wave 6: the bounded static FrameMeta path exists as structure only;
+        # the frames bridge wiring is still being rewritten this wave and is
+        # deliberately not pinned here.
+        meta_path = ROOT / "crates/kernel-core/src/frame_meta_v0199.rs"
+        self.assertTrue(meta_path.is_file())
+        meta = source(meta_path)
+        self.assertIn("pub fn initialize_static(", meta)
+        self.assertIn("regions: &[StaticRegion],", meta)
+        self.assertIn("pub struct StaticRegion {", meta)
+        self.assertIn("pub enum StaticClass {", meta)
+
+    def test_v020_wave6_structural_pins_advice_e2e_fixture_scope(self):
+        # Wave 6: the advice-chain E2E stays a fixture-scoped opt-in feature;
+        # production in-vector wiring is explicitly not claimed. The sec-n
+        # feature set in kernel/Cargo.toml is still being rewritten this wave
+        # and is deliberately not pinned here.
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        self.assertIn('v0199-advice-e2e-selftest = ["smp-selftest", "dep:sha2"]', manifest)
+        fixture_path = ROOT / "kernel/src/arch/aarch64/v0199_advice_e2e.rs"
+        self.assertTrue(fixture_path.is_file())
+        fixture = source(fixture_path)
+        self.assertIn("V0199_ADVICE_E2E_SCOPE production_wiring=false real_services=false fixture_executor=true", fixture)
+        self.assertTrue((ROOT / "tools/verify_v0199_advice_e2e.py").is_file())
+
+    def test_v020_wave6_structural_pins_net_transport_adapter_relocation(self):
+        # Wave 6: the SEC-N NativeSocket adapter lives in the active
+        # single-machine net-transport crate; cluster-transport is only a
+        # re-export facade and must not own a second adapter implementation.
+        adapter_path = ROOT / "crates/net-transport/src/local_echo_tcp.rs"
+        self.assertTrue(adapter_path.is_file())
+        adapter = source(adapter_path)
+        self.assertIn("Relocated from the excluded legacy cluster crate", adapter)
+        self.assertIn("impl<P: Port> NativeSocket for Tcp<'_, P>", adapter)
+        facade = source(ROOT / "crates/cluster-transport/src/lib.rs")
+        self.assertIn("pub use cyxia_net_transport", facade)
+        self.assertIn("pub use cyxia_net_transport::local_echo_tcp;", facade)
+        self.assertNotIn("impl<P: Port> NativeSocket", facade)
+
+    def test_v020_wave6_structural_pins_legacy_d16_decode_gate(self):
+        # Wave 6: the legacy D16 (OfferCpu/Placement) decode arms are opt-in
+        # only; the default decode rejects domain 16. The wire module lives at
+        # crates/prototype/src/policy_wire.rs (not under domains/).
+        manifest = source(ROOT / "crates/prototype/Cargo.toml")
+        self.assertIn("legacy-d16-decode = []", manifest)
+        wire = source(ROOT / "crates/prototype/src/policy_wire.rs")
+        self.assertIn('#[cfg(feature = "legacy-d16-decode")]\n        (16, 1) => Action::OfferCpu(u16_at(b, 2)?),', wire)
+        self.assertIn('#[cfg(feature = "legacy-d16-decode")]\n        (16, 2) => Action::Placement(u16_at(b, 2)?),', wire)
+        self.assertIn("_ => return Err(Error::Unsupported),", wire)
+
+    def test_v020_wave6_structural_pins_task_admission_legacy_scope_rename(self):
+        # Wave 6: the custody key's remote-task scope field is source-only
+        # legacy naming; the positional wire ABI is unchanged and the native
+        # single-machine profile carries no cluster runtime.
+        admission = source(ROOT / "crates/kernel-core/src/control_plane/task_admission.rs")
+        self.assertIn("pub legacy_remote_scope: [u8; 32],", admission)
+        self.assertIn("key.legacy_remote_scope == [0; 32]", admission)
+        self.assertNotIn("pub cluster:", admission)
 
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")

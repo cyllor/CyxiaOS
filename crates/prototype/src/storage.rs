@@ -23,12 +23,22 @@ pub const SNAPSHOT_STRIDE: u32 = 15;
 pub const BUSINESS_INODE_COUNT: u32 = 224;
 pub const SYSTEM_ROOT_INODE: u32 = 224;
 pub const BOOT_INODE: u32 = 225;
+/// Legacy media identity: inode numbers of the two reserved system volumes.
+/// Directory entries and inode validation on existing media reference these
+/// exact numbers, so the CLUSTER_* names are kept for disk compatibility even
+/// though the single-machine profile has no cluster runtime. Do not rename.
 pub const CLUSTER_INODES: [u32; 2] = [226, 227];
 pub const REQUEST_INODE: u32 = 228;
 pub const DATA_START: u32 = 4240;
 pub const SYSTEM_ROOT_BLOCK: u32 = DATA_START;
 pub const BOOT_BLOCK: u32 = DATA_START + 1;
+/// Legacy media identity: first block of the reserved-volume file region.
+/// On-disk extents point at these blocks; the name is format identity, not a
+/// live cluster concept. Do not rename.
 pub const CLUSTER_START: u32 = DATA_START + 2;
+/// Legacy media identity: fixed block reservation per reserved volume file.
+/// Existing inode extents and bitmap ownership depend on this exact size.
+/// Do not rename.
 pub const CLUSTER_FILE_BLOCKS: u32 = 2048;
 pub const SNAPSHOT_REQUEST_START: u32 = DATA_START + 4098;
 pub const SNAPSHOT_REQUEST_BLOCKS: u32 = 16;

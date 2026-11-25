@@ -4,7 +4,7 @@ use cyxia_kernel_core::control_plane::task_admission::{Authority, StartRequest, 
 fn custody_key() -> CustodyKey {
     CustodyKey {
         owner_boot: 1,
-        cluster: [4; 32],
+        legacy_remote_scope: [4; 32],
         requester: [5; 32],
         contract: [1; 16],
         request_hash: [6; 32],
@@ -29,7 +29,7 @@ fn custody_lookup_survives_service_disconnect_without_restoring_start_authority(
         let mut wrong = key;
         match field {
             0 => wrong.owner_boot += 1,
-            1 => wrong.cluster[0] ^= 1,
+            1 => wrong.legacy_remote_scope[0] ^= 1,
             2 => wrong.requester[0] ^= 1,
             3 => wrong.contract[0] ^= 1,
             _ => wrong.request_hash[0] ^= 1,

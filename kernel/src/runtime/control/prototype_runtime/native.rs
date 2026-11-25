@@ -1,5 +1,17 @@
 //! ABI3 native controller. One immutable job owns one isolated worker; physical
 //! costs survive C/B changes and are settled before the stop acknowledgement.
+//!
+//! RETIRED (V0.20 CPU0 cutover): this controller is the pre-cutover dynamic
+//! C={CPU1,CPU2} mechanism. The fixed authority admits control EL0 only on
+//! CONTROL_CPU (CPU0): begin_control rejects any CPU1/CPU2 worker with Auth, the
+//! fixed CoreSet (control={CPU0}) never offers a CPU1/CPU2 job opportunity in
+//! poll(), and control_owner_context still names the historical CPU1/CPU2 roots.
+//! The worker is therefore never admitted in the native fixed-CPU0 build — it is
+//! fail-closed, not silently promoted to a business core. The CPU1/CPU2 slot
+//! gates and bodies below are retained unchanged because host ordering/mutation
+//! harnesses (governance_priority, active_accept_retry, native_private_clear,
+//! v13_native_probe_slice) replay them against a mocked CPU1 scheduler; they are
+//! not a live control topology.
 use super::*;
 use cyxia_prototype::domains::{ApplyId, Error as DomainError, PolicyStamp, WINDOW_NS};
 
@@ -185,6 +197,9 @@ impl WorkerState {
 }
 fn credit_failure(worker: &Worker, bill: Bill, error: DomainError) {
     let slot = usize::from(bill.credit.cpu);
+    // Pre-cutover CPU1/CPU2 credit-failure evidence slots (retired). Control
+    // credit now lives only on CONTROL_CPU (CPU0), which this historical worker
+    // never reaches, so no native failure evidence is recorded here.
     if !matches!(slot, 1 | 2) {
         return;
     }
@@ -865,6 +880,12 @@ fn begin_measurement(
 }
 pub(super) fn step(worker: &mut Worker) {
     let slot = cpu::slot();
+    // Pre-cutover C={CPU1,CPU2} worker gate (retired; see module note). The fixed
+    // authority admits control credit only on CONTROL_CPU (CPU0), so begin_control
+    // below rejects this CPU1/CPU2 worker with Auth and no turn is ever prepaid
+    // natively. The gate is kept at 1|2 for the host ordering harness, which
+    // replays this body on a mocked CPU1 scheduler; it is fail-closed, not a live
+    // control path.
     if !matches!(slot, 1 | 2)
         || !READY.load(Ordering::Acquire)
         || !finish_measurement(worker)
@@ -1064,6 +1085,9 @@ fn publish(c: &mut Coordinator, now: u64) -> Result<(), DomainError> {
     crate::domain_tasks::memory_backing()?;
     put(61, 2);
     let failed = FAILED_CPUS.load(Ordering::Acquire);
+    // Pre-cutover CPU1/CPU2 suspect quarantine (retired). FAILED_CPUS is only set
+    // by the retired control worker, which the fixed CPU0 authority never admits,
+    // so it stays 0 natively and this loop is inert.
     for slot in 1..=2 {
         if failed & (1 << slot) != 0 && !c.owner.snapshot().suspect.contains(slot) {
             let _ = c.owner.suspect(slot);
@@ -1210,6 +1234,12 @@ fn core_turn(c: &mut Coordinator, tick: u64, now: u64) {
     );
 }
 fn core_action_turn(c: &mut Coordinator, tick: u64, now: u64, mut action: CoreAction) {
+    // Retired dynamic control-core migration: targets 2/6 are the pre-cutover
+    // CPU1 / CPU1+CPU2 control masks, and can/prepare_control_move(2) drained the
+    // historical CPU2 control core. Under the fixed control={CPU0} (mask 1) the
+    // equal-target branch above is the only coherent outcome; a 2/6 target is a
+    // pre-cutover request that propose() (a deterministic no-op) never hands off,
+    // so it expires fail-closed rather than moving control onto a business core.
     if action.result.is_none() && !action.started {
         let state = c.owner.snapshot();
         if action.target == state.control.bits()
@@ -1417,6 +1447,11 @@ pub(super) fn poll(c: &mut Coordinator) {
             & !state.suspect.bits()
             & !state.draining.bits()
             & !FAILED_CPUS.load(Ordering::Acquire);
+        // Pre-cutover CPU1/CPU2 round-robin opportunity selection (retired). The
+        // fixed CoreSet has control={CPU0}, so `available` never contains CPU1 or
+        // CPU2 and slot is always 0: no legacy control job opportunity is ever
+        // published under the fixed CPU0 authority. This is the fail-closed reason
+        // the retired worker above is never dispatched.
         let slot = if available & (1 << c.native.next_cpu) != 0 {
             c.native.next_cpu
         } else if available & 2 != 0 {

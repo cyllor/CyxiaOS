@@ -127,6 +127,40 @@ impl<const C: usize, const D: usize> Manager<C, D> {
             },
         )
     }
+    /// Metered variant of [`Self::review_brains`] — demonstration wiring of
+    /// the G1 lock-chain freeze scaffolding ([`super::policy_lock_v0199`]).
+    /// This engine has no trusted live clock (every `now` is caller-supplied),
+    /// so the caller provides the monotonic section entry `now` and the
+    /// observed completion `done_ns`. The review itself is unchanged: same
+    /// checks, same result, same error semantics on the happy path. The
+    /// elapsed interval is charged to the effective-work budget (≤45μs, spec
+    /// L1542); an overrun latches a sticky fail-closed fault in the meter and
+    /// closes further metered admission — it never panics and never alters
+    /// the review outcome. A regressing `done_ns` keeps the scope open
+    /// (Error::Clock) rather than inventing a duration. The production
+    /// policy_lock object and IRQ-off enforcement points remain the G1
+    /// freeze's deliverable, not this scaffold.
+    // Mirrors review_brains' exact engine signature plus the caller-supplied
+    // meter; a parameter struct would diverge from the established API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn review_brains_metered<const A: usize>(
+        &self,
+        meter: &mut super::policy_lock_v0199::CriticalSectionMeter,
+        pair: &super::fixed::Pair,
+        rules: &super::advisory::Controller<A>,
+        domain: usize,
+        subject: Identity,
+        now: u64,
+        done_ns: u64,
+    ) -> Result<super::fixed::Review, Error> {
+        meter.begin(super::policy_lock_v0199::SectionKind::EffectiveWork, now)?;
+        let review = self.review_brains(pair, rules, domain, subject, now);
+        // Settle even when the review failed: the elapsed interval is real
+        // either way. The settlement's overrun class is diagnostic; the
+        // review result is returned verbatim.
+        meter.end(done_ns)?;
+        review
+    }
     pub const fn epochs(&self) -> Epochs {
         self.epochs
     }
@@ -376,5 +410,128 @@ impl<const C: usize, const D: usize> Manager<C, D> {
         self.policy_limits = policy_limits;
         self.epochs.resources = limits.resource_epoch;
         self.sync(now)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control_plane::advisory::{Controller, Rule};
+    use crate::control_plane::fixed::Pair;
+    use crate::control_plane::policy_lock_v0199::{
+        CriticalSectionMeter, Fault, SectionKind, WORK_BUDGET_NS,
+    };
+
+    fn limits() -> Limits {
+        Limits {
+            resource_epoch: 1,
+            min_control_cores: 1,
+            min_control_capacity: 100,
+            min_business_capacity: 100,
+            committed_business_capacity: 100,
+            protected_control: 0,
+            protected_business: 0,
+            cooldown_ticks: 3,
+        }
+    }
+    fn id(n: u64) -> Identity {
+        Identity {
+            id: n,
+            generation: 1,
+        }
+    }
+    fn epochs() -> Epochs {
+        Epochs {
+            boot: 1,
+            controller: 1,
+            model: 1,
+            resources: 1,
+            cores: 1,
+        }
+    }
+    fn manager() -> Manager<4, 16> {
+        let ownership = Ownership::<4>::new_fixed(15, [100; 4], [1, 2, 4, 8], limits()).unwrap();
+        let policy_limits = policy::Limits {
+            max_units: 8,
+            max_budget_ticks: 4,
+            max_lifetime: 100,
+            allowed_cpus: 15,
+        };
+        Manager::new_fixed(ownership, id(10), epochs(), limits(), [policy_limits; 16]).unwrap()
+    }
+    fn rules() -> Controller<15> {
+        Controller::new(
+            [Rule {
+                baseline: 2,
+                options: &[1, 2, 4],
+            }; 15],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn metered_review_matches_unmetered_on_happy_path() {
+        let m = manager();
+        let pair = Pair::new(id(100), id(200)).unwrap();
+        let rules = rules();
+        let mut meter = CriticalSectionMeter::new();
+        let plain = m.review_brains(&pair, &rules, 1, id(20), 10).unwrap();
+        let metered = m
+            .review_brains_metered(&mut meter, &pair, &rules, 1, id(20), 10, 10 + 1_000)
+            .unwrap();
+        assert_eq!(plain, metered);
+        assert_eq!(meter.settled_count(), 1);
+        assert_eq!(meter.overrun_count(), 0);
+        assert!(!meter.faulted());
+        assert_eq!(meter.active_kind(), None);
+    }
+
+    #[test]
+    fn metered_review_overrun_latches_fault_without_changing_result() {
+        let m = manager();
+        let pair = Pair::new(id(100), id(200)).unwrap();
+        let rules = rules();
+        let mut meter = CriticalSectionMeter::new();
+        let plain = m.review_brains(&pair, &rules, 1, id(20), 10).unwrap();
+        let done = 10 + WORK_BUDGET_NS + 1;
+        // Overrun is diagnostic: the review outcome is returned verbatim.
+        let metered = m
+            .review_brains_metered(&mut meter, &pair, &rules, 1, id(20), 10, done)
+            .unwrap();
+        assert_eq!(plain, metered);
+        assert!(meter.faulted());
+        assert_eq!(meter.overrun_count(), 1);
+        assert!(matches!(
+            meter.fault(),
+            Some(Fault::BudgetOverrun {
+                kind: SectionKind::EffectiveWork,
+                ..
+            })
+        ));
+        // Fail-closed: further metered admission is denied, while the
+        // unmetered production path keeps its existing behavior.
+        assert_eq!(
+            m.review_brains_metered(&mut meter, &pair, &rules, 1, id(20), done, done + 1),
+            Err(Error::Denied)
+        );
+        assert_eq!(
+            m.review_brains(&pair, &rules, 1, id(20), done).unwrap(),
+            plain
+        );
+    }
+
+    #[test]
+    fn metered_review_regressing_completion_clock_keeps_scope_open() {
+        let m = manager();
+        let pair = Pair::new(id(100), id(200)).unwrap();
+        let rules = rules();
+        let mut meter = CriticalSectionMeter::new();
+        assert_eq!(
+            m.review_brains_metered(&mut meter, &pair, &rules, 1, id(20), 100, 99),
+            Err(Error::Clock)
+        );
+        assert_eq!(meter.active_kind(), Some(SectionKind::EffectiveWork));
+        assert!(!meter.faulted());
+        assert_eq!(meter.settled_count(), 0);
     }
 }

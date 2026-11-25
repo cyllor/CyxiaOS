@@ -20,6 +20,7 @@ pub enum Error {
 
 pub mod device;
 pub mod file;
+pub mod file_auth_context_v1;
 pub mod file_auth_v3;
 pub mod file_index_v0199;
 pub mod file_media_v0199;

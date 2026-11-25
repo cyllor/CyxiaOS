@@ -21,7 +21,11 @@ lto = true
 codegen-units = 1
 
 # One audited native TLS crypto implementation for host and AArch64 guests.
-# Existing V0.18 no-std ring patch supplies the freestanding AArch64 assembly
-# omitted by the registry build. This path is *not* the cluster engine.
+# Registry ring 0.17.14 lacks the freestanding AArch64 assembly required by the
+# soft-float bare-metal targets (docs/implementation/v19-security-six-tracks.md),
+# so the audited V0.18 no-std vendored copy is patched in. Relocated from
+# user/prototype-cluster/vendor/ring to this neutral repo-root path: V0.20 is
+# single-machine, so de-distribution must be able to delete user/prototype-cluster
+# without touching TLS crypto. Ring version and content are unchanged.
 [patch.crates-io]
-ring = { path = "user/prototype-cluster/vendor/ring" }
+ring = { path = "vendor/ring" }

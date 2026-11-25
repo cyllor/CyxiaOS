@@ -1,11 +1,13 @@
 //! V0.19 isolated readonly Echo adapter over the existing native smoltcp TCP
 //! implementation. This reuses *only* TCP/TLS transport, never cluster wire,
 //! membership, remote placement, resource grants or cluster discovery.
+//! Relocated from the excluded legacy cluster crate so the active
+//! single-machine network crate owns the native SEC-N adapter.
 use crate::{
     device::Port,
+    native_tcp::{NativeSocket, SocketError},
     tcp::{self, Tcp},
 };
-use cyxia_net_transport::native_tcp::{NativeSocket, SocketError};
 fn map_error(error: tcp::Error) -> SocketError {
     match error {
         tcp::Error::WouldBlock => SocketError::Again,
