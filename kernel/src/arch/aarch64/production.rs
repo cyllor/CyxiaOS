@@ -96,6 +96,8 @@ use sha2::{Digest, Sha256};
 
 #[path = "production/evidence.rs"]
 mod evidence;
+#[path = "production/frames.rs"]
+mod frames;
 
 // The production skeleton owns the CPU0 EL0 turn loop and the in-vector dispatch
 // path; it must not be combined with another profile that also hijacks CPU0 or
@@ -1200,6 +1202,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         0,
         "only boot CPU0 owns the production control plane"
     );
+    frames::register_or_fatal();
     // ---- SMP bring-up: mirrors smp::run's proven secondary-start path ----
     if info.cpu_count != REQUIRED {
         report(
@@ -1832,6 +1835,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     // tasks fill their own rows through evidence::put before this seal.
     evidence::put(evidence::W11_BASE, evidence::W11_MAGIC);
     evidence::put(evidence::W11_STAGED_BOOT_EPOCH, 1);
+    frames::publish();
     words.words[2].store(1, Ordering::Release);
     // Framed UART payloads are capped at 96 bytes; keep the scope marker short.
     // in_vector_dispatch / staged_boot_epoch / fixture_executor are proven by the

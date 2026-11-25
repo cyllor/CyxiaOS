@@ -34,6 +34,8 @@ pub const COUNT: usize = 262144;
 pub const RAM_BYTES: u64 = COUNT as u64 * PAGE;
 pub const TABLE_BYTES: usize = COUNT * 40;
 pub const POOL_BYTES: u64 = 8 * 1024 * 1024;
+/// Region-record capacity of a sparse static ledger.
+pub const MAX_STATIC_REGIONS: usize = 16;
 const NONE: u32 = u32::MAX;
 const STATE: u32 = 7;
 const FREE: u32 = 0;
@@ -154,7 +156,7 @@ pub struct Ledger<'a> {
     rows: &'a mut [FrameMeta],
     arena: u32,
     firmware_extra: u32,
-    fixed: [MemoryRegion; 4],
+    fixed: [MemoryRegion; MAX_STATIC_REGIONS],
     fixed_total: u32,
     // Bounded static mode: the table covers exactly `fixed_count` registered
     // permanent regions tiling the whole row window; there is no ordinary
@@ -165,7 +167,7 @@ pub struct Ledger<'a> {
     // ordinary reserve/handle lifecycle is refused.
     pool_mode: bool,
     fixed_count: usize,
-    classes: [StaticClass; 4],
+    classes: [StaticClass; MAX_STATIC_REGIONS],
 }
 fn span(r: MemoryRegion, base: u64) -> Result<(usize, usize), Error> {
     let end = r.end().map_err(|_| Error::Invalid)?;
@@ -181,6 +183,40 @@ fn span(r: MemoryRegion, base: u64) -> Result<(usize, usize), Error> {
         ((r.start.0 - base) / PAGE) as usize,
         ((end - base) / PAGE) as usize,
     ))
+}
+type SparseRecords = (
+    [MemoryRegion; MAX_STATIC_REGIONS],
+    [StaticClass; MAX_STATIC_REGIONS],
+    u32,
+);
+/// Validate sparse static regions against `[base, limit)` and build the
+/// region records; publishes nothing.
+fn sparse_records(base: u64, limit: u64, regions: &[StaticRegion]) -> Result<SparseRecords, Error> {
+    let mut fixed = [MemoryRegion::EMPTY; MAX_STATIC_REGIONS];
+    let mut classes = [StaticClass::Arena; MAX_STATIC_REGIONS];
+    let mut total = 0u32;
+    for (i, sr) in regions.iter().enumerate() {
+        let r = sr.region;
+        let end = r.end().map_err(|_| Error::Invalid)?;
+        if r.len == 0
+            || !r.start.0.is_multiple_of(PAGE)
+            || !r.len.is_multiple_of(PAGE)
+            || r.start.0 < base
+            || end > limit
+            || r.kind != RegionKind::Reserved
+        {
+            return Err(Error::Invalid);
+        }
+        if fixed[..i].iter().any(|p| p.overlaps(r)) {
+            return Err(Error::Conflict);
+        }
+        fixed[i] = r;
+        classes[i] = sr.class;
+        total = total
+            .checked_add((r.len / PAGE) as u32)
+            .ok_or(Error::Capacity)?;
+    }
+    Ok((fixed, classes, total))
 }
 impl<'a> Ledger<'a> {
     /// fixed = actual pinned boot/kernel/DMA arena, FrameMeta table,
@@ -252,17 +288,19 @@ impl<'a> Ledger<'a> {
             }
         }
         let arena = (fixed[0].len / PAGE) as u32;
+        let mut records = [MemoryRegion::EMPTY; MAX_STATIC_REGIONS];
+        records[..4].copy_from_slice(&fixed);
         let l = Self {
             base,
             rows,
             arena,
             firmware_extra,
-            fixed,
+            fixed: records,
             fixed_total: total + firmware_extra,
             static_mode: false,
             pool_mode: false,
             fixed_count: 4,
-            classes: [StaticClass::Arena; 4],
+            classes: [StaticClass::Arena; MAX_STATIC_REGIONS],
         };
         l.inventory()?;
         Ok(l)
@@ -295,8 +333,8 @@ impl<'a> Ledger<'a> {
         {
             return Err(Error::Invalid);
         }
-        let mut fixed = [MemoryRegion::EMPTY; 4];
-        let mut classes = [StaticClass::Arena; 4];
+        let mut fixed = [MemoryRegion::EMPTY; MAX_STATIC_REGIONS];
+        let mut classes = [StaticClass::Arena; MAX_STATIC_REGIONS];
         let mut total = 0u32;
         for (i, sr) in regions.iter().enumerate() {
             let r = sr.region;
@@ -330,6 +368,53 @@ impl<'a> Ledger<'a> {
             let b = ((r.end().map_err(|_| Error::Invalid)? - base) / PAGE) as usize;
             rows[a..b].fill(FrameMeta::unowned(PERMANENT, 0));
         }
+        let l = Self {
+            base,
+            rows,
+            arena: 0,
+            firmware_extra: 0,
+            fixed,
+            fixed_total: total,
+            static_mode: true,
+            pool_mode: false,
+            fixed_count: regions.len(),
+            classes,
+        };
+        l.inventory()?;
+        Ok(l)
+    }
+    /// Sparse bounded static initialization: register up to
+    /// [`MAX_STATIC_REGIONS`] disjoint, Reserved, page-aligned regions
+    /// (any order) inside the table window `[base, base + rows*PAGE)`. Unlike
+    /// [`Self::initialize_static`] the regions need not tile the window:
+    /// every gap row is also published unowned PERMANENT (so `reserve` can
+    /// never hand it out), but gaps are not registered and count toward no
+    /// [`StaticClass`] tally. Registered pages = sum of the class tallies.
+    /// Overlaps reject with Conflict, an empty/oversized region list or any
+    /// out-of-window or malformed region with Invalid, a non-empty table
+    /// with Busy; no row is published on any error.
+    pub fn initialize_static_sparse(
+        rows: &'a mut [FrameMeta],
+        base: u64,
+        regions: &[StaticRegion],
+    ) -> Result<Self, Error> {
+        let window = (rows.len() as u64)
+            .checked_mul(PAGE)
+            .ok_or(Error::Invalid)?;
+        let limit = base.checked_add(window).ok_or(Error::Invalid)?;
+        if rows.is_empty()
+            || rows.len() > COUNT
+            || !base.is_multiple_of(PAGE)
+            || regions.is_empty()
+            || regions.len() > MAX_STATIC_REGIONS
+        {
+            return Err(Error::Invalid);
+        }
+        let (fixed, classes, total) = sparse_records(base, limit, regions)?;
+        if rows.iter().any(|r| *r != FrameMeta::ZERO) {
+            return Err(Error::Busy);
+        }
+        rows.fill(FrameMeta::unowned(PERMANENT, 0));
         let l = Self {
             base,
             rows,
@@ -424,12 +509,12 @@ impl<'a> Ledger<'a> {
             rows,
             arena: 0,
             firmware_extra: 0,
-            fixed: [MemoryRegion::EMPTY; 4],
+            fixed: [MemoryRegion::EMPTY; MAX_STATIC_REGIONS],
             fixed_total: 0,
             static_mode: false,
             pool_mode: true,
             fixed_count: 0,
-            classes: [StaticClass::Arena; 4],
+            classes: [StaticClass::Arena; MAX_STATIC_REGIONS],
         };
         l.inventory()?;
         Ok(l)
@@ -467,7 +552,12 @@ impl<'a> Ledger<'a> {
                 return Err(Error::Conflict);
             }
         }
-        if counts.iter().sum::<u32>() != self.rows.len() as u32 || counts[4] < self.fixed_total {
+        // A static ledger (tiled or sparse) has no ordinary pool: every row
+        // in its window must be PERMANENT.
+        if counts.iter().sum::<u32>() != self.rows.len() as u32
+            || counts[4] < self.fixed_total
+            || self.static_mode && counts[4] != self.rows.len() as u32
+        {
             return Err(Error::Conflict);
         }
         let (arena, firmware_extra, metadata, control, progress) = if self.pool_mode {
@@ -1154,6 +1244,127 @@ mod tests {
             Err(Error::Invalid)
         ));
         assert!(rows.iter().all(|r| *r == FrameMeta::ZERO));
+    }
+    const P: u64 = 4096;
+    // Production-like sparse shape: unsorted, mixed classes, three gaps.
+    fn sparse_shape() -> [StaticRegion; 4] {
+        [
+            static_region(10 * P, 2 * P, StaticClass::Metadata),
+            static_region(0, 2 * P, StaticClass::Control),
+            static_region(3 * P, P, StaticClass::Control),
+            static_region(6 * P, 3 * P, StaticClass::Metadata),
+        ]
+    }
+    #[test]
+    fn sparse_gaps_are_permanent_but_unregistered() {
+        // Window 12 rows; registered 2+1+3+2 = 8; gaps rows 2, 4..6, 9 = 4.
+        let mut rows = std::vec![FrameMeta::ZERO;12];
+        let l = Ledger::initialize_static_sparse(&mut rows, 0x40000000, &sparse_shape()).unwrap();
+        let inv = l.inventory().unwrap();
+        assert_eq!(inv.permanent, 12);
+        assert_eq!(inv.free, 0);
+        assert_eq!(inv.metadata, 5);
+        assert_eq!(inv.control, 3);
+        assert_eq!(inv.arena + inv.firmware_extra + inv.progress, 0);
+        let registered = inv.arena + inv.firmware_extra + inv.metadata + inv.control + inv.progress;
+        assert_eq!(registered, 8);
+        drop(l);
+        // Every row, gap or registered, is unowned PERMANENT.
+        assert!(rows.iter().all(|r| *r == FrameMeta::unowned(PERMANENT, 0)));
+    }
+    #[test]
+    fn sparse_reserve_never_returns_gap_or_registered_rows() {
+        let mut rows = std::vec![FrameMeta::ZERO;12];
+        let mut l =
+            Ledger::initialize_static_sparse(&mut rows, 0x40000000, &sparse_shape()).unwrap();
+        let before = l.inventory().unwrap();
+        for slot in 1..=16 {
+            assert_eq!(
+                l.reserve(Owner {
+                    slot,
+                    generation: 1,
+                }),
+                Err(Error::Capacity)
+            );
+        }
+        assert_eq!(l.inventory().unwrap(), before);
+    }
+    #[test]
+    fn sparse_overlap_rejects_whole_registration() {
+        let mut rows = std::vec![FrameMeta::ZERO;12];
+        // Overlap is with an earlier-listed, higher region (unsorted input).
+        assert!(matches!(
+            Ledger::initialize_static_sparse(
+                &mut rows,
+                0x40000000,
+                &[
+                    static_region(6 * P, 3 * P, StaticClass::Metadata),
+                    static_region(0, 2 * P, StaticClass::Control),
+                    static_region(8 * P, 2 * P, StaticClass::Control),
+                ],
+            ),
+            Err(Error::Conflict)
+        ));
+        assert!(rows.iter().all(|r| *r == FrameMeta::ZERO));
+    }
+    #[test]
+    fn sparse_rejects_out_of_window_and_bad_geometry() {
+        let mut rows = std::vec![FrameMeta::ZERO;4];
+        let base = 0x40000000;
+        for bad in [
+            static_region(3 * P, 2 * P, StaticClass::Control),
+            StaticRegion {
+                region: MemoryRegion {
+                    start: PhysAddr(base - P),
+                    len: P,
+                    kind: RegionKind::Reserved,
+                },
+                class: StaticClass::Control,
+            },
+            static_region(1, P, StaticClass::Control),
+            static_region(0, 0, StaticClass::Control),
+            StaticRegion {
+                region: MemoryRegion {
+                    kind: RegionKind::Ram,
+                    ..region(0, P)
+                },
+                class: StaticClass::Control,
+            },
+        ] {
+            assert_eq!(
+                Ledger::initialize_static_sparse(&mut rows, base, &[bad]).err(),
+                Some(Error::Invalid)
+            );
+        }
+        assert_eq!(
+            Ledger::initialize_static_sparse(&mut rows, base, &[]).err(),
+            Some(Error::Invalid)
+        );
+        assert!(rows.iter().all(|r| *r == FrameMeta::ZERO));
+        // Re-registration over published rows fails closed.
+        let one = [static_region(0, P, StaticClass::Control)];
+        assert!(Ledger::initialize_static_sparse(&mut rows, base, &one).is_ok());
+        assert_eq!(
+            Ledger::initialize_static_sparse(&mut rows, base, &one).err(),
+            Some(Error::Busy)
+        );
+    }
+    #[test]
+    fn sparse_more_than_16_regions_rejected() {
+        let mut rows = std::vec![FrameMeta::ZERO;40];
+        let many: std::vec::Vec<StaticRegion> = (0..17)
+            .map(|i| static_region(2 * i * P, P, StaticClass::Control))
+            .collect();
+        assert_eq!(
+            Ledger::initialize_static_sparse(&mut rows, 0x40000000, &many).err(),
+            Some(Error::Invalid)
+        );
+        assert!(rows.iter().all(|r| *r == FrameMeta::ZERO));
+        // Exactly 16 disjoint regions are accepted.
+        let l = Ledger::initialize_static_sparse(&mut rows, 0x40000000, &many[..16]).unwrap();
+        let inv = l.inventory().unwrap();
+        assert_eq!(inv.control, 16);
+        assert_eq!(inv.permanent, 40);
     }
     #[test]
     fn static_pages_refuse_lifecycle_and_reclaim() {
