@@ -48,6 +48,25 @@ impl DesiredBank{
     }
     pub fn version(&self)->u64{self.version}
     pub fn fence_publications(&mut self){self.fenced=true;}
+    /// Controller-epoch replacement is deliberately narrower than an
+    /// arbitrary registry reset. The native owner must prove the old
+    /// controller/publisher are stopped or fenced, all retained plans
+    /// have settled, and every target policy has safely returned to its
+    /// deterministic fallback. No active work or global version is erased.
+    pub fn replace_controller(&mut self,old_epoch:u64,next_epoch:u64,next_publisher:Identity,now:u64,
+        verify_handoff:impl FnOnce(u64,u64,Identity,Identity,u64)->Result<(),Error>)->Result<(),Error>{
+        self.clock(now)?;
+        if self.boot==0||!self.fenced{return Err(Error::NotReady);}
+        if old_epoch!=self.controller||old_epoch.checked_add(1)!=Some(next_epoch)
+            ||!next_publisher.valid()||next_publisher.id!=self.publisher.id
+            ||next_publisher.generation<self.publisher.generation{return Err(Error::Stale);}
+        if self.slots.iter().flatten().any(|r|r.pending.is_some()||r.no_effect.is_some()){
+            return Err(Error::Busy);
+        }
+        verify_handoff(old_epoch,next_epoch,self.publisher,next_publisher,self.version)?;
+        self.controller=next_epoch;self.publisher=next_publisher;self.plan_hi=0;
+        self.last_ns=now;self.fenced=false;Ok(())
+    }
     fn ready(&self,now:u64)->Result<(),Error>{
         if self.boot==0||self.fenced{return Err(Error::NotReady);}
         self.clock(now)
@@ -268,6 +287,33 @@ mod tests{
         ApplyReportV1{key:w.key,action_index:w.action_index,domain_id:w.domain,target:w.target,
             executor_generation:w.executor_generation,plan_version:w.plan_version,state,
             result:if state==ActionStatus::Applied{0}else{-7},completed_ns:140,action:w.payload}
+    }
+    #[test]
+    fn epoch_replacement_cannot_discard_pending_or_reset_global_version(){
+        let mut b=DesiredBank::empty();b.bind_boot(1,1,PUB,||Ok(())).unwrap();
+        let t=binding(15);b.register_target(t,|_|Ok(())).unwrap();
+        let (p,n)=plan(1,0,false);
+        b.publish_registered(PUB,0,&p[..n],scope(0),|_|Ok(())).unwrap();
+        assert_eq!(b.replace_controller(1,2,PUB,130,|_,_,_,_,_|panic!()),Err(Error::NotReady));
+        b.fence_publications();
+        assert_eq!(b.replace_controller(1,2,PUB,130,|_,_,_,_,_|panic!()),Err(Error::Busy));
+        let terminal=report(work(15,0),ActionStatus::Cancelled);
+        b.seal_unaccepted(&terminal,ReportOrigin::Kernel,140,|_|Ok(())).unwrap();
+        b.finish(&terminal,ReportOrigin::Kernel,141,|_|Ok(())).unwrap();
+        let next=Identity{generation:2,..PUB};
+        assert_eq!(b.replace_controller(1,2,next,142,|_,_,_,_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        assert_eq!(b.version(),1);
+        b.replace_controller(1,2,next,143,|a,z,old,new,v|{
+            assert_eq!((a,z,old,new,v),(1,2,PUB,next,1));Ok(())
+        }).unwrap();
+        let (mut p,n)=plan(1,1,false);
+        let sc=TrustedRegistrationScope{controller_epoch:2,now_ns:150,..scope(1)};
+        assert_eq!(b.publish_registered(next,0,&p[..n],sc,|_|panic!()),Err(Error::Stale));
+        p[40..48].copy_from_slice(&2u64.to_le_bytes());
+        p[80..88].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(b.publish_registered(PUB,0,&p[..n],sc,|_|panic!()),Err(Error::Denied));
+        assert_eq!(b.publish_registered(next,0,&p[..n],sc,|_|Ok(())),Ok(2));
+        assert_eq!(b.version(),2);
     }
     #[test]
     fn publication_atomic_global_version_and_exact_per_target_custody(){
