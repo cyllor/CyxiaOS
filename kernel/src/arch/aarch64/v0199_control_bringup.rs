@@ -349,19 +349,40 @@ fn sync_code(addr:u64,bytes:usize){
     }
     unsafe{core::arch::asm!("dsb ish","ic ialluis","dsb ish","isb",options(nostack));}
 }
-fn tlbi(){
-    unsafe{core::arch::asm!("dsb ishst","tlbi vmalle1is","dsb ish","isb",options(nostack));}
+/// The high RAM direct map is a global 4KiB leaf mapping. Invalidate
+/// the changed VA for ALL ASIDs in the inner-shareable domain, not
+/// every unrelated RAM translation on every seal/unseal. Keep the full
+/// BBM barriers and do not use a last-level-only TLBI shortcut.
+fn invalidate_high_page(pa:u64){
+    let va=pa.checked_add(super::super::HIGH).expect("direct map VA");
+    assert_eq!(va%4096,0);
+    // AArch64 VAAE1IS operand VA[55:12], bits[63:44] RES0.
+    let operand=(va>>12)&((1u64<<44)-1);
+    unsafe{core::arch::asm!("dsb ishst","tlbi vaae1is, {}","dsb ish","isb",
+        in(reg)operand,options(nostack));}
+}
+/// Low user leaves are all nG and the role ASID is boot-unique.
+/// The architectural root disconnection still precedes this broadcast
+/// all-level invalidation, and all barriers precede any frame reuse.
+fn invalidate_role_root(index:usize,bank:usize){
+    let tcr:u64;
+    unsafe{core::arch::asm!("mrs {}, tcr_el1",out(reg)tcr,options(nomem,nostack));}
+    // This locked 39-bit/4KiB profile selects an 8-bit TTBR0 ASID.
+    assert_eq!(tcr&((1<<36)|(1<<22)),0,"TTBR0 8-bit ASID contract");
+    let operand=u64::from(role_asid(index,bank))<<48;
+    unsafe{core::arch::asm!("dsb ishst","tlbi aside1is, {}","dsb ish","isb",
+        in(reg)operand,options(nostack));}
 }
 fn seal_page(pa:u64){
     let leaf=high_leaf(pa);
     let old=unsafe{core::ptr::read_volatile(leaf)};
     assert_eq!(old,pa|0x0060_0000_0000_0703);
-    // Real break-before-make; secondary business cores never own these
-    // pages, but stale direct-map translations are invalidated globally.
+    // Real break-before-make, globally shared high VA invalidation.
+    // No user root is published while a page is being sealed.
     unsafe{core::ptr::write_volatile(leaf,0);}
-    tlbi();
+    invalidate_high_page(pa);
     unsafe{core::ptr::write_volatile(leaf,old|(1<<7));}
-    tlbi();
+    invalidate_high_page(pa);
 }
 fn load(index:usize,generation:u64,bank:usize)->(NativeRole,Running){
     load_checkpointed(index,generation,bank,||{})
@@ -449,7 +470,9 @@ fn load_checkpointed(index:usize,generation:u64,bank:usize,mut checkpoint:impl F
     checkpoint();
     // Guard and image holes have never had user mappings.
     assert_eq!(unsafe{(*t).leaf.0[STACK_BASE as usize/PAGE-1]},0);
-    tlbi();
+    // No low global mapping is admitted by this loader.
+    assert!(unsafe{(*t).leaf.0.iter().all(|&p|p==0||p&(1<<11)!=0)});
+    invalidate_role_root(index,bank);
     let member=NativeRole{role,actor,ttbr0_root:root_pa(index,bank),
         // Charge the full physically reserved image, including its RX/RO
         // pages and holes, not only mapped RW bytes.
@@ -679,8 +702,9 @@ fn retire_root(index:usize,bank:usize){
 }
 fn retire_root_checkpointed(index:usize,bank:usize,mut checkpoint:impl FnMut()){
     let t=tables(index,bank);
+    assert!(unsafe{(*t).leaf.0.iter().all(|&p|p==0||p&(1<<11)!=0)});
     unsafe{core::ptr::write_volatile(core::ptr::addr_of_mut!((*t).root.0[0]),0);}
-    tlbi();
+    invalidate_role_root(index,bank);
     checkpoint();
     // Root disconnected and context returned; all former leaf entries are
     // now inaccessible. This is not proof of a general production DMA join.
@@ -697,8 +721,8 @@ fn retire_root_checkpointed(index:usize,bank:usize,mut checkpoint:impl FnMut()){
         let old=unsafe{core::ptr::read_volatile(leaf)};
         assert!(old==rw||old==rw|(1<<7));
         if old!=rw{
-            unsafe{core::ptr::write_volatile(leaf,0);}tlbi();
-            unsafe{core::ptr::write_volatile(leaf,rw);}tlbi();
+            unsafe{core::ptr::write_volatile(leaf,0);}invalidate_high_page(pa);
+            unsafe{core::ptr::write_volatile(leaf,rw);}invalidate_high_page(pa);
         }
         checkpoint();
     }
