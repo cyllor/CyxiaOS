@@ -445,7 +445,7 @@ class EpochFixture:
         owner_raw=owner_path.read_bytes()
         require(len(owner_raw)==owner_bytes,'incomplete effect owner physical dump')
         custody=owner_raw[off:off+size]
-        for d,r in ((page[175*8:207*8],page[207*8:207*8+w[99]]),
+        for d,r in ((page[175*8:207*8],page[207*8:207*8+w[98]]),
                     (page[315*8:347*8],page[347*8:347*8+w[239]])):
             require(len(d)==256 and len(r)==98 and custody.count(d)==1 and custody.count(r)==1,
                     'actual feedback table missing or duplicating exact retained effect bytes')
