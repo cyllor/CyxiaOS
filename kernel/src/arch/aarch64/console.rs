@@ -79,7 +79,25 @@ pub(crate) fn try_log(s: &[u8]) -> Result<(), PlatformError> {
 }
 pub(crate) fn halt() -> ! {
     loop {
-        unsafe { core::arch::asm!("msr daifset, #15", "wfe") }
+        // v020-production parks with WFI. QEMU TCG implements WFE as a yield
+        // hint that never sleeps the vCPU, so every CPU parked here burned one
+        // host core for the rest of the boot; with the three halted business
+        // CPUs that starved QEMU's device-completion path and pushed scratch
+        // virtio-blk completions toward the driver's 250 ms deadline (wave-11
+        // staging flake). WFI halts the vCPU until an interrupt is pending;
+        // with DAIF masked it then just loops back here. Other profiles keep WFE.
+        #[cfg(feature = "v020-production")]
+        // SAFETY: masking DAIF and waiting for an interrupt touches no memory;
+        // this CPU never leaves the loop.
+        unsafe {
+            core::arch::asm!("msr daifset, #15", "wfi")
+        }
+        #[cfg(not(feature = "v020-production"))]
+        // SAFETY: masking DAIF and waiting for an event touches no memory;
+        // this CPU never leaves the loop.
+        unsafe {
+            core::arch::asm!("msr daifset, #15", "wfe")
+        }
     }
 }
 #[panic_handler]

@@ -677,6 +677,18 @@ class NativeSecurityWiring(unittest.TestCase):
         net = source(arm / "production/net.rs")
         self.assertIn("pub(super) fn serve(info: &BootInfo) -> NetOutcome", net)
 
+    def test_v020_wave11_production_parks_halted_cpus_with_wfi(self):
+        # Final fix wave I1: under TCG a WFE park spins a host core per halted
+        # vCPU and starved the scratch virtio-blk completions (staging flake).
+        console = source(ROOT / "kernel/src/arch/aarch64/console.rs")
+        halt = console.split("pub(crate) fn halt() -> ! {", 1)[1].split("\n}\n", 1)[0]
+        prod = halt.split('#[cfg(feature = "v020-production")]', 1)[1].split(
+            '#[cfg(not(feature = "v020-production"))]', 1)[0]
+        self.assertIn('"msr daifset, #15", "wfi"', prod)
+        self.assertNotIn("wfe", prod)
+        verifier = source(ROOT / "tools/verify_v020_production.py")
+        self.assertIn('"kernel/src/arch/aarch64/console.rs",', verifier)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

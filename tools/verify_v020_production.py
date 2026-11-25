@@ -60,6 +60,7 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/smp.rs",
     "kernel/src/arch/aarch64/boot.rs",
     "kernel/src/arch/aarch64/exceptions.rs",
+    "kernel/src/arch/aarch64/console.rs",
     "kernel/Cargo.toml",
     "kernel/build/aarch64.rs",
     "kernel/build/v0199_roles.rs",
