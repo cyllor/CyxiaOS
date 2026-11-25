@@ -83,6 +83,17 @@ net-selftest = ["smp-selftest", "prototype-memory"]
 # Default builds never compile cyxia-net-transport. The smp.rs dispatch that
 # actually deploys user/local-echo is a separate, still-open gate.
 sec-n-native = ["dep:cyxia-net-transport", "cyxia-net-transport/smoltcp"]
+# Gated SEC-N native Echo DEPLOYMENT fixture: loads the real cross-compiled
+# user/local-echo EL0 image into its own TTBR0/identity and services its SVC 0x43
+# broker from a bounded trait-level mock Port, proving the fail-closed deployment
+# negatives (identity mismatch, handshake-budget exhaustion, stale generation,
+# finish-without-quiescence). The real Admission ledger + rustls TLS run in the EL0
+# guest; the EL1 kernel stays soft-float (sec-n-native pulls smoltcp only, never
+# tls/rustls/ring). Real VirtIO-net device custody + a real pinned TLS peer (needed
+# for the positive Echo turn and finish retirement) remain the open device gap.
+# Requires the guest ELF to be built first (tools/verify_v0199_sec_n.py). Never a
+# production deployment; the default build is unaffected.
+v0199-sec-n-selftest = ["smp-selftest", "sec-n-native", "dep:sha2"]
 model-v13-selftest = ["smp-selftest", "prototype-memory"]
 storage-v13-selftest = ["smp-selftest", "prototype-memory"]
 tcp-v13-selftest = ["smp-selftest", "prototype-memory", "dep:cyxia-cluster-transport"]

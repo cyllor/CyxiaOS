@@ -1,15 +1,13 @@
 //! A single statically provisioned TCP stream over native Ethernet/ARP/IPv4.
 //! Its plaintext bytes must be consumed only by the TLS engine.
+//!
+//! This stream is discovery-free: the peer is pinned by `Config` at
+//! construction. The legacy CXD1 paired-node cluster discovery machinery was
+//! relocated to the excluded cluster-transport crate, which drives this
+//! stream through the public open-peer/phase/accessor API below.
 use crate::device::{Ethernet, Port};
 use cyxia_driver_virtio::DiagnosticStage as Stage;
-// CXD1 paired-node cluster discovery is dual-node machinery, compiled only
-// for the legacy cluster facade (`cluster-discovery`), never for the
-// single-machine SEC-N closure.
-#[cfg(feature = "cluster-discovery")]
-mod discovery;
 mod observe;
-#[cfg(feature = "cluster-discovery")]
-pub use discovery::{DiscoveryBuffers, DiscoveryConfig, DiscoverySnapshot};
 pub use observe::Observation;
 use observe::ObservedPort;
 use smoltcp::{
@@ -76,8 +74,6 @@ pub struct Tcp<'a, P> {
     config: Config,
     last_ms: u64,
     failed: bool,
-    #[cfg(feature = "cluster-discovery")]
-    discovery: Option<discovery::Socket>,
 }
 
 impl<'a, P: Port> Tcp<'a, P> {
@@ -92,6 +88,23 @@ impl<'a, P: Port> Tcp<'a, P> {
         Self::new_inner(port, config, now_ms, rx, tx, storage, false)
     }
 
+    /// Construct with the peer left open: `config.peer` must be all-zero and
+    /// `config.peer_port` zero, and the caller pins the real endpoint later
+    /// via [`Self::select_peer`]. The legacy cluster facade uses this for its
+    /// hint-selected stream; the single-machine profile always uses
+    /// [`Self::new`] with a fixed peer. The caller owns enough socket storage
+    /// for every socket it adds through [`Self::sockets_mut`].
+    pub fn new_with_open_peer(
+        port: P,
+        config: Config,
+        now_ms: u64,
+        rx: &'a mut [u8; BUFFER_SIZE],
+        tx: &'a mut [u8; BUFFER_SIZE],
+        storage: &'a mut [SocketStorage<'a>],
+    ) -> Result<Self, Error> {
+        Self::new_inner(port, config, now_ms, rx, tx, storage, true)
+    }
+
     fn new_inner(
         port: P,
         config: Config,
@@ -99,7 +112,7 @@ impl<'a, P: Port> Tcp<'a, P> {
         rx: &'a mut [u8; BUFFER_SIZE],
         tx: &'a mut [u8; BUFFER_SIZE],
         storage: &'a mut [SocketStorage<'a>],
-        discovering: bool,
+        open_peer: bool,
     ) -> Result<Self, Error> {
         let mac = EthernetAddress(config.mac);
         let local = Ipv4Address::from(config.local);
@@ -108,22 +121,22 @@ impl<'a, P: Port> Tcp<'a, P> {
         if !mac.is_unicast()
             || config.mac == [0; 6]
             || !unicast(config.local)
-            || (!discovering && (!unicast(config.peer) || local == peer))
-            || (discovering && (config.peer != [0; 4] || config.peer_port != 0))
+            || (!open_peer && (!unicast(config.peer) || local == peer))
+            || (open_peer && (config.peer != [0; 4] || config.peer_port != 0))
             || !(1..=30).contains(&config.prefix_len)
             || config.local_port == 0
-            || (!discovering && config.peer_port == 0)
+            || (!open_peer && config.peer_port == 0)
             || config.random_seed == 0
             || now_ms > i64::MAX as u64
         {
             return Err(Error::Configuration);
         }
         let cidr = IpCidr::new(IpAddress::Ipv4(local), config.prefix_len);
-        if !discovering && !cidr.contains_addr(&IpAddress::Ipv4(peer)) {
+        if !open_peer && !cidr.contains_addr(&IpAddress::Ipv4(peer)) {
             return Err(Error::Configuration);
         }
         let host_mask = u32::MAX >> config.prefix_len;
-        for address in [Some(config.local), (!discovering).then_some(config.peer)]
+        for address in [Some(config.local), (!open_peer).then_some(config.peer)]
             .into_iter()
             .flatten()
         {
@@ -160,24 +173,11 @@ impl<'a, P: Port> Tcp<'a, P> {
             config,
             last_ms: now_ms,
             failed: false,
-            #[cfg(feature = "cluster-discovery")]
-            discovery: None,
         })
     }
 
     pub fn listen(&mut self) -> Result<(), Error> {
         self.healthy()?;
-        #[cfg(feature = "cluster-discovery")]
-        if let Some(discovery) = self.discovery.as_mut() {
-            if discovery.initiator {
-                return Err(Error::Configuration);
-            }
-            discovery.armed = true;
-            return Ok(());
-        }
-        self.listen_raw()
-    }
-    fn listen_raw(&mut self) -> Result<(), Error> {
         self.sockets
             .get_mut::<Socket>(self.socket)
             .listen((Ipv4Address::from(self.config.local), self.config.local_port))
@@ -186,17 +186,6 @@ impl<'a, P: Port> Tcp<'a, P> {
 
     pub fn connect(&mut self) -> Result<(), Error> {
         self.healthy()?;
-        #[cfg(feature = "cluster-discovery")]
-        if let Some(discovery) = self.discovery.as_mut() {
-            if !discovery.initiator {
-                return Err(Error::Configuration);
-            }
-            discovery.armed = true;
-            return Ok(());
-        }
-        self.connect_raw()
-    }
-    fn connect_raw(&mut self) -> Result<(), Error> {
         self.sockets
             .get_mut::<Socket>(self.socket)
             .connect(
@@ -207,7 +196,8 @@ impl<'a, P: Port> Tcp<'a, P> {
             .map_err(|_| Error::Socket)
     }
 
-    fn healthy(&self) -> Result<(), Error> {
+    /// A failed stream never resumes; every operation fails closed.
+    pub fn healthy(&self) -> Result<(), Error> {
         if self.failed {
             Err(Error::Closed)
         } else {
@@ -215,20 +205,52 @@ impl<'a, P: Port> Tcp<'a, P> {
         }
     }
 
+    /// The socket set of this stream's bounded device turn. The legacy
+    /// cluster facade adds its auxiliary UDP socket here; a single-machine
+    /// stream only ever holds the one TCP socket created at construction.
+    /// The caller must have reserved enough storage for every added socket.
+    pub fn sockets_mut(&mut self) -> &mut SocketSet<'a> {
+        &mut self.sockets
+    }
+
+    /// Re-pin the peer endpoint after construction with an open peer. The
+    /// caller owns endpoint validation; [`Self::poll`] still verifies the
+    /// live remote endpoint against the pinned peer and aborts on mismatch.
+    /// The observation layer re-pins with the same config so RTT/retransmit
+    /// sampling follows the selected endpoint.
+    pub fn select_peer(&mut self, peer: [u8; 4], peer_port: u16) {
+        self.config.peer = peer;
+        self.config.peer_port = peer_port;
+        self.device.port_mut().select_peer(self.config);
+    }
+
+    /// The configured peer IPv4, if one is pinned. An open-peer stream
+    /// reports `None` until a peer is selected.
+    pub fn peer_ipv4(&self) -> Option<[u8; 4]> {
+        if self.config.peer == [0; 4] {
+            None
+        } else {
+            Some(self.config.peer)
+        }
+    }
+
+    /// Read-only access to the caller-owned port beneath the observation
+    /// layer. The legacy cluster facade reads its wire counters here.
+    pub fn port(&self) -> &P {
+        self.device.port().inner()
+    }
+
+    /// Mutable access to the caller-owned port beneath the observation
+    /// layer, for turn-clock bookkeeping only; protocol work must still go
+    /// through the poll phases so device credit boundaries stay intact.
+    pub fn port_mut(&mut self) -> &mut P {
+        self.device.port_mut().inner_mut()
+    }
+
     /// Read the actual socket state without advancing timers or consuming any
     /// device work. A scheduler turn with no CPU credit is not a disconnect.
     pub fn state(&self) -> Result<State, Error> {
         self.healthy()?;
-        #[cfg(feature = "cluster-discovery")]
-        // Waiting for an unauthenticated hint is a live listener lifecycle,
-        // never an established transport or a failed TCP generation.
-        if self
-            .discovery
-            .as_ref()
-            .is_some_and(|d| d.armed && d.attempt.is_none())
-        {
-            return Ok(State::Listen);
-        }
         Ok(self.sockets.get::<Socket>(self.socket).state())
     }
 
@@ -250,6 +272,22 @@ impl<'a, P: Port> Tcp<'a, P> {
         now_ms: u64,
         checkpoint: &mut dyn FnMut(),
     ) -> Result<State, Error> {
+        self.poll_ingress_phase(now_ms, checkpoint)?;
+        self.poll_egress_phase(now_ms, checkpoint)
+    }
+
+    /// First half of one protocol turn: health/clock preflight, the bounded
+    /// NIC service and flush, and at most one ingress frame with its socket
+    /// state update. Ends at a safe point with no borrow in flight. The
+    /// caller MUST complete the same turn with [`Self::poll_egress_phase`]
+    /// at the same `now_ms`; the legacy cluster facade inserts its auxiliary
+    /// UDP socket work between the two phases. A failed preflight poisons
+    /// the stream exactly as a whole-turn poll does.
+    pub fn poll_ingress_phase(
+        &mut self,
+        now_ms: u64,
+        checkpoint: &mut dyn FnMut(),
+    ) -> Result<(), Error> {
         self.device.port().diagnostic_stage(Stage::TcpHealth as u64);
         self.healthy()?;
         checkpoint();
@@ -310,12 +348,19 @@ impl<'a, P: Port> Tcp<'a, P> {
             );
         }
         checkpoint();
+        Ok(())
+    }
 
-        #[cfg(feature = "cluster-discovery")]
-        if self.discovery.is_some() {
-            self.discovery_turn(now_ms)?;
-            checkpoint();
-        }
+    /// Second half of one protocol turn: the bounded egress burst, the final
+    /// staged-TX flush and the remote-endpoint verification. Requires a
+    /// successful [`Self::poll_ingress_phase`] at the same `now_ms` in the
+    /// same turn; it does not repeat the preflight, NIC service or ingress.
+    pub fn poll_egress_phase(
+        &mut self,
+        now_ms: u64,
+        checkpoint: &mut dyn FnMut(),
+    ) -> Result<State, Error> {
+        let now = Instant::from_millis(now_ms as i64);
         // A hardware multichain port can accept multiple independent frames.
         // Keep the logical burst, but expose a safe scheduler checkpoint after
         // every complete descriptor-chain attempt. This prevents a batch from

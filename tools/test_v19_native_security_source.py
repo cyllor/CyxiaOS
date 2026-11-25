@@ -277,13 +277,18 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertNotIn('name = "ring"\nversion = "0.17.14"\nsource = "registry+', lock)
 
     def test_v020_wave_structural_pins_kernel_core_cluster_isolation(self):
-        # Wave 1: the historical dual-node security core stays compiled out of
-        # the single-machine default build; its test target needs the feature.
+        # Ledger #26 phase 0: the gated dual-node security core had zero active
+        # consumers and was deleted outright (module, tests and feature). The
+        # protective intent is unchanged: cluster code stays out of kernel-core.
+        # prototype::cluster (wire/engine) remains gated pending phase 1, while
+        # the kernel unified-runtime facade still references it.
         lib = source(ROOT / "crates/kernel-core/src/lib.rs")
         manifest = source(ROOT / "crates/kernel-core/Cargo.toml")
-        self.assertIn('#[cfg(feature = "legacy-cluster")]\npub mod cluster;', lib)
-        self.assertIn("legacy-cluster = []", manifest)
-        self.assertIn('[[test]]\nname = "cluster"\nrequired-features = ["legacy-cluster"]', manifest)
+        self.assertNotIn("pub mod cluster;", lib)
+        self.assertNotIn("legacy-cluster", manifest)
+        self.assertNotIn('name = "cluster"', manifest)
+        self.assertFalse((ROOT / "crates/kernel-core/src/cluster").exists())
+        self.assertFalse((ROOT / "crates/kernel-core/tests/cluster.rs").exists())
 
     def test_v020_wave_structural_pins_prototype_wire_isolation(self):
         # Wave 2: the cluster wire codec is legacy-only and the engine feature

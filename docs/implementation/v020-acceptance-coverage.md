@@ -161,3 +161,36 @@ python3 -B tools/acceptance_coverage.py --strict   # 证据路径缺失即失败
 - 本矩阵不判定 RUNTIME_QEMU/STATIC_EL1/MODEL_CHECK/ARCH_A53 任何证明类别；
   类别归属见安§7.4 强制证明矩阵。G4-QEMU 须 G0/G1 完成且 127 项各自规定的强制类别
   全部 PASS；当前 G1=NOT_READY，两阶段均 NOT_RUN，状态不因本矩阵改变。
+
+## 7. 第九波契约补全注记（T10 同步，2026-11-25，进行中、未提交）
+
+**计数重跑结果（T10 实测）**：`python3 -B tools/acceptance_coverage.py` 在 HEAD 711c21a
+及含第九波工作区改动的树上输出均为 **HOST=71，FIXTURE=44，GAP=12**，`--strict` PASS。
+计数未变的原因：工具是**人工核定数据表**（ROWS），第九波新增契约测试的证据路径尚未由
+工具所有者登记入表；T10 不拥有该工具，**未编辑工具**，仅在此登记差异。
+
+第九波工作区已落地（未提交、进行中）的 GAP 主题宿主契约测试，待工具所有者核定后
+应把对应 ID 从 GAP 改登记为 HOST（部分覆盖），并附下列证据路径：
+
+| GAP ID | 新证据（工作区，未提交） | 新增测试数（实测 diff） |
+|---|---|---:|
+| SEC-M11 | crates/kernel-core/src/security/memory.rs#sec_m11_*（软件 PAN 复制窗口） | 7 |
+| SEC-M12 | crates/kernel-core/src/security/memory.rs#sec_m12_*（应急栈/guard/嵌套） | 8 |
+| SEC-P11 | crates/kernel-core/src/security/process.rs#sec_p11_*（WFI/WFE/CTR_EL0/AArch32 陷入） | 10 |
+| SEC-S10 | crates/kernel-core/src/security/syscall.rs#sec_s10_*（查询不可区分性） | 8 |
+| SEC-D08 | crates/kernel-core/src/security/device.rs#v0199_sec_d08_*（可写 mount FLUSH 门） | 4 |
+| SEC-D10 | crates/kernel-core/src/security/device.rs#v0199_sec_d10_*（SPI 风暴屏蔽/安静恢复/特殊 ID） | 4 |
+| SEC-F07 | crates/kernel-core/src/security/file.rs#v0199_sec_f07_*（档位×fsync 并发） | 5 |
+| SEC-F12 | crates/kernel-core/src/security/file.rs#v0199_sec_f12_*（分组票据/配额） | 5 |
+| SEC-N07 | crates/net-transport/src/tls.rs#n07_key_material_never_reaches_key_log_or_diagnostics | 1 |
+
+尚未落地：SEC-N09/N10/N13（SYN 防洪与可用性负载，network.rs 仅新增 sha2 import，
+契约疑似编写中）。**即使全部登记，GAP 12→3 也只是覆盖类别变化（GAP→HOST），
+127 项原生验收判定仍全 NOT_RUN，HOST/FIXTURE 均不构成 PASS。**
+
+§5 结构性薄弱点中两条已被第九波工作区改动触及（同样未提交、仅契约层）：
+「RecoveryProof v2 仅存在于规范（代码零命中）」→ 新增
+crates/kernel-core/src/security/recovery_proof_v2.rs（32 项测试，原生 EL1 接线明确
+LATER）；「TLS 常量与规范分歧（握手 30s）」→ HANDSHAKE_TIMEOUT_MS 已改 3_000 并加
+编译期 pin（空闲双限等其余 reconciliation 以 T5 最终落地为准）。§4/§5 的其余描述
+仍按 HEAD 已提交状态有效。

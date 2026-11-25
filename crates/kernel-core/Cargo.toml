@@ -11,12 +11,3 @@ ed25519-dalek = { version = "=2.2.0", default-features = false }
 
 [dev-dependencies]
 cyxia-prototype = { path = "../prototype" }
-
-[features]
-# Historical dual-node security core, retained only as offline migration
-# reference; not part of the single-machine default build.
-legacy-cluster = []
-
-[[test]]
-name = "cluster"
-required-features = ["legacy-cluster"]

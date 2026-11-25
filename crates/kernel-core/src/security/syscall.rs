@@ -283,6 +283,108 @@ impl<const N: usize> Default for ReceiptTable<N> {
         Self::new()
     }
 }
+// ===========================================================================
+// SEC-S10 — query indistinguishability (response equivalence).
+//
+// Baseline (docs/design/baselines/v0.19.9-implementation-spec.txt):
+//   * SEC-S10 acceptance row, L10660–10668: cross-privilege task_query/file
+//     queries against the same absent object and a real unauthorized object
+//     must "对外返回相同拒绝错误，非授权侧无法凭结果确认其他对象存在".
+//   * SEC-S implementation contract, L10529–10530: "不存在与无权访问均报
+//     E_AUTH，不承诺常量时延不可探测（防止把本版错误码统一误称为完整侧信道防护）".
+//   * Unified error table, L10769–10777: unauthorized or non-self absent
+//     objects uniformly E_AUTH(-1); ONLY the real holder's old generation gets
+//     E_STALE(-4); "错误分类先验证 holder，不承诺常量时延".
+//   * 主§2.2, L672–674: unauthorized and absent objects both return E_AUTH to
+//     a non-authorized caller; strict constant time of the two rejection paths
+//     is NOT promised.
+//   * SEC-P implementation contract, L8632: an unauthorized service call
+//     returns the same E_AUTH whether or not the object exists.
+//   * 安§0.7, L6697+: holder_id/generation are the EL1 lookup keys.
+//
+// CONTRACT-ONLY host model of the holder-first classification rule. The
+// protected EL1 registry adapter supplies the real ObjectObservation; AI or
+// network input cannot. Error mapping: Unauthorized↔E_AUTH(-1),
+// Stale↔E_STALE(-4), Invalid↔E_FORMAT(-2).
+//
+// HONEST SCOPE: the baseline guarantees identical *external rejection*
+// (response equivalence), NOT constant time. L10529 and L674 explicitly
+// disclaim strict constant-time / full side-channel protection. This model
+// asserts NO timing property; a timing oracle is out of scope for this
+// version and must not be claimed as defended.
+// ===========================================================================
+
+/// Real object state supplied ONLY by the protected EL1 registry adapter.
+/// `Present` carries the true holder identity/generation and current object
+/// generation; a non-holder caller must never learn any of these fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectObservation {
+    Absent,
+    Present {
+        holder: u64,
+        holder_generation: u64,
+        object_generation: u64,
+    },
+}
+
+/// Holder-first query classification (SEC-S10 / error table L10771). The rule
+/// is identical for task_query (0x11 / TASK_QUERY_BY_CAP) and file stat
+/// (FILE_STAT_BY_CAP), and by the SEC-P contract (L8632) for any object query
+/// (snapshot/telemetry lookups included). Format validation runs BEFORE this
+/// rule (validate_readonly_batch / decode_v3) and is existence-independent.
+///
+/// Every non-holder outcome — absent object, real-but-unauthorized object, or
+/// invalid caller identity — collapses to the single external E_AUTH
+/// (Unauthorized). Only the verified holder of the current generation may
+/// proceed (Ok); only the verified holder requesting an old generation learns
+/// E_STALE (Stale). A non-holder NEVER receives Stale, which would otherwise
+/// leak both existence and generation.
+pub fn query_admission(
+    caller: u64,
+    caller_generation: u64,
+    requested_generation: u64,
+    observation: ObjectObservation,
+) -> Result<(), Error> {
+    // Invalid identity is indistinguishable from unauthorized: same E_AUTH.
+    if caller == 0 || caller_generation == 0 {
+        return Err(Error::Unauthorized);
+    }
+    match observation {
+        ObjectObservation::Absent => Err(Error::Unauthorized),
+        ObjectObservation::Present {
+            holder,
+            holder_generation,
+            object_generation,
+        } => {
+            // Verify holder FIRST; a non-holder gets E_AUTH regardless of the
+            // object's real generation (no existence/generation oracle).
+            if holder != caller || holder_generation != caller_generation {
+                return Err(Error::Unauthorized);
+            }
+            if requested_generation != object_generation {
+                return Err(Error::Stale);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// S10 response-equivalence rule as a checkable pure predicate: the external
+/// replies for two observations are indistinguishable to this caller iff they
+/// are equal. For a non-holder caller, `Absent` and any real unauthorized
+/// `Present` MUST be indistinguishable (no existence oracle). This compares
+/// responses only; it asserts nothing about timing (see HONEST SCOPE above).
+pub fn query_replies_indistinguishable(
+    caller: u64,
+    caller_generation: u64,
+    requested_generation: u64,
+    a: ObjectObservation,
+    b: ObjectObservation,
+) -> bool {
+    query_admission(caller, caller_generation, requested_generation, a)
+        == query_admission(caller, caller_generation, requested_generation, b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,5 +524,164 @@ mod tests {
         assert_eq!(t.submit(2, [3; 32]), Err(Error::Capacity));
         t.uncertain(1).unwrap();
         assert_eq!(t.submit(1, [2; 32]), Ok(ReceiptState::Unknown));
+    }
+
+    // ---- SEC-S10: query indistinguishability (response equivalence) ----
+    fn present(holder: u64, holder_gen: u64, obj_gen: u64) -> ObjectObservation {
+        ObjectObservation::Present {
+            holder,
+            holder_generation: holder_gen,
+            object_generation: obj_gen,
+        }
+    }
+    #[test]
+    fn sec_s10_absent_and_unauthorized_present_identical() {
+        // Caller 7 (gen 1) is not the holder (9) of the real object.
+        for req_gen in [0, 1, 2, 99, u64::MAX] {
+            let absent = query_admission(7, 1, req_gen, ObjectObservation::Absent);
+            let unauth = query_admission(7, 1, req_gen, present(9, 1, 2));
+            assert_eq!(absent, Err(Error::Unauthorized));
+            assert_eq!(absent, unauth);
+            assert!(query_replies_indistinguishable(
+                7,
+                1,
+                req_gen,
+                ObjectObservation::Absent,
+                present(9, 1, 2)
+            ));
+        }
+    }
+    #[test]
+    fn sec_s10_non_holder_never_learns_stale() {
+        // Requesting the OLD generation of a real object must still be E_AUTH
+        // for a non-holder (Stale would leak existence + generation).
+        assert_eq!(
+            query_admission(7, 1, 1, present(9, 1, 2)),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            query_admission(7, 1, 2, present(9, 1, 2)),
+            Err(Error::Unauthorized)
+        );
+        // Wrong holder generation is also E_AUTH, not Stale.
+        assert_eq!(
+            query_admission(9, 2, 1, present(9, 1, 2)),
+            Err(Error::Unauthorized)
+        );
+        // The REAL holder requesting an old generation is the only Stale case.
+        assert_eq!(
+            query_admission(9, 1, 1, present(9, 1, 2)),
+            Err(Error::Stale)
+        );
+    }
+    #[test]
+    fn sec_s10_holder_current_generation_allowed() {
+        assert_eq!(query_admission(9, 1, 2, present(9, 1, 2)), Ok(()));
+    }
+    #[test]
+    fn sec_s10_invalid_identity_same_rejection_as_absent() {
+        for (caller, caller_gen) in [(0, 1), (7, 0), (0, 0)] {
+            let r = query_admission(caller, caller_gen, 2, present(9, 1, 2));
+            assert_eq!(r, Err(Error::Unauthorized));
+            assert_eq!(
+                r,
+                query_admission(caller, caller_gen, 2, ObjectObservation::Absent)
+            );
+        }
+    }
+    #[test]
+    fn sec_s10_task_query_and_file_stat_share_the_rule() {
+        // Both registered readonly query ops feed the same admission rule and
+        // produce identical external rejections for a non-holder.
+        let ops = [
+            ReadOperation {
+                op: TASK_QUERY_BY_CAP,
+                flags: 0,
+                capability: 7,
+                generation: 1,
+                tag: 1,
+            },
+            ReadOperation {
+                op: FILE_STAT_BY_CAP,
+                flags: 0,
+                capability: 7,
+                generation: 1,
+                tag: 2,
+            },
+        ];
+        validate_vector(&ops).unwrap(); // format gate is existence-independent
+        let mut replies = [Err(Error::Unauthorized); 2];
+        for (i, op) in ops.iter().enumerate() {
+            replies[i] = query_admission(op.capability, op.generation, 2, present(9, 1, 2));
+            assert_eq!(
+                replies[i],
+                query_admission(op.capability, op.generation, 2, ObjectObservation::Absent)
+            );
+        }
+        assert_eq!(replies[0], replies[1]);
+    }
+    #[test]
+    fn sec_s10_format_gate_is_existence_independent() {
+        // A malformed op is rejected by the format preflight identically
+        // whether the object is absent or present (no existence-dependent error).
+        let bad = [ReadOperation {
+            op: 99,
+            flags: 0,
+            capability: 7,
+            generation: 1,
+            tag: 1,
+        }];
+        assert_eq!(validate_vector(&bad), Err(Error::Invalid));
+        for obs in [ObjectObservation::Absent, present(9, 1, 2)] {
+            assert_eq!(query_admission(7, 1, 2, obs), Err(Error::Unauthorized));
+        }
+    }
+    #[test]
+    fn sec_s10_no_existence_oracle_over_generation_sweep() {
+        // A fixed non-holder caller sweeping requested generations cannot
+        // distinguish absent from any real unauthorized object.
+        let real = present(9, 1, 2);
+        for req_gen in 0..64u64 {
+            assert!(query_replies_indistinguishable(
+                7,
+                1,
+                req_gen,
+                ObjectObservation::Absent,
+                real
+            ));
+            assert_eq!(
+                query_admission(7, 1, req_gen, real),
+                Err(Error::Unauthorized)
+            );
+        }
+        // Two different real objects, both unauthorized to caller 7, are also
+        // indistinguishable from each other and from absent.
+        let other = present(10, 3, 7);
+        assert!(query_replies_indistinguishable(7, 1, 2, real, other));
+        assert!(query_replies_indistinguishable(
+            7,
+            1,
+            2,
+            ObjectObservation::Absent,
+            other
+        ));
+    }
+    #[test]
+    fn sec_s10_equivalence_is_response_only_not_timing() {
+        // Records the honest scope: the contract asserts identical external
+        // responses (E_AUTH), NOT constant time. Baseline L10529/L674 disclaim
+        // strict constant-time / full side-channel protection; no timing
+        // property is claimed or tested here.
+        assert!(query_replies_indistinguishable(
+            7,
+            1,
+            2,
+            ObjectObservation::Absent,
+            present(9, 1, 2)
+        ));
+        assert_eq!(
+            query_admission(7, 1, 2, ObjectObservation::Absent),
+            Err(Error::Unauthorized)
+        );
     }
 }

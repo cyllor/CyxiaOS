@@ -12,19 +12,15 @@
 //! the `local_echo_tcp` NativeSocket adapter is available whenever the
 //! `native_tcp` trait bridge is.
 //!
-//! The legacy CXD1 paired-node CLUSTER discovery wire (`discovery` and the
-//! `tcp` discovery machinery) is dual-node equipment, gated behind the
-//! separate `cluster-discovery` feature. Neither `smoltcp` nor `tls` implies
-//! it, so the single-machine kernel closure (`sec-n-native`) never compiles
-//! it; only the legacy cluster-transport facade enables it for historical
-//! cluster diagnostics.
+//! This crate is discovery-FREE: the legacy CXD1 paired-node cluster
+//! discovery wire and its UDP socket integration were relocated to the
+//! excluded legacy cluster-transport crate. The single-machine kernel
+//! closure (`sec-n-native`) never compiles dual-node equipment.
 pub const IDLE_TIMEOUT_SECS: u64 = 60;
 #[cfg(feature = "tls")]
 pub mod admission;
 #[cfg(feature = "smoltcp")]
 pub mod device;
-#[cfg(feature = "cluster-discovery")]
-pub mod discovery;
 pub mod echo;
 #[cfg(feature = "tls")]
 pub mod local_echo_tcp;

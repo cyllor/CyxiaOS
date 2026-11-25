@@ -28,7 +28,14 @@ pub const RECORD_BUFFER: usize = 32768;
 pub const PLAINTEXT_BUFFER: usize = 16384;
 pub const MAX_CERTIFICATE: usize = 4096;
 /// Absolute guest-monotonic bound for a fresh mutually authenticated session.
-pub const HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
+/// SEC-N frozen value is 3000 ms, NOT the 30 s active-idle bound: baseline
+/// v0.19.9-implementation-spec.txt L1449 (待认证 TLS row: "单次 TLS 握手绝对
+/// 截止 3000 ms") and L9696 (SEC-N contract: "接收记录空闲 1s 与握手绝对 3s
+/// 独立"); SEC-N11 (L9805+) repeats "1s 记录/3s 握手、30s 空闲、300s 绝对".
+pub const HANDSHAKE_TIMEOUT_MS: u64 = 3_000;
+// Compile-time pins: the frozen baseline value must not drift silently, and
+// the handshake deadline must stay strictly inside the idle policy window.
+const _: () = assert!(HANDSHAKE_TIMEOUT_MS == 3_000);
 const _: () = assert!(HANDSHAKE_TIMEOUT_MS < IDLE_TIMEOUT_SECS * 1000);
 /// ALPNs are disjoint: the single-node read-only service is not the
 /// historical remote-placement/member protocol.
@@ -795,6 +802,177 @@ mod tests {
             provider,
         );
         assert!(matches!(result, Err(Error::Entropy)));
+    }
+
+    /// SEC-N07 (baseline v0.19.9 L9756): key material and packet bodies probed
+    /// through telemetry/logs must find no critical secret in any log or
+    /// AI-readable snapshot. Pin that production `Pairing` wires rustls' no-op
+    /// `NoKeyLog` in both roles and that no private key byte reaches any
+    /// diagnostic surface. `Pairing`, `Session` and `IdentitySigner` hold the
+    /// secret material and deliberately implement no `Debug` at all; the
+    /// duplex suite's `TestSecret` KeyLog is a test-only capture injected
+    /// after construction, never production wiring.
+    #[test]
+    fn n07_key_material_never_reaches_key_log_or_diagnostics() {
+        use alloc::format;
+        use rustls::KeyLog;
+
+        let a_cert = CertificateDer::from(&include_bytes!("../tests/fixtures/a-test-cert.der")[..]);
+        let b_cert = CertificateDer::from(&include_bytes!("../tests/fixtures/b-test-cert.der")[..]);
+        let a_key = include_bytes!("../tests/fixtures/a-test-key.der");
+        let b_key = include_bytes!("../tests/fixtures/b-test-key.der");
+        let mut pairings = [
+            Pairing::new_local_echo(
+                a_cert.clone(),
+                PrivatePkcs8KeyDer::from(&a_key[..]).into(),
+                node_id(&b_cert).unwrap(),
+                Arc::new(Time),
+            )
+            .unwrap(),
+            Pairing::new_local_echo(
+                b_cert.clone(),
+                PrivatePkcs8KeyDer::from(&b_key[..]).into(),
+                node_id(&a_cert).unwrap(),
+                Arc::new(Time),
+            )
+            .unwrap(),
+        ];
+        pairings.sort_by_key(|pairing| pairing.local_node());
+
+        // No key-log callback is wired in either role. The Debug name pins
+        // the concrete rustls no-op type; `will_log == false` is rustls'
+        // contract that `log` is then never called with any secret.
+        const NSS_LABELS: [&str; 7] = [
+            "CLIENT_RANDOM",
+            "CLIENT_EARLY_TRAFFIC_SECRET",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "SERVER_TRAFFIC_SECRET_0",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "EXPORTER_SECRET",
+        ];
+        for pairing in &pairings {
+            for key_log in [&pairing.client.key_log, &pairing.server.key_log] {
+                assert_eq!(format!("{:?}", key_log), "NoKeyLog");
+                for label in NSS_LABELS {
+                    assert!(!key_log.will_log(label), "key log must refuse {label}");
+                }
+            }
+        }
+
+        // Drive a real pinned mutual handshake to an authenticated Echo
+        // session, recording every wire byte, then scan all diagnostic
+        // output for the private seeds. Traffic secrets stay internal to
+        // rustls; with NoKeyLog pinned above there is no export path.
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+        }
+        let mut wire = Vec::new();
+        let mut ab = Buffers::new();
+        let mut bb = Buffers::new();
+        let mut client = pairings[0].client(&mut ab, 0).unwrap();
+        let mut server = pairings[1].server(&mut bb, 0).unwrap();
+        for _ in 0..100 {
+            client.pump(0).unwrap();
+            server.pump(0).unwrap();
+            wire.extend_from_slice(client.pending_tls());
+            wire.extend_from_slice(server.pending_tls());
+            let n = server.receive_tls(client.pending_tls()).unwrap();
+            client.consume_tls(n).unwrap();
+            let n = client.receive_tls(server.pending_tls()).unwrap();
+            server.consume_tls(n).unwrap();
+            if client.authenticated_peer().is_some()
+                && server.authenticated_peer().is_some()
+                && client.pending_tls().is_empty()
+                && server.pending_tls().is_empty()
+            {
+                break;
+            }
+        }
+        let proof = client.local_echo_proof().expect("authenticated Echo proof");
+        assert!(server.authenticated_peer().is_some());
+        // The frozen 3 s bound gates only the pre-authentication handshake;
+        // an established session answers to the idle policy, not this clock.
+        client.pump(HANDSHAKE_TIMEOUT_MS + 1).unwrap();
+
+        // The 48-byte PKCS8 fixtures end in the raw 32-byte Ed25519 seed.
+        let secrets = [
+            &a_key[..],
+            &b_key[..],
+            &a_key[a_key.len() - 32..],
+            &b_key[b_key.len() - 32..],
+        ];
+        let diagnostics = [
+            format!("{:?}", proof),
+            format!("{:?}", ApplicationProtocol::LocalEcho),
+            format!("{:?}", ApplicationProtocol::LegacyCluster),
+            format!("{:?}", Error::Identity),
+            format!("{:?}", Error::Entropy),
+            format!("{:?}", Error::Time),
+            format!("{:?}", Error::Clock),
+            format!("{:?}", Error::Timeout),
+            format!("{:?}", Error::Buffer),
+            format!("{:?}", Error::WouldBlock),
+            format!("{:?}", Error::Handshake),
+            format!("{:?}", Error::Closed),
+            format!("{:?}", Error::Direction),
+            format!(
+                "{:?}",
+                Error::Protocol(TlsError::General("n07 diagnostic probe".into()))
+            ),
+            format!(
+                "{:?}",
+                Error::Protocol(TlsError::InvalidCertificate(
+                    CertificateError::ApplicationVerificationFailure
+                ))
+            ),
+        ];
+        for secret in secrets {
+            for diagnostic in &diagnostics {
+                assert!(
+                    !contains(diagnostic.as_bytes(), secret),
+                    "private key bytes reached diagnostic output"
+                );
+            }
+            assert!(
+                !contains(&wire, secret),
+                "private key bytes reached the TLS wire"
+            );
+        }
+    }
+
+    /// SEC-N11 frozen timing (baseline L1449/L9696): the handshake absolute
+    /// deadline is 3 s, independent of the 30 s active-idle bound. It fails
+    /// closed and permanently at exactly 3000 ms of guest-monotonic time.
+    #[test]
+    fn handshake_absolute_deadline_is_frozen_three_seconds() {
+        assert_eq!(HANDSHAKE_TIMEOUT_MS, 3_000);
+        let pairing = Pairing::new_local_echo(
+            CertificateDer::from(&include_bytes!("../tests/fixtures/a-test-cert.der")[..]),
+            PrivatePkcs8KeyDer::from(&include_bytes!("../tests/fixtures/a-test-key.der")[..])
+                .into(),
+            [0xff; 32],
+            Arc::new(Time),
+        )
+        .unwrap();
+        let mut buffers = Buffers::new();
+        let mut session = pairing.client(&mut buffers, 0).unwrap();
+        // One millisecond before the frozen deadline the handshake is still
+        // admitted; the deadline itself refuses and invalidates the session.
+        session.pump(HANDSHAKE_TIMEOUT_MS - 1).unwrap();
+        assert!(matches!(
+            session.pump(HANDSHAKE_TIMEOUT_MS),
+            Err(Error::Timeout)
+        ));
+        assert!(session.authenticated_peer().is_none());
+        assert!(session.plaintext().is_empty());
+        assert_eq!(session.receive_capacity(), 0);
+        assert!(matches!(
+            session.pump(HANDSHAKE_TIMEOUT_MS + 1),
+            Err(Error::Closed)
+        ));
     }
 }
 

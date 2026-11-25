@@ -2,8 +2,6 @@
 //! consumed by the real socket. No sample is invented for an idle stream.
 use super::Config;
 use crate::device::{Error, MTU, Port};
-#[cfg(feature = "cluster-discovery")]
-use smoltcp::wire::UdpPacket;
 use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Packet, TcpPacket,
 };
@@ -42,18 +40,18 @@ pub(super) struct ObservedPort<P> {
     sent: u64,
     retransmitted: u64,
     valid: bool,
-    #[cfg(feature = "cluster-discovery")]
-    pub(super) discovery_sent: u64,
-    #[cfg(feature = "cluster-discovery")]
-    pub(super) discovery_sent_ms: u64,
-    #[cfg(feature = "cluster-discovery")]
-    pub(super) discovery_nonce: [u8; 16],
 }
 impl<P> ObservedPort<P> {
-    /// Only the cluster discovery turn re-pins a selected peer endpoint.
-    #[cfg(feature = "cluster-discovery")]
+    /// Re-pin the observed peer endpoint when the owning stream selects a
+    /// new peer after construction (legacy open-peer streams only).
     pub(super) fn select_peer(&mut self, config: Config) {
         self.config = config;
+    }
+    pub(super) fn inner(&self) -> &P {
+        &self.inner
+    }
+    pub(super) fn inner_mut(&mut self) -> &mut P {
+        &mut self.inner
     }
 }
 fn before(a: u32, b: u32) -> bool {
@@ -120,12 +118,6 @@ impl<P: Port> ObservedPort<P> {
             sent: 0,
             retransmitted: 0,
             valid: true,
-            #[cfg(feature = "cluster-discovery")]
-            discovery_sent: 0,
-            #[cfg(feature = "cluster-discovery")]
-            discovery_sent_ms: 0,
-            #[cfg(feature = "cluster-discovery")]
-            discovery_nonce: [0; 16],
         }
     }
     pub(super) fn set_time(&mut self, now: u64) {
@@ -232,21 +224,6 @@ impl<P: Port> Port for ObservedPort<P> {
         self.inner.send(frame)?;
         // Count only packets actually accepted by the device, not socket
         // preparation/queueing. PCAP remains the independent wire evidence.
-        #[cfg(feature = "cluster-discovery")]
-        if let Ok(ethernet) = EthernetFrame::new_checked(frame)
-            && ethernet.ethertype() == EthernetProtocol::Ipv4
-            && let Ok(ip) = Ipv4Packet::new_checked(ethernet.payload())
-            && ip.next_header() == IpProtocol::Udp
-            && ip.src_addr().octets() == self.config.local
-            && let Ok(udp) = UdpPacket::new_checked(ip.payload())
-            && udp.src_port() == crate::discovery::PORT
-            && udp.dst_port() == crate::discovery::PORT
-            && let Ok(message) = crate::discovery::Message::decode(udp.payload())
-        {
-            self.discovery_sent = self.discovery_sent.saturating_add(1);
-            self.discovery_sent_ms = self.now;
-            self.discovery_nonce = message.nonce;
-        }
         if let Some(packet) = packet(frame, self.config, true) {
             self.sent_packet(packet);
         }

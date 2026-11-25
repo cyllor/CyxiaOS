@@ -125,6 +125,7 @@ name = "cyxia-cluster-transport"
 version = "0.1.0"
 dependencies = [
  "cyxia-net-transport",
+ "smoltcp",
 ]
 
 [[package]]

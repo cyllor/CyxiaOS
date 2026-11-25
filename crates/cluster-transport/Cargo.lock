@@ -38,6 +38,7 @@ dependencies = [
  "getrandom",
  "ring",
  "rustls",
+ "smoltcp",
 ]
 
 [[package]]

@@ -8,10 +8,15 @@ default = []
 tls = ["dep:rustls", "dep:ring", "dep:getrandom", "cyxia-net-transport/tls"]
 
 [dependencies]
-# Legacy cluster diagnostics facade: always enables the CXD1 paired-node
-# cluster discovery wire (cluster-discovery implies smoltcp). The active
-# single-machine net-transport closure never enables that feature itself.
-cyxia-net-transport = { path = "../net-transport", default-features = false, features = ["smoltcp", "cluster-discovery"] }
+# Legacy cluster diagnostics facade. The CXD1 paired-node cluster discovery
+# wire and its UDP socket integration live in THIS crate (src/discovery.rs,
+# src/tcp/discovering.rs); the active single-machine net-transport crate is
+# discovery-free and only supplies the bounded native device/TCP stack.
+cyxia-net-transport = { path = "../net-transport", default-features = false, features = ["smoltcp"] }
+# The relocated discovery wire rides smoltcp's UDP socket and Ethernet/IPv4
+# wire types directly. Same pinned version as net-transport; feature sets
+# unify on one crate instance. No proto-ipv6: the CXD1 wire is IPv4-only.
+smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-udp"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring"], optional = true }
 ring = { version = "=0.17.14", default-features = false, features = ["alloc", "less-safe-getrandom-custom-or-rdrand"], optional = true }
 getrandom = { version = "=0.2.17", default-features = false, features = ["custom"], optional = true }

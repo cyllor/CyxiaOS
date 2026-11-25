@@ -82,6 +82,31 @@ mod v0199_epoch_disk;
 #[cfg(feature = "v0199-format-selftest")]
 #[path = "v0199_format_fixture.rs"]
 mod v0199_format_fixture;
+#[cfg(feature = "v0199-sec-n-selftest")]
+#[path = "v0199_sec_n_fixture.rs"]
+mod v0199_sec_n_fixture;
+// The SEC-N deployment fixture owns the CPU0 EL0 turn loop (its own private guest
+// TTBR0); it must not be combined with another profile that also hijacks CPU0 or
+// rewrites the dispatch/execute path.
+#[cfg(all(
+    feature = "v0199-sec-n-selftest",
+    any(
+        feature = "v0199-cpu0-role-selftest",
+        feature = "v0199-advice-e2e-selftest",
+        feature = "v0199-control-bringup",
+        feature = "v0199-epoch-disk-selftest",
+        feature = "v0199-format-selftest",
+        feature = "ai-control-selftest",
+        feature = "legacy-coreset",
+        feature = "prototype-runtime",
+        feature = "unified-runtime",
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "storage-v13-selftest",
+        feature = "tcp-v13-selftest",
+    )
+))]
+compile_error!("v0199-sec-n-selftest requires the plain smp-selftest profile");
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_ram_inventory.rs"]
 mod v0199_ram_inventory;
@@ -1074,6 +1099,8 @@ pub fn run(info: &BootInfo) -> ! {
     v0199_epoch_disk::run(info);
     #[cfg(feature = "v0199-format-selftest")]
     v0199_format_fixture::run(info);
+    #[cfg(feature = "v0199-sec-n-selftest")]
+    v0199_sec_n_fixture::run(info);
     #[cfg(feature = "v0199-control-bringup")]
     v0199_control_bringup::run();
     #[cfg(all(
@@ -1110,6 +1137,7 @@ pub fn run(info: &BootInfo) -> ! {
         feature = "prototype-runtime",
         feature = "storage-v13-selftest",
         feature = "tcp-v13-selftest",
+        feature = "v0199-sec-n-selftest",
         feature = "legacy-coreset"
     )))]
     fixed_cpu0_fixture()
@@ -1130,6 +1158,7 @@ pub fn run(info: &BootInfo) -> ! {
     feature = "prototype-runtime",
     feature = "storage-v13-selftest",
     feature = "tcp-v13-selftest",
+    feature = "v0199-sec-n-selftest",
     feature = "legacy-coreset"
 )))]
 fn fixed_cpu0_fixture() -> ! {
