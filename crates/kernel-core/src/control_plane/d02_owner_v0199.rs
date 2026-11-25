@@ -25,7 +25,7 @@ pub enum Outcome{Created(Identity),NoEffect,Unknown}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct Completion{pub outcome:Outcome,pub completed_ns:u64}
 #[derive(Clone,Copy)]
-struct Row{req:Request,state:State,sequence:u64,occupied:bool}
+struct Row{req:Request,state:State,sequence:u64,occupied:bool,started:u64,policy_version:u64}
 #[derive(Clone,Copy)]
 struct Group{id:Identity,version:u64,limit:u16,until:u64,window:u64,used:u16,
     last_change:u64,changes:[u64;4],change_count:usize,work:Option<Work>}
@@ -69,7 +69,7 @@ impl Owner{
         if self.rows.iter().flatten().filter(|r|r.state==State::Queued).count()>=MAX_PENDING{return Err(Error::Busy);}
         let i=self.rows.iter().position(Option::is_none).ok_or(Error::Exhausted)?;
         let seq=self.seq.checked_add(1).ok_or(Error::Exhausted)?;
-        self.rows[i]=Some(Row{req,state:State::Queued,sequence:seq,occupied:false});
+        self.rows[i]=Some(Row{req,state:State::Queued,sequence:seq,occupied:false,started:0,policy_version:0});
         self.seq=seq;self.last=now;Ok(State::Queued)
     }
     /// Independent native observation: known created and UNKNOWN occupied
@@ -132,19 +132,14 @@ impl Owner{
         let g=self.groups[gi].as_mut().unwrap();
         if g.window!=now/WINDOW{g.window=now/WINDOW;g.used=0;}
         g.used+=1; // a real construction attempt, never refund on uncertainty
+        let policy_version=if now<g.until{g.version}else{0};
         let r=self.rows[i].as_mut().unwrap();r.state=State::Unknown;r.occupied=true;
+        r.started=now;r.policy_version=policy_version;
         let completion=create(&req);
         if completion.completed_ns<now{return Err(Error::Clock);}
         self.last=completion.completed_ns;
         let result=self.finish(i,completion.outcome)?;
-        if matches!(result,State::Created(_)){
-            let g=self.groups[gi].as_mut().unwrap();
-            if let Some(w)=g.work.as_mut(){
-                if w.effect.is_none()&&now>=w.accepted&&now<w.until{
-                    w.effect=Some((ActionStatus::Applied,completion.completed_ns));
-                }
-            }
-        }
+        self.record_created(i,result,completion.completed_ns)?;
         Ok(Some(result))
     }
     fn finish(&mut self,i:usize,outcome:Outcome)->Result<State,Error>{
@@ -158,14 +153,26 @@ impl Owner{
         if state==State::Rejected{r.occupied=false;}
         Ok(state)
     }
-    pub fn reconcile(&mut self,caller:Identity,id:u64,outcome:Outcome,now:u64,
-        verify:impl FnOnce(Request,Outcome)->Result<(),Error>)->Result<State,Error>{
+    fn record_created(&mut self,i:usize,result:State,completed:u64)->Result<(),Error>{
+        if matches!(result,State::Created(_)){
+            let row=self.rows[i].unwrap();let gi=self.group(row.req.group)?;
+            if let Some(w)=self.groups[gi].as_mut().unwrap().work.as_mut(){
+                if w.effect.is_none()&&row.policy_version==w.version&&row.started>=w.accepted&&row.started<w.until{
+                    w.effect=Some((ActionStatus::Applied,completed));
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn reconcile(&mut self,caller:Identity,id:u64,completion:Completion,now:u64,
+        verify:impl FnOnce(Request,u64,u64,Completion)->Result<(),Error>)->Result<State,Error>{
         self.ready(now)?;let i=self.row(caller,id)?;let r=self.rows[i].unwrap();
         if r.state!=State::Unknown{return Err(Error::Stale);}
-        if outcome==Outcome::Unknown{return Err(Error::NotReady);}
-        verify(r.req,outcome)?;self.last=now;self.finish(i,outcome)
-        // A later reconciled creation does not by itself prove the policy's
-        // effective timestamp. Its original execution evidence is separate.
+        if completion.outcome==Outcome::Unknown{return Err(Error::NotReady);}
+        if completion.completed_ns<r.started||completion.completed_ns>now{return Err(Error::Clock);}
+        verify(r.req,r.started,r.policy_version,completion)?;
+        self.last=now;let state=self.finish(i,completion.outcome)?;
+        self.record_created(i,state,completion.completed_ns)?;Ok(state)
     }
     pub fn exited(&mut self,task:Identity,now:u64,verify_stopped:impl FnOnce()->Result<(),Error>)->Result<(),Error>{
         self.ready(now)?;
@@ -203,6 +210,25 @@ mod tests{
     const CALLER:Identity=Identity{id:21,generation:1};
     fn req(id:u64)->Request{Request{caller:CALLER,request_id:id,package:Identity{id:1,generation:1},group:GROUP,digest:[1;32]}}
     #[test]
+    fn recovered_creation_is_bound_to_original_policy_and_completion(){
+        let mut o=Owner::empty();o.bind(1,1,||Ok(())).unwrap();o.register_group(GROUP,||Ok(())).unwrap();
+        let w=ApplyWorkV1{key:PlanKey{boot_epoch:1,controller_epoch:1,plan_seq:1},action_index:0,domain:2,
+            target:GROUP,executor_generation:1,plan_version:1,payload:&[4,0]};
+        o.accept(&w,0,500,100,||Ok(())).unwrap();
+        o.submit(req(1),101,|_|Ok(())).unwrap();
+        o.service_one(102,0,|_|Ok(()),|_|Completion{outcome:Outcome::Unknown,completed_ns:103}).unwrap();
+        assert_eq!(o.expire(GROUP,500,||panic!()),Err(Error::NotReady));
+        let task=Identity{id:100,generation:1};
+        let completion=Completion{outcome:Outcome::Created(task),completed_ns:110};
+        o.reconcile(CALLER,1,completion,501,|r,start,version,c|{
+            assert_eq!(r,req(1));assert_eq!(start,102);assert_eq!(version,1);assert_eq!(c,completion);Ok(())
+        }).unwrap();
+        let mut out=[0;MAX_APPLY_REPORT_BYTES];let n=o.report(GROUP,&mut out).unwrap();
+        let report=ApplyReportV1::decode(&out[..n]).unwrap();
+        assert_eq!(report.state,ActionStatus::Applied);assert_eq!(report.completed_ns,110);
+        assert_eq!(o.expire(GROUP,502,||panic!()),Err(Error::Busy));
+    }
+    #[test]
     fn creation_tokens_no_refill_on_policy_change_and_unknown_retains_credit(){
         let mut o=Owner::empty();o.bind(1,1,||Ok(())).unwrap();o.register_group(GROUP,||Ok(())).unwrap();
         for id in 1..=4{o.submit(req(id),100,|_|Ok(())).unwrap();}
@@ -217,7 +243,7 @@ mod tests{
         o.accept(&w,0,1_000_000_000,105,||Ok(())).unwrap();
         let mut out=[0;MAX_APPLY_REPORT_BYTES];assert_eq!(o.report(GROUP,&mut out),Err(Error::NotReady));
         assert_eq!(o.service_one(106,62,|_|panic!(),|_|panic!()),Ok(None));
-        o.reconcile(CALLER,2,Outcome::NoEffect,107,|_,_|Ok(())).unwrap();
+        o.reconcile(CALLER,2,Completion{outcome:Outcome::NoEffect,completed_ns:107},107,|_,_,_,_|Ok(())).unwrap();
         let other=Identity{id:101,generation:1};
         assert_eq!(o.service_one(108,62,|_|Ok(()),|_|Completion{outcome:Outcome::Created(other),completed_ns:108}),Ok(Some(State::Created(other))));
         let n=o.report(GROUP,&mut out).unwrap();let r=ApplyReportV1::decode(&out[..n]).unwrap();
