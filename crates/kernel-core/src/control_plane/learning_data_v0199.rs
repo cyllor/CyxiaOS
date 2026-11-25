@@ -175,6 +175,28 @@ pub struct Holdouts{used:[Option<ReplayGroup>;MAX_SAMPLES],len:usize,blocked:boo
     history_digest:[u8;32],claims:u64}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct ValidationEvidence{pub candidate:[u8;32],pub parent:[u8;32],pub training:[u8;32],pub holdout:[u8;32]}
+/// Unforgeable in safe Rust outside this module. This proves the current
+/// independent integer-model MSE check, not Shadow/Canary or promotion.
+/// Production adapter must retain this exact binding and authenticate
+/// the actual validator, learner and model manager before evaluation.
+#[derive(Debug)]
+pub struct ValidatedCandidate{
+    binding:ValidationEvidence,learner:Identity,validator:Identity,manager:Identity,
+    claim_sequence:u64,claim_head:[u8;32],
+}
+impl ValidatedCandidate{
+    pub fn binding(&self)->ValidationEvidence{self.binding}
+    pub fn authorize_shadow(&self,manager:Identity,current_active:[u8;32],candidate:&CandidateModel,
+        verify_current:impl FnOnce(Identity,Identity,u64,[u8;32],ValidationEvidence)->Result<(),Error>)
+        ->Result<(),Error>{
+        if manager!=self.manager||candidate.learner!=self.learner
+            ||current_active!=self.binding.parent||<[u8;32]>::from(Sha256::digest(candidate.bytes))!=self.binding.candidate
+            ||candidate.data!=self.binding.training{return Err(Error::Denied);}
+        // Read-only preflight, not a state transition. Must independently
+        // prove retained validation, current schema and manager capability.
+        verify_current(self.learner,self.validator,self.claim_sequence,self.claim_head,self.binding)
+    }
+}
 pub struct HoldoutClaim<'a>{
     pub sequence:u64,
     pub prior_history:[u8;32],
@@ -254,7 +276,27 @@ impl Holdouts{
     pub fn history(&self)->(u64,[u8;32]){(self.claims,self.history_digest)}
     #[cfg(test)]
     fn new()->Self{Self::restore_claims(&[],&[],genesis(),|_,_,_|Ok(())).unwrap()}
-    pub fn validate(&mut self,validator:Identity,active:&[u8;MODEL_BYTES],model:&CandidateModel,
+    /// Role-specific entry: unauthorized callers cannot burn a valid
+    /// holdout before the independent preflight. No validation result
+    /// can be converted into a manager grant by a learner.
+    pub fn validate_registered(&mut self,
+        manifest:&super::role_manifest_v0199::NativeRoleManifest,
+        manager:Identity,validator:Identity,active:&[u8;MODEL_BYTES],model:&CandidateModel,
+        training:&TrainingData<'_>,holdout:&[Sample],
+        authenticate:impl FnOnce(Identity,Identity,Identity)->Result<(),Error>,
+        commit_consumption:impl FnOnce(&HoldoutClaim<'_>)->Result<(),Error>,
+        verify_native:impl FnOnce(Identity,&[u8;MODEL_BYTES],&CandidateModel,&[Sample])->Result<(),Error>)
+        ->Result<ValidatedCandidate,Error>{
+        use super::role_manifest_v0199::{Role,MODEL_MANAGE,VALIDATION_REGISTER,CANDIDATE_SUBMIT};
+        manifest.can_act(Role::ModelManager,manager,MODEL_MANAGE,0)?;
+        manifest.can_act(Role::Validator,validator,VALIDATION_REGISTER,0)?;
+        manifest.can_act(Role::Learner,model.learner,CANDIDATE_SUBMIT,0)?;
+        authenticate(manager,validator,model.learner)?;
+        let binding=self.validate(validator,active,model,training,holdout,commit_consumption,verify_native)?;
+        Ok(ValidatedCandidate{binding,learner:model.learner,validator,manager,
+            claim_sequence:self.claims,claim_head:self.history_digest})
+    }
+    fn validate(&mut self,validator:Identity,active:&[u8;MODEL_BYTES],model:&CandidateModel,
         training:&TrainingData<'_>,holdout:&[Sample],
         commit_consumption:impl FnOnce(&HoldoutClaim<'_>)->Result<(),Error>,
         verify_native:impl FnOnce(Identity,&[u8;MODEL_BYTES],&CandidateModel,&[Sample])->Result<(),Error>)
@@ -275,6 +317,7 @@ impl Holdouts{
             if !holdout[..i].iter().any(|t|t.group==s.group){n+=1;}
         }
         if n>MAX_SAMPLES-self.len{return Err(Error::Exhausted);}
+        let sequence=self.claims.checked_add(1).ok_or(Error::Exhausted)?;
         let first=self.len;
         let binding=ValidationEvidence{candidate:Sha256::digest(model.bytes).into(),parent:model.parent,
             training:model.data,holdout:digest(holdout,training.schemas)};
@@ -286,7 +329,6 @@ impl Holdouts{
         // Consume BEFORE exposing the holdout to evaluation. The native
         // owner must commit the exact candidate/group binding and verify
         // durable completion. Any error is conservatively ambiguous.
-        let sequence=self.claims.checked_add(1).ok_or(Error::Exhausted)?;
         let prior_history=self.history_digest;
         let next_history=claim_digest(prior_history,sequence,binding,model.learner,validator,n,
             self.used[first..self.len].iter().flatten().copied());
@@ -385,6 +427,21 @@ mod tests{
         assert!(matches!(checked_feedback(&bad,&baseline),Err(Error::Invalid)));
         let mut bad=base;bad.decision[108..112].copy_from_slice(&7u32.to_le_bytes());
         assert!(matches!(checked_feedback(&bad,&baseline),Err(Error::Denied)));
+    }
+    #[test]
+    fn shadow_preflight_binds_exact_candidate_and_independent_manager(){
+        let learner=Identity{id:10,generation:1};let validator=Identity{id:9,generation:1};
+        let manager=Identity{id:3,generation:1};
+        let model=CandidateModel{bytes:[0;MODEL_BYTES],parent:[2;32],data:[3;32],schemas:SCHEMAS,learner};
+        let binding=ValidationEvidence{candidate:Sha256::digest(model.bytes).into(),parent:model.parent,
+            training:model.data,holdout:[4;32]};
+        let proof=ValidatedCandidate{binding,learner,validator,manager,claim_sequence:1,claim_head:[5;32]};
+        assert_eq!(proof.authorize_shadow(learner,model.parent,&model,|_,_,_,_,_|panic!()),Err(Error::Denied));
+        assert_eq!(proof.authorize_shadow(manager,[9;32],&model,|_,_,_,_,_|panic!()),Err(Error::Denied));
+        assert_eq!(proof.authorize_shadow(manager,model.parent,&model,|_,_,_,_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        proof.authorize_shadow(manager,model.parent,&model,|l,v,seq,head,b|{
+            assert_eq!((l,v,seq,head,b),(learner,validator,1,[5;32],binding));Ok(())
+        }).unwrap();
     }
     #[test]
     fn complete_claim_history_cannot_lose_identity_or_consumed_prefix(){
