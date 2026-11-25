@@ -169,7 +169,15 @@ impl Owner{
         if chars>0{self.window_wait=Some(wait);}
         // Without exact aligned PMU split do not present a cross-window
         // measurement as a valid current-window value.
-        if end/WINDOW!=start/WINDOW||fault{self.window_valid=false;}
+        if end/WINDOW!=start/WINDOW{
+            // The tail of this call belongs to the later window, but we
+            // have no independently metered split. Keep that later window
+            // tainted even after subsequent calls wholly inside it.
+            self.window=end/WINDOW;self.window_calls=0;self.window_full=0;
+            self.window_cpu=0;self.window_wait=None;
+            self.window_valid=end%WINDOW==0;
+        }
+        if fault{self.window_valid=false;}
         let e=PumpEvidence{call,start_ns:start,end_ns:end,cpu_ns,before,after:self.len as u16,
             chars,limit,tx_full:full,version,written_before,written_after:self.written,wait_ns:wait};
         if fault{self.poison(end);return Err(Error::NotReady);}
@@ -195,6 +203,10 @@ impl Owner{
     }
     pub fn report(&mut self,now:u64,out:&mut[u8;super::apply_report_v1::MAX_APPLY_REPORT_BYTES])->Result<usize,Error>{
         if now<self.last_clock{return Err(Error::Clock);}
+        // Expiry is a state transition, not a pure observation. Advance
+        // the same watermark before cancelling so a stale timestamp
+        // cannot subsequently pump using the already expired policy.
+        self.last_clock=now;
         self.expire(now);
         let w=self.work.ok_or(Error::Stale)?;
         let (state,result,completed_ns)=match w.effect{
@@ -270,6 +282,41 @@ mod tests{
         o.retire(&report,||Ok(())).unwrap();
         o.pump(&mut u,&mut c).unwrap();assert_eq!(u.bytes,b"abcdefghijklmnopqrstuvwxyz0123456789");
         assert_eq!(o.observe(c.wall).unwrap()[0],Some(0));
+    }
+    #[test]
+    fn expiry_report_advances_clock_and_cannot_reopen_old_policy(){
+        let mut o=owner();
+        o.accept(&work(&[32,0]),0,200,100,||Ok(())).unwrap();
+        o.enqueue(b"abc",100).unwrap();
+        let mut b=[0;super::super::apply_report_v1::MAX_APPLY_REPORT_BYTES];
+        let n=o.report(200,&mut b).unwrap();
+        let r=ApplyReportV1::decode(&b[..n]).unwrap();
+        assert_eq!(r.state,ActionStatus::Cancelled);
+        assert_eq!(o.current(200),BASELINE);
+        assert_eq!(o.enqueue(b"d",199),Err(Error::Clock));
+        let mut c=C{wall:180,cpu:0};
+        let mut u=U{full:false,fail:false,bytes:std::vec::Vec::new()};
+        assert_eq!(o.pump(&mut u,&mut c),Err(Error::Clock));
+        assert!(u.bytes.is_empty());assert_eq!(o.pending(),3);
+        o.verify_report(&r).unwrap();
+    }
+    #[test]
+    fn unsplit_cross_window_cost_taints_following_window(){
+        let mut o=owner();
+        let mut c=C{wall:WINDOW-15,cpu:0};
+        let mut u=U{full:false,fail:false,bytes:std::vec::Vec::new()};
+        o.enqueue(b"abcdefghijklmnop",c.wall).unwrap();
+        let e=o.pump(&mut u,&mut c).unwrap().unwrap();
+        assert!(e.start_ns<WINDOW&&e.end_ns>WINDOW);
+        assert_eq!(o.observe(c.wall).unwrap(),[Some(8),None,None,None]);
+        o.pump(&mut u,&mut c).unwrap().unwrap();
+        assert_eq!(o.observe(c.wall).unwrap(),[Some(0),None,None,None]);
+        c.wall=2*WINDOW;
+        o.enqueue(b"x",c.wall).unwrap();
+        o.pump(&mut u,&mut c).unwrap().unwrap();
+        let f=o.observe(c.wall).unwrap();
+        assert_eq!(f[0],Some(0));assert_eq!(f[1],Some(0));
+        assert!(f[2].is_some()&&f[3].is_some());
     }
     #[test]
     fn uncertain_hardware_error_never_reports_applied(){
