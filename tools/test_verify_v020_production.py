@@ -14,8 +14,9 @@ import verify_v020_production as v  # noqa: E402
 
 SVC64 = 0x5600_0000
 GA_MARKER = ("V020_W11_PRODUCTION frame_meta=1 recovery=1 metered=1 net=1 "
-             "tcp_echo=1 tls_echo=0 media_staging=0")
-STAGING_MARKER = GA_MARKER[:-1] + "1"
+             "tcp_echo=1 tls_echo=0 media_staging_enabled=0 staging_ok=0")
+STAGING_MARKER = GA_MARKER.replace("media_staging_enabled=0 staging_ok=0",
+                                   "media_staging_enabled=1 staging_ok=1")
 
 
 def wave10_words() -> list:
@@ -66,7 +67,9 @@ def wave10_lines() -> list:
 
 def w11_lines(staging: bool = False) -> list:
     lines = wave10_lines()
-    lines += ["V020_W11_NET_LISTEN a=7 b=0 c=0",
+    lines += ["V020_W11_FRAME_META_ROWS a=337 b=532 c=195",
+              "V020_W11_RECOVERY_GATE_REJECTS a=0 b=1 c=1",
+              "V020_W11_NET_LISTEN a=7 b=0 c=0",
               "V020_W11_NET_GUEST_END a=0 b=0 c=0",
               "V020_W11_NET_RELAY a=71 b=1 c=512"]
     if staging:
@@ -98,8 +101,15 @@ class W11Validation(unittest.TestCase):
         self.assertTrue(obs["tcp_to_local_echo"])
         self.assertFalse(obs["tls_echo_turn_verified"])
         self.assertEqual(obs["echo_bytes_relayed"], 512)
-        self.assertEqual(obs["policy_lock_settled"] + obs["policy_lock_overruns"], 4)
+        self.assertEqual(obs["policy_lock_settled_in_budget"]
+                         + obs["policy_lock_overrun_or_unmeasured"], 4)
         self.assertFalse(obs["media_staging_enabled"])
+        self.assertEqual(obs["frame_meta_registered_static_pages"], 337)
+        self.assertEqual(obs["frame_meta_permanent_rows"], 532)
+        self.assertEqual(obs["frame_meta_permanent_gap_rows"], 195)
+        self.assertEqual(obs["recovery_publish_rejected_after_synthetic_unknown"], 1)
+        self.assertNotIn("recovery_required_publish_rejected", obs)
+        self.assertTrue(obs["w11_completion_marker"].endswith("staging_ok=0"))
 
     def test_rejects_missing_net_device(self):
         words = w11_words()
@@ -114,7 +124,7 @@ class W11Validation(unittest.TestCase):
                 self.rejects("policy_lock", words=words)
         words = w11_words()
         words[136:138] = [2, 2]
-        self.assertEqual(self.check(words=words)["policy_lock_settled"], 2)
+        self.assertEqual(self.check(words=words)["policy_lock_settled_in_budget"], 2)
 
     def test_rejects_tls_claim(self):
         words = w11_words()
@@ -162,13 +172,43 @@ class W11Validation(unittest.TestCase):
         self.rejects("relay", lines=lines)
 
     def test_rejects_bad_w11_magic_and_baseline_rows(self):
-        for at, value in ((128, 0), (129, 0), (130, 0), (131, 3), (132, 0),
-                          (133, 0), (134, 0), (143, 0)):
+        # Each word must fail for ITS OWN reason, not an unrelated check.
+        for at, value, pattern in ((128, 0, "magic"),
+                                   (129, 0, "frame_meta_production_statics"),
+                                   (130, 0, "registered static pages"),
+                                   (131, 3, "recovery_accumulators"),
+                                   (132, 0, "DegradedEvent"),
+                                   (133, 0, "word 133"),
+                                   (133, 2, "word 133"),
+                                   (134, 0, "recovery_pair_facts_staged"),
+                                   (143, 0, "staged_boot_epoch")):
             words = w11_words()
             words[at] = value
-            with self.subTest(word=at):
-                with self.assertRaises(ValueError):
-                    self.check(words=words)
+            with self.subTest(word=at, value=value):
+                self.rejects(pattern, words=words)
+
+    def test_frame_meta_rows_row_must_match_word_130(self):
+        for row in ("V020_W11_FRAME_META_ROWS a=336 b=532 c=196",
+                    "V020_W11_FRAME_META_ROWS a=337 b=532 c=194",
+                    "V020_W11_FRAME_META_ROWS a=337 b=300 c=0"):
+            lines = [row if x.startswith("V020_W11_FRAME_META_ROWS") else x
+                     for x in w11_lines()]
+            with self.subTest(row=row):
+                self.rejects("FrameMeta rows", lines=lines)
+        lines = [x for x in w11_lines() if not x.startswith("V020_W11_FRAME_META_ROWS")]
+        self.rejects("FrameMeta rows", lines=lines)
+
+    def test_gate_refusal_counter_is_a_second_signal(self):
+        for row in ("V020_W11_RECOVERY_GATE_REJECTS a=0 b=0 c=1",
+                    "V020_W11_RECOVERY_GATE_REJECTS a=1 b=1 c=1",
+                    "V020_W11_RECOVERY_GATE_REJECTS a=0 b=1 c=0"):
+            lines = [row if x.startswith("V020_W11_RECOVERY_GATE_REJECTS") else x
+                     for x in w11_lines()]
+            with self.subTest(row=row):
+                self.rejects("refusal counter", lines=lines)
+        lines = [x for x in w11_lines()
+                 if not x.startswith("V020_W11_RECOVERY_GATE_REJECTS")]
+        self.rejects("refusal counter", lines=lines)
 
     def test_rejects_nonzero_reserved_tail(self):
         words = w11_words()
@@ -208,6 +248,19 @@ class W11Validation(unittest.TestCase):
         words[152] = 1
         self.rejects("staging", words=words, staging=True)
 
+    def test_staging_rejects_incomplete_line(self):
+        lines = w11_lines(staging=True)
+        lines.insert(-3, "V020_W11_MEDIA_STAGING_INCOMPLETE step=1")
+        self.rejects("INCOMPLETE", lines=lines, staging=True)
+
+    def test_staging_marker_carries_staging_ok(self):
+        obs = self.check(staging=True)
+        self.assertTrue(obs["w11_completion_marker"].endswith(
+            "media_staging_enabled=1 staging_ok=1"))
+        # A guest claiming staging_ok=1 in the G-A lane disagrees with memory.
+        lines = [x.replace("staging_ok=0", "staging_ok=1") for x in w11_lines()]
+        self.rejects("completion marker", lines=lines)
+
     def test_staging_rejects_media_absent(self):
         lines = w11_lines(staging=True)
         lines.insert(-3, "V020_W11_MEDIA_ABSENT golden_vector_pending=1")
@@ -225,6 +278,9 @@ class Labels(unittest.TestCase):
                     "admission_leases_inferred", "production_skeleton", "staged_boot_epoch"):
             self.assertIs(meta[key], True, key)
         self.assertNotIn("golden_vector_pending", meta)
+        self.assertIs(meta["recovery_trigger_synthetic"], True)
+        self.assertIs(meta["degraded_events_drive_gate"], False)
+        self.assertIs(meta["accumulator_takeover_instantiated"], False)
         text = repr(meta) + repr(v.Production().success())
         self.assertNotIn("G4", text)
 

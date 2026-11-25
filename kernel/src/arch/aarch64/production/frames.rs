@@ -6,7 +6,9 @@
 //! production PIE BACKING and EXEC_TARGET (Control). The window runs from the
 //! lowest to the highest registered PA; rows between registered regions (other
 //! kernel statics) are published unowned PERMANENT but are NOT registered and
-//! count toward no class. Evidence word 130 reports registered pages only.
+//! count toward no class. Evidence word 130 reports registered static pages
+//! only; the serial row `V020_W11_FRAME_META_ROWS a=<registered> b=<all
+//! permanent rows> c=<unregistered permanent gap rows>` reports the rest.
 //! The ledger is a static authority record over linker-placed kernel statics:
 //! it does not move, map, zero or own them.
 //!
@@ -15,16 +17,16 @@
 //!   `register_production_statics`, guarded by the REGISTERED swap, on CPU0
 //!   before any secondary CPU or EL0 role runs. The ledger borrowing it is
 //!   dropped before return; nothing else reads or writes the rows.
-//! * REGISTERED / REGISTERED_PAGES (atomics): CPU0 only; REGISTERED makes the
-//!   registration one-shot, REGISTERED_PAGES carries the inventory figure from
-//!   registration to the evidence seal.
+//! * REGISTERED / REGISTERED_PAGES / PERMANENT_ROWS (atomics): CPU0 only;
+//!   REGISTERED makes the registration one-shot, the other two carry the
+//!   inventory figures from registration to the evidence seal.
 //! * `__sec_n_start` / `__sec_n_end` (linker symbols): only their addresses are
 //!   taken (`addr_of!`); the window is checked disjoint from that section.
 //! * Registered statics are only addressed via `addr_of!` (no reference is
 //!   formed); their PA is `VA - HIGH`, checked, failing Range on underflow.
 
 use super::super::{
-    DATA_PAGES, LEAVES, MIDDLES, PRIVATE_SPACES, Page, ROOTS, USER_STACKS, fatal,
+    DATA_PAGES, LEAVES, MIDDLES, PRIVATE_SPACES, Page, ROOTS, USER_STACKS, fatal, report,
 };
 use super::{BACKING, Backing, EXEC_TARGET, ExecTarget, ROLE_COUNT, TABLES, Tables, evidence};
 use core::ptr::{addr_of, addr_of_mut};
@@ -46,6 +48,7 @@ const FATAL_FRAME_META: u64 = 0x5731_1290;
 static mut ROWS_BACKING: [FrameMeta; ROWS] = [FrameMeta::ZERO; ROWS];
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static REGISTERED_PAGES: AtomicU64 = AtomicU64::new(0);
+static PERMANENT_ROWS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Error {
@@ -149,8 +152,7 @@ pub(super) fn register_production_statics() -> Result<Inventory, Error> {
     // EL0 run; this is the only reference ever formed to ROWS_BACKING and the
     // ledger borrowing it is dropped before return.
     let rows = unsafe { &mut (&mut *addr_of_mut!(ROWS_BACKING))[..pages] };
-    let ledger =
-        Ledger::initialize_static_sparse(rows, base, &regions).map_err(Error::Ledger)?;
+    let ledger = Ledger::initialize_static_sparse(rows, base, &regions).map_err(Error::Ledger)?;
     ledger.inventory().map_err(Error::Ledger)
 }
 
@@ -168,6 +170,7 @@ pub(super) fn register_or_fatal() {
     match register_production_statics() {
         Ok(inv) if registered_pages(&inv) > 0 => {
             REGISTERED_PAGES.store(registered_pages(&inv), Ordering::Release);
+            PERMANENT_ROWS.store(u64::from(inv.permanent), Ordering::Release);
         }
         _ => {
             evidence::put(evidence::W11_FRAME_META, 0);
@@ -176,9 +179,17 @@ pub(super) fn register_or_fatal() {
     }
 }
 
-/// Evidence-seal hook: words 129/130 (the page is zeroed before the seal).
+/// Evidence-seal hook: words 129/130 (the page is zeroed before the seal),
+/// plus the serial row with the permanent and unregistered gap row counts.
 pub(super) fn publish() {
     let pages = REGISTERED_PAGES.load(Ordering::Acquire);
+    let permanent = PERMANENT_ROWS.load(Ordering::Acquire);
     evidence::put(evidence::W11_FRAME_META, u64::from(pages > 0));
-    evidence::put(evidence::W11_FRAME_META_ROWS, pages);
+    evidence::put(evidence::W11_FRAME_META_REGISTERED_STATIC_PAGES, pages);
+    report(
+        "V020_W11_FRAME_META_ROWS",
+        pages,
+        permanent,
+        permanent.saturating_sub(pages),
+    );
 }

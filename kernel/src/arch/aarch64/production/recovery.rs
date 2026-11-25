@@ -12,6 +12,21 @@
 //! and everything lives in volatile bss, not the protected pool.
 //! `recovery_pair_facts_staged=true`.
 //!
+//! HONEST SCOPE (word 133): the 0x41 refusal is driven by a SYNTHETIC
+//! `mark_unknown()` that run() injects through `publish_probe`; the gate never
+//! reaches `RecoveryRequired`. The accumulators record EL0 faults (word 132)
+//! but do NOT feed the gate: no RECOVERY_REQUIRED entry rule is driven by
+//! them and consumer takeover is not instantiated (open items). Word 133 is
+//! the measured number of 0x41 calls the gate refused (`GATE_REJECTS`), and
+//! the probe requires it to go 0 -> 1 across its one refused call.
+//! Consequences of the probe placement:
+//! * After the probe the gate stays Unknown for the rest of the boot, so any
+//!   later legitimate 0x41 (e.g. a future second plan) is refused too.
+//! * The SEC-N guest also runs at EL0 on CPU0; its aborts go through
+//!   `record_fault`. If `acc.record` ever rejected an event, `publish` would
+//!   fail the boot at the seal (FATAL_RECORD_REJECTED). Today that is
+//!   unreachable (sticky saturation, monotonic event_id).
+//!
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
 //! * GATE (static mut MaybeUninit<RecoveryGate>): `ptr::write`-initialized once
 //!   by `init` on CPU0, guarded by the INIT_CLAIMED swap, before any secondary CPU is
@@ -31,6 +46,9 @@
 //!   Release; CPU0 reads them with Acquire at the evidence seal, after the
 //!   business CPUs stopped.
 //! * PUBLISH_REJECTED (atomic): CPU0 only (set by `publish_probe`).
+//! * GATE_REJECTS (atomic): CPU0 only; incremented by `publish_allowed` when
+//!   the gate refuses (in-vector 0x41 dispatch, cpu == 0), read by
+//!   `publish_probe` and the CPU0 seal.
 //! * `publish_probe` reads the parent's advice GATE via `gate_ptr()` on CPU0
 //!   under the parent's registration (production.rs LEDGER/GATE).
 
@@ -68,9 +86,9 @@ static mut SLOTS: [Slot; ACCUMULATOR_COUNT] =
 static READY: AtomicBool = AtomicBool::new(false);
 static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
 static EVENTS: [AtomicU64; ACCUMULATOR_COUNT] = [const { AtomicU64::new(0) }; ACCUMULATOR_COUNT];
-static REJECTED: [AtomicU64; ACCUMULATOR_COUNT] =
-    [const { AtomicU64::new(0) }; ACCUMULATOR_COUNT];
+static REJECTED: [AtomicU64; ACCUMULATOR_COUNT] = [const { AtomicU64::new(0) }; ACCUMULATOR_COUNT];
 static PUBLISH_REJECTED: AtomicBool = AtomicBool::new(false);
+static GATE_REJECTS: AtomicU64 = AtomicU64::new(0);
 
 /// The staged initial pair: both copies valid, same FS UUID, the fresh-image
 /// identical initial pair, relation provable. Every adverse fact is false.
@@ -175,8 +193,13 @@ fn with_gate<R>(f: impl FnOnce(&mut RecoveryGate) -> R) -> Option<R> {
 }
 
 /// The 0x41 publish gate: true only while the recovery state is Verified.
+/// Every refusal is counted (word 133, measured).
 pub(super) fn publish_allowed() -> bool {
-    with_gate(|g| g.state() == RecoveryState::Verified).unwrap_or(false)
+    let allowed = with_gate(|g| g.state() == RecoveryState::Verified).unwrap_or(false);
+    if !allowed {
+        GATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+    }
+    allowed
 }
 
 /// Uncertain completion: Verified -> Unknown (never back online).
@@ -188,30 +211,52 @@ fn observe_unknown() -> RecoveryState {
 }
 
 /// After publish + replay, BEFORE executor/settlement (published_count == 1):
-/// an uncertain completion closes the gate, and a fresh 0x41 through the
-/// existing publisher carrier is refused with E_AUTH before the bridge runs.
-/// published_count stays 1 and nothing is natively accepted. Word 133 is set
-/// only after all of these hold.
+/// a SYNTHETIC uncertain completion closes the gate, and a fresh 0x41 through
+/// the existing publisher carrier is refused with E_AUTH before the bridge
+/// runs. Two independent signals tie the refusal to the gate: the SVC result
+/// is E_AUTH, and the gate's own refusal counter went 0 -> 1. published_count
+/// stays 1 and nothing is natively accepted.
 pub(super) fn publish_probe(pub_space: usize, pub_args: [u64; 6]) {
     // SAFETY: CPU0 control plane; the gate reference is consumed immediately
     // and no in-vector dispatch is running between these synchronous calls.
     let published = unsafe { (&*gate_ptr()).published_count() };
     assert_eq!(published, 1, "probe must run while the plan is published");
+    let rejects_before = GATE_REJECTS.load(Ordering::Relaxed);
+    assert_eq!(rejects_before, 0, "gate refused a publish before the probe");
     if observe_unknown() != RecoveryState::Unknown {
         fatal(FATAL_PROBE);
     }
     advice_carrier(pub_space, 0x41, pub_args);
     let out = SVC_OUT[ROLE_COUNT + 3].load(Ordering::Relaxed);
     assert_eq!(out, E_AUTH as u64, "publish must be refused after UNKNOWN");
+    let rejects_after = GATE_REJECTS.load(Ordering::Relaxed);
+    assert_eq!(
+        rejects_after, 1,
+        "the refusal must come from the recovery gate"
+    );
     // SAFETY: as above; the refused SVC already returned to this CPU0 loop.
     let after = unsafe { (&*gate_ptr()).published_count() };
     assert_eq!(after, 1, "refused publish must leave published_count at 1");
-    assert_eq!(ACCEPT_COUNT.load(Ordering::Relaxed), 1, "no new native accept");
+    assert_eq!(
+        ACCEPT_COUNT.load(Ordering::Relaxed),
+        1,
+        "no new native accept"
+    );
     PUBLISH_REJECTED.store(true, Ordering::Relaxed);
     report("V020_PROD_RECOVERY_REJECT", PUB.id, out, after as u64);
+    // c = the gate's observed state discriminant (Verified=0, Unknown=1).
+    let state = with_gate(|g| g.state() as u64).unwrap_or(u64::MAX);
+    report(
+        "V020_W11_RECOVERY_GATE_REJECTS",
+        rejects_before,
+        rejects_after,
+        state,
+    );
 }
 
 /// Evidence seal: words 131..134. Any rejected record fails the boot closed.
+/// Word 133 is the measured gate refusal count, published only if the probe
+/// completed (otherwise 0).
 pub(super) fn publish() {
     if REJECTED.iter().any(|r| r.load(Ordering::Acquire) != 0) {
         fatal(FATAL_RECORD_REJECTED);
@@ -225,9 +270,14 @@ pub(super) fn publish() {
         if ready { ACCUMULATOR_COUNT as u64 } else { 0 },
     );
     evidence::put(evidence::W11_DEGRADED_EVENTS, events);
+    let rejects = if PUBLISH_REJECTED.load(Ordering::Relaxed) {
+        GATE_REJECTS.load(Ordering::Relaxed)
+    } else {
+        0
+    };
     evidence::put(
-        evidence::W11_RECOVERY_PUBLISH_REJECTED,
-        PUBLISH_REJECTED.load(Ordering::Relaxed) as u64,
+        evidence::W11_RECOVERY_REJECTED_AFTER_SYNTHETIC_UNKNOWN,
+        rejects,
     );
     evidence::put(evidence::W11_RECOVERY_PAIR_FACTS_STAGED, ready as u64);
 }

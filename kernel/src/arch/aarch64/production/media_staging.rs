@@ -12,6 +12,7 @@
 //! 4. `BootEpochAuthority::{open, allocate, confirmed_epoch}` (staged verify,
 //!    no signed config — see authority.rs);
 //! 5. `file_admission_flow_v1::run_admission_flow` under the confirmed epoch.
+//!
 //! The in-vector snapshot SVC 0x40 is routed here and answers EAGAIN: the
 //! snapshot backend (catalog/slot payloads, SnapshotStore, live ViewGrant) is
 //! golden-vector-pending, so the only honest answer is fail-closed.
@@ -20,7 +21,13 @@
 //! fail-closed paths behave; it claims NO persistence (the disk is discarded),
 //! NO format correctness against golden vectors, NO signed catalog/config and
 //! NO production mount. Missing disk => `V020_W11_MEDIA_ABSENT`, words
-//! 145..150 stay 0, the boot continues.
+//! 145..149 stay 0 (word 150 records the 0x40 fail-closed answer, which does
+//! not depend on the disk), the boot continues.
+//! Serial: `V020_W11_MEDIA_STAGING golden_vector_pending=1` is emitted only
+//! when all five steps passed; otherwise `V020_W11_MEDIA_STAGING_INCOMPLETE
+//! step=<first step that did not pass>` (1 also when the disk is absent). The
+//! completion marker carries `media_staging_enabled=1` (word 144: the lane ran)
+//! and a separate `staging_ok` flag derived from words 145..150.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
 //! * Second DMA user of the production boot: the scratch VirtIO-blk device and
@@ -61,6 +68,22 @@ pub(super) struct StagingOutcome {
     pub(super) admission_flow_ok: bool,
 }
 
+impl StagingOutcome {
+    /// First chain step (1..=5) that did not pass, or `None` if all passed.
+    fn first_incomplete_step(&self) -> Option<u8> {
+        [
+            self.formatted,
+            self.mount_validated,
+            self.unified_map_validated,
+            self.confirmed_epoch != 0,
+            self.admission_flow_ok,
+        ]
+        .iter()
+        .position(|passed| !passed)
+        .map(|i| i as u8 + 1)
+    }
+}
+
 /// EpochBlockIo adapter over the shared scratch plumbing, bounded to the
 /// 512 MiB v1 image, with device-operation counters.
 struct Disk {
@@ -83,7 +106,12 @@ impl EpochBlockIo for Disk {
             return Err(SecurityError::Invalid);
         }
         let mut scratch = [0; BLOCK_BYTES];
-        scratch_blk::sectors(&mut self.device, u64::from(block) * 8, Some(data), &mut scratch)?;
+        scratch_blk::sectors(
+            &mut self.device,
+            u64::from(block) * 8,
+            Some(data),
+            &mut scratch,
+        )?;
         self.writes += 1;
         Ok(())
     }
@@ -123,7 +151,10 @@ fn run_chain(disk: &mut Disk, out: &mut StagingOutcome) -> Option<()> {
     out.unified_map_validated = true;
     let security = mounted.ok()?.security;
     out.confirmed_epoch = step(4, authority::boot_epoch(disk, &security))?;
-    step(5, authority::admission_flow(out.confirmed_epoch).map(|()| 1))?;
+    step(
+        5,
+        authority::admission_flow(out.confirmed_epoch).map(|()| 1),
+    )?;
     out.admission_flow_ok = true;
     Some(())
 }
@@ -150,14 +181,20 @@ pub(super) fn stage(info: &BootInfo) -> StagingOutcome {
     };
     let _ = run_chain(&mut disk, &mut out);
     report("V020_W11_MEDIA_IO", disk.reads, disk.writes, disk.flushes);
+    if let Some((code, sector, site)) = scratch_blk::last_error() {
+        report("V020_W11_MEDIA_IO_ERROR", code, sector, site);
+    }
     out
 }
 
 /// Seal-time evidence: words 144..151 (G-A leaves them all 0).
 pub(super) fn publish(outcome: &StagingOutcome) {
     let fail_closed = SNAPSHOT_FAIL_CLOSED.load(Ordering::Relaxed);
-    evidence::put(evidence::W11_MEDIA_STAGING, 1);
-    evidence::put(evidence::W11_STAGING_FORMATTED, u64::from(outcome.formatted));
+    evidence::put(evidence::W11_MEDIA_STAGING_ENABLED, 1);
+    evidence::put(
+        evidence::W11_STAGING_FORMATTED,
+        u64::from(outcome.formatted),
+    );
     evidence::put(
         evidence::W11_STAGING_MOUNT_VALIDATED,
         u64::from(outcome.mount_validated),
@@ -179,9 +216,22 @@ pub(super) fn publish(outcome: &StagingOutcome) {
         u64::from(fail_closed > 0),
     );
     evidence::put(evidence::W11_STAGING_GOLDEN_VECTOR_PENDING, 1);
-    report("V020_W11_MEDIA_SNAPSHOT_0X40", fail_closed, EAGAIN as u64, 0);
+    report(
+        "V020_W11_MEDIA_SNAPSHOT_0X40",
+        fail_closed,
+        EAGAIN as u64,
+        0,
+    );
     super::super::super::log(
         b"V020_W11_MEDIA_SCOPE persistence=false format_golden=false signed_config=false\n",
     );
-    super::super::super::log(b"V020_W11_MEDIA_STAGING golden_vector_pending=1\n");
+    match outcome.first_incomplete_step() {
+        None => super::super::super::log(b"V020_W11_MEDIA_STAGING golden_vector_pending=1\n"),
+        Some(step) => {
+            let mut line = *b"V020_W11_MEDIA_STAGING_INCOMPLETE step=0\n";
+            let at = line.len() - 2;
+            line[at] = b'0' + step;
+            super::super::super::log(&line);
+        }
+    }
 }

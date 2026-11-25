@@ -19,21 +19,29 @@ pub const W11_END: usize = 160;
 pub const W11_MAGIC: u64 = 0x4359_5052_4431_3131;
 
 pub const W11_FRAME_META: usize = 129;
-pub const W11_FRAME_META_ROWS: usize = 130;
+/// Registered static pages (NOT all permanent rows; gap rows are excluded).
+pub const W11_FRAME_META_REGISTERED_STATIC_PAGES: usize = 130;
 pub const W11_RECOVERY_ACCUMULATORS: usize = 131;
 pub const W11_DEGRADED_EVENTS: usize = 132;
-pub const W11_RECOVERY_PUBLISH_REJECTED: usize = 133;
+/// Measured count of 0x41 calls the recovery gate refused after the
+/// synthetic `mark_unknown()` probe (expected 1).
+pub const W11_RECOVERY_REJECTED_AFTER_SYNTHETIC_UNKNOWN: usize = 133;
 pub const W11_RECOVERY_PAIR_FACTS_STAGED: usize = 134;
 pub const W11_POLICY_LOCK_METERED: usize = 135;
-pub const W11_CRITICAL_SECTIONS: usize = 136;
-pub const W11_OVER_BUDGET: usize = 137;
+/// Metered sections that settled within the 45 us budget.
+pub const W11_POLICY_LOCK_SETTLED_IN_BUDGET: usize = 136;
+/// Metered sections that overran, or were not measured after the sticky latch.
+pub const W11_POLICY_LOCK_OVERRUN_OR_UNMEASURED: usize = 137;
 pub const W11_REAL_NET_DEVICE: usize = 138;
 pub const W11_TCP_TO_LOCAL_ECHO: usize = 139;
 pub const W11_ADMISSION_LEASES: usize = 140;
 pub const W11_ECHO_BYTES: usize = 141;
 pub const W11_TLS_ECHO_TURN_VERIFIED: usize = 142;
 pub const W11_STAGED_BOOT_EPOCH: usize = 143;
-pub const W11_MEDIA_STAGING: usize = 144;
+/// The opt-in staging lane is compiled in and ran (says nothing about success).
+pub const W11_MEDIA_STAGING_ENABLED: usize = 144;
+/// Staging rows that must all be nonzero for `staging_ok` (145..150).
+pub const W11_STAGING_STEPS: core::ops::Range<usize> = 145..151;
 // Media-staging rows 145..151 (Task 6): written, and therefore declared, only
 // under v020-production-media-staging; G-A leaves words 145..159 zero.
 #[cfg(feature = "v020-production-media-staging")]
@@ -67,25 +75,34 @@ fn flag(word: usize, expected: u64) -> bool {
 fn fill(line: &mut [u8], flags: &[bool]) {
     let mut next = flags.iter();
     for i in 1..line.len() {
-        if line[i - 1] == b'=' {
-            if let Some(&set) = next.next() {
-                line[i] = b'0' + u8::from(set);
-            }
+        if line[i - 1] == b'='
+            && let Some(&set) = next.next()
+        {
+            line[i] = b'0' + u8::from(set);
         }
     }
 }
 
 /// Emit the wave-11 completion marker, derived from the sealed words so the
-/// verifier can cross-check serial against memory. The 98-byte line exceeds
+/// verifier can cross-check serial against memory. `staging_ok` is 1 only if
+/// every staging row 145..150 is nonzero (G-A: always 0). The line exceeds
 /// the 96-byte framed-UART payload cap, so it goes out as two frames (CPU0 is
 /// the only writer, so the decoded stream holds it as one line).
 pub fn log_completion() {
     let mut head = *b"V020_W11_PRODUCTION frame_meta=0 recovery=0 metered=0 ";
-    let mut tail = *b"net=0 tcp_echo=0 tls_echo=0 media_staging=0\n";
-    let recovery = flag(W11_RECOVERY_ACCUMULATORS, 4) && flag(W11_RECOVERY_PUBLISH_REJECTED, 1);
+    let mut tail = *b"net=0 tcp_echo=0 tls_echo=0 media_staging_enabled=0 staging_ok=0\n";
+    let recovery = flag(W11_RECOVERY_ACCUMULATORS, 4)
+        && flag(W11_RECOVERY_REJECTED_AFTER_SYNTHETIC_UNKNOWN, 1);
+    let staging_ok = SMP_EVIDENCE.words[W11_STAGING_STEPS]
+        .iter()
+        .all(|w| w.load(Ordering::Relaxed) != 0);
     fill(
         &mut head,
-        &[flag(W11_FRAME_META, 1), recovery, flag(W11_POLICY_LOCK_METERED, 1)],
+        &[
+            flag(W11_FRAME_META, 1),
+            recovery,
+            flag(W11_POLICY_LOCK_METERED, 1),
+        ],
     );
     fill(
         &mut tail,
@@ -93,7 +110,8 @@ pub fn log_completion() {
             flag(W11_REAL_NET_DEVICE, 1),
             flag(W11_TCP_TO_LOCAL_ECHO, 1),
             flag(W11_TLS_ECHO_TURN_VERIFIED, 1),
-            flag(W11_MEDIA_STAGING, 1),
+            flag(W11_MEDIA_STAGING_ENABLED, 1),
+            staging_ok,
         ],
     );
     log(&head);

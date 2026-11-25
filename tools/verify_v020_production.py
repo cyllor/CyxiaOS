@@ -90,6 +90,9 @@ POLICY_LOCK_METERED_CALLS = 4
 RECOVERY_ACCUMULATORS = 4
 W11_MARKER = "V020_W11_PRODUCTION"
 STAGING_MARKER = "V020_W11_MEDIA_STAGING golden_vector_pending=1"
+STAGING_INCOMPLETE = b"V020_W11_MEDIA_STAGING_INCOMPLETE"
+# Words 145..150 must all be nonzero for the marker's `staging_ok=1`.
+STAGING_STEP_WORDS = range(145, 151)
 NET_ABSENT = b"V020_W11_NET_ABSENT"
 # Fixed 512-byte host-peer sample (same bytes Task 5 measured). It is NOT a TLS
 # ClientHello: the guest's rustls rejects it and parks, so no echo is expected.
@@ -135,6 +138,12 @@ class Production:
             "sec_n_pools_frame_meta_registered": False,
             "host_peer_sample": "fixed 512-byte non-TLS pattern (not a ClientHello)",
             "media_staging_enabled": self.staging,
+            # Word 133 (task-3 / final-review I3): the 0x41 refusal follows a
+            # SYNTHETIC mark_unknown(); accumulators do not drive the gate and
+            # no consumer takeover exists. The count itself is measured.
+            "recovery_trigger_synthetic": True,
+            "degraded_events_drive_gate": False,
+            "accumulator_takeover_instantiated": False,
         }
         if self.staging:
             meta.update({
@@ -300,10 +309,12 @@ def check_w11_baseline(words: tuple) -> None:
     require = verify_smp.require
     require(words[128] == W11_MAGIC, "missing wave-11 evidence magic (word 128)")
     require(words[129] == 1, "frame_meta_production_statics not set (word 129)")
-    require(words[130] > 0, "FrameMeta permanent rows must be > 0 (word 130)")
+    require(words[130] > 0, "FrameMeta registered static pages must be > 0 (word 130)")
     require(words[131] == RECOVERY_ACCUMULATORS, "recovery_accumulators must be 4 (word 131)")
     require(words[132] >= 1, "no DegradedEvent recorded (word 132)")
-    require(words[133] == 1, "recovery-required 0x41 publish not rejected (word 133)")
+    require(words[133] == 1,
+            "recovery gate must refuse exactly one 0x41 publish after the synthetic "
+            f"mark_unknown() probe (word 133), got {words[133]}")
     require(words[134] == 1, "recovery_pair_facts_staged label missing (word 134)")
     require(words[135] == 1, "policy_lock_metered not set (word 135)")
     require(words[136] + words[137] == POLICY_LOCK_METERED_CALLS,
@@ -311,6 +322,22 @@ def check_w11_baseline(words: tuple) -> None:
             f"{POLICY_LOCK_METERED_CALLS} metered calls, got {words[136]}+{words[137]}")
     require(words[142] == 0, "must not claim tls_echo_turn_verified (word 142)")
     require(words[143] == 1, "staged_boot_epoch not set (word 143)")
+
+
+def check_w11_rows(words: tuple, lines: list) -> dict:
+    """Serial rows that carry measured counts beside the memory words."""
+    require = verify_smp.require
+    frame_rows = w11_rows(lines, "V020_W11_FRAME_META_ROWS")
+    require(len(frame_rows) == 1, "FrameMeta rows serial row (V020_W11_FRAME_META_ROWS) missing")
+    registered, permanent, gaps = frame_rows[0]
+    require(registered == words[130] and permanent >= registered
+            and gaps == permanent - registered,
+            "FrameMeta rows serial row disagrees with word 130 (registered static pages)")
+    gate = w11_rows(lines, "V020_W11_RECOVERY_GATE_REJECTS")
+    require(gate == [(0, words[133], 1)],
+            "recovery gate refusal counter must go 0 -> 1 with the gate Unknown "
+            "(V020_W11_RECOVERY_GATE_REJECTS) and match word 133")
+    return {"frame_meta_permanent_rows": permanent, "frame_meta_permanent_gap_rows": gaps}
 
 
 def check_w11_net(words: tuple, lines: list, serial: bytes) -> None:
@@ -337,6 +364,8 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool) -
         require(b"V020_W11_MEDIA_" not in serial, "media staging markers in the G-A lane")
         return
     require(b"V020_W11_MEDIA_ABSENT" not in serial, "V020_W11_MEDIA_ABSENT: no scratch disk")
+    require(STAGING_INCOMPLETE not in serial,
+            "guest reported V020_W11_MEDIA_STAGING_INCOMPLETE: a staging step failed")
     require(words[144] == 1, "media_staging_enabled not set (word 144)")
     require(all(words[w] == 1 for w in range(145, 151)),
             "media staging steps incomplete (words 145..150 must all be 1)")
@@ -350,6 +379,7 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool) -> dic
     """Words 128..160 and the wave-11 serial contract (words 0..127 are checked by the caller)."""
     require = verify_smp.require
     check_w11_baseline(words)
+    measured_rows = check_w11_rows(words, lines)
     check_w11_net(words, lines, serial)
     check_w11_staging(words, lines, serial, staging)
     flags = {
@@ -359,7 +389,8 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool) -> dic
         "net": words[138] == 1,
         "tcp_echo": words[139] == 1,
         "tls_echo": words[142] == 1,
-        "media_staging": words[144] == 1,
+        "media_staging_enabled": words[144] == 1,
+        "staging_ok": all(words[w] != 0 for w in STAGING_STEP_WORDS),
     }
     expected = completion_marker(flags)
     require(sum(line.startswith(W11_MARKER + " ") for line in lines) == 1
@@ -368,13 +399,14 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool) -> dic
             + repr(expected))
     return {
         "frame_meta_production_statics": True,
-        "frame_meta_permanent_rows": words[130],
+        "frame_meta_registered_static_pages": words[130],
+        **measured_rows,
         "recovery_accumulators": words[131],
         "degraded_events": words[132],
-        "recovery_required_publish_rejected": True,
+        "recovery_publish_rejected_after_synthetic_unknown": words[133],
         "policy_lock_metered": True,
-        "policy_lock_settled": words[136],
-        "policy_lock_overruns": words[137],
+        "policy_lock_settled_in_budget": words[136],
+        "policy_lock_overrun_or_unmeasured": words[137],
         "real_net_device": True,
         "tcp_to_local_echo": True,
         "admission_leases_inferred_count": words[140],
@@ -597,6 +629,9 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                             "incomplete/corrupt framed UART transport")
                     page = (output / "native-page.bin").read_bytes()
                     report["observations"] = acceptance.validate(bytes(decoded), page, len(actual_cpus))
+                    require(peer is None or report["observations"]["echo_bytes_relayed"]
+                            == peer.result["sent"],
+                            "relayed bytes (word 141) differ from the bytes the host peer sent")
                     require(sha(elf) == report["elf_sha256"], "ELF changed during guest run")
                     require(before == source_manifest(), "production source changed during guest run")
                     report["status"] = "PASS"

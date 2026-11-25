@@ -47,7 +47,11 @@ pub(super) fn metered<T>(f: impl FnOnce() -> T) -> T {
             with_meter(|m| m.end(now_ns())),
             Ok(s) if s.overrun_class == OverrunClass::None
         );
-    let counter = if within_budget { &SETTLED } else { &OVER_BUDGET };
+    let counter = if within_budget {
+        &SETTLED
+    } else {
+        &OVER_BUDGET
+    };
     counter.fetch_add(1, Ordering::Relaxed);
     out
 }
@@ -56,11 +60,11 @@ pub(super) fn metered<T>(f: impl FnOnce() -> T) -> T {
 pub(super) fn publish() {
     evidence::put(evidence::W11_POLICY_LOCK_METERED, 1);
     evidence::put(
-        evidence::W11_CRITICAL_SECTIONS,
+        evidence::W11_POLICY_LOCK_SETTLED_IN_BUDGET,
         SETTLED.load(Ordering::Relaxed),
     );
     evidence::put(
-        evidence::W11_OVER_BUDGET,
+        evidence::W11_POLICY_LOCK_OVERRUN_OR_UNMEASURED,
         OVER_BUDGET.load(Ordering::Relaxed),
     );
 }

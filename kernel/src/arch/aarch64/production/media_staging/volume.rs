@@ -87,8 +87,10 @@ pub(super) fn security() -> SecurityStateStoreV2 {
     }
 }
 
-/// Run the frozen v1 formatter on the all-zero scratch (full 512 MiB scan,
-/// §9.2.1 FLUSH order). A non-zero image is rejected before any write.
+/// Run the frozen v1 formatter on the all-zero scratch (full 512 MiB scan).
+/// A non-zero image is rejected before any write. Only the step and FLUSH
+/// COUNTS are checked here (15 steps, 4 flushes); the §9.2.1 FLUSH order is
+/// the formatter's own contract and is not re-asserted by this lane.
 pub(super) fn format(disk: &mut Disk) -> Result<SuperblockV1, SecurityError> {
     let manifest = FormatManifest {
         fs_uuid: UUID,
