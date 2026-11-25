@@ -566,6 +566,22 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertNotIn("allow(dead_code)", near)
         self.assertNotIn("not yet wired by default", near)
 
+    def test_v020_wave11_sec_n_production_pins(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        net = source(arm / "production/net.rs")
+        self.assertIn("net_device::init(", net)
+        self.assertNotIn("LoopbackPort", net)
+        self.assertNotIn("RateLimiter", net)
+        self.assertIn("tls_echo_turn_verified", net)
+        fixture = source(arm / "v0199_sec_n_fixture.rs")
+        self.assertIn("sec_n_broker::", fixture)
+        self.assertNotIn("fn broker(", fixture)
+        self.assertNotIn("fn run_until_park(", fixture)
+        broker = source(arm / "sec_n_broker.rs")
+        self.assertIn("pub(crate) fn broker<P: Port>(", broker)
+        self.assertIn("pub(crate) fn run_until_park<P: Port>(", broker)
+        self.assertIn('link_section = ".bss.sec_n', broker)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

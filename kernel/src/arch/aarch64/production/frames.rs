@@ -18,6 +18,8 @@
 //! * REGISTERED / REGISTERED_PAGES (atomics): CPU0 only; REGISTERED makes the
 //!   registration one-shot, REGISTERED_PAGES carries the inventory figure from
 //!   registration to the evidence seal.
+//! * `__sec_n_start` / `__sec_n_end` (linker symbols): only their addresses are
+//!   taken (`addr_of!`); the window is checked disjoint from that section.
 //! * Registered statics are only addressed via `addr_of!` (no reference is
 //!   formed); their PA is `VA - HIGH`, checked, failing Range on underflow.
 
@@ -108,6 +110,29 @@ fn window(regions: &[StaticRegion]) -> Result<(u64, u64), Error> {
     Ok((base, end))
 }
 
+unsafe extern "C" {
+    /// Linker bounds of the `.bss.sec_n` section (aarch64.ld).
+    static __sec_n_start: u8;
+    static __sec_n_end: u8;
+}
+
+/// The SEC-N guest/net pools (`.bss.sec_n`, unregistered this wave) must lie
+/// wholly outside the registered window, so they never widen it or land in
+/// its unowned gap rows.
+fn outside_sec_n(base: u64, end: u64) -> Result<(), Error> {
+    let start = (addr_of!(__sec_n_start) as u64)
+        .checked_sub(crate::HIGH)
+        .ok_or(Error::Range)?;
+    let stop = (addr_of!(__sec_n_end) as u64)
+        .checked_sub(crate::HIGH)
+        .ok_or(Error::Range)?;
+    if start == stop || stop <= base || start >= end {
+        Ok(())
+    } else {
+        Err(Error::Range)
+    }
+}
+
 /// Register the production statics once, before any EL0 entry.
 pub(super) fn register_production_statics() -> Result<Inventory, Error> {
     if REGISTERED.swap(true, Ordering::AcqRel) {
@@ -115,6 +140,7 @@ pub(super) fn register_production_statics() -> Result<Inventory, Error> {
     }
     let regions = statics()?;
     let (base, end) = window(&regions)?;
+    outside_sec_n(base, end)?;
     let pages = (end - base).div_ceil(PAGE) as usize;
     if pages > ROWS {
         return Err(Error::Range);

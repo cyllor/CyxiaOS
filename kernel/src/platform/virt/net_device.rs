@@ -30,14 +30,18 @@
 use crate::virtio_platform::Board;
 use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_contracts::BootInfo;
-use cyxia_driver_virtio::{Error, Platform, Transport, net::BatchedNet, queue::BatchMemory};
+use cyxia_driver_virtio::{Error, Transport, net::BatchedNet, queue::BatchMemory};
 
 /// Net MMIO window decoded from the DTB (same window as the legacy bring-up).
 const NET_WINDOW_START: u64 = 0x0a00_0000;
 const NET_WINDOW_END: u64 = 0x0a20_0000;
 
 static CLAIMED: AtomicBool = AtomicBool::new(false);
+// v020-production keeps the pinned DMA pools in the dedicated `.bss.sec_n` link
+// section, outside the wave-11 FrameMeta window (not FrameMeta-registered yet).
+#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut RX: BatchMemory = BatchMemory::zeroed();
+#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut TX: BatchMemory = BatchMemory::zeroed();
 
 /// A brought-up real VirtIO-net device. The driver owns the pinned DMA custody;

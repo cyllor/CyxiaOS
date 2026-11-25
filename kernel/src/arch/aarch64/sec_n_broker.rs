@@ -18,8 +18,12 @@
 //!   load then sealed RO through the boot direct-map (break-before-make + TLBI);
 //!   bss/stack/shared pages are writable only by CPU0 between phases. Every &mut
 //!   is created and consumed within one synchronous CPU0 call; no aliasing.
+//!   Under v020-production they live in the dedicated `.bss.sec_n` link section
+//!   (aarch64.ld places it before every other .bss input, outside the wave-11
+//!   FrameMeta window); they are NOT FrameMeta-registered this wave (open item).
 //! * Broker state (CONN_EPOCH, CONNECTED, STALL_AFTER_POLL, POLL_COUNT, OP_COUNTS,
-//!   CLOSE_SEEN, YIELD_RUN, ENTROPY_STATE, QUIESCENCE_REFUSED, HANDSHAKE_POLLS)
+//!   CLOSE_SEEN, YIELD_RUN, ENTROPY_STATE, QUIESCENCE_REFUSED, HANDSHAKE_POLLS,
+//!   POLLED_CONNECTED, LEASE_COUNTED, INFERRED_LEASES, RELAYED_BYTES)
 //!   (static mut): CPU0-only, read/written only by the functions below and the
 //!   by-value accessors; no reference escapes.
 //! * load_guest()/map_page()/seal_page()/sync_code(): raw addr_of! arithmetic over
@@ -116,11 +120,17 @@ const GUEST_ASID: u8 = 0x40; // distinct from probes 0x80..0x83 / roles 0x90..0x
 
 #[repr(C, align(4096))]
 struct Frames([Page; FRAME_CAP]);
+#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut GUEST_FRAMES: Frames = Frames([const { Page::ZERO }; FRAME_CAP]);
+#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut GUEST_LEAVES: [Page; MID_COUNT] = [const { Page::ZERO }; MID_COUNT];
+#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut GUEST_MID: Page = Page::ZERO;
+#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut GUEST_ROOT: Page = Page::ZERO;
+#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut SHARED: [Page; SHARED_PAGES] = [const { Page::ZERO }; SHARED_PAGES];
+#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut GUEST_STACK: [Page; STACK_PAGES] = [const { Page::ZERO }; STACK_PAGES];
 
 // CPU0-only broker/accounting state.
@@ -134,6 +144,11 @@ static mut YIELD_RUN: u64 = 0;
 static mut ENTROPY_STATE: u64 = 0;
 static mut QUIESCENCE_REFUSED: u64 = 0;
 static mut HANDSHAKE_POLLS: u64 = 0;
+// Production accounting (inert for the mock-port fixture, which never reads it).
+static mut POLLED_CONNECTED: bool = false;
+static mut LEASE_COUNTED: bool = false;
+static mut INFERRED_LEASES: u64 = 0;
+static mut RELAYED_BYTES: u64 = 0;
 
 fn le16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
@@ -379,6 +394,10 @@ pub(crate) fn stage_shared(local: [u8; 32], connected: bool, conn_epoch: u64) {
         YIELD_RUN = 0;
         OP_COUNTS = [0; 16];
         HANDSHAKE_POLLS = 0;
+        POLLED_CONNECTED = false;
+        LEASE_COUNTED = false;
+        INFERRED_LEASES = 0;
+        RELAYED_BYTES = 0;
     }
 }
 
@@ -493,6 +512,17 @@ fn reply(len: u64, status: u64) {
 }
 
 fn broker_entropy(len: u64) {
+    // INFERRED lease: the guest calls Admission::begin_ns right after a connected
+    // POLL and parks (CLOSE, no ENTROPY) if it fails; only a granted lease reaches
+    // Pairing::server, whose rustls session is the first ENTROPY requester. So the
+    // first ENTROPY after a connected POLL is counted as one issued lease. The
+    // guest does not report its Admission count; this is a broker-trace inference.
+    unsafe {
+        if POLLED_CONNECTED && !LEASE_COUNTED {
+            LEASE_COUNTED = true;
+            INFERRED_LEASES += 1;
+        }
+    }
     let n = len as usize;
     let mut buf = [0u8; PAYLOAD];
     fixture_entropy(&mut buf[..n]);
@@ -513,6 +543,7 @@ fn broker_poll() {
         }
     }
     let (connected, epoch) = unsafe { (CONNECTED, CONN_EPOCH) };
+    unsafe { POLLED_CONNECTED |= connected };
     shared_write(OFF_CONN_EPOCH, epoch);
     shared_write(OFF_PEER_IPV4, u64::from(SOURCE_IP));
     shared_write(OFF_ARG0, u64::from(connected));
@@ -525,6 +556,7 @@ fn broker_read<P: Port>(port: &mut P, len: u64) {
     match port.receive(&mut frame) {
         Ok(Some(n)) if n <= len as usize => {
             shared_put(OFF_PAYLOAD, &frame[..n]);
+            unsafe { RELAYED_BYTES += n as u64 };
             reply(n as u64, ST_OK);
         }
         _ => reply(0, ST_AGAIN),
@@ -584,21 +616,38 @@ pub(crate) fn run_until_park<P: Port>(layout: &Layout, port: &mut P, budget: u64
 }
 
 // ---- by-value broker state accessors (no reference to a static escapes) ----
+/// Leases inferred from the broker trace (see `broker_entropy`), not reported
+/// by the guest.
+#[cfg(feature = "v020-production")]
+pub(crate) fn inferred_leases() -> u64 {
+    unsafe { INFERRED_LEASES }
+}
+/// Ingress bytes delivered to the guest through SVC 0x43 READ.
+#[cfg(feature = "v020-production")]
+pub(crate) fn relayed_bytes() -> u64 {
+    unsafe { RELAYED_BYTES }
+}
+#[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn op_counts() -> [u64; 16] {
     unsafe { OP_COUNTS }
 }
+#[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn op_count(op: u64) -> u64 {
     op_counts()[op as usize]
 }
+#[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn close_seen() -> bool {
     unsafe { CLOSE_SEEN }
 }
+#[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn conn_epoch() -> u64 {
     unsafe { CONN_EPOCH }
 }
+#[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn quiescence_refused() -> u64 {
     unsafe { QUIESCENCE_REFUSED }
 }
+#[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn set_stall_after_poll(polls: u64) {
     unsafe { STALL_AFTER_POLL = polls };
 }

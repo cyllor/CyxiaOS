@@ -15,7 +15,9 @@ SECTIONS {
  .rodata : AT(ADDR(.rodata)-HIGH) { KEEP(*(.cyxia.boot)) *(.rodata .rodata.*) } :ro
  . = ALIGN(4096); __ro_end = .;
  .data : AT(ADDR(.data)-HIGH) { *(.data .data.*) *(.got .got.*) } :data
- .bss (NOLOAD) : AT(ADDR(.bss)-HIGH) { . = ALIGN(16); __bss_start = .; *(.bss .bss.*) *(COMMON) . = ALIGN(16); __bss_end = .; }
+ /* .bss.sec_n (v020-production SEC-N guest pool, net DMA pools, stream buffers) goes FIRST so it
+    stays outside the wave-11 FrameMeta window over the later .bss statics (frames.rs checks it). */
+ .bss (NOLOAD) : AT(ADDR(.bss)-HIGH) { . = ALIGN(16); __bss_start = .; __sec_n_start = .; *(.bss.sec_n .bss.sec_n.*) __sec_n_end = .; *(.bss .bss.*) *(COMMON) . = ALIGN(16); __bss_end = .; }
  . = ALIGN(4096);
  .stack (NOLOAD) : AT(ADDR(.stack)-HIGH) { __stack_guard = .; . += 4096; . += 262144; __stack_top = .; } :data
  . = ALIGN(4096);

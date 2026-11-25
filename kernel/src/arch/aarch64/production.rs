@@ -38,7 +38,10 @@
 //! handler, DMA or secondary CPU touches these statics or the advice spaces
 //! (index >= C*2). Secondary CPUs only run the smp business fixture; their EL0
 //! faults write only their own per-CPU recovery accumulator in recovery.rs
-//! (registered there), never any static listed here.
+//! (registered there), never any static listed here. The one DMA user is the
+//! SEC-N VirtIO-net device driven by net.rs after the business CPUs stopped;
+//! its pinned pools, stream buffers and guest pool are registered in
+//! net_device.rs / production/net.rs / sec_n_broker.rs, never listed here.
 //! * LEDGER/GATE (static mut MaybeUninit) via ledger_ptr()/gate_ptr():
 //!   ptr::write-initialized once in init_control_guards() before any dispatch.
 //!   Every later &mut/&* is created and consumed within one synchronous CPU0
@@ -102,6 +105,8 @@ mod evidence;
 mod frames;
 #[path = "production/meter.rs"]
 mod meter;
+#[path = "production/net.rs"]
+mod net;
 #[path = "production/recovery.rs"]
 pub(crate) mod recovery;
 
@@ -1738,6 +1743,9 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         );
     }
 
+    // SEC-N: real VirtIO-net + TCP relayed to the EL0 local-echo guest.
+    let net_outcome = net::serve(info);
+
     // (11) QMP-readable evidence page.
     let words = unsafe { &*core::ptr::addr_of!(SMP_EVIDENCE) };
     for w in words.words.iter() {
@@ -1855,6 +1863,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     frames::publish();
     recovery::publish();
     meter::publish();
+    net::publish(&net_outcome);
     words.words[2].store(1, Ordering::Release);
     // Framed UART payloads are capped at 96 bytes; keep the scope marker short.
     // in_vector_dispatch / staged_boot_epoch / fixture_executor are proven by the
