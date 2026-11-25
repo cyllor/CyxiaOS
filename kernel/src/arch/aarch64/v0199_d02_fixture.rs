@@ -8,7 +8,7 @@ use cyxia_kernel_core::{
     control_plane::{
         Error,Identity,action_schema_v2::ActionV2,
         candidate_registry_v0199::{CatalogEntry,FrozenCandidates},
-        d02_owner_v0199::{Owner,Request,State,Outcome,Completion},
+        d02_owner_v0199::{Owner,Request,Started,State,Outcome,Completion},
         apply_report_v1::{ActionStatus,ApplyReportV1,BoundReport,ExecutorBindingV1,ReportOrigin,TrustedApplyScope,MAX_APPLY_REPORT_BYTES},
         registered_gate_v3::{RegisteredDecisionGate,Registration,Publication,TrustedRegistrationScope},
         rule_profile_v2::{Profile,Candidates},feedback_v0199::{FeedbackInbox,CausalLabel},
@@ -32,6 +32,28 @@ pub(super) const PROOF_BYTES:usize=2048;
 static REQUEST:AtomicU64=AtomicU64::new(0);
 static DONE:AtomicU64=AtomicU64::new(0);
 static RESULT:[AtomicU64;16]=[const{AtomicU64::new(0)};16];
+// One preallocated protected diagnostic mailbox. REQUEST/DONE release
+// publishes each entire ticket/result; no subsequent ticket may overwrite
+// a live constructor. The business worker never calls the controller.
+static TICKET:[AtomicU64;16]=[const{AtomicU64::new(0)};16];
+static TICKET_ACK:[AtomicU64;4]=[const{AtomicU64::new(0)};4];
+const TICKET_PROOF_OFFSET:usize=1718;
+const TICKET_PROOF_BYTES:usize=48;
+const _:()=assert!(TICKET_PROOF_OFFSET+6*TICKET_PROOF_BYTES<=PROOF_BYTES);
+fn ticket_words(t:Started)->[u64;16]{
+    let mut w=[0;16];
+    w[..12].copy_from_slice(&[t.boot,t.executor,t.request.caller.id,t.request.caller.generation,
+        t.request.request_id,t.request.package.id,t.request.package.generation,t.request.group.id,
+        t.request.group.generation,t.sequence,t.started_ns,t.policy_version]);
+    for(i,chunk)in t.request.digest.chunks_exact(8).enumerate(){
+        w[12+i]=u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    w
+}
+fn ticket_digest(w:[u64;16])->[u8;32]{
+    let mut h=Sha256::new();h.update(b"CYX/D02-STARTED/v0199");
+    for v in w{h.update(v.to_le_bytes());}h.finalize().into()
+}
 
 fn now()->u64{
     (u128::from(timer::ticks())*1_000_000_000/u128::from(timer::frequency())).try_into().unwrap()
@@ -53,6 +75,19 @@ pub(super) fn worker_step()->bool{
     if serial==prior{return false;}
     assert_eq!(serial,prior+1);assert!((1..=6).contains(&serial));
     let began=now();let cpu_began=timer::cpu_ticks();
+    let words:[u64;16]=core::array::from_fn(|i|TICKET[i].load(Ordering::Relaxed));
+    // Independently check the exact native constructor ticket before
+    // modifying any private page. No request-derived capability is issued.
+    assert_ne!(words[0],0);
+    assert_eq!(&words[1..10],&[1,CALLER.id,CALLER.generation,serial,PACKAGE.id,PACKAGE.generation,
+        TARGET.id,TARGET.generation,serial]);
+    assert!(words[10]<=began);
+    assert_eq!(words[11],if serial<=2{0}else{3});
+    let expected=request_digest(words[0],serial,package_hash());
+    for(i,chunk)in expected.chunks_exact(8).enumerate(){
+        assert_eq!(words[12+i],u64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    let ticket_ack=ticket_digest(words);
     let (root,mid,leaf,data,stack)=unsafe{(
         core::ptr::addr_of_mut!(ROOTS).cast::<Page>().add(SLOT),
         core::ptr::addr_of_mut!(MIDDLES).cast::<Page>().add(SLOT),
@@ -107,6 +142,9 @@ pub(super) fn worker_step()->bool{
     let row=[serial,TASK,cpu::slot() as u64,phys(root as u64),phys(mid as u64),phys(leaf as u64),
         phys(data as u64),phys(stack as u64),observed,count,row_kind,row_esr,row_syscall,began,done,cost];
     for(i,v)in row.into_iter().enumerate(){RESULT[i].store(v,Ordering::Relaxed);}
+    for(i,chunk)in ticket_ack.chunks_exact(8).enumerate(){
+        TICKET_ACK[i].store(u64::from_le_bytes(chunk.try_into().unwrap()),Ordering::Relaxed);
+    }
     DONE.store(serial,Ordering::Release);
     true
 }
@@ -136,24 +174,36 @@ fn next_window()->u64{
 }
 fn service(owner:&mut Owner,boot:u64,package:[u8;32],serial:u64,window:u64,proof:&mut[u8;PROOF_BYTES]){
     let began=now();assert_eq!(began/WINDOW,window);
-    let mut captured=None;
-    let state=owner.service_one(began,3,|r|{
+    // Use the existing asynchronous D02 admission and completion API,
+    // rather than retaining a mutable owner through its constructor callback.
+    let ticket=owner.start_one(began,3,|r|{
         if *r==req(boot,serial,package){Ok(())}else{Err(Error::Denied)}
-    },|r|{
-        assert_eq!(r.request_id,serial);
-        assert_eq!(DONE.load(Ordering::Acquire),serial-1);
-        assert_eq!(REQUEST.load(Ordering::Relaxed),serial-1);
-        REQUEST.store(serial,Ordering::Release);
-        wait(||DONE.load(Ordering::Acquire)==serial);
-        let row:[u64;16]=core::array::from_fn(|i|RESULT[i].load(Ordering::Relaxed));
-        assert_eq!((row[0],row[1],row[2]),(serial,TASK,1));
-        assert!(began<=row[13]&&row[13]<=row[14]&&row[14]<=now());
-        captured=Some(row);
-        Completion{outcome:Outcome::Created(Identity{id:TASK,generation:serial}),completed_ns:row[14]}
-    }).unwrap();
+    }).unwrap().expect("native constructor admitted");
+    assert_eq!(owner.query(CALLER,serial),Ok(State::Unknown));
+    assert_eq!(DONE.load(Ordering::Acquire),serial-1);
+    assert_eq!(REQUEST.load(Ordering::Relaxed),serial-1);
+    let words=ticket_words(ticket);
+    let expected=ticket_digest(words);
+    for(i,v)in words.into_iter().enumerate(){TICKET[i].store(v,Ordering::Relaxed);}
+    REQUEST.store(serial,Ordering::Release);
+    wait(||DONE.load(Ordering::Acquire)==serial);
+    let row:[u64;16]=core::array::from_fn(|i|RESULT[i].load(Ordering::Relaxed));
+    let mut ack=[0;32];
+    for (i,word) in TICKET_ACK.iter().enumerate(){p64(&mut ack,i*8,word.load(Ordering::Relaxed));}
+    assert_eq!(ack,expected);
+    assert_eq!((row[0],row[1],row[2]),(serial,TASK,1));
+    assert!(began<=row[13]&&row[13]<=row[14]&&row[14]<=now());
     let task=Identity{id:TASK,generation:serial};
-    assert_eq!(state,Some(State::Created(task)));
-    let row=captured.expect("actual CPU1 creation");
+    let completion=Completion{outcome:Outcome::Created(task),completed_ns:row[14]};
+    let state=owner.complete_started(ticket,completion,now(),|t,c|{
+        if ticket_digest(ticket_words(t))==ack&&c==completion&&DONE.load(Ordering::Acquire)==serial{
+            Ok(())
+        }else{Err(Error::Denied)}
+    }).unwrap();
+    assert_eq!(state,State::Created(task));
+    let off=TICKET_PROOF_OFFSET+(serial as usize-1)*TICKET_PROOF_BYTES;
+    p64(proof,off,ticket.started_ns);p64(proof,off+8,ticket.policy_version);
+    proof[off+16..off+48].copy_from_slice(&ack);
     assert_eq!(row[14]/WINDOW,window,"real construction crossed token window");
     for(i,v)in row.into_iter().enumerate(){p64(proof,(serial as usize-1)*ROW_BYTES+i*8,v);}
     owner.exited(task,now(),||{
@@ -175,7 +225,7 @@ pub(super) fn run(boot:u64,gate:&mut RegisteredDecisionGate<'_>,snapshots:&mut S
     let base_window=next_window();
     for id in 1..=2{service(owner,boot,package,id,base_window,proof);}
     let t=now();assert_eq!(t/WINDOW,base_window);
-    assert_eq!(owner.service_one(t,3,|_|panic!("baseline token limit"),|_|panic!("baseline over-admission")),Ok(None));
+    assert_eq!(owner.start_one(t,3,|_|panic!("baseline token limit")),Ok(None));
     assert_eq!(owner.counts(),(5,0,0));
     let sample=now();let fields=owner.observation(TARGET,3,sample).unwrap();
     let target=Target{domain:2,object:TARGET,owner:Identity{id:1,generation:1}};
@@ -240,7 +290,7 @@ pub(super) fn run(boot:u64,gate:&mut RegisteredDecisionGate<'_>,snapshots:&mut S
     let approved_window=next_window();assert!(approved_window>base_window);
     for id in 3..=6{service(owner,boot,package,id,approved_window,proof);}
     let t=now();assert_eq!(t/WINDOW,approved_window);
-    assert_eq!(owner.service_one(t,3,|_|panic!("approved token limit"),|_|panic!("approved over-admission")),Ok(None));
+    assert_eq!(owner.start_one(t,3,|_|panic!("approved token limit")),Ok(None));
     assert_eq!(owner.counts(),(1,0,0));owner.cancel_queued(CALLER,7,now(),|r|{
         if *r==req(boot,7,package)&&DONE.load(Ordering::Acquire)==6{Ok(())}else{Err(Error::Denied)}
     }).unwrap();
@@ -261,6 +311,8 @@ pub(super) fn run(boot:u64,gate:&mut RegisteredDecisionGate<'_>,snapshots:&mut S
     for bytes in [&snap.encode().unwrap()[..],&rules,&plan,&record,&out[..n],&package]{
         proof[at..at+bytes.len()].copy_from_slice(bytes);at+=bytes.len();
     }
+    assert_eq!(at,TICKET_PROOF_OFFSET);
+    at+=6*TICKET_PROOF_BYTES;
     let row=[0x4359443032465831,base_window,approved_window,2,4,scope.plan_version,
         sample,scope.now_ns,r.completed_ns,n as u64,inbox.len() as u64,at as u64];
     for(i,v)in row.into_iter().enumerate(){SMP_EVIDENCE.words[379+i].store(v,Ordering::Relaxed);}
