@@ -33,7 +33,7 @@ pub struct Commit{
     pub view:View,pub request_hash:[u8;32],
 }
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
-pub enum Phase{Frozen,Prepared,Unknown,RestoredFrozen,Open}
+pub enum Phase{Frozen,PreparingUnknown,Prepared,Unknown,RestoredFrozen,Open}
 pub struct RestoreGate{
     recovery:Identity,reopen:Identity,view:View,phase:Phase,
     pending:Option<Prepared>,last:Option<(Prepared,Commit)>,
@@ -43,7 +43,9 @@ impl RestoreGate{
     /// admission and proved the durable freeze/protection generation.
     pub fn from_frozen(view:View,recovery:Identity,reopen:Identity,
         verify_durable_freeze:impl FnOnce(View)->Result<(),Error>)->Result<Self,Error>{
-        if !view.valid()||!recovery.valid()||!reopen.valid(){return Err(Error::Invalid);}
+        // Independent reopen authority must not be the same registered
+        // principal (including a later generation of the recovery role).
+        if !view.valid()||!recovery.valid()||!reopen.valid()||recovery.id==reopen.id{return Err(Error::Invalid);}
         verify_durable_freeze(view)?;
         Ok(Self{recovery,reopen,view,phase:Phase::Frozen,pending:None,last:None})
     }
@@ -67,7 +69,9 @@ impl RestoreGate{
             return Err(Error::Busy);
         }
         if let Some(p)=self.pending{
-            return if p.key==key&&p.request_hash==request_hash&&p.snapshot==snapshot{Ok(p)}else{Err(Error::Busy)};
+            if p.key!=key{return Err(Error::Busy);}
+            if p.request_hash!=request_hash||p.snapshot!=snapshot{return Err(Error::Conflict);}
+            return if self.phase==Phase::Prepared{Ok(p)}else{Err(Error::Unknown)};
         }
         if self.phase!=Phase::Frozen||!key.principal.valid()||key.request_seq==0
             ||snapshot.fs_uuid!=self.view.fs_uuid||snapshot.snapshot_id==0||snapshot.generation==0
@@ -75,8 +79,23 @@ impl RestoreGate{
         validate_snapshot_restore_system_projection(self.view.fs_uuid,index,security,index,security)?;
         let p=Prepared{key,snapshot,prior:self.view,next_live_epoch:self.view.live_epoch.checked_add(1).ok_or(Error::Exhausted)?,
             system_index_hash:hash(index),security_hash:hash(security),request_hash};
+        // The preparation callback may have written a durable record
+        // before its reply was lost. Close the retry gate BEFORE invoking it.
+        self.pending=Some(p);self.phase=Phase::PreparingUnknown;
         verify_native_prepare(&p)?;
-        self.pending=Some(p);self.phase=Phase::Prepared;Ok(p)
+        self.phase=Phase::Prepared;Ok(p)
+    }
+    /// Read-only reconciliation of an ambiguous preparation. Do not invoke
+    /// the original prepare writer again. The storage owner must prove the
+    /// exact retained record is durable; otherwise the gate stays closed.
+    pub fn reconcile_prepare(&mut self,actor:Identity,key:RestoreKey,request_hash:[u8;32],
+        verify_prepared:impl FnOnce(&Prepared)->Result<(),Error>)->Result<Prepared,Error>{
+        if actor!=self.recovery{return Err(Error::Unauthorized);}
+        if self.phase!=Phase::PreparingUnknown{return Err(Error::Busy);}
+        let p=self.pending.ok_or(Error::Unknown)?;
+        if p.key!=key||p.request_hash!=request_hash{return Err(Error::Conflict);}
+        verify_prepared(&p)?;
+        self.phase=Phase::Prepared;Ok(p)
     }
     /// Before the possibly side-effecting commit, mark UNKNOWN. Any
     /// failure retains the same request and cannot initiate another write.
