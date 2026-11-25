@@ -51,6 +51,8 @@ def safe_file(root,relative):
     require(isinstance(relative,str) and relative!="","missing relative evidence path")
     p=Path(relative)
     require(not p.is_absolute() and ".." not in p.parts,"evidence escapes root")
+    require(p.as_posix()==relative and "\\" not in relative and relative!=".",
+            "noncanonical evidence path")
     cur=root
     for part in p.parts:
         cur=cur/part
@@ -97,6 +99,7 @@ def aggregate(manifest_raw,locked_digest,root):
     require(type(run) is int and 0<run<2**64,"invalid run id")
     expected={}
     for item in j["proofs"]:
+        require(type(item["test_id"]) is int and 0<item["test_id"]<2**32,"invalid expected test ID")
         key=(item["test_id"],CLASSES[item["proof_class"]])
         require(key in g5 and key not in expected,"duplicate/unknown expected proof")
         require(all(k in item for k in FIELDS),"incomplete frozen expected input")
@@ -119,7 +122,7 @@ def aggregate(manifest_raw,locked_digest,root):
         stem=f'{key[0]:08x}-{key[1]}'
         rel=f'verdicts/{stem}.bin'
         path=root/rel
-        if not path.exists():
+        if not path.exists() and not path.is_symlink():
             rows[key]={**base,"status":"NOT_RUN","reason":"missing verdict"};continue
         try:
             raw=safe_file(root,rel).read_bytes()
@@ -134,10 +137,15 @@ def aggregate(manifest_raw,locked_digest,root):
                 members=strict_json(m)["files"]
                 require(isinstance(members,list) and len(members)==v["evidence_count"],"evidence count mismatch")
                 require(len({e["path"] for e in members})==len(members),"duplicate evidence member")
+                identities=set()
                 for e in members:
                     p=safe_file(root,e["path"])
+                    st=p.stat()
+                    identity=(st.st_dev,st.st_ino)
+                    require(identity not in identities,"aliased physical evidence member")
+                    identities.add(identity)
                     require(type(e["bytes"]) is int and 0<=e["bytes"]<2**64
-                            and p.stat().st_size==e["bytes"] and sha_path(p)==hash_value(e["sha256"]),
+                            and st.st_size==e["bytes"] and sha_path(p)==hash_value(e["sha256"]),
                             "evidence object mismatch")
             rows[key]={**base,"status":v["status"],"reason_code":v["reason"],"evidence_count":v["evidence_count"],
                        "record_sha256":digest(raw)}
