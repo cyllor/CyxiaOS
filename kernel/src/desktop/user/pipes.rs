@@ -1,6 +1,6 @@
 //! CPU0 foreground pipe admission and storage, independent of the socket pool.
-use cyxia_posix::{Errno, pipe::Pipes};
 use core::fmt::Write;
+use cyxia_posix::{Errno, pipe::Pipes};
 
 static mut PIPES: Pipes = Pipes::new();
 
@@ -15,9 +15,14 @@ pub(super) fn status(out: &mut impl Write) {
     let pool = unsafe { &*core::ptr::addr_of!(PIPES) };
     let free = pool.free();
     let capacity = pool.capacity();
-    let _ = writeln!(out,
+    let _ = writeln!(
+        out,
         "PIPE_POOL capacity={} unavailable={} free={} bytes_per_pair={} backing=BOOTSTRAP policy=AI_DIRECT model=8193\r",
-        capacity, capacity - free, free, cyxia_posix::pipe::CAPACITY);
+        capacity,
+        capacity - free,
+        free,
+        cyxia_posix::pipe::CAPACITY
+    );
 }
 
 pub(super) fn with<T>(f: impl FnOnce(&mut Pipes) -> Result<T, Errno>) -> Result<T, Errno> {
@@ -37,18 +42,15 @@ fn observe_with<T>(f: impl FnOnce(&mut Pipes) -> Result<T, Errno>) -> Result<T, 
     // the pool and the callback cannot return a reference to its entries.
     let pool = unsafe { &mut *core::ptr::addr_of_mut!(PIPES) };
     let result = f(pool);
-    super::objects::table().observe_backend(
-        cyxia_posix::epoll::Backend::Pipe,
-        |source| {
-            let cyxia_posix::epoll::Source::Pipe { owner, handle } = source else {
-                return None;
-            };
-            Some((
-                u32::from(pool.poll(owner, handle).ok()?),
-                pool.wake_mask(owner, handle).unwrap_or(0),
-            ))
-        },
-    );
+    super::objects::table().observe_backend(cyxia_posix::epoll::Backend::Pipe, |source| {
+        let cyxia_posix::epoll::Source::Pipe { owner, handle } = source else {
+            return None;
+        };
+        Some((
+            u32::from(pool.poll(owner, handle).ok()?),
+            pool.wake_mask(owner, handle).unwrap_or(0),
+        ))
+    });
     pool.clear_wakes();
     result
 }

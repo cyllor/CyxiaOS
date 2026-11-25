@@ -319,7 +319,10 @@ impl Heap {
         self.unmap_with_revoke(start, pages, |_, _| {})
     }
     pub fn unmap_with_revoke(
-        &mut self, start: u64, pages: usize, revoke: impl FnOnce(u64, usize),
+        &mut self,
+        start: u64,
+        pages: usize,
+        revoke: impl FnOnce(u64, usize),
     ) -> Result<(), Errno> {
         let slot = self
             .allocations
@@ -331,7 +334,9 @@ impl Heap {
     /// Release a known record without searching for it again. Teardown already
     /// walks every slot, so re-identifying each one by address made it O(A²).
     fn unmap_slot_with_revoke(
-        &mut self, slot: usize, revoke: impl FnOnce(u64, usize),
+        &mut self,
+        slot: usize,
+        revoke: impl FnOnce(u64, usize),
     ) -> Result<(), Errno> {
         let allocation = self.allocations[slot].ok_or(Errno::Io)?;
         let (start, pages) = (allocation.start, allocation.pages);

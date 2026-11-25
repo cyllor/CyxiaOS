@@ -6,6 +6,11 @@
 //! are re-exported here so historical diagnostics keep compiling against one
 //! transport implementation. Only the cluster RPC wire framing remains local.
 //! TCP connectivity is never a cluster admission proof.
+//!
+//! This facade enables net-transport's `cluster-discovery` feature: the CXD1
+//! paired-node discovery wire is cluster machinery and is NOT compiled into
+//! the single-machine closure (`smoltcp`/`tls` alone) — only legacy cluster
+//! consumers such as this facade pull it in.
 
 pub use cyxia_net_transport::device;
 pub use cyxia_net_transport::discovery;

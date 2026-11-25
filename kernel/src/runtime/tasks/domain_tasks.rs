@@ -1504,7 +1504,9 @@ pub fn begin_control(required_ns: u64, cleanup: bool) -> Result<Option<ControlCr
 /// Reconstructed or already-settled credits cannot authorize replay CPU work.
 pub(crate) fn verify_control_credit(credit: &ControlCredit) -> Result<(), Error> {
     let slot = cpu::slot();
-    if slot != cyxia_kernel_core::control_plane::fixed::CONTROL_CPU || usize::from(credit.cpu) != slot {
+    if slot != cyxia_kernel_core::control_plane::fixed::CONTROL_CPU
+        || usize::from(credit.cpu) != slot
+    {
         return Err(Error::Auth);
     }
     locked(|s| {

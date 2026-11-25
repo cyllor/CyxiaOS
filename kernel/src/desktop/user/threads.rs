@@ -129,7 +129,9 @@ impl IdleWait {
                 Wait::Display => {}
                 // Descriptor bindings, user poll arrays and timers have their
                 // own readiness rules. Leave these runners on the sampling path.
-                Wait::Poll { .. } | Wait::Epoll { .. } | Wait::Unix { .. }
+                Wait::Poll { .. }
+                | Wait::Epoll { .. }
+                | Wait::Unix { .. }
                 | Wait::TimerRead { .. } => return None,
             }
         }
@@ -138,7 +140,9 @@ impl IdleWait {
 
     fn unchanged(self, time: u64, ipc: &LocalIpc) -> bool {
         time < self.until
-            && self.ipc_epoch.is_none_or(|epoch| epoch != u64::MAX && epoch == ipc.readiness_epoch())
+            && self
+                .ipc_epoch
+                .is_none_or(|epoch| epoch != u64::MAX && epoch == ipc.readiness_epoch())
             && self.checkpoint.is_none_or(|generation| {
                 super::super::storage::checkpoint_complete(generation) == Err(Errno::Again)
             })
@@ -211,8 +215,7 @@ const RESERVED_CONTEXT_PAGES: usize =
 const _: () = {
     assert!(core::mem::size_of::<Shared>() == 4096);
     assert!(
-        core::mem::size_of::<Thread>() + core::mem::size_of::<Group>()
-            == (MAX_THREADS + 2) * 4096
+        core::mem::size_of::<Thread>() + core::mem::size_of::<Group>() == (MAX_THREADS + 2) * 4096
     );
     assert!(RESERVED_CONTEXT_PAGES <= 64); // Model 8193's existing input domain.
     assert!(MAX_THREADS <= u16::BITS as usize);
@@ -250,7 +253,11 @@ impl Runner {
         #[cfg(feature = "ported")]
         {
             if self.status.state == UserState::Waiting
-                && self.threads.shared.idle_wait.is_some_and(|idle| idle.unchanged(time, ipc))
+                && self
+                    .threads
+                    .shared
+                    .idle_wait
+                    .is_some_and(|idle| idle.unchanged(time, ipc))
                 && self.threads.shared.pending.pending() == 0
             {
                 return;
@@ -276,10 +283,12 @@ impl Runner {
             let mut candidates = [None; MAX_THREADS];
             for index in self.active_thread_slots() {
                 let thread = self.thread_at(index);
-                candidates[index] = thread.runnable().then_some(cyxia_ai_runtime::UserCandidate {
-                    waiting_ms: time.saturating_sub(thread.ready_since),
-                    cpu_bound: thread.cpu_bound,
-                });
+                candidates[index] = thread
+                    .runnable()
+                    .then_some(cyxia_ai_runtime::UserCandidate {
+                        waiting_ms: time.saturating_sub(thread.ready_since),
+                        cpu_bound: thread.cpu_bound,
+                    });
             }
             // Same bounded local model as process selection. Ages advance until
             // the chosen thread actually executes; parked threads never consume
@@ -323,7 +332,10 @@ impl Runner {
         let runnable = self.thread.runnable();
         #[cfg(feature = "ported")]
         let runnable = runnable
-            || self.threads.parked_slots().any(|slot| self.threads.parked[slot].runnable());
+            || self
+                .threads
+                .parked_slots()
+                .any(|slot| self.threads.parked[slot].runnable());
         runnable
     }
     #[cfg(feature = "graphics")]
@@ -630,8 +642,8 @@ mod linux_threads {
                     }
                     let thread = self.thread_at_mut(index);
                     if let Some(Wait::Futex {
-                            address: source, ..
-                        }) = &mut thread.waiting
+                        address: source, ..
+                    }) = &mut thread.waiting
                         && *source == address
                     {
                         *source = address2;
@@ -657,9 +669,7 @@ mod linux_threads {
             if signal as usize > cyxia_posix::signal::COUNT {
                 return Err(Errno::Inval);
             }
-            if number == cyxia_posix::linux_abi::Call::Tgkill
-                && target != self.status.pid as u64
-            {
+            if number == cyxia_posix::linux_abi::Call::Tgkill && target != self.status.pid as u64 {
                 return Err(Errno::Srch);
             }
             let info = Info {

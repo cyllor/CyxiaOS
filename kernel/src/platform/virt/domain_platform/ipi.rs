@@ -43,7 +43,9 @@ pub fn register_ipi_cpu(gic: &Gic, slot: usize) -> Result<(), Error> {
         return Err(Error::Auth);
     }
     let target = gic.local_target_mask().map_err(|_| Error::Unsupported)?;
-    TARGETS.register(slot, target).map_err(|_| Error::Conflict)?;
+    TARGETS
+        .register(slot, target)
+        .map_err(|_| Error::Conflict)?;
     MAILBOXES.register(
         slot as u16,
         super::CORE_GENERATION.load(Ordering::Acquire).max(1),
@@ -69,7 +71,9 @@ pub(super) fn publish_generation(core: u64) -> Result<(), Error> {
 }
 
 pub(super) fn registered_target(slot: usize) -> Result<u8, Error> {
-    if slot >= CPUS { return Err(Error::Range); }
+    if slot >= CPUS {
+        return Err(Error::Range);
+    }
     TARGETS.target(slot).ok_or(Error::NotReady)
 }
 

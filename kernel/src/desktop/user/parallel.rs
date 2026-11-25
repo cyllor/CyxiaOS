@@ -110,7 +110,11 @@ impl Runner {
         let (budget_ms, model) =
             cyxia_ai_runtime::user_cpu_policy(self.thread.cpu_bound, competing.min(8))
                 .expect("bounded existing process quantum policy");
-        let budget_ms = if cfg!(feature = "cosmic-session") { budget_ms * 8 } else { budget_ms };
+        let budget_ms = if cfg!(feature = "cosmic-session") {
+            budget_ms * 8
+        } else {
+            budget_ms
+        };
         ai::record(AiDomain::CpuQuantum, |c| c.proposal(model));
         Some((
             dispatch::Job {
@@ -332,10 +336,13 @@ impl Supervisor {
                 );
                 runtime::idle_until_while(
                     drain_deadline.min(current.saturating_add(1_000_000)),
-                    || tickets.iter().flatten().all(|&ticket| {
-                        !dispatch::is_complete(ticket).expect("owned dispatch ticket")
-                    }),
-                ).expect("AP completion wait");
+                    || {
+                        tickets.iter().flatten().all(|&ticket| {
+                            !dispatch::is_complete(ticket).expect("owned dispatch ticket")
+                        })
+                    },
+                )
+                .expect("AP completion wait");
             }
             let mut peers = [None; 3];
             let mut count = 0;
@@ -360,10 +367,15 @@ impl Supervisor {
         // owned but stopped. VM owners revoke affected PTEs before freeing any
         // backing; ordinary syscalls need no page-table/alias reconstruction.
         for job in jobs.iter().flatten() {
-            job.space.quiescent().expect("unpublished root must be stopped");
+            job.space
+                .quiescent()
+                .expect("unpublished root must be stopped");
         }
         for done in completions.iter().flatten() {
-            done.job.space.quiescent().expect("completed root must be stopped");
+            done.job
+                .space
+                .quiescent()
+                .expect("completed root must be stopped");
         }
         let mut outcomes = [None; 3];
         for index in 0..3 {

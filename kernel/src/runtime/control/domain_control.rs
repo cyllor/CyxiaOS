@@ -541,8 +541,10 @@ pub fn init(boot: u64) -> Result<(), Error> {
         let model = ModelBinding {
             generation: 1,
             model_hash: Sha256::digest(abi::domain_model_bytes()).into(),
-            schema_hash: Sha256::digest(include_bytes!("../../../../crates/prototype/src/features.rs"))
-                .into(),
+            schema_hash: Sha256::digest(include_bytes!(
+                "../../../../crates/prototype/src/features.rs"
+            ))
+            .into(),
         };
         let schemas = Schemas {
             feature: SchemaBinding {
@@ -551,8 +553,10 @@ pub fn init(boot: u64) -> Result<(), Error> {
             },
             action: SchemaBinding {
                 version: 13,
-                hash: Sha256::digest(include_bytes!("../../../../crates/prototype/src/policy_wire.rs"))
-                    .into(),
+                hash: Sha256::digest(include_bytes!(
+                    "../../../../crates/prototype/src/policy_wire.rs"
+                ))
+                .into(),
             },
             reward: learning::reward_schema(),
             learning: learning::learning_config(),

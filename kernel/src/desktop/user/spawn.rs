@@ -245,8 +245,12 @@ impl Supervisor {
             .iter()
             .find(|(_, p, _)| *p == resolved.as_str())
             .ok_or(Errno::Noent)?;
-        let plan = executable::parse_for_profile(bytes, crate::process_arch::IMAGE_ABI, super::super::exec_memory::PROFILE)
-            .map_err(|_| Errno::Inval)?;
+        let plan = executable::parse_for_profile(
+            bytes,
+            crate::process_arch::IMAGE_ABI,
+            super::super::exec_memory::PROFILE,
+        )
+        .map_err(|_| Errno::Inval)?;
         let cwd = request
             .cwd_len
             .map(|n| core::str::from_utf8(&request.cwd[..n]).unwrap());
@@ -275,8 +279,8 @@ impl Supervisor {
         #[cfg(not(feature = "cosmic-session"))]
         attempt.proposed(8193);
         #[cfg(feature = "cosmic-session")]
-        let (allowed, model) =
-            cyxia_ai_runtime::session_process_memory_policy(free as u32, 1).map_err(|_| Errno::Io)?;
+        let (allowed, model) = cyxia_ai_runtime::session_process_memory_policy(free as u32, 1)
+            .map_err(|_| Errno::Io)?;
         #[cfg(not(feature = "cosmic-session"))]
         let (allowed, model) =
             cyxia_ai_runtime::user_memory_policy(free as u32, 1).map_err(|_| Errno::Io)?;
@@ -316,7 +320,8 @@ impl Supervisor {
                 let [start, len] = request.env[i];
                 &request.bytes[start as usize..(start + len) as usize]
             });
-            if cfg!(feature = "cosmic-session") && actual_path.as_bytes().ends_with(b"cosmic-comp") {
+            if cfg!(feature = "cosmic-session") && actual_path.as_bytes().ends_with(b"cosmic-comp")
+            {
                 for entry in &env[..request.envc] {
                     super::super::log(b"COMP_ENV ");
                     super::super::log(entry);
@@ -352,8 +357,8 @@ impl Supervisor {
             runner.thread.signals.set_mask(parent_mask);
             runner.threads.shared.actions = child_actions;
             runner.linux = true;
-            runner.tee_stderr =
-                cfg!(feature = "cosmic-session") && actual_path.as_bytes().ends_with(b"cosmic-comp");
+            runner.tee_stderr = cfg!(feature = "cosmic-session")
+                && actual_path.as_bytes().ends_with(b"cosmic-comp");
             runner.status.parent_pid = parent_pid;
             Ok(())
         })();
@@ -456,7 +461,11 @@ impl Supervisor {
         for runner in &mut self.runners {
             if !runner.status.state.active()
                 || (runner.status.state == UserState::Waiting
-                    && runner.threads.shared.idle_wait.is_some_and(|idle| !idle.has_child))
+                    && runner
+                        .threads
+                        .shared
+                        .idle_wait
+                        .is_some_and(|idle| !idle.has_child))
             {
                 continue;
             }
@@ -466,7 +475,10 @@ impl Supervisor {
                 if index != 0 {
                     // Only Child waits need this selected usercopy context.
                     // Other 4KiB records retain their owner and wait state in place.
-                    if !matches!(runner.threads.parked[index - 1].waiting, Some(Wait::Child { .. })) {
+                    if !matches!(
+                        runner.threads.parked[index - 1].waiting,
+                        Some(Wait::Child { .. })
+                    ) {
                         continue;
                     }
                     core::mem::swap(&mut runner.thread, &mut runner.threads.parked[index - 1]);

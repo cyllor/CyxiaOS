@@ -195,7 +195,11 @@ pub(super) fn prepare(
         return Ok(());
     }
     let (_, end) = cyxia_kernel_core::security::syscall::user_copy_span(
-        address, len, 0, USER_LIMIT, usize::MAX,
+        address,
+        len,
+        0,
+        USER_LIMIT,
+        usize::MAX,
     )
     .map_err(|_| Error::Range)?;
     let mut backend = Pages {

@@ -441,6 +441,43 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("key.legacy_remote_scope == [0; 32]", admission)
         self.assertNotIn("pub cluster:", admission)
 
+    # Wave 7 pin deferrals (2026-11-25): frames.rs (FrameRecorder trait),
+    # frame_meta_v0199.rs initialize_pool, and net-transport service.rs /
+    # discovery.rs all exist at HEAD but are being rewritten by concurrent
+    # wave tasks; they are deliberately not pinned until those rewrites
+    # land. The vendor/ring neutral path is already pinned by
+    # test_v019_freestanding_ring_uses_existing_native_crypto_patch.
+
+    def test_v020_wave7_structural_pins_ai_control_retirement_replay_lane(self):
+        # Wave 7: ai-control-selftest / model-v13-selftest are retired
+        # pre-cutover CPU1-control history; a standalone build emits
+        # compile_error by design (kernel/src/arch/aarch64/smp.rs retirement
+        # marker, not pinned here while smp.rs gains its new fixture). The
+        # native CI lane survives only as an explicit legacy-coreset replay,
+        # mirroring the retired-profile lane in smp-native.yml.
+        workflow = source(ROOT / ".github/workflows/ai-control-native.yml")
+        umbrella = "--features smp-selftest,ai-control-selftest,legacy-coreset"
+        # All three build sites (clippy, debug/release profile builds, fault
+        # builds) use the retirement umbrella; no standalone feature flag
+        # may remain (comment prose is not a feature flag).
+        self.assertEqual(workflow.count(umbrella), 3)
+        self.assertNotRegex(workflow, r"--features\s+ai-control-selftest(?![\w,-])")
+        self.assertIn("Retired pre-cutover CPU1-control history", workflow)
+
+    def test_v020_wave7_structural_pins_file_auth_context_contract_layer(self):
+        # Wave 6/7: the EL1-internal AuthContext identity + admission-ledger
+        # contract layer exists and is declared. Contract layer only; native
+        # EL1 wiring is a later gate and is not claimed here. The frozen
+        # baseline bounds (16 principals, 16 ledger records) are pinned;
+        # ledger state rules stay host-test territory.
+        context_path = CORE / "file_auth_context_v1.rs"
+        self.assertTrue(context_path.is_file())
+        self.assertIn("pub mod file_auth_context_v1;", source(CORE / "mod.rs"))
+        context = source(context_path)
+        self.assertIn("pub struct AuthContextV1 {", context)
+        self.assertIn("pub const MAX_AUTH_PRINCIPALS: usize = 16;", context)
+        self.assertIn("pub const ADMISSION_LEDGER_CAPACITY: usize = 16;", context)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

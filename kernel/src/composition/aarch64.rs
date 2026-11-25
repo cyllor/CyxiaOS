@@ -225,6 +225,7 @@ mod user_heap;
     feature = "graphics",
     feature = "storage-v13-selftest",
     feature = "v0199-epoch-disk-selftest",
+    feature = "v0199-format-selftest",
     feature = "tcp-v13-selftest",
     feature = "prototype-runtime",
     feature = "net-selftest",

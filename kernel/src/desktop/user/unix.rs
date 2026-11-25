@@ -15,7 +15,8 @@ const ADMISSION_MODEL: u64 = cyxia_ai_runtime::COSMIC_UNIX_MODEL_ID;
 #[cfg(not(feature = "cosmic-workspace-applets-v1"))]
 const ADMISSION_MODEL: u64 = 8193;
 #[cfg(feature = "cosmic-workspace-applets-v1")]
-const _: () = assert!(cyxia_posix::unix::ENDPOINTS == cyxia_ai_runtime::COSMIC_UNIX_MODEL_CAPACITY as usize);
+const _: () =
+    assert!(cyxia_posix::unix::ENDPOINTS == cyxia_ai_runtime::COSMIC_UNIX_MODEL_CAPACITY as usize);
 
 pub(super) fn status(out: &mut impl core::fmt::Write) {
     // CPU0 snapshot only: reading counters must not sample epoll or clear wakes.
@@ -44,16 +45,16 @@ fn observe_with<T>(f: impl FnOnce(&mut UnixSockets) -> Result<T, Errno>) -> Resu
     let result = f(pool);
     // Other backend pools are released only after this borrow ends. Socket
     // cleanup itself stays inside the safe POSIX pool operation without reentry.
-    super::objects::table().observe_backend(
-        epoll::Backend::Socket,
-        |source| {
-            let epoll::Source::Socket { owner, handle: raw } = source else {
-                return None;
-            };
-            let ready = pool.poll(owner, handle(raw)).ok()?;
-            Some((ready_bits(ready), pool.wake_mask(owner, handle(raw)).unwrap_or(0)))
-        },
-    );
+    super::objects::table().observe_backend(epoll::Backend::Socket, |source| {
+        let epoll::Source::Socket { owner, handle: raw } = source else {
+            return None;
+        };
+        let ready = pool.poll(owner, handle(raw)).ok()?;
+        Some((
+            ready_bits(ready),
+            pool.wake_mask(owner, handle(raw)).unwrap_or(0),
+        ))
+    });
     pool.clear_wakes();
     result
 }
@@ -95,8 +96,7 @@ pub(super) fn admit<T>(
                 let decision = cyxia_ai_runtime::cosmic_unix_policy(free as u32, needed);
                 #[cfg(not(feature = "cosmic-workspace-applets-v1"))]
                 let decision = cyxia_ai_runtime::user_memory_policy(free as u32, needed);
-                let (allowed, model) = decision
-                    .map_err(|_| Errno::Io)?;
+                let (allowed, model) = decision.map_err(|_| Errno::Io)?;
                 attempt.decided(allowed, model);
                 if !allowed {
                     return Err(Errno::Again);

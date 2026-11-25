@@ -28,7 +28,12 @@ impl PageTable {
         }
         #[cfg(target_arch = "x86_64")]
         {
-            Self { pages: [0; 512], present: [0; 8], executable: [0; 8], dirty: [0; 8] }
+            Self {
+                pages: [0; 512],
+                present: [0; 8],
+                executable: [0; 8],
+                dirty: [0; 8],
+            }
         }
     }
     pub fn clear(&mut self) {
@@ -94,16 +99,20 @@ impl PageTable {
     }
     #[cfg(target_arch = "x86_64")]
     fn indices(bitmap: &[u64; 8]) -> impl Iterator<Item = usize> + '_ {
-        bitmap.iter().copied().enumerate().flat_map(|(word, mut bits)| {
-            core::iter::from_fn(move || {
-                if bits == 0 {
-                    return None;
-                }
-                let index = word * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                Some(index)
+        bitmap
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(|(word, mut bits)| {
+                core::iter::from_fn(move || {
+                    if bits == 0 {
+                        return None;
+                    }
+                    let index = word * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    Some(index)
+                })
             })
-        })
     }
     #[cfg(target_arch = "x86_64")]
     fn executable_runs(&self) -> impl Iterator<Item = (u64, usize)> + '_ {
@@ -111,7 +120,8 @@ impl PageTable {
     }
     #[cfg(target_arch = "x86_64")]
     fn executable_runs_in<'a>(
-        &'a self, bitmap: &'a [u64; 8],
+        &'a self,
+        bitmap: &'a [u64; 8],
     ) -> impl Iterator<Item = (u64, usize)> + 'a {
         let mut executable = Self::indices(bitmap).peekable();
         core::iter::from_fn(move || {
@@ -142,7 +152,8 @@ impl PageTable {
         let mut end = start + 1;
         for index in indices {
             let page = self.pages[index];
-            if index != end || page & 7 != first & 7
+            if index != end
+                || page & 7 != first & 7
                 || previous.checked_add(4096) != Some(page & !7)
             {
                 return None;
@@ -164,7 +175,8 @@ impl PageTable {
         }
         if let Some((start, physical, protection, pages)) = self.contiguous_mapping()
             && let Some(address) = base.checked_add(start as u64 * 4096)
-            && address.checked_add((pages as u64 - 1) * 4096)
+            && address
+                .checked_add((pages as u64 - 1) * 4096)
                 .is_some_and(|last| last >> 21 == address >> 21)
         {
             return space.map_table_run(address, physical, protection, pages);
@@ -179,7 +191,12 @@ impl PageTable {
     /// whose dirty bits were cleared by a previous root. Failed syncs retain
     /// their dirty set and owned successful prefix; the caller must not enter.
     #[cfg(target_arch = "x86_64")]
-    pub fn synchronize(&mut self, space: &mut ProcessSpace, base: u64, fresh: bool) -> Result<(), Errno> {
+    pub fn synchronize(
+        &mut self,
+        space: &mut ProcessSpace,
+        base: u64,
+        fresh: bool,
+    ) -> Result<(), Errno> {
         if fresh {
             self.publish(space, base)?;
             self.dirty.fill(0);
@@ -195,9 +212,12 @@ impl PageTable {
             let desired = self.pages[index];
             let old = space.root()?.translate(address);
             let matches = match old {
-                Some(old) => desired & 7 != 0 && old.physical == (desired & !7)
-                    && old.permissions.writable == (desired & 2 != 0)
-                    && old.permissions.executable == (desired & 4 != 0),
+                Some(old) => {
+                    desired & 7 != 0
+                        && old.physical == (desired & !7)
+                        && old.permissions.writable == (desired & 2 != 0)
+                        && old.permissions.executable == (desired & 4 != 0)
+                }
                 None => desired & 7 == 0,
             };
             if matches {
@@ -212,7 +232,8 @@ impl PageTable {
         // acquires the alias gate and can fence every CPU, so a per-page call
         // turned one JIT/module load into one full shootdown per page. Only the
         // executable subset is sealable; `changed` also carries RO/RW edits.
-        let sealable = core::array::from_fn::<_, 8, _>(|word| changed[word] & self.executable[word]);
+        let sealable =
+            core::array::from_fn::<_, 8, _>(|word| changed[word] & self.executable[word]);
         for (physical, bytes) in self.executable_runs_in(&sealable) {
             crate::process_arch::publish_code(crate::HIGH + physical, bytes)?;
         }
@@ -249,7 +270,10 @@ pub fn init_pc(range: cyxia_contracts::MemoryRegion) -> Result<(), Errno> {
     if range.len == 0 || range.len > TABLE_POOL_BYTES || range.len % TABLE_BYTES_PER_PROCESS != 0 {
         return Err(Errno::Inval);
     }
-    TABLE_SLOTS.store((range.len / TABLE_BYTES_PER_PROCESS) as usize, Ordering::Release);
+    TABLE_SLOTS.store(
+        (range.len / TABLE_BYTES_PER_PROCESS) as usize,
+        Ordering::Release,
+    );
     TABLE_POOL.store(range.start.0, Ordering::Release);
     Ok(())
 }
@@ -295,9 +319,12 @@ impl ProcessSpace {
         }
         let pool = TABLE_POOL.load(core::sync::atomic::Ordering::Acquire);
         if pool == 0 || self.slot >= process_slots() || self.pid == 0 {
-            crate::process_arch::trace_entry_error("begin.owner", self.pid, 0, format_args!(
-                "error={:?} slot={} pool={pool:#x}", Errno::Nodev, self.slot,
-            ));
+            crate::process_arch::trace_entry_error(
+                "begin.owner",
+                self.pid,
+                0,
+                format_args!("error={:?} slot={} pool={pool:#x}", Errno::Nodev, self.slot,),
+            );
             return Err(Errno::Nodev);
         }
         let physical = pool + self.slot as u64 * TABLE_BYTES_PER_PROCESS;
@@ -309,10 +336,16 @@ impl ProcessSpace {
             )
         }
         .map_err(|error| {
-            crate::process_arch::trace_entry_error("begin.arena", self.pid, 0, format_args!(
-                "error={error:?} va={:#x} pa={physical:#x} bytes={}",
-                crate::HIGH + physical, TABLE_PAGES_PER_PROCESS * 4096,
-            ));
+            crate::process_arch::trace_entry_error(
+                "begin.arena",
+                self.pid,
+                0,
+                format_args!(
+                    "error={error:?} va={:#x} pa={physical:#x} bytes={}",
+                    crate::HIGH + physical,
+                    TABLE_PAGES_PER_PROCESS * 4096,
+                ),
+            );
             Errno::Nomem
         })?;
         self.current = Some(
@@ -327,10 +360,16 @@ impl ProcessSpace {
                 )
             }
             .map_err(|error| {
-                crate::process_arch::trace_entry_error("begin.root", self.pid, 0, format_args!(
-                    "error={error:?} va={:#x} pa={physical:#x} bytes={}",
-                    crate::HIGH + physical, TABLE_PAGES_PER_PROCESS * 4096,
-                ));
+                crate::process_arch::trace_entry_error(
+                    "begin.root",
+                    self.pid,
+                    0,
+                    format_args!(
+                        "error={error:?} va={:#x} pa={physical:#x} bytes={}",
+                        crate::HIGH + physical,
+                        TABLE_PAGES_PER_PROCESS * 4096,
+                    ),
+                );
                 Errno::Io
             })?,
         );
@@ -350,50 +389,100 @@ impl ProcessSpace {
             executable: protection & 4 != 0,
         };
         let pid = self.pid;
-        self.current.as_mut().ok_or_else(|| {
-            crate::process_arch::trace_entry_error("map.owner", pid, 0, format_args!(
-                "error={:?} va={virtual_address:#x} pa={physical:#x} bytes=4096", Errno::Nodev,
-            ));
-            Errno::Nodev
-        })?.map(virtual_address, physical, permissions).map_err(|error| {
-            crate::process_arch::trace_entry_error("map", pid, 0, format_args!(
-                "error={error:?} va={virtual_address:#x} pa={physical:#x} bytes=4096",
-            ));
-            Errno::Io
-        })
-    }
-    /// Trusted staged metadata only; executable pages must be sealed first.
-    pub fn map_table_run(&mut self, address: u64, physical: u64, protection: u8, pages: usize) -> Result<(), Errno> {
-        let pid = self.pid;
-        self.current.as_mut().ok_or(Errno::Nodev)?
-            .map_table_run(address, physical, cyxia_arch_x86_64::space::UserPermissions {
-                writable: protection & 2 != 0,
-                executable: protection & 4 != 0,
-            }, pages).map_err(|error| {
-                crate::process_arch::trace_entry_error("map_table_run", pid, 0,
-                    format_args!("error={error:?} va={address:#x} pa={physical:#x} pages={pages}"));
+        self.current
+            .as_mut()
+            .ok_or_else(|| {
+                crate::process_arch::trace_entry_error(
+                    "map.owner",
+                    pid,
+                    0,
+                    format_args!(
+                        "error={:?} va={virtual_address:#x} pa={physical:#x} bytes=4096",
+                        Errno::Nodev,
+                    ),
+                );
+                Errno::Nodev
+            })?
+            .map(virtual_address, physical, permissions)
+            .map_err(|error| {
+                crate::process_arch::trace_entry_error(
+                    "map",
+                    pid,
+                    0,
+                    format_args!(
+                        "error={error:?} va={virtual_address:#x} pa={physical:#x} bytes=4096",
+                    ),
+                );
                 Errno::Io
             })
     }
     /// Trusted staged metadata only; executable pages must be sealed first.
-    pub fn map_pages(&mut self, pages: impl IntoIterator<Item = (u64, u64, u8)>) -> Result<(), Errno> {
+    pub fn map_table_run(
+        &mut self,
+        address: u64,
+        physical: u64,
+        protection: u8,
+        pages: usize,
+    ) -> Result<(), Errno> {
         let pid = self.pid;
-        self.current.as_mut().ok_or_else(|| {
-            crate::process_arch::trace_entry_error("map_pages.owner", pid, 0, format_args!(
-                "error={:?}", Errno::Nodev,
-            ));
-            Errno::Nodev
-        })?.map_pages(pages.into_iter().map(|(address, physical, protection)| {
-            (address, physical, cyxia_arch_x86_64::space::UserPermissions {
-                writable: protection & 2 != 0,
-                executable: protection & 4 != 0,
+        self.current
+            .as_mut()
+            .ok_or(Errno::Nodev)?
+            .map_table_run(
+                address,
+                physical,
+                cyxia_arch_x86_64::space::UserPermissions {
+                    writable: protection & 2 != 0,
+                    executable: protection & 4 != 0,
+                },
+                pages,
+            )
+            .map_err(|error| {
+                crate::process_arch::trace_entry_error(
+                    "map_table_run",
+                    pid,
+                    0,
+                    format_args!("error={error:?} va={address:#x} pa={physical:#x} pages={pages}"),
+                );
+                Errno::Io
             })
-        })).map_err(|error| {
-            crate::process_arch::trace_entry_error("map_pages", pid, 0, format_args!(
-                "error={error:?}",
-            ));
-            Errno::Io
-        })
+    }
+    /// Trusted staged metadata only; executable pages must be sealed first.
+    pub fn map_pages(
+        &mut self,
+        pages: impl IntoIterator<Item = (u64, u64, u8)>,
+    ) -> Result<(), Errno> {
+        let pid = self.pid;
+        self.current
+            .as_mut()
+            .ok_or_else(|| {
+                crate::process_arch::trace_entry_error(
+                    "map_pages.owner",
+                    pid,
+                    0,
+                    format_args!("error={:?}", Errno::Nodev,),
+                );
+                Errno::Nodev
+            })?
+            .map_pages(pages.into_iter().map(|(address, physical, protection)| {
+                (
+                    address,
+                    physical,
+                    cyxia_arch_x86_64::space::UserPermissions {
+                        writable: protection & 2 != 0,
+                        executable: protection & 4 != 0,
+                    },
+                )
+            }))
+            .map_err(|error| {
+                crate::process_arch::trace_entry_error(
+                    "map_pages",
+                    pid,
+                    0,
+                    format_args!("error={error:?}",),
+                );
+                Errno::Io
+            })
     }
     pub fn root(&self) -> Result<&cyxia_arch_x86_64::space::AddressSpace<'static>, Errno> {
         self.current.as_ref().ok_or(Errno::Nodev)
@@ -414,8 +503,12 @@ impl ProcessSpace {
         if space.resident_cpus() != 0 {
             return Err(Errno::Busy);
         }
-        if !address.is_multiple_of(4096) || address < 4096 || address >= 0x8000_0000_0000
-            || pages.checked_mul(4096).and_then(|bytes| address.checked_add(bytes as u64))
+        if !address.is_multiple_of(4096)
+            || address < 4096
+            || address >= 0x8000_0000_0000
+            || pages
+                .checked_mul(4096)
+                .and_then(|bytes| address.checked_add(bytes as u64))
                 .is_none_or(|end| end > 0x8000_0000_0000)
         {
             return Err(Errno::Inval);
@@ -427,15 +520,17 @@ impl ProcessSpace {
             while remaining != 0 {
                 let leaf_pages = 512 - ((address / 4096) & 511) as usize;
                 let count = remaining.min(leaf_pages);
-                space.unmap_table_run(address, count).map_err(|_| Errno::Io)?;
+                space
+                    .unmap_table_run(address, count)
+                    .map_err(|_| Errno::Io)?;
                 address += count as u64 * 4096;
                 remaining -= count;
             }
             Ok(())
         })();
-        self.revoke_ns = self.revoke_ns.saturating_add(
-            crate::process_arch::now_ns().saturating_sub(started),
-        );
+        self.revoke_ns = self
+            .revoke_ns
+            .saturating_add(crate::process_arch::now_ns().saturating_sub(started));
         result
     }
     // Called by incremental preparation (already timed in space_prepare_ns),
@@ -457,9 +552,9 @@ impl ProcessSpace {
         }
         let started = crate::process_arch::now_ns();
         drop(self.current.take());
-        self.retire_ns = self.retire_ns.saturating_add(
-            crate::process_arch::now_ns().saturating_sub(started),
-        );
+        self.retire_ns = self
+            .retire_ns
+            .saturating_add(crate::process_arch::now_ns().saturating_sub(started));
     }
     /// Read only after the owned job has returned; no live AP is inspected.
     pub fn retired_ns(&self) -> u64 {

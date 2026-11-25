@@ -5,8 +5,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_ai_runtime::accounting::Attempt;
 #[cfg(target_arch = "aarch64")]
 use cyxia_contracts::BootInfo;
-use cyxia_contracts::{PageCount, RedemptionId};
 use cyxia_contracts::user_layout::ImageProfile;
+use cyxia_contracts::{PageCount, RedemptionId};
 use cyxia_kernel_core::grants::{AuthorizedGrantRequest, GrantLedger, Owner, ReleaseReceipt};
 use cyxia_posix::{
     Errno,
@@ -145,12 +145,19 @@ impl ExecMemory {
         }
         attempt.proposed(match PROFILE {
             ImageProfile::Legacy => 8195,
-            ImageProfile::FullOsV1 | ImageProfile::FullOsV2 | ImageProfile::FullOsV3 => cyxia_ai_runtime::FULL_OS_EXEC_MODEL_ID,
+            ImageProfile::FullOsV1 | ImageProfile::FullOsV2 | ImageProfile::FullOsV3 => {
+                cyxia_ai_runtime::FULL_OS_EXEC_MODEL_ID
+            }
         });
         let (allowed, model) = match PROFILE {
-            ImageProfile::Legacy => cyxia_ai_runtime::executable_memory_policy(PAGES as u32, count as u32),
-            ImageProfile::FullOsV1 | ImageProfile::FullOsV2 | ImageProfile::FullOsV3 => cyxia_ai_runtime::full_os_executable_memory_policy(PAGES as u32, count as u32),
-        }.map_err(|_| Errno::Io)?;
+            ImageProfile::Legacy => {
+                cyxia_ai_runtime::executable_memory_policy(PAGES as u32, count as u32)
+            }
+            ImageProfile::FullOsV1 | ImageProfile::FullOsV2 | ImageProfile::FullOsV3 => {
+                cyxia_ai_runtime::full_os_executable_memory_policy(PAGES as u32, count as u32)
+            }
+        }
+        .map_err(|_| Errno::Io)?;
         attempt.decided(allowed, model);
         if !allowed {
             return Err(Errno::Nomem);

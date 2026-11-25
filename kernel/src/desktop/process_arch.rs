@@ -363,7 +363,11 @@ pub unsafe fn enter(
 /// # Safety
 /// The caller owns this stopped context and its matching root. The CPU0
 /// service owner and other workers cannot access its private backing.
-#[cfg(all(target_arch = "x86_64", feature = "cosmic-session", not(feature = "abi-trace")))]
+#[cfg(all(
+    target_arch = "x86_64",
+    feature = "cosmic-session",
+    not(feature = "abi-trace")
+))]
 pub(crate) unsafe fn complete_ap_clock(
     context: &mut Context,
     root: &cyxia_arch_x86_64::space::AddressSpace<'_>,
@@ -408,7 +412,9 @@ pub(crate) unsafe fn complete_ap_clock(
         return false;
     }
     // The admitted writable private mapping pins a complete 16-byte span.
-    unsafe { core::ptr::copy_nonoverlapping(encode_timespec(ns).as_ptr(), output as *mut u8, BYTES) };
+    unsafe {
+        core::ptr::copy_nonoverlapping(encode_timespec(ns).as_ptr(), output as *mut u8, BYTES)
+    };
     context.set_result(0);
     true
 }

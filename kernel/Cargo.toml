@@ -60,6 +60,10 @@ v0199-control-bringup = ["v0199-cpu0-role-selftest"]
 v0199-control-bringup-1g = ["v0199-control-bringup", "prototype-memory"]
 # Separate native scratch journal, never a production mounted filesystem.
 v0199-epoch-disk-selftest = ["v0199-cpu0-role-selftest", "prototype-memory", "dep:sha2"]
+# Separate native all-zero scratch format fixture: the §9.2.1 formatter
+# contract runs against real VirtIO block with guest FLUSH-ordering proof.
+# Never a production format path, signed catalog or mounted filesystem.
+v0199-format-selftest = ["v0199-cpu0-role-selftest", "prototype-memory", "dep:sha2"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]
 ai-control-selftest = ["smp-selftest"]
 # Retired dynamic C/B/T/Q control-core migration mechanism, retained only as

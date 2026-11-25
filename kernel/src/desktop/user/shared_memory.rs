@@ -70,8 +70,7 @@ impl SharedMappings {
             #[cfg(not(feature = "cosmic-workspace-applets-v1"))]
             let proposed = 8193;
             attempt.proposed(proposed);
-            let (allowed, model) = policy(self.maps.free() as u32, 1)
-                .map_err(|_| Errno::Io)?;
+            let (allowed, model) = policy(self.maps.free() as u32, 1).map_err(|_| Errno::Io)?;
             attempt.decided(allowed, model);
             if !allowed {
                 return Err(Errno::Nomem);
@@ -90,7 +89,10 @@ impl SharedMappings {
         self.unmap_with_revoke(address, pages, |_, _| {})
     }
     fn unmap_with_revoke(
-        &mut self, address: u64, pages: usize, revoke: impl FnOnce(u64, usize),
+        &mut self,
+        address: u64,
+        pages: usize,
+        revoke: impl FnOnce(u64, usize),
     ) -> Result<(), Errno> {
         let m = self.maps.whole(address, pages)?;
         revoke(address, pages);
@@ -330,8 +332,13 @@ impl Runner {
         protection: u8,
         shared: bool,
     ) -> Result<u64, Errno> {
-        let copy_len =
-            cyxia_posix::vm::immutable_snapshot_bytes(bytes.len(), offset, len, protection, shared)?;
+        let copy_len = cyxia_posix::vm::immutable_snapshot_bytes(
+            bytes.len(),
+            offset,
+            len,
+            protection,
+            shared,
+        )?;
         let offset = usize::try_from(offset).map_err(|_| Errno::Inval)?;
         let pages = len.div_ceil(PAGE_SIZE);
         let address = self.heap.allocate(pages)?;
@@ -339,7 +346,8 @@ impl Runner {
             // CPU0 owns the stopped process. All backing pages were zeroed by
             // the admitted heap allocation, including the partial EOF tail.
             // Static source bytes require neither a retained OFD nor a seek.
-            self.heap.write(address, &bytes[offset..offset + copy_len])?;
+            self.heap
+                .write(address, &bytes[offset..offset + copy_len])?;
             if shared {
                 self.heap.seal_readonly(address, pages * PAGE_SIZE)?;
             }
@@ -395,9 +403,13 @@ impl Runner {
     }
     pub(super) fn unmap_shared(&mut self, address: u64, pages: usize) -> Result<(), Errno> {
         #[cfg(target_arch = "x86_64")]
-        return self.shared.unmap_with_revoke(address, pages, |start, count| {
-            self.space.revoke_range(start, count).expect("shared PTE revoke failed; retain backing");
-        });
+        return self
+            .shared
+            .unmap_with_revoke(address, pages, |start, count| {
+                self.space
+                    .revoke_range(start, count)
+                    .expect("shared PTE revoke failed; retain backing");
+            });
         #[cfg(target_arch = "aarch64")]
         self.shared.unmap(address, pages)
     }

@@ -4,7 +4,10 @@ use core::fmt::Write;
 
 pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
     if shell.take_objects_request() {
-        let _ = writeln!(out, "\r\nAI_OBJECTS schema=1 scope=live_objects_and_shared_admission\r");
+        let _ = writeln!(
+            out,
+            "\r\nAI_OBJECTS schema=1 scope=live_objects_and_shared_admission\r"
+        );
         super::user::object_details(out);
         let _ = writeln!(out, "AI_OBJECTS_END\r");
     }
@@ -18,9 +21,12 @@ pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
         cyxia_platform_virt::RAM_MIB
     );
     #[cfg(target_arch = "x86_64")]
-    let _ = writeln!(out,
+    let _ = writeln!(
+        out,
         "\r\nAI_SYSTEM schema=1 architecture=x86_64 cpus={} ram_bytes={} models=local_integer full_contract=false\r",
-        crate::machine::runtime::online_cpus().count_ones(), crate::os::memory_bytes());
+        crate::machine::runtime::online_cpus().count_ones(),
+        crate::os::memory_bytes()
+    );
     let _ = shell.ai_status(out);
     super::user::ai_status(out);
     super::storage::ai_status(out);
@@ -42,7 +48,9 @@ pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
         "AI_GAPS coordinator=absent network=absent smp=absent cross_platform=unverified global_learning=absent durable_model_state=absent\r"
     );
     #[cfg(target_arch = "x86_64")]
-    let _ = writeln!(out,
-        "AI_GAPS coordinator=absent network=absent smp=independent_processes services=cpu0_serial execution_billing=unconnected global_learning=absent durable_model_state=absent\r");
+    let _ = writeln!(
+        out,
+        "AI_GAPS coordinator=absent network=absent smp=independent_processes services=cpu0_serial execution_billing=unconnected global_learning=absent durable_model_state=absent\r"
+    );
     let _ = writeln!(out, "AI_SYSTEM_END\r");
 }

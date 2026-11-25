@@ -2,8 +2,10 @@
 //! consumed by the real socket. No sample is invented for an idle stream.
 use super::Config;
 use crate::device::{Error, MTU, Port};
+#[cfg(feature = "cluster-discovery")]
+use smoltcp::wire::UdpPacket;
 use smoltcp::wire::{
-    EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Packet, TcpPacket, UdpPacket,
+    EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Packet, TcpPacket,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,11 +42,16 @@ pub(super) struct ObservedPort<P> {
     sent: u64,
     retransmitted: u64,
     valid: bool,
+    #[cfg(feature = "cluster-discovery")]
     pub(super) discovery_sent: u64,
+    #[cfg(feature = "cluster-discovery")]
     pub(super) discovery_sent_ms: u64,
+    #[cfg(feature = "cluster-discovery")]
     pub(super) discovery_nonce: [u8; 16],
 }
 impl<P> ObservedPort<P> {
+    /// Only the cluster discovery turn re-pins a selected peer endpoint.
+    #[cfg(feature = "cluster-discovery")]
     pub(super) fn select_peer(&mut self, config: Config) {
         self.config = config;
     }
@@ -113,8 +120,11 @@ impl<P: Port> ObservedPort<P> {
             sent: 0,
             retransmitted: 0,
             valid: true,
+            #[cfg(feature = "cluster-discovery")]
             discovery_sent: 0,
+            #[cfg(feature = "cluster-discovery")]
             discovery_sent_ms: 0,
+            #[cfg(feature = "cluster-discovery")]
             discovery_nonce: [0; 16],
         }
     }
@@ -222,6 +232,7 @@ impl<P: Port> Port for ObservedPort<P> {
         self.inner.send(frame)?;
         // Count only packets actually accepted by the device, not socket
         // preparation/queueing. PCAP remains the independent wire evidence.
+        #[cfg(feature = "cluster-discovery")]
         if let Ok(ethernet) = EthernetFrame::new_checked(frame)
             && ethernet.ethertype() == EthernetProtocol::Ipv4
             && let Ok(ip) = Ipv4Packet::new_checked(ethernet.payload())

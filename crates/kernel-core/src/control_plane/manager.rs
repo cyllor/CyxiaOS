@@ -322,6 +322,45 @@ impl<const C: usize, const D: usize> Manager<C, D> {
         self.sync(now)?;
         Ok(s)
     }
+    /// Metered variant of [`Self::publish`] — a second demonstration wiring of
+    /// the G1 lock-chain freeze scaffolding ([`super::policy_lock_v0199`]),
+    /// alongside [`Self::review_brains_metered`]. Drain publication is a real
+    /// bounded critical section: it swaps the ownership partition and
+    /// reconfigures the policy cache, with no allocation, IPC or waiting.
+    ///
+    /// Same trust model as the review wiring: the engine has no trusted live
+    /// clock, so the caller supplies the monotonic section entry `now` and the
+    /// observed completion `done_ns`. The publication itself is unchanged —
+    /// same checks, same snapshot, same error semantics on the happy path.
+    /// The elapsed interval is charged to the effective-work budget (≤45μs,
+    /// spec L1542); an overrun latches a sticky fail-closed fault in the meter
+    /// and closes further metered admission. It never panics and never alters
+    /// the publication outcome. A regressing `done_ns` keeps the scope open
+    /// ([`Error::Clock`]) rather than inventing a duration.
+    ///
+    /// Unlike the read-only review, `publish` mutates engine state. Metering is
+    /// observational, never a transaction: if settlement fails with
+    /// [`Error::Clock`] the publication has already been applied and is NOT
+    /// rolled back; the open scope must be settled by the caller through
+    /// [`super::policy_lock_v0199::CriticalSectionMeter::end`] with a corrected
+    /// timestamp, and the resulting snapshot re-read via [`Self::snapshot`].
+    /// The production policy_lock object and IRQ-off enforcement points remain
+    /// the G1 freeze's deliverable, not this scaffold.
+    pub fn publish_metered(
+        &mut self,
+        meter: &mut super::policy_lock_v0199::CriticalSectionMeter,
+        ticket: Ticket,
+        now: u64,
+        done_ns: u64,
+    ) -> Result<Snapshot, Error> {
+        meter.begin(super::policy_lock_v0199::SectionKind::EffectiveWork, now)?;
+        let published = self.publish(ticket, now);
+        // Settle even when publication failed: the elapsed interval is real
+        // either way. The settlement's overrun class is diagnostic; the
+        // publication result is returned verbatim.
+        meter.end(done_ns)?;
+        published
+    }
     pub fn expire(&mut self, now: u64) -> Result<Option<Ticket>, Error> {
         self.check_time(now)?;
         let result = self.ownership.expire(now)?;
@@ -417,9 +456,10 @@ impl<const C: usize, const D: usize> Manager<C, D> {
 mod tests {
     use super::*;
     use crate::control_plane::advisory::{Controller, Rule};
+    use crate::control_plane::cores::ScaleProposal;
     use crate::control_plane::fixed::Pair;
     use crate::control_plane::policy_lock_v0199::{
-        CriticalSectionMeter, Fault, SectionKind, WORK_BUDGET_NS,
+        CriticalSectionMeter, Fault, OverrunClass, SectionKind, WORK_BUDGET_NS,
     };
 
     fn limits() -> Limits {
@@ -533,5 +573,147 @@ mod tests {
         assert_eq!(meter.active_kind(), Some(SectionKind::EffectiveWork));
         assert!(!meter.faulted());
         assert_eq!(meter.settled_count(), 0);
+    }
+
+    // ---- publish_metered: second real critical section (drain publication) ----
+
+    /// Historical mutable topology (NOT new_fixed): only this path admits a
+    /// Scale proposal, so a real drain/publication critical section can run.
+    fn mutable_manager() -> Manager<4, 16> {
+        let ownership = Ownership::<4>::new(15, 1, [100; 4], [1, 2, 4, 8], limits()).unwrap();
+        let policy_limits = policy::Limits {
+            max_units: 8,
+            max_budget_ticks: 4,
+            max_lifetime: 100,
+            allowed_cpus: 15,
+        };
+        Manager::new(ownership, id(10), epochs(), limits(), [policy_limits; 16]).unwrap()
+    }
+    /// Drive a real Scale admission to a pending drain ticket ready to publish:
+    /// CPU1 moves business→control (control mask 1→3), drained and handed off.
+    fn drain_ticket(m: &mut Manager<4, 16>, now: u64) -> Ticket {
+        let scale = Request::Scale {
+            epochs: m.epochs(),
+            proposal: ScaleProposal {
+                generation: m.snapshot().generation,
+                resource_epoch: 1,
+                sequence: 1,
+                desired_control: 3,
+                deadline: 100,
+            },
+        };
+        let t = match m.submit(id(10), 0, scale.encode(), now).unwrap() {
+            Receipt::Draining(t) => t,
+            _ => panic!("expected draining receipt"),
+        };
+        m.acknowledge_drain(t, 1, Proof::DRAIN, now + 1).unwrap();
+        m.acknowledge_handoff(t, 1, Proof::HANDOFF, now + 1)
+            .unwrap();
+        t
+    }
+
+    #[test]
+    fn metered_publish_matches_unmetered_on_happy_path() {
+        // Two identical engines driven to the same pre-publication state; one
+        // publishes plain, the other metered. The snapshot must be identical.
+        let mut plain = mutable_manager();
+        let mut metered = mutable_manager();
+        let tp = drain_ticket(&mut plain, 10);
+        let tm = drain_ticket(&mut metered, 10);
+        let mut meter = CriticalSectionMeter::new();
+        let s_plain = plain.publish(tp, 12).unwrap();
+        let s_metered = metered
+            .publish_metered(&mut meter, tm, 12, 12 + 1_000)
+            .unwrap();
+        assert_eq!(s_plain, s_metered);
+        assert_eq!(s_metered.control, 3);
+        assert_eq!(metered.snapshot(), plain.snapshot());
+        assert_eq!(meter.settled_count(), 1);
+        assert_eq!(meter.overrun_count(), 0);
+        assert!(!meter.faulted());
+        assert_eq!(meter.active_kind(), None);
+    }
+
+    #[test]
+    fn metered_publish_overrun_latches_fault_without_changing_result() {
+        let mut m = mutable_manager();
+        let t = drain_ticket(&mut m, 10);
+        let mut meter = CriticalSectionMeter::new();
+        let done = 12 + WORK_BUDGET_NS + 1;
+        // Overrun is diagnostic: the publication outcome is returned verbatim.
+        let s = m.publish_metered(&mut meter, t, 12, done).unwrap();
+        assert_eq!(s.control, 3);
+        assert!(meter.faulted());
+        assert_eq!(meter.overrun_count(), 1);
+        assert!(matches!(
+            meter.fault(),
+            Some(Fault::BudgetOverrun {
+                kind: SectionKind::EffectiveWork,
+                ..
+            })
+        ));
+        // Fail-closed: further metered admission is denied before the engine
+        // runs, so engine state is untouched by the denied call.
+        let before = m.snapshot();
+        assert_eq!(
+            m.publish_metered(&mut meter, t, done, done + 1),
+            Err(Error::Denied)
+        );
+        assert_eq!(m.snapshot(), before);
+        // The unmetered production path keeps its existing behavior: a consumed
+        // ticket still reports the engine's own error, not the meter's.
+        assert_eq!(m.publish(t, 13), Err(Error::Stale));
+    }
+
+    #[test]
+    fn metered_publish_settles_even_when_publication_fails() {
+        // No drain/handoff proofs: the engine rejects with NotReady, but the
+        // elapsed interval is real and must still settle within budget.
+        let mut m = mutable_manager();
+        let scale = Request::Scale {
+            epochs: m.epochs(),
+            proposal: ScaleProposal {
+                generation: m.snapshot().generation,
+                resource_epoch: 1,
+                sequence: 1,
+                desired_control: 3,
+                deadline: 100,
+            },
+        };
+        let t = match m.submit(id(10), 0, scale.encode(), 10).unwrap() {
+            Receipt::Draining(t) => t,
+            _ => panic!("expected draining receipt"),
+        };
+        let mut meter = CriticalSectionMeter::new();
+        assert_eq!(
+            m.publish_metered(&mut meter, t, 12, 12 + 1_000),
+            Err(Error::NotReady)
+        );
+        assert_eq!(meter.settled_count(), 1);
+        assert_eq!(meter.overrun_count(), 0);
+        assert!(!meter.faulted());
+        assert_eq!(meter.active_kind(), None);
+    }
+
+    #[test]
+    fn metered_publish_regressing_completion_clock_keeps_scope_open() {
+        let mut m = mutable_manager();
+        let t = drain_ticket(&mut m, 10);
+        let mut meter = CriticalSectionMeter::new();
+        // now=50 is before the proposal deadline (100), so publication applies;
+        // done_ns=49 regresses and keeps the scope open.
+        assert_eq!(m.publish_metered(&mut meter, t, 50, 49), Err(Error::Clock));
+        assert_eq!(meter.active_kind(), Some(SectionKind::EffectiveWork));
+        assert!(!meter.faulted());
+        assert_eq!(meter.settled_count(), 0);
+        // Metering is observational, never a transaction: the publication was
+        // already applied and is NOT rolled back by the bad completion clock.
+        assert_eq!(m.snapshot().control, 3);
+        // The caller settles the open scope with a corrected timestamp; the
+        // snapshot is re-read from the engine, not from the failed return.
+        let s = meter.end(50 + 1_000).unwrap();
+        assert_eq!(s.overrun_class, OverrunClass::None);
+        assert_eq!(meter.settled_count(), 1);
+        assert!(!meter.faulted());
     }
 }

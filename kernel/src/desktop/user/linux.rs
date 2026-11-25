@@ -34,10 +34,14 @@ impl PollSnapshot {
     }
 
     fn matches(&self, process: &Process<'_>, records: &[u8], epoch: u64) -> bool {
-        self.epoch != u64::MAX && self.epoch == epoch && self.count * 8 == records.len()
+        self.epoch != u64::MAX
+            && self.epoch == epoch
+            && self.count * 8 == records.len()
             && records.chunks_exact(8).enumerate().all(|(i, record)| {
-                record[..6] == self.inputs[i] && record[6..] == [0; 2]
-                    && process.poll_snapshot_identity(Self::descriptor(record)) == Some(self.identities[i])
+                record[..6] == self.inputs[i]
+                    && record[6..] == [0; 2]
+                    && process.poll_snapshot_identity(Self::descriptor(record))
+                        == Some(self.identities[i])
             })
     }
 }
@@ -138,7 +142,10 @@ impl Runner {
         self.copy_from(address, records)?;
         let epoch = waiting_slot.map(|_| self.process.poll_readiness_epoch());
         if let (Some(slot), Some(epoch)) = (waiting_slot, epoch)
-            && self.thread_at(slot).poll_snapshot.matches(&self.process, records, epoch)
+            && self
+                .thread_at(slot)
+                .poll_snapshot
+                .matches(&self.process, records, epoch)
         {
             return Ok(0);
         }
@@ -184,9 +191,13 @@ impl Runner {
             // Sampling a later nested epoll can publish readiness for an FD
             // sampled earlier in the sweep. Never cache that mixed result.
             self.thread_at_mut(slot).poll_snapshot.invalidate();
-            if ready_count == 0 && epoch != u64::MAX && epoch == self.process.poll_readiness_epoch() {
+            if ready_count == 0 && epoch != u64::MAX && epoch == self.process.poll_readiness_epoch()
+            {
                 let captured = records.chunks_exact(8).enumerate().all(|(i, record)| {
-                    let Some(identity) = self.process.poll_snapshot_identity(PollSnapshot::descriptor(record)) else {
+                    let Some(identity) = self
+                        .process
+                        .poll_snapshot_identity(PollSnapshot::descriptor(record))
+                    else {
                         return false;
                     };
                     let snapshot = &mut self.thread_at_mut(slot).poll_snapshot;
@@ -570,11 +581,19 @@ impl Runner {
             Call::InotifyAddWatch => {
                 let mut path = [0u8; 96];
                 let n = self.path(b, &mut path)?;
-                self.process.inotify_add_watch(fs, fd(a)?,
-                    core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?, c as u32)
+                self.process
+                    .inotify_add_watch(
+                        fs,
+                        fd(a)?,
+                        core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?,
+                        c as u32,
+                    )
                     .map(|wd| wd as u64)
             }
-            Call::InotifyRmWatch => self.process.inotify_rm_watch(fs, fd(a)?, b as i32).map(|()| 0),
+            Call::InotifyRmWatch => self
+                .process
+                .inotify_rm_watch(fs, fd(a)?, b as i32)
+                .map(|()| 0),
             Call::EpollCreate1 => self
                 .process
                 .epoll_create(u32::try_from(a).map_err(|_| Errno::Inval)?)
@@ -777,7 +796,9 @@ impl Runner {
                     return self.copy_stat(c, self.process.stat_empty_at(fs, a as i32)?);
                 }
                 let path = core::str::from_utf8(&path[..n]).map_err(|_| Errno::Inval)?;
-                let resolved = self.process.path_at_with_follow(fs, a as i32, path, d & 0x100 == 0)?;
+                let resolved =
+                    self.process
+                        .path_at_with_follow(fs, a as i32, path, d & 0x100 == 0)?;
                 self.copy_stat(c, self.resolved_stat(fs, resolved)?)
             }
             Call::Fstat => self.copy_stat(b, self.descriptor_stat(fs, fd(a)?)?),
@@ -1149,7 +1170,9 @@ impl Runner {
                 let follow = flags & cyxia_posix::O_NOFOLLOW == 0
                     && flags & (cyxia_posix::O_CREAT | cyxia_posix::O_EXCL)
                         != cyxia_posix::O_CREAT | cyxia_posix::O_EXCL;
-                let resolved = self.process.path_at_with_follow(fs, a as i32, path, follow)?;
+                let resolved = self
+                    .process
+                    .path_at_with_follow(fs, a as i32, path, follow)?;
                 if let Some((inode, bytes)) = self.readonly_asset(resolved) {
                     return self
                         .process
@@ -1186,7 +1209,8 @@ impl Runner {
                     return Err(Errno::Inval);
                 }
                 let directory = call == Call::Mkdirat || c == 0x200;
-                if call == Call::Unlinkat && c == 0x200
+                if call == Call::Unlinkat
+                    && c == 0x200
                     && path.rsplit('/').find(|part| !part.is_empty()) == Some(".")
                 {
                     return Err(Errno::Inval);
@@ -1194,10 +1218,20 @@ impl Runner {
                 // Directory creation/removal acts on a final link itself,
                 // including a name ending in '/'; never remove its target.
                 let trimmed = path.trim_end_matches('/');
-                let lookup = if directory && !trimmed.is_empty() { trimmed } else { path };
-                let resolved = self.process.path_at_with_follow(fs, a as i32, lookup, false)?;
+                let lookup = if directory && !trimmed.is_empty() {
+                    trimmed
+                } else {
+                    path
+                };
+                let resolved = self
+                    .process
+                    .path_at_with_follow(fs, a as i32, lookup, false)?;
                 if self.readonly_asset(resolved).is_some() {
-                    return Err(if call == Call::Mkdirat { Errno::Exist } else { Errno::Rofs });
+                    return Err(if call == Call::Mkdirat {
+                        Errno::Exist
+                    } else {
+                        Errno::Rofs
+                    });
                 }
                 if call == Call::Mkdirat {
                     match super::unix::inspect(|s| s.pathname_stat(resolved.as_str().as_bytes())) {
@@ -1214,7 +1248,9 @@ impl Runner {
                     // only then may the separate socket namespace remove it.
                     match self.process.unlink_resolved(fs, resolved) {
                         Ok(()) => {}
-                        Err(Errno::Noent) => super::unix::with(|s| s.unlink(resolved.as_str().as_bytes()))?,
+                        Err(Errno::Noent) => {
+                            super::unix::with(|s| s.unlink(resolved.as_str().as_bytes()))?
+                        }
                         Err(error) => return Err(error),
                     }
                 }
@@ -1383,8 +1419,13 @@ impl Runner {
                     super::super::hex(self.heap.free() as u64);
                     let usage = self.heap.usage();
                     super::super::log(b"MMAP_USAGE used,peak,allocations,peak_allocations,largest_free MECHANISM\n");
-                    for value in [self.heap.used(), usage.peak_pages, usage.allocations,
-                                  usage.peak_allocations, usage.largest_free] {
+                    for value in [
+                        self.heap.used(),
+                        usage.peak_pages,
+                        usage.allocations,
+                        usage.peak_allocations,
+                        usage.largest_free,
+                    ] {
                         super::super::hex(value as u64);
                     }
                 }

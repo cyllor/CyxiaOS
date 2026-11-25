@@ -31,30 +31,37 @@ struct Input {
 #[cfg(target_arch = "x86_64")]
 pub fn scanout_bytes() -> usize {
     let gpu = unsafe { &*core::ptr::addr_of!(GPU) };
-    if gpu.is_some() { core::mem::size_of::<Frame>() } else { 0 }
+    if gpu.is_some() {
+        core::mem::size_of::<Frame>()
+    } else {
+        0
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 pub fn init(info: &cyxia_contracts::BootInfo) {
-    let transports = info.virtio[..info.virtio_count].iter().filter_map(|resource| {
-        // entry.S maps this board-specific 2 MiB Device window. Discovery remains
-        // DTB-based, and resources outside the window are never dereferenced.
-        if resource.base.0 < 0x0a000000
-            || resource
-                .base
-                .0
-                .checked_add(resource.len)
-                .is_none_or(|end| end > 0x0a200000)
-        {
-            return None;
-        }
-        unsafe {
-            Transport::attach(
-                (super::HIGH + resource.base.0) as usize,
-                resource.len as usize,
-            )
-        }.ok()
-    });
+    let transports = info.virtio[..info.virtio_count]
+        .iter()
+        .filter_map(|resource| {
+            // entry.S maps this board-specific 2 MiB Device window. Discovery remains
+            // DTB-based, and resources outside the window are never dereferenced.
+            if resource.base.0 < 0x0a000000
+                || resource
+                    .base
+                    .0
+                    .checked_add(resource.len)
+                    .is_none_or(|end| end > 0x0a200000)
+            {
+                return None;
+            }
+            unsafe {
+                Transport::attach(
+                    (super::HIGH + resource.base.0) as usize,
+                    resource.len as usize,
+                )
+            }
+            .ok()
+        });
     init_transports(transports);
 }
 

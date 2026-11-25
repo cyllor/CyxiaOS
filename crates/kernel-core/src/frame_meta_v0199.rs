@@ -20,9 +20,12 @@
 //! only after an explicit zero proof, failed zeroing -> QUARANTINED|DIRTY,
 //! generation exhaustion -> PERMANENT). This is an accounting mirror, not a
 //! replacement allocator: the general-allocator native cutover remains a
-//! later gate, and unattached pools (including desktop boot paths) keep
-//! their historical behavior bit-identically.
-use crate::frames::{FrameError, FrameRecorder};
+//! later gate. Unattached pools keep their historical behavior
+//! bit-identically; the desktop full-OS pool attaches a mirror only under
+//! the explicit `full-os` + `v0199-local-native` gate (default, host and
+//! formal OS builds stay unattached). Native boot verification of that
+//! gated desktop attachment remains open.
+use crate::frames::{FrameError, FrameRecorder, FrameSnapshot};
 use crate::security::Error;
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind, TaskId};
 pub const PAGE: u64 = 4096;
@@ -783,8 +786,11 @@ impl<'a> Ledger<'a> {
 ///
 /// Scope: this is an accounting mirror for the historical <=256MiB pool,
 /// not a replacement allocator. The general-allocator native cutover to the
-/// V0.19.9 ledger remains a later gate; desktop boot paths keep the
-/// unattached pool and are bit-identical to before.
+/// V0.19.9 ledger remains a later gate. The desktop full-OS pool attaches
+/// this bridge only under the explicit `full-os` + `v0199-local-native`
+/// gate; default, host and formal OS builds keep the unattached pool and
+/// are bit-identical to before. Native boot verification of the gated
+/// desktop attachment remains open.
 pub struct PoolBridge<'a> {
     ledger: core::cell::RefCell<Ledger<'a>>,
 }
@@ -802,6 +808,44 @@ impl<'a> PoolBridge<'a> {
     }
     pub fn inventory(&self) -> Result<Inventory, Error> {
         self.ledger.borrow().inventory()
+    }
+    /// Aggregate conservation check between the mirrored pool's snapshot
+    /// and this ledger's inventory. The per-transition recording helpers
+    /// already fail closed on any divergence; this is the whole-table
+    /// verdict used at attach time and by diagnostics:
+    ///
+    /// - capacity == free + reserved + allocated + quarantined (every
+    ///   non-permanent row is accounted in exactly one pool state);
+    /// - permanent + capacity == the mirrored window's row count (reserved
+    ///   exclusions, window gaps and retired frames are the only permanent
+    ///   rows; implied by the inventory partition, kept as an explicit
+    ///   guard);
+    /// - allocated <= used <= allocated + quarantined: revoking frames stay
+    ///   used in the pool while the mirror already quarantines them, and
+    ///   unowned quarantined rows (failed zeroing, or completed revocation
+    ///   awaiting its zero proof) count as pool free capacity.
+    ///
+    /// Any violation rejects with [`Error::Conflict`] without mutation.
+    pub fn conservation(&self, snapshot: FrameSnapshot) -> Result<(), Error> {
+        let inv = self.inventory()?;
+        let window = self.ledger.borrow().rows.len() as u64;
+        let capacity = snapshot.capacity as u64;
+        let used = snapshot.used as u64;
+        let free = inv.free as u64;
+        let reserved = inv.reserved as u64;
+        let allocated = inv.allocated as u64;
+        let quarantined = inv.quarantined as u64;
+        let permanent = inv.permanent as u64;
+        if capacity != free + reserved + allocated + quarantined {
+            return Err(Error::Conflict);
+        }
+        if permanent + capacity != window {
+            return Err(Error::Conflict);
+        }
+        if used < allocated || used > allocated + quarantined {
+            return Err(Error::Conflict);
+        }
+        Ok(())
     }
 }
 fn pool_owner(owner: TaskId) -> Result<Owner, FrameError> {
@@ -1635,5 +1679,196 @@ mod tests {
             Err(Error::Busy)
         );
         assert_eq!(bridge.inventory().unwrap().allocated, 1);
+    }
+    #[test]
+    fn pool_bridge_conservation_desktop_lifecycle() {
+        // Exact desktop pool ordering: alloc_zeroed grants ownership;
+        // release begins revocation, zeroes the page, then finishes; freed
+        // pages are re-zeroed by the next alloc_zeroed (the desktop pool
+        // never calls clean_one). Conservation must hold at every step.
+        let ram = [pool_ram(0x40000000, 3)];
+        let mut metadata = std::vec![crate::frames::FrameMeta::EMPTY; 3];
+        let mut pool = FramePool::from_memory(&ram, &[], &mut metadata).unwrap();
+        let mut rows = std::vec![FrameMeta::ZERO; 3];
+        let bridge =
+            PoolBridge::new(Ledger::initialize_pool(&mut rows, 0x40000000, &ram, &[]).unwrap())
+                .unwrap();
+        pool.attach_recorder(&bridge);
+        let owner = TaskId::new(7).unwrap();
+        assert!(bridge.conservation(pool.snapshot()).is_ok());
+        let mut handles = std::vec::Vec::new();
+        for _ in 0..3 {
+            handles.push(pool.alloc_zeroed(owner, &mut OkZero).unwrap());
+            assert!(bridge.conservation(pool.snapshot()).is_ok());
+        }
+        assert_eq!(pool.snapshot().used, 3);
+        assert_eq!(bridge.inventory().unwrap().allocated, 3);
+        // While revoking, the frame stays used in the pool but is already
+        // quarantined in the mirror; the used bound must cover that.
+        let h = handles[1];
+        pool.begin_revoke(h, owner).unwrap();
+        let mid = bridge.inventory().unwrap();
+        assert_eq!((mid.allocated, mid.quarantined), (2, 1));
+        assert_eq!(pool.snapshot().used, 3);
+        assert!(bridge.conservation(pool.snapshot()).is_ok());
+        OkZero.zero(h.address()).unwrap();
+        pool.finish_revoke(h, unsafe { RevokeComplete::after_unmap(h) })
+            .unwrap();
+        // The returned dirty page is pool free capacity but stays
+        // quarantined in the mirror until the next allocation's zero proof.
+        let after = bridge.inventory().unwrap();
+        assert_eq!((after.free, after.allocated, after.quarantined), (0, 2, 1));
+        assert_eq!(pool.snapshot().free, 1);
+        assert!(bridge.conservation(pool.snapshot()).is_ok());
+        // Re-allocation re-zeroes the dirty page and records generation 2.
+        let again = pool.alloc_zeroed(owner, &mut OkZero).unwrap();
+        assert_eq!(again.index(), h.index());
+        assert!(bridge.conservation(pool.snapshot()).is_ok());
+        assert_eq!(bridge.ledger.borrow().rows[1].frame_generation, 2);
+        // Failed zeroing quarantines without consuming pool free capacity.
+        pool.begin_revoke(handles[0], owner).unwrap();
+        pool.finish_revoke(handles[0], unsafe {
+            RevokeComplete::after_unmap(handles[0])
+        })
+        .unwrap();
+        assert_eq!(
+            pool.alloc_zeroed(owner, &mut FailZero),
+            Err(FrameError::ZeroFailed)
+        );
+        assert!(bridge.conservation(pool.snapshot()).is_ok());
+        assert_eq!(bridge.inventory().unwrap().quarantined, 1);
+        assert_eq!(pool.snapshot().free, 1);
+        // Recovery: the retried allocation is the zero proof.
+        let recovered = pool.alloc_zeroed(owner, &mut OkZero).unwrap();
+        assert_eq!(recovered.index(), handles[0].index());
+        assert!(bridge.conservation(pool.snapshot()).is_ok());
+        assert_eq!(bridge.inventory().unwrap().allocated, 3);
+    }
+    #[test]
+    fn pool_bridge_conservation_rejects_divergent_snapshots() {
+        let ram = [pool_ram(0x40000000, 2)];
+        let mut metadata = std::vec![crate::frames::FrameMeta::EMPTY; 2];
+        let mut pool = FramePool::from_memory(&ram, &[], &mut metadata).unwrap();
+        let mut rows = std::vec![FrameMeta::ZERO; 2];
+        let bridge =
+            PoolBridge::new(Ledger::initialize_pool(&mut rows, 0x40000000, &ram, &[]).unwrap())
+                .unwrap();
+        pool.attach_recorder(&bridge);
+        let owner = TaskId::new(7).unwrap();
+        let h = pool.alloc_zeroed(owner, &mut OkZero).unwrap();
+        let good = pool.snapshot();
+        assert!(bridge.conservation(good).is_ok());
+        // Capacity must equal the ledger's non-permanent rows exactly.
+        assert_eq!(
+            bridge.conservation(FrameSnapshot {
+                capacity: good.capacity + 1,
+                ..good
+            }),
+            Err(Error::Conflict)
+        );
+        assert_eq!(
+            bridge.conservation(FrameSnapshot {
+                capacity: good.capacity - 1,
+                ..good
+            }),
+            Err(Error::Conflict)
+        );
+        // Used must stay within [allocated, allocated + quarantined].
+        assert_eq!(
+            bridge.conservation(FrameSnapshot { used: 0, ..good }),
+            Err(Error::Conflict)
+        );
+        assert_eq!(
+            bridge.conservation(FrameSnapshot {
+                used: good.used + 2,
+                ..good
+            }),
+            Err(Error::Conflict)
+        );
+        // Divergence checks never mutate the mirror.
+        assert_eq!(bridge.inventory().unwrap().allocated, 1);
+        // A ledger-side retirement diverges from the unchanged pool ...
+        pool.begin_revoke(h, owner).unwrap();
+        pool.finish_revoke(h, unsafe { RevokeComplete::after_unmap(h) })
+            .unwrap();
+        assert_eq!(
+            bridge.ledger.borrow_mut().record_retired(0x40000000),
+            Ok(())
+        );
+        assert_eq!(bridge.conservation(pool.snapshot()), Err(Error::Conflict));
+        // ... and conserves only with the matching capacity shrink.
+        assert!(
+            bridge
+                .conservation(FrameSnapshot {
+                    capacity: 1,
+                    free: 1,
+                    used: 0
+                })
+                .is_ok()
+        );
+    }
+    #[test]
+    fn static_attachment_pattern_matches_desktop_wiring() {
+        // Compile-and-run evidence for the gated desktop pool wiring: a
+        // static row table plus a static bridge slot, 'static attachment
+        // through addr_of_mut!, conservation before publishing, then the
+        // desktop lifecycle through the published static pool. These
+        // statics are local to this test and touched nowhere else.
+        const PAGES: usize = 4;
+        static mut ROWS: [FrameMeta; PAGES] = [FrameMeta::ZERO; PAGES];
+        static mut BRIDGE: Option<PoolBridge<'static>> = None;
+        static mut META: [crate::frames::FrameMeta; PAGES] =
+            [crate::frames::FrameMeta::EMPTY; PAGES];
+        static mut POOL: Option<FramePool<'static>> = None;
+        let base = 0x40000000u64;
+        let ram = [pool_ram(base, PAGES as u64)];
+        // SAFETY: single-threaded test; no aliasing access to these statics.
+        let metadata: &'static mut [crate::frames::FrameMeta] =
+            unsafe { &mut *core::ptr::addr_of_mut!(META) };
+        let mut new_pool = FramePool::from_memory(&ram, &[], metadata).unwrap();
+        let rows: &'static mut [FrameMeta] = unsafe { &mut *core::ptr::addr_of_mut!(ROWS) };
+        // The desktop wiring admits a window slice of the static table.
+        let ledger = Ledger::initialize_pool(&mut rows[..PAGES], base, &ram, &[]).unwrap();
+        let bridge = PoolBridge::new(ledger).unwrap();
+        assert!(bridge.conservation(new_pool.snapshot()).is_ok());
+        let slot: &'static mut Option<PoolBridge<'static>> =
+            unsafe { &mut *core::ptr::addr_of_mut!(BRIDGE) };
+        *slot = Some(bridge);
+        new_pool.attach_recorder(slot.as_ref().unwrap());
+        let pool_slot: &'static mut Option<FramePool<'static>> =
+            unsafe { &mut *core::ptr::addr_of_mut!(POOL) };
+        *pool_slot = Some(new_pool);
+        let pool = pool_slot.as_mut().unwrap();
+        let owner = TaskId::new(7).unwrap();
+        let mut handles = std::vec::Vec::new();
+        for _ in 0..PAGES {
+            handles.push(pool.alloc_zeroed(owner, &mut OkZero).unwrap());
+            assert!(slot.as_ref().unwrap().conservation(pool.snapshot()).is_ok());
+        }
+        assert_eq!(
+            pool.alloc_zeroed(owner, &mut OkZero),
+            Err(FrameError::Exhausted)
+        );
+        for h in handles {
+            pool.begin_revoke(h, owner).unwrap();
+            OkZero.zero(h.address()).unwrap();
+            pool.finish_revoke(h, unsafe { RevokeComplete::after_unmap(h) })
+                .unwrap();
+            assert!(slot.as_ref().unwrap().conservation(pool.snapshot()).is_ok());
+        }
+        let inv = slot.as_ref().unwrap().inventory().unwrap();
+        assert_eq!(
+            (inv.free, inv.allocated, inv.quarantined, inv.permanent),
+            (0, 0, PAGES as u32, 0)
+        );
+        assert_eq!(pool.snapshot().free, PAGES);
+        // Re-allocation after release stays in generation lockstep.
+        let again = pool.alloc_zeroed(owner, &mut OkZero).unwrap();
+        assert_eq!(again.index(), 0);
+        assert!(slot.as_ref().unwrap().conservation(pool.snapshot()).is_ok());
+        assert_eq!(
+            slot.as_ref().unwrap().ledger.borrow().rows[0].frame_generation,
+            2
+        );
     }
 }

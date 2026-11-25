@@ -2,8 +2,13 @@
 //! Its plaintext bytes must be consumed only by the TLS engine.
 use crate::device::{Ethernet, Port};
 use cyxia_driver_virtio::DiagnosticStage as Stage;
+// CXD1 paired-node cluster discovery is dual-node machinery, compiled only
+// for the legacy cluster facade (`cluster-discovery`), never for the
+// single-machine SEC-N closure.
+#[cfg(feature = "cluster-discovery")]
 mod discovery;
 mod observe;
+#[cfg(feature = "cluster-discovery")]
 pub use discovery::{DiscoveryBuffers, DiscoveryConfig, DiscoverySnapshot};
 pub use observe::Observation;
 use observe::ObservedPort;
@@ -71,6 +76,7 @@ pub struct Tcp<'a, P> {
     config: Config,
     last_ms: u64,
     failed: bool,
+    #[cfg(feature = "cluster-discovery")]
     discovery: Option<discovery::Socket>,
 }
 
@@ -154,12 +160,14 @@ impl<'a, P: Port> Tcp<'a, P> {
             config,
             last_ms: now_ms,
             failed: false,
+            #[cfg(feature = "cluster-discovery")]
             discovery: None,
         })
     }
 
     pub fn listen(&mut self) -> Result<(), Error> {
         self.healthy()?;
+        #[cfg(feature = "cluster-discovery")]
         if let Some(discovery) = self.discovery.as_mut() {
             if discovery.initiator {
                 return Err(Error::Configuration);
@@ -178,6 +186,7 @@ impl<'a, P: Port> Tcp<'a, P> {
 
     pub fn connect(&mut self) -> Result<(), Error> {
         self.healthy()?;
+        #[cfg(feature = "cluster-discovery")]
         if let Some(discovery) = self.discovery.as_mut() {
             if !discovery.initiator {
                 return Err(Error::Configuration);
@@ -210,6 +219,7 @@ impl<'a, P: Port> Tcp<'a, P> {
     /// device work. A scheduler turn with no CPU credit is not a disconnect.
     pub fn state(&self) -> Result<State, Error> {
         self.healthy()?;
+        #[cfg(feature = "cluster-discovery")]
         // Waiting for an unauthenticated hint is a live listener lifecycle,
         // never an established transport or a failed TCP generation.
         if self
@@ -301,6 +311,7 @@ impl<'a, P: Port> Tcp<'a, P> {
         }
         checkpoint();
 
+        #[cfg(feature = "cluster-discovery")]
         if self.discovery.is_some() {
             self.discovery_turn(now_ms)?;
             checkpoint();

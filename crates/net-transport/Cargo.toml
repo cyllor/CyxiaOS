@@ -6,10 +6,17 @@ edition.workspace = true
 [features]
 default = []
 tls = ["dep:rustls", "dep:ring", "dep:getrandom", "smoltcp"]
-# Bounded native smoltcp Ethernet/IPv4/TCP stack (device, tcp, discovery)
-# relocated from the excluded legacy cluster crate. `tls` implies it so the
-# SEC-N NativeSocket adapter is available whenever the trait bridge is.
+# Bounded native smoltcp Ethernet/IPv4/TCP stack (device, tcp) relocated from
+# the excluded legacy cluster crate. `tls` implies it so the SEC-N
+# NativeSocket adapter is available whenever the trait bridge is.
 smoltcp = ["dep:smoltcp", "dep:cyxia-driver-virtio"]
+# CXD1 paired-node CLUSTER discovery (local_node/peer_node UDP broadcast wire
+# and begin_auth peer selection). Dual-node machinery, deliberately NOT
+# implied by `smoltcp` or `tls`: the single-machine SEC-N closure must never
+# compile it. Only the legacy cluster-transport facade (historical cluster
+# diagnostics) enables it. Implies `smoltcp` because the wire rides the same
+# bounded native device/socket turn.
+cluster-discovery = ["smoltcp"]
 
 [dependencies]
 cyxia-driver-virtio = { path = "../driver-virtio", optional = true }

@@ -79,6 +79,9 @@ mod v0199_control_bringup;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_epoch_disk.rs"]
 mod v0199_epoch_disk;
+#[cfg(feature = "v0199-format-selftest")]
+#[path = "v0199_format_fixture.rs"]
+mod v0199_format_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_ram_inventory.rs"]
 mod v0199_ram_inventory;
@@ -87,6 +90,16 @@ mod v0199_ram_inventory;
     feature = "v0199-epoch-disk-selftest"
 ))]
 compile_error!("epoch scratch disk and role bringup require separate evidence profiles");
+#[cfg(all(
+    feature = "v0199-format-selftest",
+    any(
+        feature = "v0199-control-bringup",
+        feature = "v0199-epoch-disk-selftest"
+    )
+))]
+compile_error!(
+    "format scratch disk requires a separate evidence profile from role bringup and epoch scratch"
+);
 #[cfg(feature = "register-v15-selftest")]
 #[path = "../../diagnostics/register_evidence.rs"]
 mod register_evidence;
@@ -1059,13 +1072,16 @@ pub fn run(info: &BootInfo) -> ! {
     prototype_model::run();
     #[cfg(feature = "v0199-epoch-disk-selftest")]
     v0199_epoch_disk::run(info);
+    #[cfg(feature = "v0199-format-selftest")]
+    v0199_format_fixture::run(info);
     #[cfg(feature = "v0199-control-bringup")]
     v0199_control_bringup::run();
     #[cfg(all(
         feature = "v0199-cpu0-role-selftest",
         not(any(
             feature = "v0199-control-bringup",
-            feature = "v0199-epoch-disk-selftest"
+            feature = "v0199-epoch-disk-selftest",
+            feature = "v0199-format-selftest"
         ))
     ))]
     v0199_role_selftest::run();
