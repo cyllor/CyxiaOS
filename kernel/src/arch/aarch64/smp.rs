@@ -89,6 +89,10 @@ mod v0199_epoch_disk;
 #[cfg(feature = "v0199-format-selftest")]
 #[path = "v0199_format_fixture.rs"]
 mod v0199_format_fixture;
+// SEC-N local-echo guest loader + SVC 0x43 broker, shared by the SEC-N fixture.
+#[cfg(feature = "v0199-sec-n-selftest")]
+#[path = "sec_n_broker.rs"]
+mod sec_n_broker;
 #[cfg(feature = "v0199-sec-n-selftest")]
 #[path = "v0199_sec_n_fixture.rs"]
 mod v0199_sec_n_fixture;
