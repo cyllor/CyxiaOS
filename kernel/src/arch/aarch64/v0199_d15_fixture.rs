@@ -191,4 +191,7 @@ pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     retain_bytes(104,&snap.encode().unwrap());retain_bytes(137,&rules);
     retain_bytes(148,&plan);retain_bytes(175,&record);retain_bytes(207,&report_bytes[..n]);
     report("V0199_D15_EFFECT",baseline_max,applied_max,first.version);
+    // Use the same protected snapshot/decision sequences and feedback
+    // custody; never duplicate the boot-scoped key for a second domain.
+    super::v0199_d07_fixture::run(boot,&mut gate,snapshots,inbox);
 }
