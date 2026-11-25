@@ -4,8 +4,8 @@
 extern crate alloc;
 
 use crate::IDLE_TIMEOUT_SECS;
-use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 use ring::digest;
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName, Error as TlsError,
@@ -39,7 +39,10 @@ static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 /// Unforgeable within a single native TLS service instance: never decoded
 /// from a network message. A matching peer pin alone is NOT connection identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EchoProof { session: u64, peer: [u8; 32] }
+pub struct EchoProof {
+    session: u64,
+    peer: [u8; 32],
+}
 
 pub const LEGACY_CLUSTER_ALPN: &[u8] = b"cyxia-cluster/1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -449,7 +452,8 @@ impl<'a> Session<'a> {
         let session_serial = NEXT_SESSION
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
             .map_err(|_| Error::Clock)?
-            .checked_add(1).ok_or(Error::Clock)?;
+            .checked_add(1)
+            .ok_or(Error::Clock)?;
         buffers.input.fill(0);
         buffers.output.fill(0);
         buffers.received.fill(0);
@@ -484,13 +488,16 @@ impl<'a> Session<'a> {
     /// cannot be constructed by a peer, a model or an application wire frame.
     pub fn local_echo_proof(&self) -> Option<EchoProof> {
         let peer = self.authenticated_peer()?;
-        if self.application != ApplicationProtocol::LocalEcho { return None; }
+        if self.application != ApplicationProtocol::LocalEcho {
+            return None;
+        }
         let negotiated = match &self.connection {
             Connection::Client(connection) => connection.alpn_protocol(),
             Connection::Server(connection) => connection.alpn_protocol(),
         };
         (negotiated == Some(LOCAL_ECHO_ALPN)).then_some(EchoProof {
-            session: self.session_serial, peer,
+            session: self.session_serial,
+            peer,
         })
     }
     /// A checked local read-only application message can be created only
@@ -664,7 +671,9 @@ impl<'a> Session<'a> {
             && progress.received == 0
             && !progress.sent;
         self.output = progress.output;
-        self.received = accepted.checked_add(progress.received).ok_or(Error::Buffer)?;
+        self.received = accepted
+            .checked_add(progress.received)
+            .ok_or(Error::Buffer)?;
         if progress.sent {
             self.buffers.sending[..self.sending].fill(0);
             self.sending = 0;

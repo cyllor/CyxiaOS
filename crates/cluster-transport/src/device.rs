@@ -37,7 +37,9 @@ pub trait Port {
         1
     }
     /// An unknown port cannot certify that its DMA engine stopped.
-    fn tx_quiescent(&self) -> bool { false }
+    fn tx_quiescent(&self) -> bool {
+        false
+    }
 }
 
 pub trait VirtioLink {
@@ -58,10 +60,14 @@ pub trait VirtioLink {
     }
     fn finish_turn(&mut self, p: &impl Platform) -> Result<(), DriverError>;
     fn burst_capacity(&self) -> usize;
-    fn tx_quiescent(&self) -> bool { false }
+    fn tx_quiescent(&self) -> bool {
+        false
+    }
 }
 impl VirtioLink for Net {
-    fn tx_quiescent(&self) -> bool { Net::tx_quiescent(self) }
+    fn tx_quiescent(&self) -> bool {
+        Net::tx_quiescent(self)
+    }
     fn transmit(&mut self, f: &[u8], p: &impl Platform) -> Result<(), DriverError> {
         self.send(f, p)
     }
@@ -83,7 +89,9 @@ impl VirtioLink for Net {
     }
 }
 impl VirtioLink for BatchedNet {
-    fn tx_quiescent(&self) -> bool { BatchedNet::tx_quiescent(self) }
+    fn tx_quiescent(&self) -> bool {
+        BatchedNet::tx_quiescent(self)
+    }
     fn transmit(&mut self, f: &[u8], p: &impl Platform) -> Result<(), DriverError> {
         self.send_queued(f, p)
     }
@@ -121,7 +129,9 @@ impl<P: Platform, N: VirtioLink> Port for VirtioPort<'_, P, N> {
     fn diagnostic_stage(&self, stage: u64) {
         self.platform.diagnostic_stage(stage);
     }
-    fn tx_quiescent(&self) -> bool { self.net.tx_quiescent() }
+    fn tx_quiescent(&self) -> bool {
+        self.net.tx_quiescent()
+    }
     fn send(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.net
             .poll_transmit(self.platform)

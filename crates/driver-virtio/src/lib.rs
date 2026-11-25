@@ -318,7 +318,8 @@ impl Queue {
             platform.sync(m.response.address(), 4096);
             platform.sync(m.desc.address(), 4096);
         }
-        m.avail.put16(4 + usize::from(self.available % self.size) * 2, 0);
+        m.avail
+            .put16(4 + usize::from(self.available % self.size) * 2, 0);
         self.available = self.available.wrapping_add(1);
         platform.barrier();
         m.avail.put16(2, self.available);
@@ -575,9 +576,19 @@ mod tests {
                 page.clear_prefix(4096);
                 page.copy_prefix_from(offset, &source[..len]);
                 page.copy_prefix_to(&mut back, 4096);
-                assert_eq!(&back[offset..offset + len], &source[..len], "offset={offset} len={len}");
-                assert!(back[..offset].iter().all(|v| *v == 0), "wrote before offset");
-                assert!(back[offset + len..].iter().all(|v| *v == 0), "wrote past the prefix");
+                assert_eq!(
+                    &back[offset..offset + len],
+                    &source[..len],
+                    "offset={offset} len={len}"
+                );
+                assert!(
+                    back[..offset].iter().all(|v| *v == 0),
+                    "wrote before offset"
+                );
+                assert!(
+                    back[offset + len..].iter().all(|v| *v == 0),
+                    "wrote past the prefix"
+                );
             }
         }
     }
@@ -620,40 +631,44 @@ mod tests {
                 q.memory.used.put32(4, 0);
                 q.memory.used.put32(8, 8);
                 q.memory.used.put16(2, 1);
-                assert_eq!(q.poll(&mut t, &mut [0;8], &Host),Ok(Some(8)));
+                assert_eq!(q.poll(&mut t, &mut [0; 8], &Host), Ok(Some(8)));
             }
-            let index=q.used;
-            let before=q.available;
-            let at=4+usize::from(index % q.size)*8;
-            q.memory.used.put32(at,0);
-            q.memory.used.put32(at+4,8);
-            q.memory.used.put16(2,index.wrapping_add(1));
-            assert_eq!(q.submit(&mut t,b"next",8,&Host),Err(Error::Queue));
-            assert_eq!(q.available,before);
-            assert_eq!(q.memory.avail.get16(2),before);
+            let index = q.used;
+            let before = q.available;
+            let at = 4 + usize::from(index % q.size) * 8;
+            q.memory.used.put32(at, 0);
+            q.memory.used.put32(at + 4, 8);
+            q.memory.used.put16(2, index.wrapping_add(1));
+            assert_eq!(q.submit(&mut t, b"next", 8, &Host), Err(Error::Queue));
+            assert_eq!(q.available, before);
+            assert_eq!(q.memory.avail.get16(2), before);
             assert!(!q.pending);
-            assert_eq!(q.poll(&mut t,&mut [0;8],&Host),Err(Error::Device));
+            assert_eq!(q.poll(&mut t, &mut [0; 8], &Host), Err(Error::Device));
         }
     }
     #[test]
     fn idle_poll_quarantines_unsolicited_used_index() {
-        let (mut t,mut q)=fixture();
-        q.memory.used.put16(2,1);
-        assert_eq!(q.poll(&mut t,&mut [0;8],&Host),Err(Error::Queue));
-        assert_eq!(q.submit(&mut t,b"x",8,&Host),Err(Error::Device));
+        let (mut t, mut q) = fixture();
+        q.memory.used.put16(2, 1);
+        assert_eq!(q.poll(&mut t, &mut [0; 8], &Host), Err(Error::Queue));
+        assert_eq!(q.submit(&mut t, b"x", 8, &Host), Err(Error::Device));
     }
     #[test]
     fn single_chain_wide_copy_preserves_odd_length_and_output_tail() {
-        let (mut t,mut q)=fixture();
-        q.submit(&mut t,b"x",32,&Host).unwrap();
-        for i in 0..19 { q.memory.response.put8(i,(i as u8).wrapping_mul(13)); }
-        q.memory.used.put32(4,0);
-        q.memory.used.put32(8,19);
-        q.memory.used.put16(2,1);
-        let mut out=[0xcc;32];
-        assert_eq!(q.poll(&mut t,&mut out,&Host),Ok(Some(19)));
-        for (i,b) in out[..19].iter().enumerate() {assert_eq!(*b,(i as u8).wrapping_mul(13));}
-        assert!(out[19..].iter().all(|b|*b==0xcc));
+        let (mut t, mut q) = fixture();
+        q.submit(&mut t, b"x", 32, &Host).unwrap();
+        for i in 0..19 {
+            q.memory.response.put8(i, (i as u8).wrapping_mul(13));
+        }
+        q.memory.used.put32(4, 0);
+        q.memory.used.put32(8, 19);
+        q.memory.used.put16(2, 1);
+        let mut out = [0xcc; 32];
+        assert_eq!(q.poll(&mut t, &mut out, &Host), Ok(Some(19)));
+        for (i, b) in out[..19].iter().enumerate() {
+            assert_eq!(*b, (i as u8).wrapping_mul(13));
+        }
+        assert!(out[19..].iter().all(|b| *b == 0xcc));
     }
 
     #[test]
@@ -755,9 +770,17 @@ mod tests {
         let delivered = posted.min(24 * 2);
         for index in 0..delivered {
             let slot = events.queue.memory.avail.get16(4 + index * 2) as usize;
-            events.queue.memory.response.put16(slot * 8, if index % 2 == 0 { 2 } else { 0 });
+            events
+                .queue
+                .memory
+                .response
+                .put16(slot * 8, if index % 2 == 0 { 2 } else { 0 });
             events.queue.memory.response.put16(slot * 8 + 2, 0);
-            events.queue.memory.response.put32(slot * 8 + 4, if index % 2 == 0 { 8 } else { 0 });
+            events
+                .queue
+                .memory
+                .response
+                .put32(slot * 8 + 4, if index % 2 == 0 { 8 } else { 0 });
             events.queue.memory.used.put32(4 + index * 8, slot as u32);
             events.queue.memory.used.put32(8 + index * 8, 8);
         }
@@ -765,10 +788,17 @@ mod tests {
         let mut delta = 0;
         let mut reports = 0;
         while let Some(event) = events.poll(&mut transport, &Host).unwrap() {
-            if event.kind == 2 { delta += event.value; }
-            if event.kind == 0 && event.code == 0 { reports += 1; }
+            if event.kind == 2 {
+                delta += event.value;
+            }
+            if event.kind == 0 && event.code == 0 {
+                reports += 1;
+            }
         }
-        assert_eq!(delta, 192, "driver lost motion before the software input buffer");
+        assert_eq!(
+            delta, 192,
+            "driver lost motion before the software input buffer"
+        );
         assert_eq!(reports, 24);
         assert_eq!(core::mem::size_of::<QueueMemory>(), 5 * 4096);
     }
@@ -779,8 +809,13 @@ mod tests {
         mmio.put32(8, 18);
         mmio.put32(0x34, maximum);
         let mut transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
-        let queue = Queue::configure(&mut transport,
-            Box::leak(Box::new(QueueMemory::zeroed())), 0, &Host).unwrap();
+        let queue = Queue::configure(
+            &mut transport,
+            Box::leak(Box::new(QueueMemory::zeroed())),
+            0,
+            &Host,
+        )
+        .unwrap();
         let events = EventQueue::prime(queue, &mut transport, &Host).unwrap();
         (transport, events, mmio)
     }
@@ -801,13 +836,29 @@ mod tests {
         for scenario in 0..4 {
             let (mut t, mut e, _) = input_fixture(64);
             let published = e.queue.available;
-            e.queue.memory.used.put32(4, if scenario == 0 { 64 } else { 63 });
-            e.queue.memory.used.put32(8, if scenario == 1 { 9 } else { 8 });
+            e.queue
+                .memory
+                .used
+                .put32(4, if scenario == 0 { 64 } else { 63 });
+            e.queue
+                .memory
+                .used
+                .put32(8, if scenario == 1 { 9 } else { 8 });
             e.queue.memory.used.put32(12, 63);
             e.queue.memory.used.put32(16, 8);
-            e.queue.memory.used.put16(2, match scenario { 2 => 2, 3 => 65, _ => 1 });
+            e.queue.memory.used.put16(
+                2,
+                match scenario {
+                    2 => 2,
+                    3 => 65,
+                    _ => 1,
+                },
+            );
             assert_eq!(e.poll(&mut t, &Host), Err(Error::Queue));
-            assert_eq!(e.queue.available, published, "invalid device metadata reposted a buffer");
+            assert_eq!(
+                e.queue.available, published,
+                "invalid device metadata reposted a buffer"
+            );
             assert_eq!(e.poll(&mut t, &Host), Err(Error::Device));
         }
     }
@@ -821,7 +872,14 @@ mod tests {
         e.queue.memory.used.put16(2, 0);
         e.queue.memory.response.put16(63 * 8, 2);
         e.queue.memory.response.put32(63 * 8 + 4, (-7i32) as u32);
-        assert_eq!(e.poll(&mut t, &Host), Ok(Some(InputEvent { kind: 2, code: 0, value: -7 })));
+        assert_eq!(
+            e.poll(&mut t, &Host),
+            Ok(Some(InputEvent {
+                kind: 2,
+                code: 0,
+                value: -7
+            }))
+        );
         assert_eq!(e.queue.used, 0);
         assert_eq!(e.queue.available, 64);
         assert_eq!(e.poll(&mut t, &Host), Ok(None));

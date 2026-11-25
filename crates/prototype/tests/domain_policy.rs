@@ -49,9 +49,18 @@ fn v0199_native_local_action_gate_rejects_legacy_core_and_remote_effects() {
     for current in [
         Action::CpuWeight(1),
         Action::SpawnTokens(2),
-        Action::Cache { pages: 256, batch: 16 },
-        Action::Filesystem { readahead: 0, flush: 4 },
-        Action::Ipc { budget: 32, batch: 4 },
+        Action::Cache {
+            pages: 256,
+            batch: 16,
+        },
+        Action::Filesystem {
+            readahead: 0,
+            flush: 4,
+        },
+        Action::Ipc {
+            budget: 32,
+            batch: 4,
+        },
         Action::IrqTarget(2),
         Action::SoftCoalesce(0),
         Action::ServiceBatch(1),
@@ -63,7 +72,11 @@ fn v0199_native_local_action_gate_rejects_legacy_core_and_remote_effects() {
         Action::RecoveryRecipe(0),
         Action::ConsoleBatch(8),
     ] {
-        assert!(current.permitted_v0199_local(), "domain {}", current.domain());
+        assert!(
+            current.permitted_v0199_local(),
+            "domain {}",
+            current.domain()
+        );
     }
 }
 

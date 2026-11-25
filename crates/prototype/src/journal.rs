@@ -869,8 +869,8 @@ pub fn format<D: BlockDevice>(
     }
     for (slot, (inode_id, name)) in [
         (BOOT_INODE, ".cyxia-boot"),
-        (CLUSTER_INODES[0], crate::cluster::volume::NAMES[0]),
-        (CLUSTER_INODES[1], crate::cluster::volume::NAMES[1]),
+        (CLUSTER_INODES[0], crate::local_volume::NAMES[0]),
+        (CLUSTER_INODES[1], crate::local_volume::NAMES[1]),
         (REQUEST_INODE, ".cyxia-snapshot-requests"),
     ]
     .into_iter()

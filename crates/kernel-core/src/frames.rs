@@ -256,7 +256,11 @@ impl<'a> FramePool<'a> {
                 generation,
             });
         }
-        Err(if revoking { FrameError::Again } else { FrameError::Exhausted })
+        Err(if revoking {
+            FrameError::Again
+        } else {
+            FrameError::Exhausted
+        })
     }
 
     fn find(&mut self, h: FrameHandle) -> Result<&mut FrameMeta, FrameError> {
@@ -345,10 +349,18 @@ mod tests {
         struct Zero(bool);
         impl PageZeroer for Zero {
             fn zero(&mut self, _: PhysAddr) -> Result<(), FrameError> {
-                if self.0 { Err(FrameError::ZeroFailed) } else { Ok(()) }
+                if self.0 {
+                    Err(FrameError::ZeroFailed)
+                } else {
+                    Ok(())
+                }
             }
         }
-        let ram = [MemoryRegion { start: PhysAddr(0x1000), len: 4 * 4096, kind: RegionKind::Ram }];
+        let ram = [MemoryRegion {
+            start: PhysAddr(0x1000),
+            len: 4 * 4096,
+            kind: RegionKind::Ram,
+        }];
         let mut metadata = [FrameMeta::EMPTY; 4];
         let mut pool = FramePool::from_memory(&ram, &[], &mut metadata).unwrap();
         let mut zero = Zero(false);
@@ -362,7 +374,8 @@ mod tests {
         assert_eq!(frame.index(), 0);
         pool.begin_revoke(frame, owner).unwrap();
         assert!(!pool.clean_one(&mut zero).unwrap());
-        pool.finish_revoke(frame, unsafe { RevokeComplete::after_unmap(frame) }).unwrap();
+        pool.finish_revoke(frame, unsafe { RevokeComplete::after_unmap(frame) })
+            .unwrap();
         assert_eq!(pool.next_dirty, 0);
         zero.0 = true;
         assert_eq!(pool.clean_one(&mut zero), Err(FrameError::ZeroFailed));
@@ -395,9 +408,19 @@ mod tests {
                 pool.alloc_clean(owner)
             };
             assert_eq!(result, Err(FrameError::Exhausted));
-            assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 0, free: 0, used: 0 });
+            assert_eq!(
+                pool.snapshot(),
+                FrameSnapshot {
+                    capacity: 0,
+                    free: 0,
+                    used: 0
+                }
+            );
             assert_eq!(pool.meta[0].state, State::Retired);
-            assert_eq!(pool.alloc_zeroed(owner, &mut NoZero), Err(FrameError::Exhausted));
+            assert_eq!(
+                pool.alloc_zeroed(owner, &mut NoZero),
+                Err(FrameError::Exhausted)
+            );
             assert_eq!(pool.snapshot().free, 0);
         }
     }
@@ -405,17 +428,20 @@ mod tests {
     #[test]
     fn forged_index_does_not_authorize_another_frame() {
         let owner = TaskId::new(1).unwrap();
-        let mut metadata = [FrameMeta {
-            address: PhysAddr(0x1000),
-            generation: 1,
-            owner: Some(owner),
-            state: State::Owned,
-        }, FrameMeta {
-            address: PhysAddr(0x2000),
-            generation: 1,
-            owner: Some(owner),
-            state: State::Owned,
-        }];
+        let mut metadata = [
+            FrameMeta {
+                address: PhysAddr(0x1000),
+                generation: 1,
+                owner: Some(owner),
+                state: State::Owned,
+            },
+            FrameMeta {
+                address: PhysAddr(0x2000),
+                generation: 1,
+                owner: Some(owner),
+                state: State::Owned,
+            },
+        ];
         let mut pool = FramePool {
             meta: &mut metadata,
             capacity: 2,
@@ -424,10 +450,21 @@ mod tests {
             next_dirty: 0,
         };
         for index in [1, usize::MAX] {
-            let forged = FrameHandle { index, address: PhysAddr(0x1000), generation: 1 };
+            let forged = FrameHandle {
+                index,
+                address: PhysAddr(0x1000),
+                generation: 1,
+            };
             assert_eq!(pool.check_owned(forged, owner), Err(FrameError::Stale));
             assert_eq!(pool.begin_revoke(forged, owner), Err(FrameError::Stale));
-            assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 2, free: 0, used: 2 });
+            assert_eq!(
+                pool.snapshot(),
+                FrameSnapshot {
+                    capacity: 2,
+                    free: 0,
+                    used: 2
+                }
+            );
         }
     }
 }

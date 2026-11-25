@@ -137,7 +137,10 @@ fn full_os_v2_complete_windows_fit_private_tables_and_preserve_stack_guard() {
     );
 }
 
-fn full_os_windows_fit_private_tables(profile: cyxia_contracts::user_layout::ImageProfile, heap_bytes: u64) {
+fn full_os_windows_fit_private_tables(
+    profile: cyxia_contracts::user_layout::ImageProfile,
+    heap_bytes: u64,
+) {
     #[derive(Clone)]
     #[repr(C, align(4096))]
     struct TableFrame([u8; 4096]);

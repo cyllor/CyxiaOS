@@ -8,5 +8,12 @@ sha2 = { version = "=0.10.9", default-features = false }
 cyxia-arch = { path = "../arch", optional = true }
 
 [features]
-cluster-engine = []
+# Historical cluster wire codec, offline migration reference only.
+legacy-cluster = []
+# The engine consumes the wire codec, so it implies legacy-cluster.
+cluster-engine = ["legacy-cluster"]
 hardware-sha256 = ["dep:cyxia-arch"]
+
+[[test]]
+name = "cluster_wire"
+required-features = ["legacy-cluster"]

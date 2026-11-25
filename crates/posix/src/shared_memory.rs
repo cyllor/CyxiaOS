@@ -150,8 +150,7 @@ impl Backings {
             .count()
     }
     pub fn create(&mut self, allow_sealing: bool) -> Result<u64, Errno> {
-        let i = self
-            .objects[..self.object_limit]
+        let i = self.objects[..self.object_limit]
             .iter()
             .position(|o| !o.live && o.generation < MAX_GENERATION)
             .ok_or(Errno::Mfile)?;

@@ -1240,7 +1240,8 @@ fn neither_automatic_nor_manual_delete_can_remove_either_tiers_last_readable_roo
         assert_eq!(h.manager.active(key).unwrap().state, State::Active);
     }
     let replacement = h.periodic(PeriodicLayer::Short);
-    let deleted = h.manager
+    let deleted = h
+        .manager
         .delete(
             &mut h.journal,
             &mut h.disk,
@@ -1253,7 +1254,10 @@ fn neither_automatic_nor_manual_delete_can_remove_either_tiers_last_readable_roo
         )
         .unwrap();
     assert_eq!(deleted.state, RequestState::Done);
-    assert_eq!(h.manager.catalog.entries[short.snapshot_key.slot as usize].state, State::Deleting);
+    assert_eq!(
+        h.manager.catalog.entries[short.snapshot_key.slot as usize].state,
+        State::Deleting
+    );
     assert!(h.manager.active(replacement.snapshot_key).is_ok());
     assert!(h.manager.active(long.snapshot_key).is_ok());
     h.disk.crash();
@@ -1593,11 +1597,24 @@ fn periodic_delete_refuses_corrupt_surviving_image_and_retains_valid_root() {
         h.checkpoint();
         let home = descriptor_block(survivor.snapshot_key.slot as usize) + 1;
         h.disk.stable.get_mut(&home).unwrap()[17] ^= 1;
-        let request = h.request(if automatic {14} else {0}, if automatic {3} else {1}, 0);
-        assert_eq!(h.manager.delete(
-            &mut h.journal, &mut h.disk, &mut h.scratch, &mut h.tx,
-            request, old.snapshot_key, false, automatic
-        ), Err(Error::Status(Status::Corrupt)));
+        let request = h.request(
+            if automatic { 14 } else { 0 },
+            if automatic { 3 } else { 1 },
+            0,
+        );
+        assert_eq!(
+            h.manager.delete(
+                &mut h.journal,
+                &mut h.disk,
+                &mut h.scratch,
+                &mut h.tx,
+                request,
+                old.snapshot_key,
+                false,
+                automatic
+            ),
+            Err(Error::Status(Status::Corrupt))
+        );
         assert!(h.manager.active(old.snapshot_key).is_ok());
         assert!(h.manager.control.cleanup_freeze);
         assert_eq!(h.manager.control.business_write_gate, Gate::Frozen);

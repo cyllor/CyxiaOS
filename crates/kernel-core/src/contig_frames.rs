@@ -33,16 +33,26 @@ impl<const N: usize> ContigFramePool<N> {
         if base == 0 || !base.is_multiple_of(4096) || capacity == 0 || N == 0 {
             return Err(FrameError::Invalid);
         }
-        let bytes = (capacity as u64).checked_mul(4096).ok_or(FrameError::Capacity)?;
+        let bytes = (capacity as u64)
+            .checked_mul(4096)
+            .ok_or(FrameError::Capacity)?;
         if base.checked_add(bytes).is_none() {
             return Err(FrameError::Capacity);
         }
-        Ok(Self { base, capacity, runs: [None; N] })
+        Ok(Self {
+            base,
+            capacity,
+            runs: [None; N],
+        })
     }
 
     pub fn snapshot(&self) -> FrameSnapshot {
         let used: usize = self.runs.iter().filter_map(|r| *r).map(|r| r.pages).sum();
-        FrameSnapshot { capacity: self.capacity, free: self.capacity - used, used }
+        FrameSnapshot {
+            capacity: self.capacity,
+            free: self.capacity - used,
+            used,
+        }
     }
 
     /// First-fit contiguous run owned by `owner`. Returns the physical base.
@@ -50,7 +60,11 @@ impl<const N: usize> ContigFramePool<N> {
         if pages == 0 || pages > self.capacity {
             return Err(FrameError::Invalid);
         }
-        let slot = self.runs.iter().position(|r| r.is_none()).ok_or(FrameError::Capacity)?;
+        let slot = self
+            .runs
+            .iter()
+            .position(|r| r.is_none())
+            .ok_or(FrameError::Capacity)?;
         let mut occupied: [(u64, u64); N] = [(0, 0); N];
         let mut count = 0;
         for run in self.runs.iter().filter_map(|r| *r) {
@@ -83,7 +97,9 @@ impl<const N: usize> ContigFramePool<N> {
     pub fn release(&mut self, base: u64, pages: usize, owner: TaskId) -> Result<(), FrameError> {
         for run in self.runs.iter_mut() {
             if let Some(r) = run
-                && r.base == base && r.pages == pages {
+                && r.base == base
+                && r.pages == pages
+            {
                 if r.owner != owner {
                     return Err(FrameError::Owner);
                 }
@@ -106,12 +122,33 @@ mod tests {
     #[test]
     fn sequential_allocation_charges_contiguous_runs_and_reports_capacity() {
         let mut pool = ContigFramePool::<4>::new(0x1000, 16).unwrap();
-        assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 16, free: 16, used: 0 });
+        assert_eq!(
+            pool.snapshot(),
+            FrameSnapshot {
+                capacity: 16,
+                free: 16,
+                used: 0
+            }
+        );
         assert_eq!(pool.allocate(4, owner(1)).unwrap(), 0x1000);
         assert_eq!(pool.allocate(4, owner(2)).unwrap(), 0x5000);
-        assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 16, free: 8, used: 8 });
+        assert_eq!(
+            pool.snapshot(),
+            FrameSnapshot {
+                capacity: 16,
+                free: 8,
+                used: 8
+            }
+        );
         assert_eq!(pool.allocate(8, owner(3)).unwrap(), 0x9000);
-        assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 16, free: 0, used: 16 });
+        assert_eq!(
+            pool.snapshot(),
+            FrameSnapshot {
+                capacity: 16,
+                free: 0,
+                used: 16
+            }
+        );
         assert_eq!(pool.allocate(1, owner(4)), Err(FrameError::Exhausted));
     }
 
@@ -139,7 +176,14 @@ mod tests {
         pool.release(b, 4, owner(2)).unwrap();
         // Neither 4-page hole alone fits 8 pages; the coalesced gap does.
         assert_eq!(pool.allocate(8, owner(4)).unwrap(), 0x1000);
-        assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 16, free: 0, used: 16 });
+        assert_eq!(
+            pool.snapshot(),
+            FrameSnapshot {
+                capacity: 16,
+                free: 0,
+                used: 16
+            }
+        );
     }
 
     #[test]
@@ -157,7 +201,10 @@ mod tests {
         let base = pool.allocate(4, owner(1)).unwrap();
         assert_eq!(pool.release(base, 4, owner(2)), Err(FrameError::Owner));
         assert_eq!(pool.snapshot().used, 4);
-        assert_eq!(pool.release(base + 4096, 4, owner(1)), Err(FrameError::Stale));
+        assert_eq!(
+            pool.release(base + 4096, 4, owner(1)),
+            Err(FrameError::Stale)
+        );
         assert_eq!(pool.release(base, 8, owner(1)), Err(FrameError::Stale));
         pool.release(base, 4, owner(1)).unwrap();
         assert_eq!(pool.snapshot().used, 0);
@@ -171,15 +218,34 @@ mod tests {
         let b = pool.allocate(4, owner(2)).unwrap();
         assert_eq!(pool.release(a, 4, owner(2)), Err(FrameError::Owner));
         assert_eq!(pool.release(b, 4, owner(1)), Err(FrameError::Owner));
-        assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 16, free: 8, used: 8 });
+        assert_eq!(
+            pool.snapshot(),
+            FrameSnapshot {
+                capacity: 16,
+                free: 8,
+                used: 8
+            }
+        );
     }
 
     #[test]
     fn invalid_geometry_and_requests_are_rejected() {
-        assert_eq!(ContigFramePool::<4>::new(0, 16).unwrap_err(), FrameError::Invalid);
-        assert_eq!(ContigFramePool::<4>::new(0x1001, 16).unwrap_err(), FrameError::Invalid);
-        assert_eq!(ContigFramePool::<4>::new(0x1000, 0).unwrap_err(), FrameError::Invalid);
-        assert_eq!(ContigFramePool::<0>::new(0x1000, 16).unwrap_err(), FrameError::Invalid);
+        assert_eq!(
+            ContigFramePool::<4>::new(0, 16).unwrap_err(),
+            FrameError::Invalid
+        );
+        assert_eq!(
+            ContigFramePool::<4>::new(0x1001, 16).unwrap_err(),
+            FrameError::Invalid
+        );
+        assert_eq!(
+            ContigFramePool::<4>::new(0x1000, 0).unwrap_err(),
+            FrameError::Invalid
+        );
+        assert_eq!(
+            ContigFramePool::<0>::new(0x1000, 16).unwrap_err(),
+            FrameError::Invalid
+        );
         let mut pool = ContigFramePool::<4>::new(0x1000, 16).unwrap();
         assert_eq!(pool.allocate(0, owner(1)), Err(FrameError::Invalid));
         assert_eq!(pool.allocate(17, owner(1)), Err(FrameError::Invalid));

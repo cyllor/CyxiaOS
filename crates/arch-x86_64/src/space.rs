@@ -412,7 +412,10 @@ impl<'a> AddressSpace<'a> {
                 | U
                 | if permissions.writable { W } else { 0 }
                 | if permissions.executable { 0 } else { NX };
-            if let Err(error) = publication.aliases.change(physical, None, Some(permissions)) {
+            if let Err(error) = publication
+                .aliases
+                .change(physical, None, Some(permissions))
+            {
                 // The new path may now contain an empty table even without an unmap.
                 self.arena.reclaim_pending = true;
                 return Err(error);
@@ -438,21 +441,29 @@ impl<'a> AddressSpace<'a> {
         if self.resident_cpus() != 0 {
             return Err(Error::Active);
         }
-        if pages > 512 || address.checked_add((pages as u64 - 1) * PAGE_BYTES)
-            .is_none_or(|last| last >> 21 != address >> 21)
+        if pages > 512
+            || address
+                .checked_add((pages as u64 - 1) * PAGE_BYTES)
+                .is_none_or(|last| last >> 21 != address >> 21)
         {
             return Err(Error::Address);
         }
         self.validate_mapping(address, physical, permissions)?;
         let aliases = MappingBatch::acquire()?;
-        let mut publication = MappingPublication { epoch: &self.epoch, published: 0, aliases };
+        let mut publication = MappingPublication {
+            epoch: &self.epoch,
+            published: 0,
+            aliases,
+        };
         let table = self.arena.mapping_table(self.root, address)?;
         let leaf = unsafe { table.add(((address >> 12) & 511) as usize) };
         let mut valid = 0;
         let mut error = None;
         for index in 0..pages {
             let offset = index as u64 * PAGE_BYTES;
-            let result = physical.checked_add(offset).ok_or(Error::Address)
+            let result = physical
+                .checked_add(offset)
+                .ok_or(Error::Address)
                 .and_then(|page| self.validate_mapping(address + offset, page, permissions));
             if let Err(failure) = result {
                 error = Some(failure);
@@ -464,9 +475,13 @@ impl<'a> AddressSpace<'a> {
             }
             valid += 1;
         }
-        let changed = publication.aliases.change_run(physical, None, Some(permissions), valid);
+        let changed = publication
+            .aliases
+            .change_run(physical, None, Some(permissions), valid);
         for index in 0..changed {
-            let value = (physical + index as u64 * PAGE_BYTES) | P | U
+            let value = (physical + index as u64 * PAGE_BYTES)
+                | P
+                | U
                 | if permissions.writable { W } else { 0 }
                 | if permissions.executable { 0 } else { NX };
             unsafe { leaf.add(index).write_volatile(value) };
@@ -617,7 +632,9 @@ impl<'a> AddressSpace<'a> {
                 }
                 end += 1;
             }
-            let changed = publication.aliases.change_run(physical, Some(old), None, end - index);
+            let changed = publication
+                .aliases
+                .change_run(physical, Some(old), None, end - index);
             for at in index..index + changed {
                 unsafe { leaf.add(at).write_volatile(0) };
             }
@@ -714,26 +731,54 @@ impl MappingBatch {
         };
         #[cfg(not(all(feature = "runtime", target_arch = "x86_64", target_os = "none")))]
         let owner = 0;
-        Ok(Self { owner, _same_cpu: PhantomData })
+        Ok(Self {
+            owner,
+            _same_cpu: PhantomData,
+        })
     }
-    fn change_run(&self, physical: u64, old: Option<UserPermissions>,
-                  new: Option<UserPermissions>, pages: usize) -> usize {
-        if pages == 0 { return 0; }
+    fn change_run(
+        &self,
+        physical: u64,
+        old: Option<UserPermissions>,
+        new: Option<UserPermissions>,
+        pages: usize,
+    ) -> usize {
+        if pages == 0 {
+            return 0;
+        }
         #[cfg(all(feature = "runtime", target_arch = "x86_64", target_os = "none"))]
         {
             unsafe extern "C" {
-                fn x86_runtime_mapping_batch_run(owner: u64, physical: u64, pages: u64, old: u64, new: u64) -> u64;
+                fn x86_runtime_mapping_batch_run(
+                    owner: u64,
+                    physical: u64,
+                    pages: u64,
+                    old: u64,
+                    new: u64,
+                ) -> u64;
             }
             let flags = |p: Option<UserPermissions>| {
-                p.map_or(0, |p| 1 | u64::from(p.writable) << 1 | u64::from(p.executable) << 2)
+                p.map_or(0, |p| {
+                    1 | u64::from(p.writable) << 1 | u64::from(p.executable) << 2
+                })
             };
-            let changed = unsafe { x86_runtime_mapping_batch_run(
-                self.owner, physical, pages as u64, flags(old), flags(new)) } as usize;
+            let changed = unsafe {
+                x86_runtime_mapping_batch_run(
+                    self.owner,
+                    physical,
+                    pages as u64,
+                    flags(old),
+                    flags(new),
+                )
+            } as usize;
             assert!(changed <= pages, "invalid alias prefix; retain backing");
             changed
         }
         #[cfg(not(all(feature = "runtime", target_arch = "x86_64", target_os = "none")))]
-        { let _ = (physical, old, new); pages }
+        {
+            let _ = (physical, old, new);
+            pages
+        }
     }
     #[inline(always)]
     fn change(
@@ -745,12 +790,21 @@ impl MappingBatch {
         #[cfg(all(feature = "runtime", target_arch = "x86_64", target_os = "none"))]
         {
             unsafe extern "C" {
-                fn x86_runtime_mapping_batch_change(owner: u64, physical: u64, old: u64, new: u64) -> bool;
+                fn x86_runtime_mapping_batch_change(
+                    owner: u64,
+                    physical: u64,
+                    old: u64,
+                    new: u64,
+                ) -> bool;
             }
             let flags = |p: Option<UserPermissions>| {
-                p.map_or(0, |p| 1 | u64::from(p.writable) << 1 | u64::from(p.executable) << 2)
+                p.map_or(0, |p| {
+                    1 | u64::from(p.writable) << 1 | u64::from(p.executable) << 2
+                })
             };
-            if !unsafe { x86_runtime_mapping_batch_change(self.owner, physical, flags(old), flags(new)) } {
+            if !unsafe {
+                x86_runtime_mapping_batch_change(self.owner, physical, flags(old), flags(new))
+            } {
                 return Err(Error::Permissions);
             }
         }
@@ -766,7 +820,10 @@ impl Drop for MappingBatch {
             unsafe extern "C" {
                 fn x86_runtime_mapping_batch_end(owner: u64) -> bool;
             }
-            assert!(unsafe { x86_runtime_mapping_batch_end(self.owner) }, "mapping batch lost owner; retain backing");
+            assert!(
+                unsafe { x86_runtime_mapping_batch_end(self.owner) },
+                "mapping batch lost owner; retain backing"
+            );
         }
     }
 }
@@ -780,7 +837,8 @@ impl Drop for MappingPublication<'_> {
         if self.published != 0 {
             // Exclusive owner, same wrapped final epoch as N one-page changes.
             // Also publish the successful prefix on an error or unwind.
-            self.epoch.fetch_add(self.published, core::sync::atomic::Ordering::Release);
+            self.epoch
+                .fetch_add(self.published, core::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -795,8 +853,17 @@ impl Drop for AddressSpace<'_> {
     fn drop(&mut self) {
         assert_eq!(self.resident_cpus(), 0, "dropping an entered address space");
         let aliases = MappingBatch::acquire().expect("retiring mappings requires alias custody");
-        fn retire(space: &AddressSpace<'_>, aliases: &MappingBatch, physical: u64, level: u8, entries: usize) {
-            let table = space.arena.table(physical).expect("invalid retiring table; retain backing");
+        fn retire(
+            space: &AddressSpace<'_>,
+            aliases: &MappingBatch,
+            physical: u64,
+            level: u8,
+            entries: usize,
+        ) {
+            let table = space
+                .arena
+                .table(physical)
+                .expect("invalid retiring table; retain backing");
             let mut first = 0;
             if level == 1 {
                 // Batch only the first present contiguous run. Fragmented tails
@@ -808,7 +875,10 @@ impl Drop for AddressSpace<'_> {
                         continue;
                     }
                     let physical = value & MASK;
-                    assert!(physical < space.ram_bytes, "invalid retiring frame; retain backing");
+                    assert!(
+                        physical < space.ram_bytes,
+                        "invalid retiring frame; retain backing"
+                    );
                     let mut end = first + 1;
                     while end < entries {
                         let next = unsafe { table.add(end).read_volatile() };
@@ -821,10 +891,20 @@ impl Drop for AddressSpace<'_> {
                         end += 1;
                     }
                     if end - first > 1 {
-                        let changed = aliases.change_run(physical,
-                            Some(UserPermissions { writable: value & W != 0, executable: value & NX == 0 }),
-                            None, end - first);
-                        assert_eq!(changed, end - first, "retiring alias count failed; retain backing");
+                        let changed = aliases.change_run(
+                            physical,
+                            Some(UserPermissions {
+                                writable: value & W != 0,
+                                executable: value & NX == 0,
+                            }),
+                            None,
+                            end - first,
+                        );
+                        assert_eq!(
+                            changed,
+                            end - first,
+                            "retiring alias count failed; retain backing"
+                        );
                         first = end;
                     }
                     break;
@@ -836,14 +916,26 @@ impl Drop for AddressSpace<'_> {
                     continue;
                 }
                 if level == 1 {
-                    assert!(value & MASK < space.ram_bytes, "invalid retiring frame; retain backing");
-                    aliases.change(
-                        value & MASK,
-                        Some(UserPermissions { writable: value & W != 0, executable: value & NX == 0 }),
-                        None,
-                    ).expect("retiring alias count failed; retain backing");
+                    assert!(
+                        value & MASK < space.ram_bytes,
+                        "invalid retiring frame; retain backing"
+                    );
+                    aliases
+                        .change(
+                            value & MASK,
+                            Some(UserPermissions {
+                                writable: value & W != 0,
+                                executable: value & NX == 0,
+                            }),
+                            None,
+                        )
+                        .expect("retiring alias count failed; retain backing");
                 } else {
-                    assert_eq!(value & (1 << 7), 0, "unexpected large user leaf; retain backing");
+                    assert_eq!(
+                        value & (1 << 7),
+                        0,
+                        "unexpected large user leaf; retain backing"
+                    );
                     retire(space, aliases, value & MASK, level - 1, 512);
                 }
             }

@@ -20,7 +20,12 @@ fn elf(machine: u16, base: u64, entry: u64) -> Vec<u8> {
 #[test]
 fn x86_control_accepts_byte_aligned_code_but_rejects_cross_isa() {
     let bytes = elf(62, image::BASE, image::BASE + 1);
-    assert_eq!(image::Image::parse_for(&bytes, ImageAbi::X86_64).unwrap().entry, 0x80001);
+    assert_eq!(
+        image::Image::parse_for(&bytes, ImageAbi::X86_64)
+            .unwrap()
+            .entry,
+        0x80001
+    );
     assert!(image::Image::parse_for(&bytes, ImageAbi::Aarch64).is_err());
     assert!(image::Image::parse(&bytes).is_err());
     let arm = elf(183, image::BASE, image::BASE);
@@ -31,7 +36,12 @@ fn x86_control_accepts_byte_aligned_code_but_rejects_cross_isa() {
 #[test]
 fn x86_service_accepts_byte_aligned_code_but_rejects_cross_isa() {
     let bytes = elf(62, service_image::BASE, service_image::BASE + 1);
-    assert_eq!(service_image::Image::parse_for(&bytes, ImageAbi::X86_64).unwrap().entry, 0x01000001);
+    assert_eq!(
+        service_image::Image::parse_for(&bytes, ImageAbi::X86_64)
+            .unwrap()
+            .entry,
+        0x01000001
+    );
     assert!(service_image::Image::parse_for(&bytes, ImageAbi::Aarch64).is_err());
     assert!(service_image::Image::parse(&bytes).is_err());
     let arm = elf(183, service_image::BASE, service_image::BASE);
@@ -41,8 +51,17 @@ fn x86_service_accepts_byte_aligned_code_but_rejects_cross_isa() {
 
 #[test]
 fn arm_entry_alignment_stays_strict_for_both_loaders() {
-    assert!(image::Image::parse_for(&elf(183, image::BASE, image::BASE + 1), ImageAbi::Aarch64).is_err());
-    assert!(service_image::Image::parse_for(&elf(183, service_image::BASE, service_image::BASE + 1), ImageAbi::Aarch64).is_err());
+    assert!(
+        image::Image::parse_for(&elf(183, image::BASE, image::BASE + 1), ImageAbi::Aarch64)
+            .is_err()
+    );
+    assert!(
+        service_image::Image::parse_for(
+            &elf(183, service_image::BASE, service_image::BASE + 1),
+            ImageAbi::Aarch64
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -74,12 +93,19 @@ fn x86_still_rejects_wx_dynamic_overlap_and_unbacked_entry() {
 fn x86_retains_loader_windows_size_caps_and_segment_alignment() {
     for (base, limit, cap, control) in [
         (image::BASE, image::BASE + 32 * 4096, 512 * 1024, true),
-        (service_image::BASE, service_image::LIMIT, 8 * 1024 * 1024, false),
+        (
+            service_image::BASE,
+            service_image::LIMIT,
+            8 * 1024 * 1024,
+            false,
+        ),
     ] {
-        let rejects = |bytes: &[u8]| if control {
-            image::Image::parse_for(bytes, ImageAbi::X86_64).is_err()
-        } else {
-            service_image::Image::parse_for(bytes, ImageAbi::X86_64).is_err()
+        let rejects = |bytes: &[u8]| {
+            if control {
+                image::Image::parse_for(bytes, ImageAbi::X86_64).is_err()
+            } else {
+                service_image::Image::parse_for(bytes, ImageAbi::X86_64).is_err()
+            }
         };
         assert!(rejects(&elf(62, limit, limit)));
         let mut bytes = elf(62, base, base + 1);

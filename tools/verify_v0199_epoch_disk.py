@@ -126,7 +126,7 @@ def fixed_metadata():
     put(root,124,'I',crc(root[:128]))
     return {4098:bytes(bitmap),4102:b''.join(inodes),
             RECEIPTS_HOME:bytes(6*BLOCK)+bytes(index),ACL_HOME:bytes(acl),
-            ROOT_HOME:bytes(root),HOME+1:MARKER.ljust(BLOCK,b'\\0')}
+            ROOT_HOME:bytes(root),HOME+1:MARKER.ljust(BLOCK,b'\0')}
 
 def create_disk(path):
     assert crc(b'123456789')==0xe3069283 and len(UUID)==16
@@ -157,7 +157,7 @@ def check_disk(path,epoch,out):
             f.seek(block*BLOCK)
             require(f.read(len(data))==data,'fixed metadata/ACL/receipt changed at '+str(block))
         f.seek(HOME*BLOCK);home=f.read(3*BLOCK)
-        require(home==state(2*(epoch-1))+MARKER.ljust(BLOCK,b'\\0')+boot_store(epoch-1),
+        require(home==state(2*(epoch-1))+MARKER.ljust(BLOCK,b'\0')+boot_store(epoch-1),
                 'checkpointed home differs from latest prior commit')
     (out/'superblocks.bin').write_bytes(original)
     (out/'redo-blocks.bin').write_bytes(log)

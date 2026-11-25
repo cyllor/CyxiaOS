@@ -471,7 +471,7 @@ impl State {
             vector_ids: [0; TASKS],
             exits: [None; 256],
             layout: CpuLayout {
-                business_mask: 13,
+                business_mask: 14,
                 healthy_mask: 15,
                 generation: 1,
             },
@@ -1479,9 +1479,9 @@ pub fn control_owner_context(slot: usize) -> Result<(u64, u64), Error> {
         Ok((s.layout.generation, s.generation))
     })
 }
-/// Only the dedicated CPU1 control worker may spend this credit. CPU0 is the
-/// deterministic broker; CPU2/3 are business-only, including during cleanup.
-/// Existing CPU1 work may settle during drain before the stop acknowledgement.
+/// Only the dedicated CPU0 control worker may spend this credit. CPU1-3 are
+/// business-only, including during cleanup; no business core is ever promoted.
+/// Existing CPU0 work may settle during drain before the stop acknowledgement.
 pub fn begin_control(required_ns: u64, cleanup: bool) -> Result<Option<ControlCredit>, Error> {
     let slot = cpu::slot();
     if slot != cyxia_kernel_core::control_plane::fixed::CONTROL_CPU {

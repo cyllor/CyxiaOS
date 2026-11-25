@@ -130,7 +130,10 @@ impl PageZeroer for TrackedZero {
         if offset % 4096 != 0 {
             return Err(FrameError::Invalid);
         }
-        *self.contents.get_mut(offset as usize / 4096).ok_or(FrameError::Invalid)? = 0;
+        *self
+            .contents
+            .get_mut(offset as usize / 4096)
+            .ok_or(FrameError::Invalid)? = 0;
         Ok(())
     }
 }
@@ -155,7 +158,14 @@ fn complete_256_mib_shared_pool_preserves_owners_and_reuses_every_frame() {
         calls: 0,
         fail: false,
     };
-    assert_eq!(pool.snapshot(), FrameSnapshot { capacity: PAGES, free: PAGES, used: 0 });
+    assert_eq!(
+        pool.snapshot(),
+        FrameSnapshot {
+            capacity: PAGES,
+            free: PAGES,
+            used: 0
+        }
+    );
     let mut frames = Vec::with_capacity(PAGES);
     let mut seen = vec![false; PAGES];
     for index in 0..PAGES {
@@ -172,21 +182,51 @@ fn complete_256_mib_shared_pool_preserves_owners_and_reuses_every_frame() {
     assert!(seen.into_iter().all(|seen| seen));
     assert_eq!(frames.last().unwrap().1.index(), 65_535);
     assert_eq!(zero.calls, PAGES);
-    assert_eq!(pool.snapshot(), FrameSnapshot { capacity: PAGES, free: 0, used: PAGES });
-    assert_eq!(pool.alloc_zeroed(owner(), &mut zero), Err(FrameError::Exhausted));
+    assert_eq!(
+        pool.snapshot(),
+        FrameSnapshot {
+            capacity: PAGES,
+            free: 0,
+            used: PAGES
+        }
+    );
+    assert_eq!(
+        pool.alloc_zeroed(owner(), &mut zero),
+        Err(FrameError::Exhausted)
+    );
     assert_eq!(pool.check_owned(frames[0].1, frames[0].0), Ok(()));
-    assert_eq!(pool.check_owned(frames[0].1, TaskId::new(99).unwrap()), Err(FrameError::Owner));
-    assert_eq!(pool.begin_revoke(frames[0].1, TaskId::new(99).unwrap()), Err(FrameError::Owner));
+    assert_eq!(
+        pool.check_owned(frames[0].1, TaskId::new(99).unwrap()),
+        Err(FrameError::Owner)
+    );
+    assert_eq!(
+        pool.begin_revoke(frames[0].1, TaskId::new(99).unwrap()),
+        Err(FrameError::Owner)
+    );
     for &(actor, frame) in &frames {
         pool.begin_revoke(frame, actor).unwrap();
     }
     assert_eq!(pool.snapshot().free, 0, "revocation is not completed reuse");
-    assert_eq!(pool.check_owned(frames[0].1, frames[0].0), Err(FrameError::Stale));
-    assert_eq!(pool.alloc_zeroed(owner(), &mut zero), Err(FrameError::Again));
+    assert_eq!(
+        pool.check_owned(frames[0].1, frames[0].0),
+        Err(FrameError::Stale)
+    );
+    assert_eq!(
+        pool.alloc_zeroed(owner(), &mut zero),
+        Err(FrameError::Again)
+    );
     for &(_, frame) in &frames {
-        pool.finish_revoke(frame, unsafe { RevokeComplete::after_unmap(frame) }).unwrap();
+        pool.finish_revoke(frame, unsafe { RevokeComplete::after_unmap(frame) })
+            .unwrap();
     }
-    assert_eq!(pool.snapshot(), FrameSnapshot { capacity: PAGES, free: PAGES, used: 0 });
+    assert_eq!(
+        pool.snapshot(),
+        FrameSnapshot {
+            capacity: PAGES,
+            free: PAGES,
+            used: 0
+        }
+    );
     for (index, &(_, stale)) in frames.iter().enumerate() {
         let actor = TaskId::new(101 + (index % 8) as u32).unwrap();
         let frame = pool.alloc_zeroed(actor, &mut zero).unwrap();
@@ -199,19 +239,35 @@ fn complete_256_mib_shared_pool_preserves_owners_and_reuses_every_frame() {
         assert_eq!(pool.begin_revoke(stale, actor), Err(FrameError::Stale));
         assert_eq!(pool.snapshot(), before);
         pool.begin_revoke(frame, actor).unwrap();
-        pool.finish_revoke(frame, unsafe { RevokeComplete::after_unmap(frame) }).unwrap();
+        pool.finish_revoke(frame, unsafe { RevokeComplete::after_unmap(frame) })
+            .unwrap();
     }
     assert_eq!(zero.calls, 2 * PAGES);
-    assert_eq!(pool.snapshot(), FrameSnapshot { capacity: PAGES, free: PAGES, used: 0 });
+    assert_eq!(
+        pool.snapshot(),
+        FrameSnapshot {
+            capacity: PAGES,
+            free: PAGES,
+            used: 0
+        }
+    );
 }
 
 #[test]
 fn allocation_zero_failure_retains_free_dirty_frame_without_ownership() {
     let mut metadata = [FrameMeta::EMPTY; 1];
     let mut pool = FramePool::from_memory(&[region(0x1000, 1)], &[], &mut metadata).unwrap();
-    let mut zero = TrackedZero { base: 0x1000, contents: vec![0xa5], calls: 0, fail: true };
+    let mut zero = TrackedZero {
+        base: 0x1000,
+        contents: vec![0xa5],
+        calls: 0,
+        fail: true,
+    };
     let before = pool.snapshot();
-    assert_eq!(pool.alloc_zeroed(owner(), &mut zero), Err(FrameError::ZeroFailed));
+    assert_eq!(
+        pool.alloc_zeroed(owner(), &mut zero),
+        Err(FrameError::ZeroFailed)
+    );
     assert_eq!(pool.snapshot(), before);
     assert_eq!(pool.alloc_clean(owner()), Err(FrameError::Again));
     assert_eq!(zero.contents, [0xa5]);
@@ -219,7 +275,14 @@ fn allocation_zero_failure_retains_free_dirty_frame_without_ownership() {
     let frame = pool.alloc_zeroed(owner(), &mut zero).unwrap();
     assert_eq!(frame.index(), 0);
     assert_eq!(zero.contents, [0]);
-    assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 1, free: 0, used: 1 });
+    assert_eq!(
+        pool.snapshot(),
+        FrameSnapshot {
+            capacity: 1,
+            free: 0,
+            used: 1
+        }
+    );
 }
 
 #[test]
@@ -227,15 +290,34 @@ fn zeroed_allocation_reuses_clean_pages_without_rezeroing_and_excludes_reservati
     let mut metadata = [FrameMeta::EMPTY; 3];
     let reserved = [region(0x1000, 1)];
     let mut pool = FramePool::from_memory(&[region(0x1000, 3)], &reserved, &mut metadata).unwrap();
-    let mut zero = TrackedZero { base: 0x1000, contents: vec![0xa5; 3], calls: 0, fail: false };
-    assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 2, free: 2, used: 0 });
+    let mut zero = TrackedZero {
+        base: 0x1000,
+        contents: vec![0xa5; 3],
+        calls: 0,
+        fail: false,
+    };
+    assert_eq!(
+        pool.snapshot(),
+        FrameSnapshot {
+            capacity: 2,
+            free: 2,
+            used: 0
+        }
+    );
     assert!(pool.clean_one(&mut zero).unwrap());
     zero.fail = true;
     let clean = pool.alloc_zeroed(owner(), &mut zero).unwrap();
     assert_eq!(clean.index(), 1);
     assert_eq!(zero.calls, 1, "clean page needs no second zero");
     assert_eq!(zero.contents[0], 0xa5, "reserved memory is never cleared");
-    assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 2, free: 1, used: 1 });
+    assert_eq!(
+        pool.snapshot(),
+        FrameSnapshot {
+            capacity: 2,
+            free: 1,
+            used: 1
+        }
+    );
 }
 
 #[test]
@@ -244,7 +326,12 @@ fn indexed_handles_reject_foreign_pool_and_mismatched_completion() {
     let mut second_meta = [FrameMeta::EMPTY; 1];
     let mut first = FramePool::from_memory(&[region(0x1000, 1)], &[], &mut first_meta).unwrap();
     let mut second = FramePool::from_memory(&[region(0x2000, 1)], &[], &mut second_meta).unwrap();
-    let mut zero = TrackedZero { base: 0x1000, contents: vec![0xa5; 2], calls: 0, fail: false };
+    let mut zero = TrackedZero {
+        base: 0x1000,
+        contents: vec![0xa5; 2],
+        calls: 0,
+        fail: false,
+    };
     let a = first.alloc_zeroed(owner(), &mut zero).unwrap();
     let b = second.alloc_zeroed(owner(), &mut zero).unwrap();
     assert_eq!(a.index(), b.index());
@@ -252,11 +339,26 @@ fn indexed_handles_reject_foreign_pool_and_mismatched_completion() {
     assert_eq!(first.begin_revoke(b, owner()), Err(FrameError::Stale));
     first.begin_revoke(a, owner()).unwrap();
     let before = first.snapshot();
-    assert_eq!(first.finish_revoke(a, unsafe { RevokeComplete::after_unmap(b) }), Err(FrameError::Stale));
+    assert_eq!(
+        first.finish_revoke(a, unsafe { RevokeComplete::after_unmap(b) }),
+        Err(FrameError::Stale)
+    );
     assert_eq!(first.snapshot(), before);
-    first.finish_revoke(a, unsafe { RevokeComplete::after_unmap(a) }).unwrap();
-    assert_eq!(first.finish_revoke(a, unsafe { RevokeComplete::after_unmap(a) }), Err(FrameError::Stale));
-    assert_eq!(first.snapshot(), FrameSnapshot { capacity: 1, free: 1, used: 0 });
+    first
+        .finish_revoke(a, unsafe { RevokeComplete::after_unmap(a) })
+        .unwrap();
+    assert_eq!(
+        first.finish_revoke(a, unsafe { RevokeComplete::after_unmap(a) }),
+        Err(FrameError::Stale)
+    );
+    assert_eq!(
+        first.snapshot(),
+        FrameSnapshot {
+            capacity: 1,
+            free: 1,
+            used: 0
+        }
+    );
 }
 
 #[test]
@@ -274,14 +376,29 @@ fn legacy_and_zeroed_allocations_share_capacity_and_preserve_first_fit() {
     let first = pool.alloc_clean(owner()).unwrap();
     let second = pool.alloc_zeroed(owner(), &mut zero).unwrap();
     assert_eq!((first.index(), second.index()), (0, 1));
-    assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 3, free: 1, used: 2 });
+    assert_eq!(
+        pool.snapshot(),
+        FrameSnapshot {
+            capacity: 3,
+            free: 1,
+            used: 2
+        }
+    );
     pool.begin_revoke(first, owner()).unwrap();
     assert_eq!(pool.snapshot().free, 1);
-    pool.finish_revoke(first, unsafe { RevokeComplete::after_unmap(first) }).unwrap();
+    pool.finish_revoke(first, unsafe { RevokeComplete::after_unmap(first) })
+        .unwrap();
     assert_eq!(pool.snapshot().free, 2);
     pool.clean_one(&mut zero).unwrap();
     let reused = pool.alloc_clean(owner()).unwrap();
     assert_eq!(reused.address(), first.address());
     assert_ne!(reused, first);
-    assert_eq!(pool.snapshot(), FrameSnapshot { capacity: 3, free: 1, used: 2 });
+    assert_eq!(
+        pool.snapshot(),
+        FrameSnapshot {
+            capacity: 3,
+            free: 1,
+            used: 2
+        }
+    );
 }

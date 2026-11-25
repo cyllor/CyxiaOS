@@ -59,21 +59,42 @@ fn runtime_profile_admits_full_gib_without_weakening_legacy_limit() {
     record(&mut map, 0xfffc_0000, 0x4_0000, 2);
     let mut h = header(&map, MAP_PA);
     write_u32(&mut h, 8, ((limit - KERNEL_START) / 1024) as u32);
-    assert_eq!(parse_multiboot(MULTIBOOT_BOOT_MAGIC, &h, HEADER_PA, &map, MAP_PA,
-        KERNEL_START, KERNEL_END), Err(BootError::UnsupportedMemory));
-    let info = parse_multiboot_with_limit(MULTIBOOT_BOOT_MAGIC, &h, HEADER_PA, &map,
-        MAP_PA, KERNEL_START, KERNEL_END, limit).unwrap();
+    assert_eq!(
+        parse_multiboot(
+            MULTIBOOT_BOOT_MAGIC,
+            &h,
+            HEADER_PA,
+            &map,
+            MAP_PA,
+            KERNEL_START,
+            KERNEL_END
+        ),
+        Err(BootError::UnsupportedMemory)
+    );
+    let info = parse_multiboot_with_limit(
+        MULTIBOOT_BOOT_MAGIC,
+        &h,
+        HEADER_PA,
+        &map,
+        MAP_PA,
+        KERNEL_START,
+        KERNEL_END,
+        limit,
+    )
+    .unwrap();
     assert!(contains(info.ram_regions(), KERNEL_START, limit - 0x2_0000));
     assert!(contains(info.reserved_regions(), limit - 0x2_0000, limit));
     assert!(contains(info.reserved_regions(), 0, KERNEL_END));
-    assert!(info.ram_regions().iter().all(|r| r.start.0 + r.len <= limit));
+    assert!(
+        info.ram_regions()
+            .iter()
+            .all(|r| r.start.0 + r.len <= limit)
+    );
 }
 
 #[test]
 fn two_gib_memory_is_rejected_instead_of_silently_truncated() {
-    use cyxia_platform_pc::boot::{
-        MAX_RUNTIME_PHYSICAL_MEMORY, parse_multiboot_with_limit,
-    };
+    use cyxia_platform_pc::boot::{MAX_RUNTIME_PHYSICAL_MEMORY, parse_multiboot_with_limit};
     let limit = 2 << 30;
     let mut map = Vec::new();
     record(&mut map, 0, 0x9_fc00, 1);
@@ -83,27 +104,74 @@ fn two_gib_memory_is_rejected_instead_of_silently_truncated() {
     let mut h = header(&map, MAP_PA);
     write_u32(&mut h, 8, ((limit - KERNEL_START) / 1024) as u32);
     for smaller in [MAX_PHYSICAL_MEMORY, MAX_RUNTIME_PHYSICAL_MEMORY] {
-        assert_eq!(parse_multiboot_with_limit(MULTIBOOT_BOOT_MAGIC, &h, HEADER_PA,
-            &map, MAP_PA, KERNEL_START, KERNEL_END, smaller), Err(BootError::UnsupportedMemory));
+        assert_eq!(
+            parse_multiboot_with_limit(
+                MULTIBOOT_BOOT_MAGIC,
+                &h,
+                HEADER_PA,
+                &map,
+                MAP_PA,
+                KERNEL_START,
+                KERNEL_END,
+                smaller
+            ),
+            Err(BootError::UnsupportedMemory)
+        );
     }
-    assert_eq!(parse_multiboot_with_limit(MULTIBOOT_BOOT_MAGIC, &h, HEADER_PA,
-        &map, MAP_PA, KERNEL_START, KERNEL_END, limit), Err(BootError::UnsupportedMemory));
+    assert_eq!(
+        parse_multiboot_with_limit(
+            MULTIBOOT_BOOT_MAGIC,
+            &h,
+            HEADER_PA,
+            &map,
+            MAP_PA,
+            KERNEL_START,
+            KERNEL_END,
+            limit
+        ),
+        Err(BootError::UnsupportedMemory)
+    );
 }
 
 #[test]
 fn explicit_memory_limit_rejects_invalid_limit_and_never_truncates_ram() {
     use cyxia_platform_pc::boot::{MAX_RUNTIME_PHYSICAL_MEMORY, parse_multiboot_with_limit};
     let map = pc_map();
-    for limit in [0, 4096, MAX_PHYSICAL_MEMORY + 1, MAX_RUNTIME_PHYSICAL_MEMORY + 4096] {
-        assert_eq!(parse_multiboot_with_limit(MULTIBOOT_BOOT_MAGIC, &header(&map, MAP_PA),
-            HEADER_PA, &map, MAP_PA, KERNEL_START, KERNEL_END, limit),
-            Err(BootError::UnsupportedMemory));
+    for limit in [
+        0,
+        4096,
+        MAX_PHYSICAL_MEMORY + 1,
+        MAX_RUNTIME_PHYSICAL_MEMORY + 4096,
+    ] {
+        assert_eq!(
+            parse_multiboot_with_limit(
+                MULTIBOOT_BOOT_MAGIC,
+                &header(&map, MAP_PA),
+                HEADER_PA,
+                &map,
+                MAP_PA,
+                KERNEL_START,
+                KERNEL_END,
+                limit
+            ),
+            Err(BootError::UnsupportedMemory)
+        );
     }
     let mut map = Vec::new();
     record(&mut map, KERNEL_START, MAX_RUNTIME_PHYSICAL_MEMORY, 1);
-    assert_eq!(parse_multiboot_with_limit(MULTIBOOT_BOOT_MAGIC, &header(&map, MAP_PA),
-        HEADER_PA, &map, MAP_PA, KERNEL_START, KERNEL_END, MAX_RUNTIME_PHYSICAL_MEMORY),
-        Err(BootError::UnsupportedMemory));
+    assert_eq!(
+        parse_multiboot_with_limit(
+            MULTIBOOT_BOOT_MAGIC,
+            &header(&map, MAP_PA),
+            HEADER_PA,
+            &map,
+            MAP_PA,
+            KERNEL_START,
+            KERNEL_END,
+            MAX_RUNTIME_PHYSICAL_MEMORY
+        ),
+        Err(BootError::UnsupportedMemory)
+    );
 }
 
 #[test]
@@ -113,11 +181,18 @@ fn production_pool_reservations_exclude_firmware_kernel_and_previous_allocations
     let second = info.reserve_pool(128 * 4096, KERNEL_START).unwrap();
     assert_eq!(first.start.0, KERNEL_END);
     assert_eq!(second.start.0, first.start.0 + first.len);
-    assert!(contains(info.reserved_regions(), first.start.0, second.start.0 + second.len));
+    assert!(contains(
+        info.reserved_regions(),
+        first.start.0,
+        second.start.0 + second.len
+    ));
     assert!(!first.overlaps(second));
     let before = info;
     assert!(info.reserve_pool(1, KERNEL_START).is_err());
-    assert!(info.reserve_pool(MAX_PHYSICAL_MEMORY, KERNEL_START).is_err());
+    assert!(
+        info.reserve_pool(MAX_PHYSICAL_MEMORY, KERNEL_START)
+            .is_err()
+    );
     assert_eq!(info, before);
 }
 
@@ -126,16 +201,25 @@ fn boot_pool_plan_scales_with_unreserved_ram_and_keeps_the_system_budget() {
     use cyxia_platform_pc::boot::PoolSize;
     const MIB: u64 = 1024 * 1024;
     let info = parse(&pc_map()).unwrap();
-    let plan = info.plan_pools([
-        PoolSize::fixed(4 * MIB),
-        PoolSize::bounded(96 * MIB, 128 * MIB, MIB),
-        PoolSize::bounded(64 * MIB, 96 * MIB, MIB),
-    ], 64 * MIB).unwrap();
+    let plan = info
+        .plan_pools(
+            [
+                PoolSize::fixed(4 * MIB),
+                PoolSize::bounded(96 * MIB, 128 * MIB, MIB),
+                PoolSize::bounded(64 * MIB, 96 * MIB, MIB),
+            ],
+            64 * MIB,
+        )
+        .unwrap();
     assert_eq!(plan.percent, 40);
     assert_eq!(plan.ranges.map(|r| r.len / MIB), [4, 108, 76]);
     assert_eq!(plan.free_bytes, 66 * MIB - 0x2_0000);
     assert!(plan.ranges.windows(2).all(|r| !r[0].overlaps(r[1])));
-    assert!(plan.ranges.iter().all(|r| contains(plan.memory.reserved_regions(), r.start.0, r.start.0 + r.len)));
+    assert!(plan.ranges.iter().all(|r| contains(
+        plan.memory.reserved_regions(),
+        r.start.0,
+        r.start.0 + r.len
+    )));
     assert_eq!(info, parse(&pc_map()).unwrap());
 }
 
@@ -148,9 +232,17 @@ fn boot_pool_plan_checks_contiguous_ranges_and_leaves_input_intact_on_failure() 
     record(&mut map, 80 * MIB, 32 * MIB, 2);
     record(&mut map, 112 * MIB, 80 * MIB, 1);
     let info = parse(&map).unwrap();
-    let plan = info.plan_pools([PoolSize::bounded(64 * MIB, 104 * MIB, MIB)], 32 * MIB).unwrap();
-    assert_eq!((plan.ranges[0].start.0, plan.ranges[0].len), (112 * MIB, 80 * MIB));
-    assert_eq!(info.plan_pools([PoolSize::fixed(81 * MIB)], 32 * MIB).err(), Some(BootError::NoUsableMemory));
+    let plan = info
+        .plan_pools([PoolSize::bounded(64 * MIB, 104 * MIB, MIB)], 32 * MIB)
+        .unwrap();
+    assert_eq!(
+        (plan.ranges[0].start.0, plan.ranges[0].len),
+        (112 * MIB, 80 * MIB)
+    );
+    assert_eq!(
+        info.plan_pools([PoolSize::fixed(81 * MIB)], 32 * MIB).err(),
+        Some(BootError::NoUsableMemory)
+    );
     assert_eq!(info, parse(&map).unwrap());
 }
 

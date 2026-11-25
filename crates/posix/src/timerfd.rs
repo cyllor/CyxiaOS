@@ -1,7 +1,7 @@
 //! Bounded monotonic timers. Each timer belongs to its open description and
 //! future expirations are ordered in a fixed-capacity deadline heap.
-use super::{Description, Errno, O_CLOEXEC, O_NONBLOCK, O_RDWR, Object, Process};
 use super::open_description::Handle;
+use super::{Description, Errno, O_CLOEXEC, O_NONBLOCK, O_RDWR, Object, Process};
 mod deadlines;
 pub(crate) use deadlines::Deadlines;
 
@@ -121,7 +121,8 @@ impl super::OpenDescriptions {
             object: Object::Timer(timer),
             ..description
         });
-        table.timer_deadlines
+        table
+            .timer_deadlines
             .set(handle, timer.deadline.filter(|&deadline| deadline > now));
         table.publish_poll_change();
         let ready = u32::from(timer.ready(now)) * super::epoll::IN;
@@ -226,19 +227,57 @@ mod tests {
         let late = process.timerfd_create(1, O_NONBLOCK).unwrap();
         let periodic = process.timerfd_create(1, O_NONBLOCK).unwrap();
         let removed = process.timerfd_create(1, O_NONBLOCK).unwrap();
-        for (fd, data, value, interval) in [(late, 1, 40, 0), (periodic, 2, 20, 10), (removed, 3, 10, 0)] {
-            process.epoll_ctl(epfd, 1, fd, Event { events: IN | EDGE, data }).unwrap();
-            process.timerfd_set(fd, 0, ABSTIME, Setting { value, interval }).unwrap();
+        for (fd, data, value, interval) in
+            [(late, 1, 40, 0), (periodic, 2, 20, 10), (removed, 3, 10, 0)]
+        {
+            process
+                .epoll_ctl(
+                    epfd,
+                    1,
+                    fd,
+                    Event {
+                        events: IN | EDGE,
+                        data,
+                    },
+                )
+                .unwrap();
+            process
+                .timerfd_set(fd, 0, ABSTIME, Setting { value, interval })
+                .unwrap();
         }
-        process.timerfd_set(late, 0, ABSTIME, Setting { value: 70, interval: 0 }).unwrap();
+        process
+            .timerfd_set(
+                late,
+                0,
+                ABSTIME,
+                Setting {
+                    value: 70,
+                    interval: 0,
+                },
+            )
+            .unwrap();
         process.close(&mut fs, removed).unwrap();
         let replacement = process.timerfd_create(1, O_NONBLOCK).unwrap();
         assert_eq!(replacement, removed);
-        process.epoll_ctl(epfd, 1, replacement, Event { events: IN | EDGE, data: 4 }).unwrap();
+        process
+            .epoll_ctl(
+                epfd,
+                1,
+                replacement,
+                Event {
+                    events: IN | EDGE,
+                    data: 4,
+                },
+            )
+            .unwrap();
         let unrelated = process.epoll_create(0).unwrap();
-        process.epoll_sample_at(unrelated, || panic!("queried the clock for an unrelated epoll"), |_| {
-            panic!("sampled an unwatched timer")
-        }).unwrap();
+        process
+            .epoll_sample_at(
+                unrelated,
+                || panic!("queried the clock for an unrelated epoll"),
+                |_| panic!("sampled an unwatched timer"),
+            )
+            .unwrap();
 
         let wait = |process: &mut Process, time, expected_data: Option<u64>, clock_reads| {
             let reads = core::cell::Cell::new(0);
@@ -246,11 +285,19 @@ mod tests {
                 reads.set(reads.get() + 1);
                 time
             };
-            let readiness = process.epoll_sample_at(epfd, clock, |_| panic!("timer escaped the deadline queue")).unwrap();
+            let readiness = process
+                .epoll_sample_at(epfd, clock, |_| panic!("timer escaped the deadline queue"))
+                .unwrap();
             assert_eq!(reads.get(), clock_reads, "clock reads at {time}");
             let mut events = [Event::default(); 3];
-            let delivered = process.epoll_collect(epfd, &readiness, &mut events).unwrap();
-            assert_eq!(delivered, usize::from(expected_data.is_some()), "events at {time}");
+            let delivered = process
+                .epoll_collect(epfd, &readiness, &mut events)
+                .unwrap();
+            assert_eq!(
+                delivered,
+                usize::from(expected_data.is_some()),
+                "events at {time}"
+            );
             if let Some(data) = expected_data {
                 assert_eq!(events[0], Event { events: IN, data });
             }
@@ -263,7 +310,9 @@ mod tests {
         wait(&mut process, 49, None, 1);
         wait(&mut process, 50, Some(2), 1);
         wait(&mut process, 70, Some(1), 1);
-        process.timerfd_set(periodic, 70, 0, Setting::default()).unwrap();
+        process
+            .timerfd_set(periodic, 70, 0, Setting::default())
+            .unwrap();
         process.timerfd_read(late, 70, &mut ticks).unwrap();
         assert_eq!(u64::from_le_bytes(ticks), 1);
         wait(&mut process, 80, None, 0);

@@ -5,9 +5,9 @@
 //! The Rust TLS engine requires a real EL0 quota-backed allocator/CSPRNG.
 //! This library alone is NOT an EL0 service, execution grant or QEMU evidence.
 pub const IDLE_TIMEOUT_SECS: u64 = 60;
-pub mod echo;
 #[cfg(feature = "tls")]
 pub mod admission;
+pub mod echo;
 #[cfg(feature = "tls")]
 pub mod native_tcp;
 #[cfg(feature = "tls")]

@@ -712,7 +712,7 @@ impl<const C: usize> FileSystem<C> {
         if self.inodes[parent].kind != InodeKind::Directory {
             return Err(Error::NotDirectory);
         }
-        if parent == 0 && (name == ".cyxia-boot" || crate::cluster::volume::NAMES.contains(&name)) {
+        if parent == 0 && (name == ".cyxia-boot" || crate::local_volume::NAMES.contains(&name)) {
             return Err(Error::Auth);
         }
         Ok((parent, name))

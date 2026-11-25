@@ -1493,21 +1493,25 @@ fn v019_sec_f01_direct_filesystem_rejects_ambiguous_path_without_disk_effect() {
                 )
                 .unwrap();
             let mut files = FileSystem::<64>::new();
-            files.mount(&mut journal, &mut disk, &mut scratch()).unwrap();
-            files.initialize_business(&mut journal, &mut disk, &mut scratch())
+            files
+                .mount(&mut journal, &mut disk, &mut scratch())
+                .unwrap();
+            files
+                .initialize_business(&mut journal, &mut disk, &mut scratch())
                 .unwrap();
             let durable_before = journal.last_commit_lsn();
             disk.operations.clear();
-            for invalid in [
-                "//a", "/a//b", "/a/", "/./a", "/a/../b", "/a/.", "/a/..",
-            ] {
+            for invalid in ["//a", "/a//b", "/a/", "/./a", "/a/../b", "/a/.", "/a/.."] {
                 assert_eq!(
                     files.create(invalid, &mut journal, &mut disk, &mut scratch()),
                     Err(DomainError::Format),
                     "ambiguous path {invalid:?}"
                 );
                 assert_eq!(journal.last_commit_lsn(), durable_before);
-                assert!(disk.operations.is_empty(), "path {invalid:?} had disk side effects");
+                assert!(
+                    disk.operations.is_empty(),
+                    "path {invalid:?} had disk side effects"
+                );
             }
             assert_eq!(
                 files.create("/a\0b", &mut journal, &mut disk, &mut scratch()),
@@ -1522,7 +1526,8 @@ fn v019_sec_f01_direct_filesystem_rejects_ambiguous_path_without_disk_effect() {
             assert!(disk.operations.is_empty());
             // Valid ordinary creation still goes through the existing redo,
             // bitmap, inode and flush protocol after the guard.
-            files.create("/valid", &mut journal, &mut disk, &mut scratch())
+            files
+                .create("/valid", &mut journal, &mut disk, &mut scratch())
                 .unwrap();
             assert!(journal.last_commit_lsn() > durable_before);
         })

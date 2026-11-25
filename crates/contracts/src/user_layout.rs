@@ -75,12 +75,22 @@ mod tests {
 
     #[test]
     fn full_os_image_heap_stack_and_existing_shared_window_do_not_alias() {
-        for profile in [ImageProfile::FullOsV1, ImageProfile::FullOsV2, ImageProfile::FullOsV3] {
+        for profile in [
+            ImageProfile::FullOsV1,
+            ImageProfile::FullOsV2,
+            ImageProfile::FullOsV3,
+        ] {
             let layout = profile.layout();
             let regions = [
                 (layout.image_base, layout.image_end),
-                (layout.stack_base, layout.stack_base + layout.stack_pages as u64 * 4096),
-                (layout.heap_base, layout.heap_base + layout.heap_pages as u64 * 4096),
+                (
+                    layout.stack_base,
+                    layout.stack_base + layout.stack_pages as u64 * 4096,
+                ),
+                (
+                    layout.heap_base,
+                    layout.heap_base + layout.heap_pages as u64 * 4096,
+                ),
                 (0x0600_0000, 0x0700_0000),
             ];
             for (i, &(start, end)) in regions.iter().enumerate() {
@@ -98,14 +108,20 @@ mod tests {
             let leaf_tables = layout.image_pages() / 512 + layout.heap_pages / 512 + 8 + 1;
             assert!(leaf_tables + 8 < 128);
             let stack_end = layout.stack_base + layout.stack_pages as u64 * 4096;
-            assert!(layout.heap_base > stack_end || layout.heap_base + layout.heap_pages as u64 * 4096 < layout.stack_base);
+            assert!(
+                layout.heap_base > stack_end
+                    || layout.heap_base + layout.heap_pages as u64 * 4096 < layout.stack_base
+            );
         }
     }
 
     #[test]
     fn legacy_profile_retains_historical_image_and_stack_contract() {
         let layout = ImageProfile::Legacy.layout();
-        assert_eq!((layout.image_base, layout.image_end), (0x01000000, 0x02000000));
+        assert_eq!(
+            (layout.image_base, layout.image_end),
+            (0x01000000, 0x02000000)
+        );
         assert_eq!((layout.stack_base, layout.stack_pages), (0x03000000, 64));
         assert_eq!(layout.exec_pool_pages, 4096);
     }
@@ -115,9 +131,18 @@ mod tests {
         let previous = ImageProfile::FullOsV2.layout();
         let layout = ImageProfile::FullOsV3.layout();
         assert_eq!(ImageProfile::FullOsV3.name(), "full-os-v3");
-        assert_eq!(layout, ImageLayout { heap_pages: 16384, ..previous });
+        assert_eq!(
+            layout,
+            ImageLayout {
+                heap_pages: 16384,
+                ..previous
+            }
+        );
         assert_eq!(layout.heap_base, 0x0c00_0000);
-        assert_eq!(layout.heap_base + layout.heap_pages as u64 * 4096, 0x1000_0000);
+        assert_eq!(
+            layout.heap_base + layout.heap_pages as u64 * 4096,
+            0x1000_0000
+        );
         assert_eq!(ImageProfile::FullOsV1.layout().heap_pages, 4096);
         assert_eq!(previous.heap_pages, 8192);
     }

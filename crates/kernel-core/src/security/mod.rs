@@ -18,15 +18,16 @@ pub enum Error {
     Exhausted,
 }
 
-pub mod process;
+pub mod device;
 pub mod file;
-pub mod file_service_v4;
-pub mod file_media_v0199;
+pub mod file_auth_v3;
 pub mod file_index_v0199;
+pub mod file_media_v0199;
 pub mod file_receipt_store_v0199;
+pub mod file_service_v4;
 pub mod memory;
 pub mod network;
-pub mod device;
+pub mod process;
 pub mod syscall;
 pub mod syscall_v3;
 
@@ -51,4 +52,5 @@ pub mod recovery_v1;
 
 pub mod boot_epoch_v1;
 
+pub mod file_format_v1;
 pub mod file_mount_v1;

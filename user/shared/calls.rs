@@ -54,7 +54,11 @@ pub fn release_shared() {
 #[inline(always)]
 pub unsafe fn fault() -> ! {
     #[cfg(target_arch = "aarch64")]
-    unsafe { core::arch::asm!("brk #0", options(noreturn, nostack)); }
+    unsafe {
+        core::arch::asm!("brk #0", options(noreturn, nostack));
+    }
     #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("ud2", options(noreturn, nostack)); }
+    unsafe {
+        core::arch::asm!("ud2", options(noreturn, nostack));
+    }
 }

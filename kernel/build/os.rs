@@ -1,5 +1,9 @@
 //! x86 NativeOs entries and explicit target-image catalog for the shared OS.
-use std::{env, fs, path::{Path, PathBuf}, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn checked(command: &mut Command) {
     let status = command.status().expect("cannot execute OS user compiler");
@@ -7,12 +11,21 @@ fn checked(command: &mut Command) {
 }
 
 fn feature(name: &str) -> bool {
-    env::var_os(format!("CARGO_FEATURE_{}", name.replace('-', "_").to_uppercase())).is_some()
+    env::var_os(format!(
+        "CARGO_FEATURE_{}",
+        name.replace('-', "_").to_uppercase()
+    ))
+    .is_some()
 }
 
 fn word(bytes: &[u8], offset: usize, count: usize) -> u64 {
     let mut value = 0;
-    for (shift, byte) in bytes.get(offset..offset + count).expect("truncated user ELF").iter().enumerate() {
+    for (shift, byte) in bytes
+        .get(offset..offset + count)
+        .expect("truncated user ELF")
+        .iter()
+        .enumerate()
+    {
         value |= u64::from(*byte) << (shift * 8);
     }
     value
@@ -21,8 +34,12 @@ fn word(bytes: &[u8], offset: usize, count: usize) -> u64 {
 /// Validate actual bytes at the embedding boundary; a filename is not an ISA.
 fn x86_image(path: &Path) -> Vec<u8> {
     println!("cargo:rerun-if-changed={}", path.display());
-    let bytes = fs::read(path).unwrap_or_else(|error| panic!("missing OS image {}: {error}", path.display()));
-    assert!(bytes.len() >= 64 && bytes.get(..7) == Some(b"\x7fELF\x02\x01\x01"), "user image must be ELF64 LE");
+    let bytes = fs::read(path)
+        .unwrap_or_else(|error| panic!("missing OS image {}: {error}", path.display()));
+    assert!(
+        bytes.len() >= 64 && bytes.get(..7) == Some(b"\x7fELF\x02\x01\x01"),
+        "user image must be ELF64 LE"
+    );
     assert_eq!(word(&bytes, 16, 2), 2, "user image must be ET_EXEC");
     assert_eq!(word(&bytes, 18, 2), 62, "refuse non-x86 user image");
     let entry = word(&bytes, 24, 8);
@@ -33,24 +50,45 @@ fn x86_image(path: &Path) -> Vec<u8> {
     let mut executable = false;
     let mut mapped = Vec::new();
     for index in 0..count {
-        let at = offset.checked_add(index * 56).expect("program-header overflow");
+        let at = offset
+            .checked_add(index * 56)
+            .expect("program-header overflow");
         let kind = word(&bytes, at, 4);
-        assert!(!matches!(kind, 2 | 3), "dynamic/interpreter image requires a real loader");
-        if kind != 1 { continue; }
+        assert!(
+            !matches!(kind, 2 | 3),
+            "dynamic/interpreter image requires a real loader"
+        );
+        if kind != 1 {
+            continue;
+        }
         let flags = word(&bytes, at + 4, 4);
         let file = usize::try_from(word(&bytes, at + 8, 8)).expect("segment file offset");
         let va = word(&bytes, at + 16, 8);
         let file_size = usize::try_from(word(&bytes, at + 32, 8)).expect("segment file size");
         let size = word(&bytes, at + 40, 8);
         let end = va.checked_add(size).expect("segment virtual overflow");
-        assert!(file_size as u64 <= size && bytes.get(file..file.checked_add(file_size).expect("file overflow")).is_some(), "segment backing");
-        assert!(va >= 4096 && end <= 0x0000_8000_0000_0000 && flags & 3 != 3, "segment user bounds/W^X");
+        assert!(
+            file_size as u64 <= size
+                && bytes
+                    .get(file..file.checked_add(file_size).expect("file overflow"))
+                    .is_some(),
+            "segment backing"
+        );
+        assert!(
+            va >= 4096 && end <= 0x0000_8000_0000_0000 && flags & 3 != 3,
+            "segment user bounds/W^X"
+        );
         assert_eq!(word(&bytes, at + 48, 8), 4096, "segment page alignment");
         assert_eq!(va % 4096, file as u64 % 4096, "segment file alignment");
         if size != 0 {
             let first = va / 4096;
             let last = end.div_ceil(4096);
-            assert!(mapped.iter().all(|&(old_first, old_last)| last <= old_first || first >= old_last), "overlapping user pages");
+            assert!(
+                mapped
+                    .iter()
+                    .all(|&(old_first, old_last)| last <= old_first || first >= old_last),
+                "overlapping user pages"
+            );
             mapped.push((first, last));
         }
         executable |= flags & 1 != 0 && entry >= va && entry < va + file_size as u64;
@@ -60,61 +98,181 @@ fn x86_image(path: &Path) -> Vec<u8> {
 }
 
 fn assets(directory: &Path, files: &mut Vec<PathBuf>) {
-    if !directory.exists() { return; }
+    if !directory.exists() {
+        return;
+    }
     for entry in fs::read_dir(directory).expect("rootfs directory") {
         let entry = entry.expect("rootfs entry");
         let kind = entry.file_type().expect("rootfs file type");
         assert!(!kind.is_symlink(), "rootfs cannot follow links");
-        if kind.is_dir() { assets(&entry.path(), files); }
-        else { assert!(kind.is_file(), "rootfs must contain regular files"); files.push(entry.path()); }
+        if kind.is_dir() {
+            assets(&entry.path(), files);
+        } else {
+            assert!(kind.is_file(), "rootfs must contain regular files");
+            files.push(entry.path());
+        }
     }
 }
 
 fn catalog(root: &Path, out: &Path) {
     println!("cargo:rerun-if-env-changed=CYXIA_SYSROOT");
-    let prefix = env::var_os("CYXIA_SYSROOT").map(PathBuf::from)
+    let prefix = env::var_os("CYXIA_SYSROOT")
+        .map(PathBuf::from)
         .unwrap_or_else(|| root.join("artifacts/sysroot/x86_64-musl"));
-    let mut names = vec!["probe", "env-probe", "rust-env-probe", "session-env-probe", "panel-config-probe", "panel-allocation-probe", "async-io-probe", "wayland-client-probe", "wayland-egl-probe", "zbus-probe", "zbus-peer-probe", "notifications-peer-probe", "socket-rights-probe", "wayland-server-probe", "wake-probe", "signal-restart-probe", "compose-probe", "xau-probe", "x11-probe", "x11-inspect", "socket-probe", "socket-options-probe", "fsync-probe", "fsync-concurrent-probe", "dbus-daemon", "dbus-send", "dbus-uuidgen", "dbus-probe", "cosmic-config", "cosmic-session", "cosmic-settings-daemon", "cosmic-panel", "cosmic-applet-time", "cosmic-notifications", "settings-probe", "filesystem-probe", "theme-defaults", "session-process-probe", "signal-probe", "desktop-api-probe",
-        "pipe-probe", "pipe-capacity-probe", "notification-probe", "file-probe", "clock-probe", "event-probe", "timerfd-probe", "edge-probe", "fd-share-probe", "scm-probe",
-        "memfd-probe", "rust-std-probe", "wayland-probe", "xkbcommon-probe", "xkb-rules-probe", "cyxia-save", "cyxia-terminal", "cyxia-sh", "pty-probe", "thread-probe", "thread-capacity-probe", "spawn-probe", "flock-probe", "nested-epoll-probe", "inotify-probe", "thread-exit-probe", "heap-capacity-probe", "heap-pool-probe"];
+    let mut names = vec![
+        "probe",
+        "env-probe",
+        "rust-env-probe",
+        "session-env-probe",
+        "panel-config-probe",
+        "panel-allocation-probe",
+        "async-io-probe",
+        "wayland-client-probe",
+        "wayland-egl-probe",
+        "zbus-probe",
+        "zbus-peer-probe",
+        "notifications-peer-probe",
+        "socket-rights-probe",
+        "wayland-server-probe",
+        "wake-probe",
+        "signal-restart-probe",
+        "compose-probe",
+        "xau-probe",
+        "x11-probe",
+        "x11-inspect",
+        "socket-probe",
+        "socket-options-probe",
+        "fsync-probe",
+        "fsync-concurrent-probe",
+        "dbus-daemon",
+        "dbus-send",
+        "dbus-uuidgen",
+        "dbus-probe",
+        "cosmic-config",
+        "cosmic-session",
+        "cosmic-settings-daemon",
+        "cosmic-panel",
+        "cosmic-applet-time",
+        "cosmic-notifications",
+        "settings-probe",
+        "filesystem-probe",
+        "theme-defaults",
+        "session-process-probe",
+        "signal-probe",
+        "desktop-api-probe",
+        "pipe-probe",
+        "pipe-capacity-probe",
+        "notification-probe",
+        "file-probe",
+        "clock-probe",
+        "event-probe",
+        "timerfd-probe",
+        "edge-probe",
+        "fd-share-probe",
+        "scm-probe",
+        "memfd-probe",
+        "rust-std-probe",
+        "wayland-probe",
+        "xkbcommon-probe",
+        "xkb-rules-probe",
+        "cyxia-save",
+        "cyxia-terminal",
+        "cyxia-sh",
+        "pty-probe",
+        "thread-probe",
+        "thread-capacity-probe",
+        "spawn-probe",
+        "flock-probe",
+        "nested-epoll-probe",
+        "inotify-probe",
+        "thread-exit-probe",
+        "heap-capacity-probe",
+        "heap-pool-probe",
+    ];
     let mut required = vec!["probe"];
     for (flag, images) in [
-        ("rust-reactor-probe", &["rust-reactor-probe"][..]), ("rust-egl-probe", &["rust-egl-probe"][..]),
-        ("mesa-probe", &["egl-probe"][..]), ("smithay-probe", &["smithay-probe"][..]),
-        ("smithay-wayland-probe", &["smithay-wayland-probe", "smithay-wayland-client"][..]),
-        ("smithay-xdg-probe", &["smithay-xdg-probe", "smithay-xdg-client"][..]),
-        ("smithay-multi-probe", &["smithay-multi-probe", "smithay-multi-client"][..]),
-        ("smithay-interactive-probe", &["smithay-interactive-probe", "smithay-interactive-client"][..]),
-        ("smithay-resize-probe", &["smithay-resize-probe", "smithay-resize-client"][..]),
-        ("smithay-dynamic-probe", &["smithay-dynamic-probe", "smithay-dynamic-client"][..]),
-        ("wayland-shm-probe", &["wayland-shm-probe"][..]), ("openbox", &["openbox"][..]),
-        ("gtk", &["gtk-probe"][..]), ("pcmanfm", &["pcmanfm"][..]), ("lxpanel", &["lxpanel"][..]),
+        ("rust-reactor-probe", &["rust-reactor-probe"][..]),
+        ("rust-egl-probe", &["rust-egl-probe"][..]),
+        ("mesa-probe", &["egl-probe"][..]),
+        ("smithay-probe", &["smithay-probe"][..]),
+        (
+            "smithay-wayland-probe",
+            &["smithay-wayland-probe", "smithay-wayland-client"][..],
+        ),
+        (
+            "smithay-xdg-probe",
+            &["smithay-xdg-probe", "smithay-xdg-client"][..],
+        ),
+        (
+            "smithay-multi-probe",
+            &["smithay-multi-probe", "smithay-multi-client"][..],
+        ),
+        (
+            "smithay-interactive-probe",
+            &["smithay-interactive-probe", "smithay-interactive-client"][..],
+        ),
+        (
+            "smithay-resize-probe",
+            &["smithay-resize-probe", "smithay-resize-client"][..],
+        ),
+        (
+            "smithay-dynamic-probe",
+            &["smithay-dynamic-probe", "smithay-dynamic-client"][..],
+        ),
+        ("wayland-shm-probe", &["wayland-shm-probe"][..]),
+        ("openbox", &["openbox"][..]),
+        ("gtk", &["gtk-probe"][..]),
+        ("pcmanfm", &["pcmanfm"][..]),
+        ("lxpanel", &["lxpanel"][..]),
         ("spawn-test", &["glib-spawn-probe"][..]),
         ("cosmic-desktop", &["cosmic-comp"][..]),
-        ("cosmic-workspace-applets-v1", &["cosmic-applet-workspaces", "cosmic-applet-tiling"][..]),
-        ("cosmic-notifications-applet-v1", &["cosmic-applet-notifications"][..]),
+        (
+            "cosmic-workspace-applets-v1",
+            &["cosmic-applet-workspaces", "cosmic-applet-tiling"][..],
+        ),
+        (
+            "cosmic-notifications-applet-v1",
+            &["cosmic-applet-notifications"][..],
+        ),
         ("cosmic-bg-v1", &["cosmic-bg"][..]),
         ("cosmic-app-library-v1", &["cosmic-app-library"][..]),
     ] {
-        if feature(flag) { names.extend_from_slice(images); required.extend_from_slice(images); }
+        if feature(flag) {
+            names.extend_from_slice(images);
+            required.extend_from_slice(images);
+        }
     }
     if feature("cosmic-core-services-v1") || feature("cosmic-time-applet-v1") {
         // Missing genuine services must fail at the embedding boundary, rather
         // than produce an image which later panics on an optional ENOENT.
-        for name in ["cosmic-comp", "cosmic-session", "cosmic-settings-daemon",
-                     "cosmic-notifications", "cosmic-panel"] {
-            if !names.contains(&name) { names.push(name); }
-            if !required.contains(&name) { required.push(name); }
+        for name in [
+            "cosmic-comp",
+            "cosmic-session",
+            "cosmic-settings-daemon",
+            "cosmic-notifications",
+            "cosmic-panel",
+        ] {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+            if !required.contains(&name) {
+                required.push(name);
+            }
         }
     }
     if feature("cosmic-time-applet-v1") {
         required.push("cosmic-applet-time");
-        let entry = prefix.join("rootfs/usr/share/applications/com.system76.CosmicAppletTime.desktop");
+        let entry =
+            prefix.join("rootfs/usr/share/applications/com.system76.CosmicAppletTime.desktop");
         println!("cargo:rerun-if-changed={}", entry.display());
         let desktop = fs::read_to_string(entry).expect("missing cosmic-applet-time desktop entry");
-        assert!(desktop.lines().any(|line| line == "Exec=cosmic-applet-time")
-            && desktop.lines().any(|line| line == "X-CosmicApplet=true"),
-            "invalid cosmic-applet-time desktop entry");
+        assert!(
+            desktop
+                .lines()
+                .any(|line| line == "Exec=cosmic-applet-time")
+                && desktop.lines().any(|line| line == "X-CosmicApplet=true"),
+            "invalid cosmic-applet-time desktop entry"
+        );
     }
     if feature("cosmic-workspace-applets-v1") {
         names.push("workspace-state-probe");
@@ -127,31 +285,58 @@ fn catalog(root: &Path, out: &Path) {
         } else {
             ("cosmic-applets-objects-v1", 32)
         };
-        assert!(contract.contains(&format!("\"profile\": \"{profile}\""))
-            && contract.contains(&format!("\"shared_objects\": {shared_objects}")),
-            "cosmic applet shared-object contract mismatch");
-        for field in ["\"fds_per_process\": 128",
-                      "\"open_descriptions\": 512", "\"unix_endpoints\": 128", "\"unix_connections\": 64",
-                      "\"shared_mappings_per_process\": 32",
-                      "\"session_bus_connections\": 32", "\"panel_popup_input\": \"cosmic-panel-popup-input-v1\""] {
-            assert!(contract.contains(field), "cosmic applet object contract mismatch");
+        assert!(
+            contract.contains(&format!("\"profile\": \"{profile}\""))
+                && contract.contains(&format!("\"shared_objects\": {shared_objects}")),
+            "cosmic applet shared-object contract mismatch"
+        );
+        for field in [
+            "\"fds_per_process\": 128",
+            "\"open_descriptions\": 512",
+            "\"unix_endpoints\": 128",
+            "\"unix_connections\": 64",
+            "\"shared_mappings_per_process\": 32",
+            "\"session_bus_connections\": 32",
+            "\"panel_popup_input\": \"cosmic-panel-popup-input-v1\"",
+        ] {
+            assert!(
+                contract.contains(field),
+                "cosmic applet object contract mismatch"
+            );
         }
-        for (name, identity) in [("cosmic-applet-workspaces", "Workspaces"), ("cosmic-applet-tiling", "Tiling")] {
-            let entry = prefix.join(format!("rootfs/usr/share/applications/com.system76.CosmicApplet{identity}.desktop"));
+        for (name, identity) in [
+            ("cosmic-applet-workspaces", "Workspaces"),
+            ("cosmic-applet-tiling", "Tiling"),
+        ] {
+            let entry = prefix.join(format!(
+                "rootfs/usr/share/applications/com.system76.CosmicApplet{identity}.desktop"
+            ));
             println!("cargo:rerun-if-changed={}", entry.display());
-            let desktop = fs::read_to_string(entry).unwrap_or_else(|_| panic!("missing {name} desktop entry"));
-            assert!(desktop.lines().any(|line| line == format!("Exec={name}"))
-                && desktop.lines().any(|line| line == "X-CosmicApplet=true"),
-                "invalid {name} desktop entry");
+            let desktop = fs::read_to_string(entry)
+                .unwrap_or_else(|_| panic!("missing {name} desktop entry"));
+            assert!(
+                desktop.lines().any(|line| line == format!("Exec={name}"))
+                    && desktop.lines().any(|line| line == "X-CosmicApplet=true"),
+                "invalid {name} desktop entry"
+            );
         }
     }
     if feature("cosmic-notifications-applet-v1") {
-        let entry = prefix.join("rootfs/usr/share/applications/com.system76.CosmicAppletNotifications.desktop");
+        let entry = prefix
+            .join("rootfs/usr/share/applications/com.system76.CosmicAppletNotifications.desktop");
         println!("cargo:rerun-if-changed={}", entry.display());
-        let desktop = fs::read_to_string(entry).expect("missing cosmic-applet-notifications desktop entry");
-        assert!(["Exec=cosmic-applet-notifications", "X-CosmicApplet=true", "X-NotificationsApplet=true"]
-            .iter().all(|field| desktop.lines().any(|line| line == *field)),
-            "invalid COSMIC notification applet desktop entry");
+        let desktop =
+            fs::read_to_string(entry).expect("missing cosmic-applet-notifications desktop entry");
+        assert!(
+            [
+                "Exec=cosmic-applet-notifications",
+                "X-CosmicApplet=true",
+                "X-NotificationsApplet=true"
+            ]
+            .iter()
+            .all(|field| desktop.lines().any(|line| line == *field)),
+            "invalid COSMIC notification applet desktop entry"
+        );
     }
     if feature("cosmic-bg-v1") {
         for relative in [
@@ -160,49 +345,90 @@ fn catalog(root: &Path, out: &Path) {
         ] {
             let asset = prefix.join(relative);
             println!("cargo:rerun-if-changed={}", asset.display());
-            assert!(asset.is_file(), "missing COSMIC background asset {relative}");
+            assert!(
+                asset.is_file(),
+                "missing COSMIC background asset {relative}"
+            );
         }
     }
     if feature("cosmic-app-library-v1") {
         names.push("app-library-fixture");
-        let entry = prefix.join("rootfs/usr/share/applications/com.system76.CosmicAppLibrary.desktop");
+        let entry =
+            prefix.join("rootfs/usr/share/applications/com.system76.CosmicAppLibrary.desktop");
         println!("cargo:rerun-if-changed={}", entry.display());
-        let desktop = fs::read_to_string(entry).expect("missing COSMIC application library desktop entry");
-        assert!(desktop.lines().any(|line| line == "Exec=cosmic-app-library"),
-            "invalid COSMIC application library desktop entry");
-        let icon = prefix.join(
-            "rootfs/usr/share/icons/hicolor/scalable/apps/com.system76.CosmicAppLibrary.svg");
+        let desktop =
+            fs::read_to_string(entry).expect("missing COSMIC application library desktop entry");
+        assert!(
+            desktop
+                .lines()
+                .any(|line| line == "Exec=cosmic-app-library"),
+            "invalid COSMIC application library desktop entry"
+        );
+        let icon = prefix
+            .join("rootfs/usr/share/icons/hicolor/scalable/apps/com.system76.CosmicAppLibrary.svg");
         println!("cargo:rerun-if-changed={}", icon.display());
         assert!(icon.is_file(), "missing COSMIC application library icon");
     }
-    if prefix.join("Xcyxia.elf").is_file() { names.push("xorg"); }
+    if prefix.join("Xcyxia.elf").is_file() {
+        names.push("xorg");
+    }
     let mut text = String::from("const PORTED: &[(&str, &str, &[u8])] = &[\n");
     let mut paths = Vec::new();
     // The complete five-program core plus preserved probe/assets exceeds the
     // old 96 MiB catalog. Only this explicit versioned image profile selects
     // 128 MiB of ROM inputs; no process grant or physical pool is enlarged.
-    let budget = if feature("cosmic-workspace-applets-v1") { 256 }
-        else if feature("cosmic-time-applet-v1") { 192 }
-        else if feature("cosmic-core-services-v1") { 128 }
-        else if feature("full-os") { 96 } else if feature("large-memory") { 52 } else { 48 } * 1024 * 1024;
+    let budget = if feature("cosmic-workspace-applets-v1") {
+        256
+    } else if feature("cosmic-time-applet-v1") {
+        192
+    } else if feature("cosmic-core-services-v1") {
+        128
+    } else if feature("full-os") {
+        96
+    } else if feature("large-memory") {
+        52
+    } else {
+        48
+    } * 1024
+        * 1024;
     let mut total = 0usize;
     if feature("ported") {
         for name in names {
-            let variable = if name == "probe" { "CYXIA_PORTED_ELF".into() }
-                else { format!("CYXIA_{}_ELF", name.replace('-', "_").to_uppercase()) };
+            let variable = if name == "probe" {
+                "CYXIA_PORTED_ELF".into()
+            } else {
+                format!("CYXIA_{}_ELF", name.replace('-', "_").to_uppercase())
+            };
             println!("cargo:rerun-if-env-changed={variable}");
-            let image = env::var_os(&variable).map(PathBuf::from).unwrap_or_else(|| prefix.join(if name == "xorg" { "Xcyxia.elf".into() } else { format!("{name}.elf") }));
-            if !image.is_file() && !required.contains(&name) { continue; }
+            let image = env::var_os(&variable)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    prefix.join(if name == "xorg" {
+                        "Xcyxia.elf".into()
+                    } else {
+                        format!("{name}.elf")
+                    })
+                });
+            if !image.is_file() && !required.contains(&name) {
+                continue;
+            }
             let bytes = x86_image(&image);
-            total = total.checked_add(bytes.len()).expect("catalog size overflow");
-            assert!(total <= budget, "ported image catalog exceeds existing budget");
+            total = total
+                .checked_add(bytes.len())
+                .expect("catalog size overflow");
+            assert!(
+                total <= budget,
+                "ported image catalog exceeds existing budget"
+            );
             fs::write(out.join(format!("{name}.elf")), bytes).expect("copy actual user image");
             text.push_str(&format!("({name:?}, \"/bin/{name}\", include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{name}.elf\"))),\n"));
             paths.push(format!("/bin/{name}"));
         }
     }
     text.push_str("];\nconst ROOT_FILES: &[(&str, &[u8])] = &[\n");
-    for (index, path) in paths.iter().enumerate() { text.push_str(&format!("({path:?}, PORTED[{index}].2),\n")); }
+    for (index, path) in paths.iter().enumerate() {
+        text.push_str(&format!("({path:?}, PORTED[{index}].2),\n"));
+    }
     if feature("ported") {
         let rootfs = prefix.join("rootfs");
         let mut files = Vec::new();
@@ -212,15 +438,29 @@ fn catalog(root: &Path, out: &Path) {
         // Full COSMIC light/dark defaults contribute 78 immutable key files.
         // They occupy ROM catalog entries, not mutable RAMFS file nodes.
         let catalog_limit = if feature("full-os") { 256 } else { 128 };
-        assert!(files.len() + paths.len() <= catalog_limit, "rootfs catalog count");
+        assert!(
+            files.len() + paths.len() <= catalog_limit,
+            "rootfs catalog count"
+        );
         for (index, file) in files.iter().enumerate() {
-            let name = format!("/{}", file.strip_prefix(&rootfs).expect("rootfs prefix").to_str().expect("UTF8 asset path"));
-            assert!(name.len() < 96 && !paths.contains(&name), "rootfs asset path conflict/bound");
+            let name = format!(
+                "/{}",
+                file.strip_prefix(&rootfs)
+                    .expect("rootfs prefix")
+                    .to_str()
+                    .expect("UTF8 asset path")
+            );
+            assert!(
+                name.len() < 96 && !paths.contains(&name),
+                "rootfs asset path conflict/bound"
+            );
             let bytes = fs::read(file).expect("read asset");
             total = total.checked_add(bytes.len()).expect("asset size overflow");
             assert!(total <= budget, "rootfs catalog exceeds existing budget");
             fs::write(out.join(format!("asset-{index}")), bytes).expect("copy asset");
-            text.push_str(&format!("({name:?}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/asset-{index}\"))),\n"));
+            text.push_str(&format!(
+                "({name:?}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/asset-{index}\"))),\n"
+            ));
         }
     }
     text.push_str("];\n");
@@ -228,7 +468,11 @@ fn catalog(root: &Path, out: &Path) {
 }
 
 pub fn build() {
-    assert_eq!(env::var("TARGET").as_deref(), Ok("x86_64-unknown-none"), "OS x86 adapter target");
+    assert_eq!(
+        env::var("TARGET").as_deref(),
+        Ok("x86_64-unknown-none"),
+        "OS x86 adapter target"
+    );
     let kernel = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("kernel manifest"));
     let root = kernel.parent().expect("repository root");
     let user = root.join("user");
@@ -240,28 +484,103 @@ pub fn build() {
     let mut objects = Vec::new();
     for source in ["start.S", "libc.c", "demo.c"] {
         let object = out.join(format!("{source}.o"));
-        checked(Command::new(&cc).args(["--target=x86_64-none-elf", "-ffreestanding", "-fno-builtin", "-fno-stack-protector",
-            "-mno-red-zone", "-mno-sse", "-mno-mmx", "-msoft-float", "-fno-pic", "-O2", "-Wall", "-Wextra", "-Werror", "-c"])
-            .arg(format!("-DCYXIA_FILE_BYTES={file_bytes}"))
-            .arg("-I").arg(user.join("include")).arg(user.join("src").join(source)).arg("-o").arg(&object));
+        checked(
+            Command::new(&cc)
+                .args([
+                    "--target=x86_64-none-elf",
+                    "-ffreestanding",
+                    "-fno-builtin",
+                    "-fno-stack-protector",
+                    "-mno-red-zone",
+                    "-mno-sse",
+                    "-mno-mmx",
+                    "-msoft-float",
+                    "-fno-pic",
+                    "-O2",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-c",
+                ])
+                .arg(format!("-DCYXIA_FILE_BYTES={file_bytes}"))
+                .arg("-I")
+                .arg(user.join("include"))
+                .arg(user.join("src").join(source))
+                .arg("-o")
+                .arg(&object),
+        );
         objects.push(object);
     }
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let sysroot = Command::new(&rustc).args(["--print", "sysroot"]).output().expect("rust sysroot");
+    let sysroot = Command::new(&rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("rust sysroot");
     assert!(sysroot.status.success());
-    let lld = PathBuf::from(String::from_utf8(sysroot.stdout).expect("sysroot UTF8").trim())
-        .join("lib/rustlib").join(env::var("HOST").expect("compiler host")).join("bin/rust-lld");
-    checked(Command::new(lld).args(["-flavor", "gnu", "-m", "elf_x86_64", "-z", "max-page-size=4096", "--build-id=none", "-T"])
-        .arg(user.join("linker.ld")).args(objects).arg("-o").arg(out.join("posix-demo.elf")));
+    let lld = PathBuf::from(
+        String::from_utf8(sysroot.stdout)
+            .expect("sysroot UTF8")
+            .trim(),
+    )
+    .join("lib/rustlib")
+    .join(env::var("HOST").expect("compiler host"))
+    .join("bin/rust-lld");
+    checked(
+        Command::new(lld)
+            .args([
+                "-flavor",
+                "gnu",
+                "-m",
+                "elf_x86_64",
+                "-z",
+                "max-page-size=4096",
+                "--build-id=none",
+                "-T",
+            ])
+            .arg(user.join("linker.ld"))
+            .args(objects)
+            .arg("-o")
+            .arg(out.join("posix-demo.elf")),
+    );
     let mut command = Command::new(&rustc);
-    command.arg(user.join("rust/services.rs")).args(["--edition=2024", "--target=x86_64-unknown-none", "--check-cfg=cfg(cyxia_large_memory)",
-        "-C", "panic=abort", "-C", "opt-level=s", "-C", "relocation-model=static", "-C", "code-model=small", "-C", "no-redzone=yes",
-        "-C", "strip=debuginfo", "-C", "link-arg=--build-id=none", "-C", "link-arg=-zmax-page-size=4096", "-D", "warnings"]);
-    if feature("large-memory") { command.args(["--cfg", "cyxia_large_memory"]); }
+    command.arg(user.join("rust/services.rs")).args([
+        "--edition=2024",
+        "--target=x86_64-unknown-none",
+        "--check-cfg=cfg(cyxia_large_memory)",
+        "-C",
+        "panic=abort",
+        "-C",
+        "opt-level=s",
+        "-C",
+        "relocation-model=static",
+        "-C",
+        "code-model=small",
+        "-C",
+        "no-redzone=yes",
+        "-C",
+        "strip=debuginfo",
+        "-C",
+        "link-arg=--build-id=none",
+        "-C",
+        "link-arg=-zmax-page-size=4096",
+        "-D",
+        "warnings",
+    ]);
+    if feature("large-memory") {
+        command.args(["--cfg", "cyxia_large_memory"]);
+    }
     command.arg("--check-cfg=cfg(cyxia_full_os)");
     command.arg("--check-cfg=cfg(test)");
-    if feature("full-os") { command.args(["--cfg", "cyxia_full_os"]); }
-    checked(command.arg("-C").arg(format!("link-arg=-T{}", user.join("linker.ld").display())).arg("-o").arg(out.join("native-services.elf")));
+    if feature("full-os") {
+        command.args(["--cfg", "cyxia_full_os"]);
+    }
+    checked(
+        command
+            .arg("-C")
+            .arg(format!("link-arg=-T{}", user.join("linker.ld").display()))
+            .arg("-o")
+            .arg(out.join("native-services.elf")),
+    );
     let _ = x86_image(&out.join("posix-demo.elf"));
     let _ = x86_image(&out.join("native-services.elf"));
     catalog(root, &out);

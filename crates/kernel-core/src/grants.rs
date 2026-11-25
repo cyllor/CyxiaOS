@@ -330,7 +330,9 @@ impl<const RECORDS: usize> BoundedGrantLedger<RECORDS> {
     }
     pub fn release_completed(&mut self, r: ReleaseReceipt) -> Result<(), GrantError> {
         let j = self
-            .find_record(&self.redemptions, r.id.get(), |x| x.is_some_and(|x| x.id == r.id))
+            .find_record(&self.redemptions, r.id.get(), |x| {
+                x.is_some_and(|x| x.id == r.id)
+            })
             .ok_or(GrantError::Stale)?;
         let d = self.redemptions[j].unwrap();
         if d.owner != r.owner || d.pages != r.pages {
@@ -387,9 +389,8 @@ mod tests {
             generation: Generation::new(2).unwrap(),
             ..owner
         };
-        let request = |owner, pages| unsafe {
-            AuthorizedGrantRequest::bootstrap(owner, PageCount(pages))
-        };
+        let request =
+            |owner, pages| unsafe { AuthorizedGrantRequest::bootstrap(owner, PageCount(pages)) };
         let receipt = |id, owner| unsafe { ReleaseReceipt::after_revoke(id, owner, PageCount(1)) };
         let mut ledger = BoundedGrantLedger::<3>::new(PageCount(12));
         let first = ledger.commit(request(owner, 1)).unwrap();
@@ -403,7 +404,10 @@ mod tests {
         assert_eq!(colliding.get() - first.get(), 3);
         assert_eq!(second_redemption.get() - first_redemption.get(), 3);
         let before = ledger.snapshot();
-        assert_eq!(ledger.cancel_unused(colliding, owner), Err(GrantError::Owner));
+        assert_eq!(
+            ledger.cancel_unused(colliding, owner),
+            Err(GrantError::Owner)
+        );
         assert_eq!(
             ledger.release_completed(receipt(second_redemption, owner)),
             Err(GrantError::Invalid)
@@ -411,14 +415,18 @@ mod tests {
         assert_eq!(ledger.snapshot(), before);
         assert_rescan(&ledger);
 
-        ledger.release_completed(receipt(first_redemption, owner)).unwrap();
+        ledger
+            .release_completed(receipt(first_redemption, owner))
+            .unwrap();
         assert_eq!(ledger.cancel_unused(first, owner), Err(GrantError::Stale));
         assert_eq!(
             ledger.release_completed(receipt(first_redemption, owner)),
             Err(GrantError::Stale)
         );
         assert_eq!(ledger.cancel_unused(colliding, other), Ok(PageCount(1)));
-        ledger.release_completed(receipt(second_redemption, other)).unwrap();
+        ledger
+            .release_completed(receipt(second_redemption, other))
+            .unwrap();
         assert_eq!(ledger.snapshot().free, 12);
         assert_rescan(&ledger);
     }

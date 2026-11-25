@@ -40,7 +40,9 @@ impl<const WORDS: usize> Default for PhaseTable<WORDS> {
 }
 impl<const WORDS: usize> PhaseTable<WORDS> {
     pub const fn new() -> Self {
-        Self { words: [const { AtomicU64::new(0) }; WORDS] }
+        Self {
+            words: [const { AtomicU64::new(0) }; WORDS],
+        }
     }
     /// Whether this page has phase storage, without reading its current phase.
     pub const fn contains_page(&self, page: usize) -> bool {
@@ -60,7 +62,8 @@ impl<const WORDS: usize> PhaseTable<WORDS> {
         let shift = page % 32 * 2;
         word.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
             Some((old & !(3 << shift)) | ((phase as u64) << shift))
-        }).expect("unconditional phase update");
+        })
+        .expect("unconditional phase update");
         Ok(())
     }
 }
@@ -73,8 +76,11 @@ pub struct Pages {
 impl Pages {
     pub fn new(start: u64, bytes: usize, limit: u64) -> Result<Self, Error> {
         let end = start.checked_add(bytes as u64).ok_or(Error::Address)?;
-        if start == 0 || !start.is_multiple_of(PAGE_BYTES) || bytes == 0
-            || !(bytes as u64).is_multiple_of(PAGE_BYTES) || end > limit
+        if start == 0
+            || !start.is_multiple_of(PAGE_BYTES)
+            || bytes == 0
+            || !(bytes as u64).is_multiple_of(PAGE_BYTES)
+            || end > limit
         {
             return Err(Error::Address);
         }
@@ -104,7 +110,10 @@ pub fn seal(pages: Pages, backend: &mut impl Backend) -> Result<(), Error> {
             return Err(Error::Permissions);
         }
     }
-    if pages.iter().all(|page| backend.phase(page) == Phase::StableSealed) {
+    if pages
+        .iter()
+        .all(|page| backend.phase(page) == Phase::StableSealed)
+    {
         return Ok(());
     }
     for page in pages.iter() {
@@ -129,7 +138,10 @@ pub fn unseal(pages: Pages, backend: &mut impl Backend) -> Result<(), Error> {
             return Err(Error::Active);
         }
     }
-    if pages.iter().all(|page| backend.phase(page) == Phase::StableWritable) {
+    if pages
+        .iter()
+        .all(|page| backend.phase(page) == Phase::StableWritable)
+    {
         return Ok(());
     }
     for page in pages.iter() {
@@ -165,13 +177,24 @@ mod tests {
     impl Hardware {
         fn new(phase: Phase) -> Self {
             let writable = phase == Phase::StableWritable;
-            Self { phases: [phase; 3], pte_write: [writable; 3],
-                   local_write: [writable; 3], peer_write: [writable; 3],
-                   aliases: [(0, 0); 3], call: 0, fail: None, events: Vec::new() }
+            Self {
+                phases: [phase; 3],
+                pte_write: [writable; 3],
+                local_write: [writable; 3],
+                peer_write: [writable; 3],
+                aliases: [(0, 0); 3],
+                call: 0,
+                fail: None,
+                events: Vec::new(),
+            }
         }
         fn operation(&mut self) -> Result<(), Error> {
             self.call += 1;
-            if self.fail == Some(self.call) { Err(Error::Timeout) } else { Ok(()) }
+            if self.fail == Some(self.call) {
+                Err(Error::Timeout)
+            } else {
+                Ok(())
+            }
         }
         fn zero_eligible(&self) -> bool {
             self.phases.iter().all(|p| *p == Phase::StableWritable)
@@ -179,14 +202,25 @@ mod tests {
                 && self.peer_write.iter().all(|p| *p)
         }
     }
-    fn index(page: u64) -> usize { (page / PAGE_BYTES - 1) as usize }
-    fn pages() -> Pages { Pages::new(PAGE_BYTES, 3 * PAGE_BYTES as usize, 4 * PAGE_BYTES).unwrap() }
+    fn index(page: u64) -> usize {
+        (page / PAGE_BYTES - 1) as usize
+    }
+    fn pages() -> Pages {
+        Pages::new(PAGE_BYTES, 3 * PAGE_BYTES as usize, 4 * PAGE_BYTES).unwrap()
+    }
     impl Backend for Hardware {
-        fn phase(&self, physical: u64) -> Phase { self.phases[index(physical)] }
-        fn record(&mut self, physical: u64, phase: Phase) { self.phases[index(physical)] = phase; }
-        fn aliases(&self, physical: u64) -> (u64, u64) { self.aliases[index(physical)] }
+        fn phase(&self, physical: u64) -> Phase {
+            self.phases[index(physical)]
+        }
+        fn record(&mut self, physical: u64, phase: Phase) {
+            self.phases[index(physical)] = phase;
+        }
+        fn aliases(&self, physical: u64) -> (u64, u64) {
+            self.aliases[index(physical)]
+        }
         fn set_writable(&mut self, physical: u64, writable: bool) -> Result<(), Error> {
-            self.events.push((if writable { 'W' } else { 'R' }, index(physical)));
+            self.events
+                .push((if writable { 'W' } else { 'R' }, index(physical)));
             self.operation()?;
             self.pte_write[index(physical)] = writable;
             Ok(())
@@ -206,7 +240,11 @@ mod tests {
     fn packed_states_boundaries_and_invalid_encoding_fail_closed() {
         let table = PhaseTable::<2>::new();
         for page in [0, 31, 32, 63] {
-            for phase in [Phase::Transition, Phase::StableSealed, Phase::StableWritable] {
+            for phase in [
+                Phase::Transition,
+                Phase::StableSealed,
+                Phase::StableWritable,
+            ] {
                 table.set(page, phase).unwrap();
                 assert_eq!(table.get(page), Some(phase));
             }
@@ -220,21 +258,32 @@ mod tests {
 
     #[test]
     fn invalid_ranges_are_rejected_before_any_transaction() {
-        for (start, bytes, limit) in [(0, 4096, 8192), (4097, 4096, 16384),
-                (4096, 0, 8192), (4096, 4097, 16384), (4096, 8192, 8192),
-                (u64::MAX - 4095, 4096, u64::MAX)] {
+        for (start, bytes, limit) in [
+            (0, 4096, 8192),
+            (4097, 4096, 16384),
+            (4096, 0, 8192),
+            (4096, 4097, 16384),
+            (4096, 8192, 8192),
+            (u64::MAX - 4095, 4096, u64::MAX),
+        ] {
             assert!(Pages::new(start, bytes, limit).is_err());
         }
     }
 
     #[test]
     fn transition_blocks_new_aliases_but_allows_old_alias_removal() {
-        for phase in [Phase::StableWritable, Phase::Transition, Phase::StableSealed] {
+        for phase in [
+            Phase::StableWritable,
+            Phase::Transition,
+            Phase::StableSealed,
+        ] {
             assert!(phase.permits_mapping(0));
             assert!(!phase.permits_mapping(7));
             assert!(!phase.permits_mapping(8));
         }
-        for flags in [1, 3, 5] { assert!(!Phase::Transition.permits_mapping(flags)); }
+        for flags in [1, 3, 5] {
+            assert!(!Phase::Transition.permits_mapping(flags));
+        }
         assert!(Phase::StableWritable.permits_mapping(3));
         assert!(!Phase::StableWritable.permits_mapping(5));
         assert!(Phase::StableSealed.permits_mapping(5));
@@ -257,13 +306,18 @@ mod tests {
 
     #[test]
     fn every_seal_failure_remains_quarantined_and_can_retry() {
-        for fail in 1..=4 { // Each of three PTE writes and the real fence.
+        for fail in 1..=4 {
+            // Each of three PTE writes and the real fence.
             let mut hw = Hardware::new(Phase::StableWritable);
             hw.fail = Some(fail);
             assert_eq!(seal(pages(), &mut hw), Err(Error::Timeout));
             assert_eq!(hw.phases, [Phase::Transition; 3]);
             assert!(!hw.zero_eligible());
-            assert!(hw.phases.iter().all(|p| !p.permits_mapping(5) && !p.permits_mapping(3)));
+            assert!(
+                hw.phases
+                    .iter()
+                    .all(|p| !p.permits_mapping(5) && !p.permits_mapping(3))
+            );
             hw.fail = None;
             seal(pages(), &mut hw).unwrap();
             assert_eq!(hw.phases, [Phase::StableSealed; 3]);
@@ -283,19 +337,27 @@ mod tests {
         hw.fail = None;
         let before = hw.events.len();
         unseal(pages(), &mut hw).unwrap();
-        assert_eq!(&hw.events[before..], &[('F', 0), ('W', 0), ('W', 1), ('W', 2), ('F', 0)]);
+        assert_eq!(
+            &hw.events[before..],
+            &[('F', 0), ('W', 0), ('W', 1), ('W', 2), ('F', 0)]
+        );
         assert!(hw.zero_eligible());
     }
 
     #[test]
     fn every_unseal_failure_blocks_rx_and_zero_until_complete_retry() {
-        for fail in 1..=5 { // Retirement fence, three PTEs, publication fence.
+        for fail in 1..=5 {
+            // Retirement fence, three PTEs, publication fence.
             let mut hw = Hardware::new(Phase::StableSealed);
             hw.fail = Some(fail);
             assert_eq!(unseal(pages(), &mut hw), Err(Error::Timeout));
             assert_eq!(hw.phases, [Phase::Transition; 3]);
             assert!(!hw.zero_eligible());
-            assert!(hw.phases.iter().all(|p| !p.permits_mapping(5) && !p.permits_mapping(3)));
+            assert!(
+                hw.phases
+                    .iter()
+                    .all(|p| !p.permits_mapping(5) && !p.permits_mapping(3))
+            );
             hw.fail = None;
             unseal(pages(), &mut hw).unwrap();
             assert!(hw.zero_eligible());

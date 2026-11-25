@@ -20,124 +20,157 @@ use rustls::{
 #[derive(Debug)]
 struct Clock;
 impl TimeProvider for Clock {
-    fn current_time(&self)->Option<UnixTime>{
-        broker::unix_seconds().map(|secs|UnixTime::since_unix_epoch(Duration::from_secs(secs)))
+    fn current_time(&self) -> Option<UnixTime> {
+        broker::unix_seconds().map(|secs| UnixTime::since_unix_epoch(Duration::from_secs(secs)))
     }
 }
-struct BrokerSocket{generation:u64,source:u32}
-impl NativeSocket for BrokerSocket{
+struct BrokerSocket {
+    generation: u64,
+    source: u32,
+}
+impl NativeSocket for BrokerSocket {
     // Not an independently verified TCP+VirtIO completion witness. The
     // existing broker does not yet expose protected generation-bound TX
     // quiescence; until then it must fail closed, not fake successful drain.
-    fn terminal_tx_quiescent(&self)->bool{false}
-    fn poll_native(&mut self,_now_ms:u64)->Result<(),SocketError>{
-        match broker::poll(){
-            Ok((true,generation,ip)) if generation==self.generation && ip==self.source=>Ok(()),
-            Ok(_)=>Err(SocketError::Closed),
-            Err(broker::Error::Again)=>Err(SocketError::Again),
-            Err(_)=>Err(SocketError::Device),
+    fn terminal_tx_quiescent(&self) -> bool {
+        false
+    }
+    fn poll_native(&mut self, _now_ms: u64) -> Result<(), SocketError> {
+        match broker::poll() {
+            Ok((true, generation, ip)) if generation == self.generation && ip == self.source => {
+                Ok(())
+            }
+            Ok(_) => Err(SocketError::Closed),
+            Err(broker::Error::Again) => Err(SocketError::Again),
+            Err(_) => Err(SocketError::Device),
         }
     }
-    fn read_ciphertext(&mut self,out:&mut [u8])->Result<usize,SocketError>{
-        match broker::read(out){
-            Ok(0)|Err(broker::Error::Again)=>Err(SocketError::Again),
-            Ok(n)=>Ok(n),
-            Err(broker::Error::Closed)=>Err(SocketError::Closed),
-            Err(_)=>Err(SocketError::Device),
+    fn read_ciphertext(&mut self, out: &mut [u8]) -> Result<usize, SocketError> {
+        match broker::read(out) {
+            Ok(0) | Err(broker::Error::Again) => Err(SocketError::Again),
+            Ok(n) => Ok(n),
+            Err(broker::Error::Closed) => Err(SocketError::Closed),
+            Err(_) => Err(SocketError::Device),
         }
     }
-    fn queue_ciphertext(&mut self,bytes:&[u8])->Result<usize,SocketError>{
-        let chunk=&bytes[..bytes.len().min(cyxia_local_echo::broker_surface::PAYLOAD)];
-        match broker::write_ciphertext(chunk){
-            Ok(n)=>Ok(n),
-            Err(broker::Error::Again)=>Err(SocketError::Again),
-            Err(broker::Error::Closed)=>Err(SocketError::Closed),
-            Err(_)=>Err(SocketError::Device),
+    fn queue_ciphertext(&mut self, bytes: &[u8]) -> Result<usize, SocketError> {
+        let chunk = &bytes[..bytes.len().min(cyxia_local_echo::broker_surface::PAYLOAD)];
+        match broker::write_ciphertext(chunk) {
+            Ok(n) => Ok(n),
+            Err(broker::Error::Again) => Err(SocketError::Again),
+            Err(broker::Error::Closed) => Err(SocketError::Closed),
+            Err(_) => Err(SocketError::Device),
         }
     }
 }
-fn send_pending(socket:&mut BrokerSocket,tls:&mut Session<'_>)->Result<(),()>{
-    let pending=tls.pending_tls();
-    if pending.is_empty(){return Ok(());}
-    let accepted=match socket.queue_ciphertext(pending){
-        Ok(n) if n<=pending.len()=>n,
-        Err(SocketError::Again)=>0,
-        _=>return Err(()),
+fn send_pending(socket: &mut BrokerSocket, tls: &mut Session<'_>) -> Result<(), ()> {
+    let pending = tls.pending_tls();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let accepted = match socket.queue_ciphertext(pending) {
+        Ok(n) if n <= pending.len() => n,
+        Err(SocketError::Again) => 0,
+        _ => return Err(()),
     };
-    tls.consume_tls(accepted).map_err(|_|())?;
+    tls.consume_tls(accepted).map_err(|_| ())?;
     Ok(())
 }
 fn handshake(
-    socket:&mut BrokerSocket,tls:&mut Session<'_>,scratch:&mut [u8],
-)->Result<(),()>{
+    socket: &mut BrokerSocket,
+    tls: &mut Session<'_>,
+    scratch: &mut [u8],
+) -> Result<(), ()> {
     // Bounded number of cooperative native turns plus rustls' own monotonic
     // handshake deadline. No blocking model, external POSIX or host socket.
     for _ in 0..8192 {
-        let now=broker::now().map_err(|_|())?;
-        socket.poll_native(now).map_err(|_|())?;
-        send_pending(socket,tls)?;
-        let capacity=tls.receive_capacity().min(scratch.len());
-        if capacity!=0{
-            match socket.read_ciphertext(&mut scratch[..capacity]){
-                Ok(n) if n<=capacity=>{
-                    if tls.receive_tls(&scratch[..n]).map_err(|_|())?!=n {return Err(());}
+        let now = broker::now().map_err(|_| ())?;
+        socket.poll_native(now).map_err(|_| ())?;
+        send_pending(socket, tls)?;
+        let capacity = tls.receive_capacity().min(scratch.len());
+        if capacity != 0 {
+            match socket.read_ciphertext(&mut scratch[..capacity]) {
+                Ok(n) if n <= capacity => {
+                    if tls.receive_tls(&scratch[..n]).map_err(|_| ())? != n {
+                        return Err(());
+                    }
                 }
-                Err(SocketError::Again)=>{}
-                _=>return Err(()),
+                Err(SocketError::Again) => {}
+                _ => return Err(()),
             }
         }
-        tls.pump(now).map_err(|_|())?;
-        send_pending(socket,tls)?;
-        if tls.local_echo_proof().is_some(){return Ok(());}
+        tls.pump(now).map_err(|_| ())?;
+        send_pending(socket, tls)?;
+        if tls.local_echo_proof().is_some() {
+            return Ok(());
+        }
         broker::yield_cpu();
     }
     Err(())
 }
-pub fn run()->!{
-    let certificate=CertificateDer::from(
-        &include_bytes!(concat!(env!("OUT_DIR"),"/cert.der"))[..]
-    );
-    let peer:[u8;32]=*include_bytes!(concat!(env!("OUT_DIR"),"/peer.pin"));
-    let Some((kernel_local,kernel_peer))=broker::boot_identity() else{broker::park();};
-    if node_id(&certificate).ok()!=Some(kernel_local) || kernel_peer!=peer {
+pub fn run() -> ! {
+    let certificate =
+        CertificateDer::from(&include_bytes!(concat!(env!("OUT_DIR"), "/cert.der"))[..]);
+    let peer: [u8; 32] = *include_bytes!(concat!(env!("OUT_DIR"), "/peer.pin"));
+    let Some((kernel_local, kernel_peer)) = broker::boot_identity() else {
+        broker::park();
+    };
+    if node_id(&certificate).ok() != Some(kernel_local) || kernel_peer != peer {
         broker::park();
     }
-    let mut gate=Admission::new();
-    let mut buffers=Buffers::new();
-    let mut scratch=[0u8;cyxia_local_echo::broker_surface::PAYLOAD];
-    loop{
-        let now=broker::now().unwrap_or_else(|_|broker::park());
-        let (connected,generation,source)=broker::poll().unwrap_or_else(|_|broker::park());
+    let mut gate = Admission::new();
+    let mut buffers = Buffers::new();
+    let mut scratch = [0u8; cyxia_local_echo::broker_surface::PAYLOAD];
+    loop {
+        let now = broker::now().unwrap_or_else(|_| broker::park());
+        let (connected, generation, source) = broker::poll().unwrap_or_else(|_| broker::park());
         if !connected {
             broker::yield_cpu();
             continue;
         }
-        if generation==0 || source==0 {broker::park();}
+        if generation == 0 || source == 0 {
+            broker::park();
+        }
         // The broker currently exposes monotonic milliseconds. Preserve that
         // precision instead of truncating to whole seconds; full native ns
         // clock/ABI migration remains a separate acceptance requirement.
-        let admission_ns=now.checked_mul(1_000_000).unwrap_or_else(||broker::park());
-        let ticket=gate.begin_ns(source,admission_ns,16).unwrap_or_else(|_|broker::park());
+        let admission_ns = now.checked_mul(1_000_000).unwrap_or_else(|| broker::park());
+        let ticket = gate
+            .begin_ns(source, admission_ns, 16)
+            .unwrap_or_else(|_| broker::park());
         // Reconstruct the key object from static provisioned DER only. No
         // private key or peer identity is ever taken from wire requests.
-        let key=PrivatePkcs8KeyDer::from(
-            &include_bytes!(concat!(env!("OUT_DIR"),"/key.der"))[..]
-        );
-        let pairing=Pairing::new_local_echo(certificate.clone(),key.into(),peer,Arc::new(Clock))
-            .unwrap_or_else(|_|broker::park());
+        let key =
+            PrivatePkcs8KeyDer::from(&include_bytes!(concat!(env!("OUT_DIR"), "/key.der"))[..]);
+        let pairing =
+            Pairing::new_local_echo(certificate.clone(), key.into(), peer, Arc::new(Clock))
+                .unwrap_or_else(|_| broker::park());
         // V0.19 Echo is a passive server; no cluster peer auto-dial. This
         // native profile requires a kernel-owned listener and pinned client.
-        let mut session=pairing.server(&mut buffers,now).unwrap_or_else(|_|broker::park());
-        let mut socket=BrokerSocket{generation,source};
-        if handshake(&mut socket,&mut session,&mut scratch).is_err(){
-            let _=gate.reject(ticket);
+        let mut session = pairing
+            .server(&mut buffers, now)
+            .unwrap_or_else(|_| broker::park());
+        let mut socket = BrokerSocket { generation, source };
+        if handshake(&mut socket, &mut session, &mut scratch).is_err() {
+            let _ = gate.reject(ticket);
             gate.begin_restart();
             broker::park();
         }
-        let active=gate.authenticate(ticket,&session).unwrap_or_else(|_|broker::park());
-        loop{
-            let now=broker::now().unwrap_or_else(|_|broker::park());
-            if native_tcp::turn(&mut socket,&mut gate,active,&mut session,&mut scratch,now).is_err(){
+        let active = gate
+            .authenticate(ticket, &session)
+            .unwrap_or_else(|_| broker::park());
+        loop {
+            let now = broker::now().unwrap_or_else(|_| broker::park());
+            if native_tcp::turn(
+                &mut socket,
+                &mut gate,
+                active,
+                &mut session,
+                &mut scratch,
+                now,
+            )
+            .is_err()
+            {
                 // UNKNOWN TLS or NIC ownership may still exist. No automatic
                 // credit release/reconnect until a protected reset authority
                 // can prove all outstanding descriptors have stopped.

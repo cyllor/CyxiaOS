@@ -802,7 +802,7 @@ pub fn publish_context(context: Context) -> Result<(), Error> {
     with(|s| {
         if context.core_generation == 0
             || context.ledger_generation == 0
-            || (cfg!(feature = "unified-runtime") && context.control_mask != 0b10)
+            || (cfg!(feature = "unified-runtime") && context.control_mask != 0b0001)
             || context.control_mask & context.business_mask != 0
         {
             return Err(Error::Conflict);
@@ -951,8 +951,8 @@ fn tiers(current: Action) -> ([Option<Action>; 32], usize) {
         }
         Action::ControlSet(mask) => {
             if cfg!(feature = "unified-runtime") {
-                // V0.19: the only legal control identity is unchanged CPU1.
-                add(Action::ControlSet(0b10));
+                // V0.20: the only legal control identity is unchanged CPU0.
+                add(Action::ControlSet(0b0001));
             } else {
                 // Archived dynamic transition self-tests retain old fixtures.
                 add(Action::ControlSet(mask));
@@ -1104,10 +1104,10 @@ fn validate_selection_with_at(
     if guard.family() != (action.domain(), action.kind()) || guard.target() != target {
         return Err(Error::Stale);
     }
-    // V0.19 native refuses every model suggestion to expand or move the
+    // V0.20 native refuses every model suggestion to expand or move the
     // control CPU. Keeping the old action encoding is ABI compatibility only.
     if cfg!(feature = "unified-runtime")
-        && matches!(action, Action::ControlSet(mask) if mask != 0b10)
+        && matches!(action, Action::ControlSet(mask) if mask != 0b0001)
     {
         return Err(Error::Denied);
     }

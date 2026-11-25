@@ -6,7 +6,11 @@
 //! CRC alone is not a persistence transaction. This read-only verifier
 //! identifies malformed/torn receipts and the exact home-block closure.
 //! Only real COMMIT + device FLUSH evidence may authorize DONE.
-use super::{Error, file_media_v0199::FileReceiptV4, file_index_v0199::{FileStreamIndexV4, GROUP_COUNT, STREAM_COUNT, STREAMS_PER_GROUP}};
+use super::{
+    Error,
+    file_index_v0199::{FileStreamIndexV4, GROUP_COUNT, STREAM_COUNT, STREAMS_PER_GROUP},
+    file_media_v0199::FileReceiptV4,
+};
 
 pub const RECEIPTS: usize = 128;
 pub const RECEIPT_BYTES: usize = 192;
@@ -21,7 +25,9 @@ pub struct ReceiptHome {
     pub second: Option<usize>,
 }
 pub const fn receipt_home(index: usize) -> Option<ReceiptHome> {
-    if index >= RECEIPTS { return None; }
+    if index >= RECEIPTS {
+        return None;
+    }
     let offset = index * RECEIPT_BYTES;
     let first = offset / BLOCK_BYTES;
     let crosses = offset % BLOCK_BYTES + RECEIPT_BYTES > BLOCK_BYTES;
@@ -89,29 +95,33 @@ fn scan_receipts_inner(
     if data.len() != RECEIPT_STORE_BYTES || expected_fs_uuid == [0; 16] {
         return Err(Error::Invalid);
     }
-    let mut summary=ReceiptStoreSummary {
-        occupied:0, unresolved:0, across_block:0,
+    let mut summary = ReceiptStoreSummary {
+        occupied: 0,
+        unresolved: 0,
+        across_block: 0,
     };
     let mut stream_counts = [0u8; STREAM_COUNT];
     let mut inflight = [false; STREAM_COUNT];
     let mut group_counts = [0u8; GROUP_COUNT];
     for slot in 0..RECEIPTS {
-        let at=slot*RECEIPT_BYTES;
-        let raw=&data[at..at+RECEIPT_BYTES];
-        if raw.iter().all(|byte|*byte==0) {
+        let at = slot * RECEIPT_BYTES;
+        let raw = &data[at..at + RECEIPT_BYTES];
+        if raw.iter().all(|byte| *byte == 0) {
             continue; // explicitly unallocated slot
         }
-        let record=FileReceiptV4::decode(raw)?;
-        if record.fs_uuid!=expected_fs_uuid {
+        let record = FileReceiptV4::decode(raw)?;
+        if record.fs_uuid != expected_fs_uuid {
             return Err(Error::Invalid);
         }
         // Earlier records were either all-zero or fully decoded, including
         // their CRC. Rechecking their canonical LE identity bytes avoids
         // O(N^2) repeated CRC work without allocating a second receipt table.
         for previous in 0..slot {
-            let offset=previous*RECEIPT_BYTES;
-            let earlier=&data[offset..offset+RECEIPT_BYTES];
-            if earlier[172..180] == [0; 8] { continue; }
+            let offset = previous * RECEIPT_BYTES;
+            let earlier = &data[offset..offset + RECEIPT_BYTES];
+            if earlier[172..180] == [0; 8] {
+                continue;
+            }
             if earlier[172..180] == raw[172..180] || earlier[8..64] == raw[8..64] {
                 return Err(Error::Invalid);
             }
@@ -121,7 +131,8 @@ fn scan_receipts_inner(
             let stream_at = group_at * STREAMS_PER_GROUP + record.stream_slot as usize;
             let group = &index.groups[group_at];
             let stream = &index.streams[stream_at];
-            if group.flags == 0 || stream.flags == 0
+            if group.flags == 0
+                || stream.flags == 0
                 || record.owner_principal_id != group.manifest_principal_id
                 || record.group_generation > group.generation
                 || record.issued_boot_epoch > group.boot_epoch
@@ -133,8 +144,12 @@ fn scan_receipts_inner(
             {
                 return Err(Error::Invalid);
             }
-            stream_counts[stream_at] = stream_counts[stream_at].checked_add(1).ok_or(Error::Invalid)?;
-            group_counts[group_at] = group_counts[group_at].checked_add(1).ok_or(Error::Invalid)?;
+            stream_counts[stream_at] = stream_counts[stream_at]
+                .checked_add(1)
+                .ok_or(Error::Invalid)?;
+            group_counts[group_at] = group_counts[group_at]
+                .checked_add(1)
+                .ok_or(Error::Invalid)?;
             if usize::from(group_counts[group_at]) > STREAMS_PER_GROUP {
                 return Err(Error::Invalid);
             }
@@ -142,16 +157,18 @@ fn scan_receipts_inner(
             // terminal predecessor and cannot coexist with a second inflight
             // request in the same stream.
             if matches!(record.status, 1 | 2 | 5) {
-                if inflight[stream_at] || record.request_seq != stream.issued_hi { return Err(Error::Invalid); }
+                if inflight[stream_at] || record.request_seq != stream.issued_hi {
+                    return Err(Error::Invalid);
+                }
                 inflight[stream_at] = true;
             }
         }
-        summary.occupied+=1;
-        if matches!(record.status,1|2|5) {
-            summary.unresolved+=1;
+        summary.occupied += 1;
+        if matches!(record.status, 1 | 2 | 5) {
+            summary.unresolved += 1;
         }
         if receipt_home(slot).ok_or(Error::Invalid)?.second.is_some() {
-            summary.across_block+=1;
+            summary.across_block += 1;
         }
     }
     if let Some(index) = index {
@@ -168,15 +185,15 @@ fn scan_receipts_inner(
 
 #[cfg(test)]
 mod tests {
+    use super::super::file_media_v0199::{crc32c_zeroed, local_request_id};
     use super::*;
-    use super::super::file_media_v0199::{crc32c_zeroed,local_request_id};
 
-    fn receipt(id:u64,seq:u64)->[u8;RECEIPT_BYTES]{
-        let mut b=[0u8;RECEIPT_BYTES];
+    fn receipt(id: u64, seq: u64) -> [u8; RECEIPT_BYTES] {
+        let mut b = [0u8; RECEIPT_BYTES];
         b[0..4].copy_from_slice(&0x4359_5243u32.to_le_bytes());
         b[4..6].copy_from_slice(&4u16.to_le_bytes());
         b[6..8].copy_from_slice(&(RECEIPT_BYTES as u16).to_le_bytes());
-        b[8..24].copy_from_slice(&[1u8;16]);
+        b[8..24].copy_from_slice(&[1u8; 16]);
         b[24..32].copy_from_slice(&1u64.to_le_bytes());
         b[36..40].copy_from_slice(&1u32.to_le_bytes());
         b[48..56].copy_from_slice(&1u64.to_le_bytes());
@@ -184,124 +201,144 @@ mod tests {
         b[96..98].copy_from_slice(&1u16.to_le_bytes());
         b[172..180].copy_from_slice(&id.to_le_bytes());
         b[180..188].copy_from_slice(&2u64.to_le_bytes());
-        let crc=crc32c_zeroed(&b,188).unwrap();
+        let crc = crc32c_zeroed(&b, 188).unwrap();
         b[188..192].copy_from_slice(&crc.to_le_bytes());
         b
     }
     #[test]
-    fn every_cross_block_receipt_requires_both_home_blocks_and_index(){
-        let across=[21,42,85,106];
-        let mut found=0;
+    fn every_cross_block_receipt_requires_both_home_blocks_and_index() {
+        let across = [21, 42, 85, 106];
+        let mut found = 0;
         for i in 0..RECEIPTS {
-            let closure=home_closure(i).unwrap();
+            let closure = home_closure(i).unwrap();
             assert!(closure.requires_stream_index_block);
-            assert!(closure.receipt.first<RECEIPT_HOME_BLOCKS);
-            if let Some(other)=closure.receipt.second {
-                found+=1;
-                assert_eq!(other,closure.receipt.first+1);
+            assert!(closure.receipt.first < RECEIPT_HOME_BLOCKS);
+            if let Some(other) = closure.receipt.second {
+                found += 1;
+                assert_eq!(other, closure.receipt.first + 1);
                 assert!(across.contains(&i));
-                assert_eq!(closure.receipt_block_count,2);
-            }else{
-                assert_eq!(closure.receipt_block_count,1);
+                assert_eq!(closure.receipt_block_count, 2);
+            } else {
+                assert_eq!(closure.receipt_block_count, 1);
             }
         }
-        assert_eq!(found,4);
-        assert_eq!(home_closure(RECEIPTS),None);
+        assert_eq!(found, 4);
+        assert_eq!(home_closure(RECEIPTS), None);
     }
     #[test]
-    fn clean_store_and_frozen_cross_block_receipts_are_decoded_as_one_record(){
-        let mut data=[0u8;RECEIPT_STORE_BYTES];
-        assert_eq!(scan_receipts(&data,[1;16]).unwrap().occupied,0);
-        for (index,seq) in [(21usize,1u64),(42,2),(85,3),(106,4)] {
-            let at=index*RECEIPT_BYTES;
-            data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0,0,seq).unwrap(),seq));
+    fn clean_store_and_frozen_cross_block_receipts_are_decoded_as_one_record() {
+        let mut data = [0u8; RECEIPT_STORE_BYTES];
+        assert_eq!(scan_receipts(&data, [1; 16]).unwrap().occupied, 0);
+        for (index, seq) in [(21usize, 1u64), (42, 2), (85, 3), (106, 4)] {
+            let at = index * RECEIPT_BYTES;
+            data[at..at + RECEIPT_BYTES]
+                .copy_from_slice(&receipt(local_request_id(0, 0, seq).unwrap(), seq));
         }
-        let result=scan_receipts(&data,[1;16]).unwrap();
-        assert_eq!(result.occupied,4);
-        assert_eq!(result.unresolved,4);
-        assert_eq!(result.across_block,4);
-        assert!(scan_receipts(&data,[2;16]).is_err());
+        let result = scan_receipts(&data, [1; 16]).unwrap();
+        assert_eq!(result.occupied, 4);
+        assert_eq!(result.unresolved, 4);
+        assert_eq!(result.across_block, 4);
+        assert!(scan_receipts(&data, [2; 16]).is_err());
         // Simulate second-home tearing at a straddling record; CRC must fail.
-        let torn=21*RECEIPT_BYTES+RECEIPT_BYTES-1;
-        data[torn]^=1;
-        assert!(scan_receipts(&data,[1;16]).is_err());
+        let torn = 21 * RECEIPT_BYTES + RECEIPT_BYTES - 1;
+        data[torn] ^= 1;
+        assert!(scan_receipts(&data, [1; 16]).is_err());
     }
     #[test]
-    fn conflicting_receipt_keys_and_short_staging_are_rejected(){
-        let mut data=[0u8;RECEIPT_STORE_BYTES];
-        data[..RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0,0,1).unwrap(),1));
-        let at=RECEIPT_BYTES;
-        data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0,0,1).unwrap(),2));
-        assert!(scan_receipts(&data,[1;16]).is_err()); // inconsistent local ID
-        data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0,0,1).unwrap(),1));
-        assert!(scan_receipts(&data,[1;16]).is_err()); // duplicate canonical full stream key
-        data[at..at+RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0,0,2).unwrap(),2));
-        assert!(scan_receipts(&data,[1;16]).is_ok());
-        assert!(scan_receipts(&data[..RECEIPT_STORE_BYTES-1],[1;16]).is_err());
+    fn conflicting_receipt_keys_and_short_staging_are_rejected() {
+        let mut data = [0u8; RECEIPT_STORE_BYTES];
+        data[..RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0, 0, 1).unwrap(), 1));
+        let at = RECEIPT_BYTES;
+        data[at..at + RECEIPT_BYTES]
+            .copy_from_slice(&receipt(local_request_id(0, 0, 1).unwrap(), 2));
+        assert!(scan_receipts(&data, [1; 16]).is_err()); // inconsistent local ID
+        data[at..at + RECEIPT_BYTES]
+            .copy_from_slice(&receipt(local_request_id(0, 0, 1).unwrap(), 1));
+        assert!(scan_receipts(&data, [1; 16]).is_err()); // duplicate canonical full stream key
+        data[at..at + RECEIPT_BYTES]
+            .copy_from_slice(&receipt(local_request_id(0, 0, 2).unwrap(), 2));
+        assert!(scan_receipts(&data, [1; 16]).is_ok());
+        assert!(scan_receipts(&data[..RECEIPT_STORE_BYTES - 1], [1; 16]).is_err());
     }
     fn strict_index(issued: u64, retired: u64) -> [u8; BLOCK_BYTES] {
-        use super::super::file_index_v0199::{INDEX_MAGIC, INDEX_VERSION, INDEX_HEADER, STREAM_BASE, CRC_OFFSET};
+        use super::super::file_index_v0199::{
+            CRC_OFFSET, INDEX_HEADER, INDEX_MAGIC, INDEX_VERSION, STREAM_BASE,
+        };
         let mut b = [0; BLOCK_BYTES];
         b[0..4].copy_from_slice(&INDEX_MAGIC.to_le_bytes());
         b[4..6].copy_from_slice(&INDEX_VERSION.to_le_bytes());
         b[6..8].copy_from_slice(&(INDEX_HEADER as u16).to_le_bytes());
-        b[8..24].copy_from_slice(&[1;16]);
+        b[8..24].copy_from_slice(&[1; 16]);
         b[32..40].copy_from_slice(&1u64.to_le_bytes());
         for group in 0..GROUP_COUNT {
-            let at=INDEX_HEADER+group*24;
-            b[at+16..at+24].copy_from_slice(&(group as u64+2).to_le_bytes());
+            let at = INDEX_HEADER + group * 24;
+            b[at + 16..at + 24].copy_from_slice(&(group as u64 + 2).to_le_bytes());
         }
         b[64..68].copy_from_slice(&1u32.to_le_bytes());
         b[68..72].copy_from_slice(&1u32.to_le_bytes());
         b[72..80].copy_from_slice(&1u64.to_le_bytes());
-        b[STREAM_BASE..STREAM_BASE+4].copy_from_slice(&1u32.to_le_bytes());
-        b[STREAM_BASE+4..STREAM_BASE+8].copy_from_slice(&1u32.to_le_bytes());
-        b[STREAM_BASE+8..STREAM_BASE+16].copy_from_slice(&issued.to_le_bytes());
-        b[STREAM_BASE+16..STREAM_BASE+24].copy_from_slice(&retired.to_le_bytes());
-        let crc=crc32c_zeroed(&b,CRC_OFFSET).unwrap();
+        b[STREAM_BASE..STREAM_BASE + 4].copy_from_slice(&1u32.to_le_bytes());
+        b[STREAM_BASE + 4..STREAM_BASE + 8].copy_from_slice(&1u32.to_le_bytes());
+        b[STREAM_BASE + 8..STREAM_BASE + 16].copy_from_slice(&issued.to_le_bytes());
+        b[STREAM_BASE + 16..STREAM_BASE + 24].copy_from_slice(&retired.to_le_bytes());
+        let crc = crc32c_zeroed(&b, CRC_OFFSET).unwrap();
         b[CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
         b
     }
     fn reseal(raw: &mut [u8]) {
-        let crc=crc32c_zeroed(raw,188).unwrap();
+        let crc = crc32c_zeroed(raw, 188).unwrap();
         raw[188..192].copy_from_slice(&crc.to_le_bytes());
     }
     #[test]
     fn joint_receipt_index_rejects_gap_retired_or_forged_identity() {
-        let mut data=[0u8;RECEIPT_STORE_BYTES];
-        let at=21*RECEIPT_BYTES;
-        let raw=receipt((1u64<<56)|2,2);
-        data[at..at+RECEIPT_BYTES].copy_from_slice(&raw);
-        let index=strict_index(2,1);
-        assert_eq!(scan_receipts_with_index(&data,&index,[1;16]).unwrap().across_block,1);
-        assert!(scan_receipts_with_index(&data,&strict_index(3,1),[1;16]).is_err());
-        assert!(scan_receipts_with_index(&data,&strict_index(2,2),[1;16]).is_err());
-        assert!(scan_receipts_with_index(&data,&strict_index((1u64<<53)-1,0),[1;16]).is_err());
-        for (offset,value) in [(172usize,9u8),(180,3),(48,2),(36,2),(24,2)] {
-            data[at..at+RECEIPT_BYTES].copy_from_slice(&raw);
-            data[at+offset]=value;
-            reseal(&mut data[at..at+RECEIPT_BYTES]);
-            assert!(scan_receipts_with_index(&data,&index,[1;16]).is_err(),"offset {offset}");
+        let mut data = [0u8; RECEIPT_STORE_BYTES];
+        let at = 21 * RECEIPT_BYTES;
+        let raw = receipt((1u64 << 56) | 2, 2);
+        data[at..at + RECEIPT_BYTES].copy_from_slice(&raw);
+        let index = strict_index(2, 1);
+        assert_eq!(
+            scan_receipts_with_index(&data, &index, [1; 16])
+                .unwrap()
+                .across_block,
+            1
+        );
+        assert!(scan_receipts_with_index(&data, &strict_index(3, 1), [1; 16]).is_err());
+        assert!(scan_receipts_with_index(&data, &strict_index(2, 2), [1; 16]).is_err());
+        assert!(
+            scan_receipts_with_index(&data, &strict_index((1u64 << 53) - 1, 0), [1; 16]).is_err()
+        );
+        for (offset, value) in [(172usize, 9u8), (180, 3), (48, 2), (36, 2), (24, 2)] {
+            data[at..at + RECEIPT_BYTES].copy_from_slice(&raw);
+            data[at + offset] = value;
+            reseal(&mut data[at..at + RECEIPT_BYTES]);
+            assert!(
+                scan_receipts_with_index(&data, &index, [1; 16]).is_err(),
+                "offset {offset}"
+            );
         }
-        data[at..at+RECEIPT_BYTES].copy_from_slice(&raw);
-        data[..RECEIPT_BYTES].copy_from_slice(&receipt((1u64<<56)|1,1));
-        assert!(scan_receipts_with_index(&data,&strict_index(2,0),[1;16]).is_err());
+        data[at..at + RECEIPT_BYTES].copy_from_slice(&raw);
+        data[..RECEIPT_BYTES].copy_from_slice(&receipt((1u64 << 56) | 1, 1));
+        assert!(scan_receipts_with_index(&data, &strict_index(2, 0), [1; 16]).is_err());
         // UNKNOWN is unresolved even if its binding digest is present.
         data[96..98].copy_from_slice(&5u16.to_le_bytes());
-        data[108]=1;
+        data[108] = 1;
         reseal(&mut data[..RECEIPT_BYTES]);
-        assert!(scan_receipts_with_index(&data,&strict_index(2,0),[1;16]).is_err());
+        assert!(scan_receipts_with_index(&data, &strict_index(2, 0), [1; 16]).is_err());
         // A bound, proven terminal predecessor can coexist with one pending.
         data[96..98].copy_from_slice(&3u16.to_le_bytes());
-        data[108]=1;
+        data[108] = 1;
         reseal(&mut data[..RECEIPT_BYTES]);
-        assert_eq!(scan_receipts_with_index(&data,&strict_index(2,0),[1;16]).unwrap().occupied,2);
+        assert_eq!(
+            scan_receipts_with_index(&data, &strict_index(2, 0), [1; 16])
+                .unwrap()
+                .occupied,
+            2
+        );
         data[96..98].copy_from_slice(&5u16.to_le_bytes());
         reseal(&mut data[..RECEIPT_BYTES]);
-        data[at+96..at+98].copy_from_slice(&3u16.to_le_bytes());
-        data[at+108]=1;
-        reseal(&mut data[at..at+RECEIPT_BYTES]);
-        assert!(scan_receipts_with_index(&data,&strict_index(2,0),[1;16]).is_err());
+        data[at + 96..at + 98].copy_from_slice(&3u16.to_le_bytes());
+        data[at + 108] = 1;
+        reseal(&mut data[at..at + RECEIPT_BYTES]);
+        assert!(scan_receipts_with_index(&data, &strict_index(2, 0), [1; 16]).is_err());
     }
-
 }

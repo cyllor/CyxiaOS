@@ -388,9 +388,9 @@ impl<'a, P: Port> Tcp<'a, P> {
     /// of outstanding VirtIO transmit descriptor leases. This is NOT proof
     /// that the remote endpoint consumed or acknowledged application bytes.
     pub fn terminal_tx_quiescent(&self) -> bool {
-        let socket=self.sockets.get::<Socket>(self.socket);
-        socket.state()==State::Closed
-            && socket.send_queue()==0
+        let socket = self.sockets.get::<Socket>(self.socket);
+        socket.state() == State::Closed
+            && socket.send_queue() == 0
             && self.device.port().tx_quiescent()
     }
 

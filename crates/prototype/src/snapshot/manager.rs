@@ -884,9 +884,10 @@ impl Manager {
         let digest = request_digest(OP_DELETE, request, &payload)?;
         match self.lookup(j, d, s, tx, request.key, Some(digest))? {
             Lookup::Existing(_, _) => Ok(false),
-            Lookup::New(_, _) => Ok(self.delete_eligibility::<D::Error>(
-                request, key, has_refs, automatic
-            )?.slot_class == SlotClass::Periodic),
+            Lookup::New(_, _) => Ok(self
+                .delete_eligibility::<D::Error>(request, key, has_refs, automatic)?
+                .slot_class
+                == SlotClass::Periodic),
         }
     }
 

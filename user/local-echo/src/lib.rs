@@ -20,7 +20,9 @@ pub mod broker_surface {
     /// Gate every broker operation at the guest side, *in addition to*
     /// independent protected kernel service rights.
     pub const fn allowed(op: u64, len: usize, arg0: u64) -> bool {
-        if len > PAYLOAD { return false; }
+        if len > PAYLOAD {
+            return false;
+        }
         match op {
             ENTROPY | READ => arg0 == 0,
             WRITE => arg0 == DIRECT_TLS_CIPHERTEXT && len != 0,
@@ -32,18 +34,19 @@ pub mod broker_surface {
 #[cfg(test)]
 mod tests {
     use super::broker_surface::*;
-    #[test] fn sec_n_native_guest_has_no_remote_or_file_mutation_syscalls() {
-        for op in [7,8,9,10,11,13,19,20,0xffff] {
-            assert!(!allowed(op,0,0), "unexpected broker right {op}");
+    #[test]
+    fn sec_n_native_guest_has_no_remote_or_file_mutation_syscalls() {
+        for op in [7, 8, 9, 10, 11, 13, 19, 20, 0xffff] {
+            assert!(!allowed(op, 0, 0), "unexpected broker right {op}");
         }
-        assert!(allowed(ENTROPY,32,0));
-        assert!(allowed(READ,4096,0));
-        assert!(allowed(WRITE,20,DIRECT_TLS_CIPHERTEXT));
-        assert!(!allowed(WRITE,20,0));
-        assert!(!allowed(WRITE,0,DIRECT_TLS_CIPHERTEXT));
-        assert!(!allowed(READ,4097,0));
-        assert!(allowed(POLL,0,0));
-        assert!(allowed(CLOSE,0,0));
-        assert!(!allowed(CLOSE,1,0));
+        assert!(allowed(ENTROPY, 32, 0));
+        assert!(allowed(READ, 4096, 0));
+        assert!(allowed(WRITE, 20, DIRECT_TLS_CIPHERTEXT));
+        assert!(!allowed(WRITE, 20, 0));
+        assert!(!allowed(WRITE, 0, DIRECT_TLS_CIPHERTEXT));
+        assert!(!allowed(READ, 4097, 0));
+        assert!(allowed(POLL, 0, 0));
+        assert!(allowed(CLOSE, 0, 0));
+        assert!(!allowed(CLOSE, 1, 0));
     }
 }

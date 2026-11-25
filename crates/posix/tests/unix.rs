@@ -93,7 +93,9 @@ fn bind_snapshots_process_umask_without_consuming_or_reapplying_it() {
     assert_eq!(process.current_umask(), 0o077);
     let mut sockets = UnixSockets::new();
     let server = sockets.socket(1).unwrap();
-    sockets.bind_with_umask(1, server, b"/bus", process.current_umask()).unwrap();
+    sockets
+        .bind_with_umask(1, server, b"/bus", process.current_umask())
+        .unwrap();
     assert_eq!(sockets.pathname_stat(b"/bus").unwrap().mode, 0o140700);
     process.umask(0o777);
     assert_eq!(sockets.pathname_stat(b"/bus").unwrap().mode, 0o140700);

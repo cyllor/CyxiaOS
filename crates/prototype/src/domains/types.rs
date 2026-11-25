@@ -158,7 +158,10 @@ impl Action {
     /// variants remain decodable for offline evidence and old media inspection,
     /// but MUST NOT reach a new native prepare/apply/publish operation.
     pub const fn permitted_v0199_local(self) -> bool {
-        !matches!(self, Self::ControlSet(_) | Self::OfferCpu(_) | Self::Placement(_))
+        !matches!(
+            self,
+            Self::ControlSet(_) | Self::OfferCpu(_) | Self::Placement(_)
+        )
     }
     pub const fn domain(self) -> u16 {
         match self {

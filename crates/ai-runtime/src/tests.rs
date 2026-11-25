@@ -32,8 +32,13 @@ fn runtime() -> Runtime {
 fn cosmic_unix_domain_is_bounded_and_keeps_original_admission_scores() {
     for free in 0..=COSMIC_UNIX_MODEL_CAPACITY {
         for requested in 1..=2 {
-            assert_eq!(cosmic_unix_policy(free, requested),
-                Ok((user_memory_policy(free.min(64), requested).unwrap().0, COSMIC_UNIX_MODEL_ID)));
+            assert_eq!(
+                cosmic_unix_policy(free, requested),
+                Ok((
+                    user_memory_policy(free.min(64), requested).unwrap().0,
+                    COSMIC_UNIX_MODEL_ID
+                ))
+            );
         }
     }
     for (free, requested) in [(129, 1), (128, 0), (128, 3)] {
@@ -45,13 +50,27 @@ fn cosmic_unix_domain_is_bounded_and_keeps_original_admission_scores() {
 fn shared_object_metadata_policy_exhaustive_and_page_policy_preserved() {
     for free in 0..=SHARED_OBJECT_MODEL_CAPACITY {
         for requested in 1..=SHARED_OBJECT_MODEL_CAPACITY {
-            assert_eq!(shared_object_policy(free, requested),
-                Ok((free >= requested, SHARED_OBJECT_MODEL_ID)));
+            assert_eq!(
+                shared_object_policy(free, requested),
+                Ok((free >= requested, SHARED_OBJECT_MODEL_ID))
+            );
         }
     }
-    assert_eq!(shared_object_policy(SHARED_OBJECT_MODEL_CAPACITY + 1, 1), Err(Error::Invalid));
-    assert_eq!(shared_object_policy(SHARED_OBJECT_MODEL_CAPACITY, 0), Err(Error::Invalid));
-    assert_eq!(shared_object_policy(SHARED_OBJECT_MODEL_CAPACITY, SHARED_OBJECT_MODEL_CAPACITY + 1), Err(Error::Invalid));
+    assert_eq!(
+        shared_object_policy(SHARED_OBJECT_MODEL_CAPACITY + 1, 1),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        shared_object_policy(SHARED_OBJECT_MODEL_CAPACITY, 0),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        shared_object_policy(
+            SHARED_OBJECT_MODEL_CAPACITY,
+            SHARED_OBJECT_MODEL_CAPACITY + 1
+        ),
+        Err(Error::Invalid)
+    );
     assert_eq!(user_memory_policy(2, 1), Ok((false, 8193)));
     assert!(anonymous_memory_policy(2048, 2048).is_ok_and(|(allowed, _)| !allowed));
 }
@@ -60,12 +79,17 @@ fn shared_object_metadata_policy_exhaustive_and_page_policy_preserved() {
 fn applet_shared_mapping_policy_covers_every_slot_and_rejects_outside_domain() {
     for free in 0..=COSMIC_SHARED_MAPPING_CAPACITY {
         for requested in 1..=COSMIC_SHARED_MAPPING_CAPACITY {
-            assert_eq!(cosmic_shared_mapping_policy(free, requested),
-                Ok((free >= requested, COSMIC_SHARED_MAPPING_MODEL_ID)));
+            assert_eq!(
+                cosmic_shared_mapping_policy(free, requested),
+                Ok((free >= requested, COSMIC_SHARED_MAPPING_MODEL_ID))
+            );
         }
     }
     for (free, requested) in [(33, 1), (32, 0), (32, 33)] {
-        assert_eq!(cosmic_shared_mapping_policy(free, requested), Err(Error::Invalid));
+        assert_eq!(
+            cosmic_shared_mapping_policy(free, requested),
+            Err(Error::Invalid)
+        );
     }
     assert_eq!(user_memory_policy(2, 1), Ok((false, 8193)));
 }
@@ -461,13 +485,24 @@ fn eight_slot_admission_keeps_the_trained_boundary_and_one_slot_reserve() {
 #[test]
 fn session_process_admission_versions_domain_and_admits_full_session_demand() {
     // Out-of-domain inputs are rejected, never clamped.
-    assert_eq!(session_process_memory_policy(SESSION_LEDGER_PAGES + 1, 8), Err(Error::Invalid));
-    assert_eq!(session_process_memory_policy(SESSION_LEDGER_PAGES, 0), Err(Error::Invalid));
-    assert_eq!(session_process_memory_policy(SESSION_LEDGER_PAGES, 9), Err(Error::Invalid));
+    assert_eq!(
+        session_process_memory_policy(SESSION_LEDGER_PAGES + 1, 8),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        session_process_memory_policy(SESSION_LEDGER_PAGES, 0),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        session_process_memory_policy(SESSION_LEDGER_PAGES, 9),
+        Err(Error::Invalid)
+    );
     // The session model is versioned separately from the demo Arena model 8193.
     assert_ne!(SESSION_PROCESS_MODEL_ID, 8193);
     assert_eq!(
-        session_process_memory_policy(SESSION_LEDGER_PAGES, 8).unwrap().1,
+        session_process_memory_policy(SESSION_LEDGER_PAGES, 8)
+            .unwrap()
+            .1,
         SESSION_PROCESS_MODEL_ID
     );
     // Every in-domain decision matches the trained weights, never overcommits the
@@ -490,11 +525,17 @@ fn session_process_admission_versions_domain_and_admits_full_session_demand() {
     // broker + session + 13 direct children + 18 applets) is admitted with headroom.
     let mut free = SESSION_LEDGER_PAGES;
     let mut admitted = 0;
-    while session_process_memory_policy(free, SESSION_PROCESS_BASE_GRANT).unwrap().0 {
+    while session_process_memory_policy(free, SESSION_PROCESS_BASE_GRANT)
+        .unwrap()
+        .0
+    {
         admitted += 1;
         free -= SESSION_PROCESS_BASE_GRANT;
     }
-    assert!(admitted >= 33, "session must admit the 33-process demand, got {admitted}");
+    assert!(
+        admitted >= 33,
+        "session must admit the 33-process demand, got {admitted}"
+    );
     assert!(admitted <= SESSION_PROCESS_SLOTS);
     // The demo model 8193 boundary is unchanged: still 7 admitted at 64 pages.
     let mut demo_free = 64;
@@ -578,8 +619,7 @@ fn full_os_anonymous_policy_quantized_endpoints_keep_thirty_two_pages_spare() {
         for requested_units in 1..=128 {
             let requested_low = (requested_units - 1) * 16 + 1;
             let requested_high = requested_units * 16;
-            let reference =
-                full_os_anonymous_memory_policy(free_low, requested_high).unwrap();
+            let reference = full_os_anonymous_memory_policy(free_low, requested_high).unwrap();
             assert_eq!(reference.1, 8198);
             for free in [free_low, free_high] {
                 for requested in [requested_low, requested_high] {
@@ -635,7 +675,10 @@ fn full_os_pool_anonymous_policy_admits_the_observed_515_page_request() {
         full_os_pool_anonymous_memory_policy(16384 - observed_used, 515),
         Ok((true, 8199))
     );
-    assert_eq!(full_os_pool_anonymous_memory_policy(16384, 2048), Ok((true, 8199)));
+    assert_eq!(
+        full_os_pool_anonymous_memory_policy(16384, 2048),
+        Ok((true, 8199))
+    );
     // The kernel supplies the smaller virtual/physical free count: enlarging
     // the virtual window must not admit a physically exhausted shared pool.
     assert_eq!(
@@ -646,11 +689,28 @@ fn full_os_pool_anonymous_policy_admits_the_observed_515_page_request() {
 
 #[test]
 fn full_os_pool_anonymous_policy_rejects_invalid_inputs_and_keeps_reserve() {
-    for (free, requested, allowed) in [(0, 1, false), (47, 16, false), (48, 16, true), (2048, 2048, false)] {
-        assert_eq!(full_os_pool_anonymous_memory_policy(free, requested), Ok((allowed, 8199)));
+    for (free, requested, allowed) in [
+        (0, 1, false),
+        (47, 16, false),
+        (48, 16, true),
+        (2048, 2048, false),
+    ] {
+        assert_eq!(
+            full_os_pool_anonymous_memory_policy(free, requested),
+            Ok((allowed, 8199))
+        );
     }
-    for (free, requested) in [(16385, 1), (u32::MAX, 1), (16384, 0), (16384, 2049), (16384, u32::MAX)] {
-        assert_eq!(full_os_pool_anonymous_memory_policy(free, requested), Err(Error::Invalid));
+    for (free, requested) in [
+        (16385, 1),
+        (u32::MAX, 1),
+        (16384, 0),
+        (16384, 2049),
+        (16384, u32::MAX),
+    ] {
+        assert_eq!(
+            full_os_pool_anonymous_memory_policy(free, requested),
+            Err(Error::Invalid)
+        );
     }
     for free_units in 0..=1024 {
         let free_low = free_units * 16;
@@ -664,7 +724,10 @@ fn full_os_pool_anonymous_policy_rejects_invalid_inputs_and_keeps_reserve() {
                 for requested in [requested_low, requested_high] {
                     let decision = full_os_pool_anonymous_memory_policy(free, requested).unwrap();
                     assert_eq!(decision, reference, "free={free} requested={requested}");
-                    assert!(!decision.0 || requested + 32 <= free, "free={free} requested={requested}");
+                    assert!(
+                        !decision.0 || requested + 32 <= free,
+                        "free={free} requested={requested}"
+                    );
                 }
             }
         }
@@ -825,26 +888,40 @@ fn full_os_thread_dispatch_reaches_sixteenth_slot_without_changing_process_limit
         cpu_bound: false,
         ..cpu
     });
-    let selected = full_os_thread_dispatch_policy(&candidates).unwrap().unwrap();
+    let selected = full_os_thread_dispatch_policy(&candidates)
+        .unwrap()
+        .unwrap();
     assert_eq!(selected.index, 15);
     assert_eq!(selected.source, DecisionSource::AiDirect);
     assert_eq!(selected.model, 12289);
     candidates[14] = candidates[15];
     assert_eq!(
-        full_os_thread_dispatch_policy(&candidates).unwrap().unwrap().index,
+        full_os_thread_dispatch_policy(&candidates)
+            .unwrap()
+            .unwrap()
+            .index,
         14
     );
     candidates[15] = Some(UserCandidate {
         waiting_ms: 100,
         ..cpu
     });
-    let selected = full_os_thread_dispatch_policy(&candidates).unwrap().unwrap();
+    let selected = full_os_thread_dispatch_policy(&candidates)
+        .unwrap()
+        .unwrap();
     assert_eq!(selected.index, 15);
     assert_eq!(selected.source, DecisionSource::SafetyGuard);
     assert_eq!(selected.model, 12289);
-    assert!(full_os_thread_dispatch_policy(&[None; 16]).unwrap().is_none());
+    assert!(
+        full_os_thread_dispatch_policy(&[None; 16])
+            .unwrap()
+            .is_none()
+    );
     assert!(full_os_thread_dispatch_policy(&[]).unwrap().is_none());
-    assert_eq!(full_os_thread_dispatch_policy(&[None; 17]), Err(Error::Invalid));
+    assert_eq!(
+        full_os_thread_dispatch_policy(&[None; 17]),
+        Err(Error::Invalid)
+    );
     assert_eq!(user_dispatch_policy(&[None; 9]), Err(Error::Invalid));
 }
 
@@ -860,14 +937,19 @@ fn session_process_dispatch_reaches_full_slot_count_without_changing_demo_limit(
         cpu_bound: false,
         ..cpu
     });
-    let selected = session_process_dispatch_policy(&candidates).unwrap().unwrap();
+    let selected = session_process_dispatch_policy(&candidates)
+        .unwrap()
+        .unwrap();
     assert_eq!(selected.index, slots - 1);
     assert_eq!(selected.source, DecisionSource::AiDirect);
     assert_eq!(selected.model, 12289);
     // Tie-break to the lower index, exactly as the unchanged ranking model does.
     candidates[slots - 2] = candidates[slots - 1];
     assert_eq!(
-        session_process_dispatch_policy(&candidates).unwrap().unwrap().index,
+        session_process_dispatch_policy(&candidates)
+            .unwrap()
+            .unwrap()
+            .index,
         slots - 2
     );
     // Starvation guard still forces the oldest candidate.
@@ -875,13 +957,22 @@ fn session_process_dispatch_reaches_full_slot_count_without_changing_demo_limit(
         waiting_ms: 100,
         ..cpu
     });
-    let selected = session_process_dispatch_policy(&candidates).unwrap().unwrap();
+    let selected = session_process_dispatch_policy(&candidates)
+        .unwrap()
+        .unwrap();
     assert_eq!(selected.index, slots - 1);
     assert_eq!(selected.source, DecisionSource::SafetyGuard);
     assert_eq!(selected.model, 12289);
-    assert!(session_process_dispatch_policy(&std::vec![None; slots]).unwrap().is_none());
+    assert!(
+        session_process_dispatch_policy(&std::vec![None; slots])
+            .unwrap()
+            .is_none()
+    );
     assert!(session_process_dispatch_policy(&[]).unwrap().is_none());
-    assert_eq!(session_process_dispatch_policy(&std::vec![None; slots + 1]), Err(Error::Invalid));
+    assert_eq!(
+        session_process_dispatch_policy(&std::vec![None; slots + 1]),
+        Err(Error::Invalid)
+    );
     // The demo process selector remains bounded to 8 candidates.
     assert_eq!(user_dispatch_policy(&[None; 9]), Err(Error::Invalid));
 }
@@ -917,7 +1008,10 @@ fn session_process_dispatch_selects_aged_preempted_work_in_a_contended_batch() {
     // Age resets after a real slice. For equal ages, fresh I/O wins, and the
     // preemption estimate reaches the same floor as I/O at 32 ms.
     for (waiting_ms, index) in [(0, 1), (31, 1), (32, 0), (99, 0)] {
-        let cpu = UserCandidate { waiting_ms, ..preempted };
+        let cpu = UserCandidate {
+            waiting_ms,
+            ..preempted
+        };
         let decision = session_process_dispatch_policy(&[Some(cpu), io(waiting_ms)])
             .unwrap()
             .unwrap();
@@ -934,7 +1028,10 @@ fn session_process_dispatch_preserves_oldest_guard_and_guard_tie_break() {
             cpu_bound: true,
         })
     };
-    let io = Some(UserCandidate { waiting_ms: 100, cpu_bound: false });
+    let io = Some(UserCandidate {
+        waiting_ms: 100,
+        cpu_bound: false,
+    });
     let oldest = session_process_dispatch_policy(&[cpu(100), io, cpu(101)])
         .unwrap()
         .unwrap();
@@ -942,11 +1039,14 @@ fn session_process_dispatch_preserves_oldest_guard_and_guard_tie_break() {
         .unwrap()
         .unwrap();
     for (decision, index) in [(oldest, 2), (tie, 1)] {
-        assert_eq!(decision, UserDispatch {
-            index,
-            source: DecisionSource::SafetyGuard,
-            model: 12289,
-        });
+        assert_eq!(
+            decision,
+            UserDispatch {
+                index,
+                source: DecisionSource::SafetyGuard,
+                model: 12289,
+            }
+        );
     }
 }
 

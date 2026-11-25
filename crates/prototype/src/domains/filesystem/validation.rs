@@ -121,10 +121,7 @@ fn validate_system<D: BlockDevice>(
         return Err(Error::Conflict);
     }
     for (file, &id) in CLUSTER_INODES.iter().enumerate() {
-        if !crate::cluster::volume::valid_file(
-            file,
-            &read_inode(INODE_START, id as usize, j, d, s)?,
-        ) {
+        if !crate::local_volume::valid_file(file, &read_inode(INODE_START, id as usize, j, d, s)?) {
             return Err(Error::Conflict);
         }
     }
@@ -141,8 +138,8 @@ fn validate_system<D: BlockDevice>(
     ];
     let names = [
         ".cyxia-boot",
-        crate::cluster::volume::NAMES[0],
-        crate::cluster::volume::NAMES[1],
+        crate::local_volume::NAMES[0],
+        crate::local_volume::NAMES[1],
         ".cyxia-snapshot-requests",
     ];
     for n in 0..4 {

@@ -1,5 +1,12 @@
+//! Local reserved-volume storage for the single-machine journal/filesystem.
 //! Two system files use a fixed, format-time sixteen MiB reservation.
 //! Logical used lengths grow atomically with redo data, outside business snapshots.
+// Same bound and cfg semantics as the former cluster::MAX_EFFECT: when the
+// historical engine is compiled in it supplies the canonical constant.
+#[cfg(feature = "cluster-engine")]
+pub use crate::cluster::engine::MAX_EFFECT;
+#[cfg(not(feature = "cluster-engine"))]
+pub const MAX_EFFECT: usize = 33_200;
 use crate::{
     journal::{self, AfterImage, BlockDevice, Journal, Scratch},
     storage::{
@@ -95,7 +102,7 @@ impl Volume {
         body: &[u8],
         closing: bool,
     ) -> Result<(), Error<D::Error>> {
-        if body.is_empty() || body.len() > super::MAX_EFFECT {
+        if body.is_empty() || body.len() > MAX_EFFECT {
             return Err(Error::Capacity);
         }
         let len = 16 + body.len();
@@ -221,7 +228,7 @@ impl Volume {
             || storage::crc32c(&header[..12])
                 != u32::from_le_bytes(header[12..16].try_into().unwrap())
             || len == 0
-            || len > super::MAX_EFFECT
+            || len > MAX_EFFECT
             || len > out.len()
             || c.offset + 16 + len as u64 > self.sizes[c.file]
         {

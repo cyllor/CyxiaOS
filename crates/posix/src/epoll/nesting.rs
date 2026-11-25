@@ -143,7 +143,9 @@ impl Table {
             if dirty & bit == 0 {
                 continue;
             }
-            let handle = self.epolls[child].description.expect("live epoll description");
+            let handle = self.epolls[child]
+                .description
+                .expect("live epoll description");
             let ready = u32::from(self.epolls[child].readable()) * IN;
             let notification = u32::from(wakes & bit != 0) * IN;
             let parents = self.observe_description(handle, ready, notification);

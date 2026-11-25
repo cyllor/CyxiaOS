@@ -301,327 +301,391 @@ fn authenticated_close_notify_precedes_owned_plaintext() {
 #[test]
 fn local_echo_requires_pinned_handshake_and_distinct_alpn() {
     let mut fixtures = [
-        (&include_bytes!("../tests/fixtures/a-test-cert.der")[..],
-         &include_bytes!("../tests/fixtures/a-test-key.der")[..]),
-        (&include_bytes!("../tests/fixtures/b-test-cert.der")[..],
-         &include_bytes!("../tests/fixtures/b-test-key.der")[..]),
+        (
+            &include_bytes!("../tests/fixtures/a-test-cert.der")[..],
+            &include_bytes!("../tests/fixtures/a-test-key.der")[..],
+        ),
+        (
+            &include_bytes!("../tests/fixtures/b-test-cert.der")[..],
+            &include_bytes!("../tests/fixtures/b-test-key.der")[..],
+        ),
     ];
     fixtures.sort_by_key(|(cert, _)| node_id(&CertificateDer::from(*cert)).unwrap());
     let locals: [Pairing; 2] = core::array::from_fn(|i| {
         Pairing::new_local_echo(
             CertificateDer::from(fixtures[i].0),
             PrivatePkcs8KeyDer::from(fixtures[i].1).into(),
-            node_id(&CertificateDer::from(fixtures[1-i].0)).unwrap(),
+            node_id(&CertificateDer::from(fixtures[1 - i].0)).unwrap(),
             Arc::new(Time),
-        ).unwrap()
+        )
+        .unwrap()
     });
-    assert_eq!(locals[0].client.alpn_protocols, vec![LOCAL_ECHO_ALPN.to_vec()]);
-    assert_eq!(locals[1].server.alpn_protocols, vec![LOCAL_ECHO_ALPN.to_vec()]);
-    let mut raw=[0u8;20];
+    assert_eq!(
+        locals[0].client.alpn_protocols,
+        vec![LOCAL_ECHO_ALPN.to_vec()]
+    );
+    assert_eq!(
+        locals[1].server.alpn_protocols,
+        vec![LOCAL_ECHO_ALPN.to_vec()]
+    );
+    let mut raw = [0u8; 20];
     raw[..2].copy_from_slice(&1u16.to_le_bytes());
     raw[2..4].copy_from_slice(&1u16.to_le_bytes());
     raw[4..8].copy_from_slice(&4u32.to_le_bytes());
     raw[8..16].copy_from_slice(&0x1234u64.to_le_bytes());
-    raw[16..20].copy_from_slice(&[1,2,3,4]);
-    let mut a_buf=Buffers::new();
-    let mut b_buf=Buffers::new();
-    let mut a=locals[0].client(&mut a_buf,0).unwrap();
-    let mut b=locals[1].server(&mut b_buf,0).unwrap();
-    assert!(matches!(b.accept_local_echo(&raw),Err(Error::Handshake)));
-    handshake(&mut a,&mut b);
+    raw[16..20].copy_from_slice(&[1, 2, 3, 4]);
+    let mut a_buf = Buffers::new();
+    let mut b_buf = Buffers::new();
+    let mut a = locals[0].client(&mut a_buf, 0).unwrap();
+    let mut b = locals[1].server(&mut b_buf, 0).unwrap();
+    assert!(matches!(b.accept_local_echo(&raw), Err(Error::Handshake)));
+    handshake(&mut a, &mut b);
     assert!(matches!(&b.connection, Connection::Server(server)
         if server.alpn_protocol() == Some(LOCAL_ECHO_ALPN)));
-    let parsed=b.accept_local_echo(&raw).unwrap();
-    assert_eq!(parsed.id(),0x1234);
-    assert_eq!(parsed.payload(),&[1,2,3,4]);
-    let mut bad=raw;
-    bad[2]=19;
-    assert!(matches!(b.accept_local_echo(&bad),Err(Error::Buffer)));
-    let [legacy_small,legacy_large] = pairings(Arc::new(TestSecret::default()));
-    let mut legacy_a_buf=Buffers::new();
-    let mut legacy_b_buf=Buffers::new();
-    let mut la=legacy_small.client(&mut legacy_a_buf,0).unwrap();
-    let mut lb=legacy_large.server(&mut legacy_b_buf,0).unwrap();
-    handshake(&mut la,&mut lb);
-    assert!(matches!(lb.accept_local_echo(&raw),Err(Error::Direction)));
+    let parsed = b.accept_local_echo(&raw).unwrap();
+    assert_eq!(parsed.id(), 0x1234);
+    assert_eq!(parsed.payload(), &[1, 2, 3, 4]);
+    let mut bad = raw;
+    bad[2] = 19;
+    assert!(matches!(b.accept_local_echo(&bad), Err(Error::Buffer)));
+    let [legacy_small, legacy_large] = pairings(Arc::new(TestSecret::default()));
+    let mut legacy_a_buf = Buffers::new();
+    let mut legacy_b_buf = Buffers::new();
+    let mut la = legacy_small.client(&mut legacy_a_buf, 0).unwrap();
+    let mut lb = legacy_large.server(&mut legacy_b_buf, 0).unwrap();
+    handshake(&mut la, &mut lb);
+    assert!(matches!(lb.accept_local_echo(&raw), Err(Error::Direction)));
 }
 
 fn v019_local_pairings() -> [Pairing; 2] {
     let mut fixtures = [
-        (&include_bytes!("../tests/fixtures/a-test-cert.der")[..],
-         &include_bytes!("../tests/fixtures/a-test-key.der")[..]),
-        (&include_bytes!("../tests/fixtures/b-test-cert.der")[..],
-         &include_bytes!("../tests/fixtures/b-test-key.der")[..]),
+        (
+            &include_bytes!("../tests/fixtures/a-test-cert.der")[..],
+            &include_bytes!("../tests/fixtures/a-test-key.der")[..],
+        ),
+        (
+            &include_bytes!("../tests/fixtures/b-test-cert.der")[..],
+            &include_bytes!("../tests/fixtures/b-test-key.der")[..],
+        ),
     ];
     fixtures.sort_by_key(|(cert, _)| node_id(&CertificateDer::from(*cert)).unwrap());
-    core::array::from_fn(|i| Pairing::new_local_echo(
-        CertificateDer::from(fixtures[i].0),
-        PrivatePkcs8KeyDer::from(fixtures[i].1).into(),
-        node_id(&CertificateDer::from(fixtures[1-i].0)).unwrap(),
-        Arc::new(Time),
-    ).unwrap())
+    core::array::from_fn(|i| {
+        Pairing::new_local_echo(
+            CertificateDer::from(fixtures[i].0),
+            PrivatePkcs8KeyDer::from(fixtures[i].1).into(),
+            node_id(&CertificateDer::from(fixtures[1 - i].0)).unwrap(),
+            Arc::new(Time),
+        )
+        .unwrap()
+    })
 }
 #[test]
 fn v019_sec_n06_actual_tls_plaintext_requires_exact_generation_bound_active_ticket() {
     use crate::admission::{Admission, Error as AdmissionError};
-    let locals=v019_local_pairings();
-    let mut admission=Admission::new();
-    let invalid=admission.begin(7,0,4).unwrap();
-    let mut first_buffer=Buffers::new();
-    let first=locals[1].server(&mut first_buffer,0).unwrap();
-    assert_eq!(admission.authenticate(invalid,&first),Err(AdmissionError::Unauthenticated));
-    assert_eq!(admission.pending_count(),0);
+    let locals = v019_local_pairings();
+    let mut admission = Admission::new();
+    let invalid = admission.begin(7, 0, 4).unwrap();
+    let mut first_buffer = Buffers::new();
+    let first = locals[1].server(&mut first_buffer, 0).unwrap();
+    assert_eq!(
+        admission.authenticate(invalid, &first),
+        Err(AdmissionError::Unauthenticated)
+    );
+    assert_eq!(admission.pending_count(), 0);
     drop(first);
-    let ticket=admission.begin(7,0,4).unwrap();
-    let mut client_buf=Buffers::new();
-    let mut server_buf=Buffers::new();
-    let mut a=locals[0].client(&mut client_buf,0).unwrap();
-    let mut b=locals[1].server(&mut server_buf,0).unwrap();
-    handshake(&mut a,&mut b);
-    let active=admission.authenticate(ticket,&b).unwrap();
-    assert_eq!(admission.active_count(),1);
-    let duplicate=admission.begin(7,0,4).unwrap();
-    assert_eq!(admission.authenticate(duplicate,&b),Err(AdmissionError::Duplicate));
-    assert_eq!(admission.pending_count(),0);
-    let mut frame=[0u8;20];
+    let ticket = admission.begin(7, 0, 4).unwrap();
+    let mut client_buf = Buffers::new();
+    let mut server_buf = Buffers::new();
+    let mut a = locals[0].client(&mut client_buf, 0).unwrap();
+    let mut b = locals[1].server(&mut server_buf, 0).unwrap();
+    handshake(&mut a, &mut b);
+    let active = admission.authenticate(ticket, &b).unwrap();
+    assert_eq!(admission.active_count(), 1);
+    let duplicate = admission.begin(7, 0, 4).unwrap();
+    assert_eq!(
+        admission.authenticate(duplicate, &b),
+        Err(AdmissionError::Duplicate)
+    );
+    assert_eq!(admission.pending_count(), 0);
+    let mut frame = [0u8; 20];
     frame[..2].copy_from_slice(&1u16.to_le_bytes());
     frame[2..4].copy_from_slice(&1u16.to_le_bytes());
     frame[4..8].copy_from_slice(&4u32.to_le_bytes());
     frame[8..16].copy_from_slice(&9u64.to_le_bytes());
-    frame[16..20].copy_from_slice(&[1,2,3,4]);
+    frame[16..20].copy_from_slice(&[1, 2, 3, 4]);
     a.send_plaintext(&frame).unwrap();
     for now in 1..=16 {
         a.pump(now).unwrap();
-        transfer(&mut a,&mut b);
+        transfer(&mut a, &mut b);
         b.pump(now).unwrap();
-        if b.plaintext()==frame.as_slice() { break; }
+        if b.plaintext() == frame.as_slice() {
+            break;
+        }
     }
-    assert_eq!(b.plaintext(),frame.as_slice());
-    let mut reply=[0u8;20];
-    assert_eq!(admission.reply(active,&b,&mut reply),Ok(20));
-    assert_eq!(reply,frame);
-    let mut unrelated_buf=Buffers::new();
-    let unrelated=locals[1].server(&mut unrelated_buf,0).unwrap();
-    assert_eq!(admission.reply(active,&unrelated,&mut reply),Err(AdmissionError::Unauthenticated));
-    assert_eq!(admission.finish_drain(active),Err(AdmissionError::Busy));
+    assert_eq!(b.plaintext(), frame.as_slice());
+    let mut reply = [0u8; 20];
+    assert_eq!(admission.reply(active, &b, &mut reply), Ok(20));
+    assert_eq!(reply, frame);
+    let mut unrelated_buf = Buffers::new();
+    let unrelated = locals[1].server(&mut unrelated_buf, 0).unwrap();
+    assert_eq!(
+        admission.reply(active, &unrelated, &mut reply),
+        Err(AdmissionError::Unauthenticated)
+    );
+    assert_eq!(admission.finish_drain(active), Err(AdmissionError::Busy));
     b.consume_plaintext(20).unwrap();
     b.abort();
-    assert_eq!(admission.reply(active,&b,&mut reply),Err(AdmissionError::Unauthenticated));
-    assert_eq!(admission.active_count(),1); // abort never frees unknown DMA
+    assert_eq!(
+        admission.reply(active, &b, &mut reply),
+        Err(AdmissionError::Unauthenticated)
+    );
+    assert_eq!(admission.active_count(), 1); // abort never frees unknown DMA
     admission.begin_drain(active).unwrap();
     admission.finish_drain(active).unwrap(); // host witness; native must prove TX/DMA
-    assert_eq!(admission.finish_drain(active),Err(AdmissionError::Stale));
+    assert_eq!(admission.finish_drain(active), Err(AdmissionError::Stale));
 }
 #[test]
 fn v019_sec_n03_16_authenticated_connections_do_not_steal_17th_active_credit() {
-    use crate::admission::{Admission, Error as AdmissionError, ACTIVE};
-    let locals=v019_local_pairings();
-    let mut gate=Admission::new();
-    let mut tickets=[None; ACTIVE];
+    use crate::admission::{ACTIVE, Admission, Error as AdmissionError};
+    let locals = v019_local_pairings();
+    let mut gate = Admission::new();
+    let mut tickets = [None; ACTIVE];
     for (i, out) in tickets.iter_mut().enumerate() {
-        let pending=gate.begin(i as u32+1,i as u64+1,32).unwrap();
-        let mut client_buf=Buffers::new();
-        let mut server_buf=Buffers::new();
-        let mut client=locals[0].client(&mut client_buf,0).unwrap();
-        let mut server=locals[1].server(&mut server_buf,0).unwrap();
-        handshake(&mut client,&mut server);
-        *out=Some(gate.authenticate(pending,&server).unwrap());
+        let pending = gate.begin(i as u32 + 1, i as u64 + 1, 32).unwrap();
+        let mut client_buf = Buffers::new();
+        let mut server_buf = Buffers::new();
+        let mut client = locals[0].client(&mut client_buf, 0).unwrap();
+        let mut server = locals[1].server(&mut server_buf, 0).unwrap();
+        handshake(&mut client, &mut server);
+        *out = Some(gate.authenticate(pending, &server).unwrap());
     }
-    assert_eq!(gate.active_count(),ACTIVE);
-    let pending=gate.begin(99,17,32).unwrap();
-    let mut client_buf=Buffers::new();
-    let mut server_buf=Buffers::new();
-    let mut client=locals[0].client(&mut client_buf,0).unwrap();
-    let mut server=locals[1].server(&mut server_buf,0).unwrap();
-    handshake(&mut client,&mut server);
-    assert_eq!(gate.authenticate(pending,&server),Err(AdmissionError::Capacity));
-    assert_eq!(gate.active_count(),ACTIVE);
-    assert_eq!(gate.pending_count(),0);
+    assert_eq!(gate.active_count(), ACTIVE);
+    let pending = gate.begin(99, 17, 32).unwrap();
+    let mut client_buf = Buffers::new();
+    let mut server_buf = Buffers::new();
+    let mut client = locals[0].client(&mut client_buf, 0).unwrap();
+    let mut server = locals[1].server(&mut server_buf, 0).unwrap();
+    handshake(&mut client, &mut server);
+    assert_eq!(
+        gate.authenticate(pending, &server),
+        Err(AdmissionError::Capacity)
+    );
+    assert_eq!(gate.active_count(), ACTIVE);
+    assert_eq!(gate.pending_count(), 0);
     gate.begin_restart();
     assert!(gate.restarting());
-    assert_eq!(gate.finish_restart(),Err(AdmissionError::Busy));
-    assert_eq!(gate.begin(100,18,32),Err(AdmissionError::Busy));
+    assert_eq!(gate.finish_restart(), Err(AdmissionError::Busy));
+    assert_eq!(gate.begin(100, 18, 32), Err(AdmissionError::Busy));
     for ticket in tickets.into_iter().flatten() {
         gate.finish_drain(ticket).unwrap();
     }
-    assert_eq!(gate.active_count(),0);
+    assert_eq!(gate.active_count(), 0);
     gate.finish_restart().unwrap();
     assert!(!gate.restarting());
-    let fresh=gate.begin(100,18,32).unwrap();
+    let fresh = gate.begin(100, 18, 32).unwrap();
     gate.reject(fresh).unwrap();
 }
 
 #[test]
 fn v019_sec_n06_echo_dispatch_encrypts_authenticated_request_before_consuming() {
     use crate::admission::Admission;
-    let pairs=v019_local_pairings();
-    let mut gate=Admission::new();
-    let ticket=gate.begin(7,0,16).unwrap();
-    let mut a_buf=Buffers::new();
-    let mut b_buf=Buffers::new();
-    let mut client=pairs[0].client(&mut a_buf,0).unwrap();
-    let mut server=pairs[1].server(&mut b_buf,0).unwrap();
-    handshake(&mut client,&mut server);
-    let key=gate.authenticate(ticket,&server).unwrap();
+    let pairs = v019_local_pairings();
+    let mut gate = Admission::new();
+    let ticket = gate.begin(7, 0, 16).unwrap();
+    let mut a_buf = Buffers::new();
+    let mut b_buf = Buffers::new();
+    let mut client = pairs[0].client(&mut a_buf, 0).unwrap();
+    let mut server = pairs[1].server(&mut b_buf, 0).unwrap();
+    handshake(&mut client, &mut server);
+    let key = gate.authenticate(ticket, &server).unwrap();
 
-    let mut frame=[0u8;20];
+    let mut frame = [0u8; 20];
     frame[..2].copy_from_slice(&1u16.to_le_bytes());
     frame[2..4].copy_from_slice(&1u16.to_le_bytes());
     frame[4..8].copy_from_slice(&4u32.to_le_bytes());
     frame[8..16].copy_from_slice(&123u64.to_le_bytes());
-    frame[16..20].copy_from_slice(&[5,6,7,8]);
+    frame[16..20].copy_from_slice(&[5, 6, 7, 8]);
 
     client.send_plaintext(&frame).unwrap();
     for now in 1..=16 {
         client.pump(now).unwrap();
-        transfer(&mut client,&mut server);
+        transfer(&mut client, &mut server);
         server.pump(now).unwrap();
-        if server.plaintext()==frame.as_slice() { break; }
+        if server.plaintext() == frame.as_slice() {
+            break;
+        }
     }
-    assert_eq!(server.plaintext(),frame.as_slice());
-    assert_eq!(gate.dispatch_echo(key,&mut server).unwrap(),frame.len());
+    assert_eq!(server.plaintext(), frame.as_slice());
+    assert_eq!(gate.dispatch_echo(key, &mut server).unwrap(), frame.len());
     assert!(server.plaintext().is_empty());
     assert!(server.has_pending_plaintext());
-    assert_eq!(gate.confirm_tls_output_drained(key,&server),
-        Err(crate::admission::Error::Busy));
-    assert_eq!(gate.dispatch_echo(key,&mut server),
-        Err(crate::admission::Error::Busy));
+    assert_eq!(
+        gate.confirm_tls_output_drained(key, &server),
+        Err(crate::admission::Error::Busy)
+    );
+    assert_eq!(
+        gate.dispatch_echo(key, &mut server),
+        Err(crate::admission::Error::Busy)
+    );
     gate.begin_drain(key).unwrap();
-    assert_eq!(gate.finish_drain(key),Err(crate::admission::Error::Busy));
+    assert_eq!(gate.finish_drain(key), Err(crate::admission::Error::Busy));
     // Plaintext was accepted only into the real pinned TLS session; the
     // ciphertext must traverse the live TLS record output to reach the peer.
     for now in 17..=40 {
         server.pump(now).unwrap();
-        transfer(&mut server,&mut client);
+        transfer(&mut server, &mut client);
         client.pump(now).unwrap();
-        if client.plaintext()==frame.as_slice() { break; }
+        if client.plaintext() == frame.as_slice() {
+            break;
+        }
     }
-    assert_eq!(client.plaintext(),frame.as_slice());
+    assert_eq!(client.plaintext(), frame.as_slice());
     client.consume_plaintext(frame.len()).unwrap();
     assert!(!server.has_pending_plaintext());
-    gate.confirm_tls_output_drained(key,&server).unwrap();
-    assert_eq!(gate.confirm_tls_output_drained(key,&server),
-        Err(crate::admission::Error::Stale));
+    gate.confirm_tls_output_drained(key, &server).unwrap();
+    assert_eq!(
+        gate.confirm_tls_output_drained(key, &server),
+        Err(crate::admission::Error::Stale)
+    );
     gate.finish_drain(key).unwrap(); // host only: native TX/DMA proof still required
 }
 
 #[test]
 fn v019_sec_n06_echo_dispatch_rejects_mutating_opcode_without_queuing_response() {
-    use crate::admission::{Admission,Error as AdmissionError};
-    let pairs=v019_local_pairings();
-    let mut gate=Admission::new();
-    let ticket=gate.begin(7,0,16).unwrap();
-    let mut a_buf=Buffers::new();
-    let mut b_buf=Buffers::new();
-    let mut client=pairs[0].client(&mut a_buf,0).unwrap();
-    let mut server=pairs[1].server(&mut b_buf,0).unwrap();
-    handshake(&mut client,&mut server);
-    let active=gate.authenticate(ticket,&server).unwrap();
-    let mut bad=[0u8;16];
+    use crate::admission::{Admission, Error as AdmissionError};
+    let pairs = v019_local_pairings();
+    let mut gate = Admission::new();
+    let ticket = gate.begin(7, 0, 16).unwrap();
+    let mut a_buf = Buffers::new();
+    let mut b_buf = Buffers::new();
+    let mut client = pairs[0].client(&mut a_buf, 0).unwrap();
+    let mut server = pairs[1].server(&mut b_buf, 0).unwrap();
+    handshake(&mut client, &mut server);
+    let active = gate.authenticate(ticket, &server).unwrap();
+    let mut bad = [0u8; 16];
     bad[..2].copy_from_slice(&1u16.to_le_bytes());
     bad[2..4].copy_from_slice(&19u16.to_le_bytes()); // removed remote-placement RPC
     bad[8..16].copy_from_slice(&31u64.to_le_bytes());
     client.send_plaintext(&bad).unwrap();
     for now in 1..=16 {
         client.pump(now).unwrap();
-        transfer(&mut client,&mut server);
+        transfer(&mut client, &mut server);
         server.pump(now).unwrap();
-        if server.plaintext()==bad.as_slice() {break;}
+        if server.plaintext() == bad.as_slice() {
+            break;
+        }
     }
-    assert_eq!(server.plaintext(),bad.as_slice());
-    assert_eq!(gate.dispatch_echo(active,&mut server),Err(AdmissionError::Invalid));
-    assert_eq!(server.plaintext(),bad.as_slice());
+    assert_eq!(server.plaintext(), bad.as_slice());
+    assert_eq!(
+        gate.dispatch_echo(active, &mut server),
+        Err(AdmissionError::Invalid)
+    );
+    assert_eq!(server.plaintext(), bad.as_slice());
     assert!(!server.has_pending_plaintext());
 }
 
 #[test]
 fn v019_sec_n05_fragmented_tls_records_preserve_echo_and_generation() {
-    use crate::admission::{Admission,Error as AdmissionError};
-    let pairs=v019_local_pairings();
-    let mut a_buf=Buffers::new();
-    let mut b_buf=Buffers::new();
-    let mut client=pairs[0].client(&mut a_buf,0).unwrap();
-    let mut server=pairs[1].server(&mut b_buf,0).unwrap();
-    handshake(&mut client,&mut server);
-    let mut gate=Admission::new();
-    let pending=gate.begin(7,0,16).unwrap();
-    let active=gate.authenticate(pending,&server).unwrap();
-    let mut frame=[0u8;20];
+    use crate::admission::{Admission, Error as AdmissionError};
+    let pairs = v019_local_pairings();
+    let mut a_buf = Buffers::new();
+    let mut b_buf = Buffers::new();
+    let mut client = pairs[0].client(&mut a_buf, 0).unwrap();
+    let mut server = pairs[1].server(&mut b_buf, 0).unwrap();
+    handshake(&mut client, &mut server);
+    let mut gate = Admission::new();
+    let pending = gate.begin(7, 0, 16).unwrap();
+    let active = gate.authenticate(pending, &server).unwrap();
+    let mut frame = [0u8; 20];
     frame[..2].copy_from_slice(&1u16.to_le_bytes());
     frame[2..4].copy_from_slice(&1u16.to_le_bytes());
     frame[4..8].copy_from_slice(&4u32.to_le_bytes());
     frame[8..16].copy_from_slice(&77u64.to_le_bytes());
-    frame[16..20].copy_from_slice(&[1,2,3,4]);
+    frame[16..20].copy_from_slice(&[1, 2, 3, 4]);
 
     client.send_plaintext(&frame[..8]).unwrap();
     for now in 1..=16 {
         client.pump(now).unwrap();
-        transfer(&mut client,&mut server);
+        transfer(&mut client, &mut server);
         server.pump(now).unwrap();
-        if server.plaintext()==&frame[..8] {break;}
+        if server.plaintext() == &frame[..8] {
+            break;
+        }
     }
-    assert_eq!(server.plaintext(),&frame[..8]);
-    assert_eq!(gate.dispatch_echo(active,&mut server),Err(AdmissionError::Busy));
+    assert_eq!(server.plaintext(), &frame[..8]);
+    assert_eq!(
+        gate.dispatch_echo(active, &mut server),
+        Err(AdmissionError::Busy)
+    );
     assert!(!server.has_pending_plaintext());
     client.send_plaintext(&frame[8..]).unwrap();
     for now in 17..=32 {
         client.pump(now).unwrap();
-        transfer(&mut client,&mut server);
+        transfer(&mut client, &mut server);
         server.pump(now).unwrap();
-        if server.plaintext()==frame.as_slice() {break;}
+        if server.plaintext() == frame.as_slice() {
+            break;
+        }
     }
-    assert_eq!(server.plaintext(),frame.as_slice());
-    assert_eq!(gate.dispatch_echo(active,&mut server),Ok(20));
+    assert_eq!(server.plaintext(), frame.as_slice());
+    assert_eq!(gate.dispatch_echo(active, &mut server), Ok(20));
     assert!(server.plaintext().is_empty());
 }
 #[test]
 fn v019_sec_n05_two_coalesced_echoes_are_consumed_one_at_a_time() {
-    use crate::admission::{Admission,Error as AdmissionError};
-    let pairs=v019_local_pairings();
-    let mut a_buf=Buffers::new();
-    let mut b_buf=Buffers::new();
-    let mut client=pairs[0].client(&mut a_buf,0).unwrap();
-    let mut server=pairs[1].server(&mut b_buf,0).unwrap();
-    handshake(&mut client,&mut server);
-    let mut gate=Admission::new();
-    let pending=gate.begin(7,0,16).unwrap();
-    let active=gate.authenticate(pending,&server).unwrap();
-    let mut frames=[0u8;40];
+    use crate::admission::{Admission, Error as AdmissionError};
+    let pairs = v019_local_pairings();
+    let mut a_buf = Buffers::new();
+    let mut b_buf = Buffers::new();
+    let mut client = pairs[0].client(&mut a_buf, 0).unwrap();
+    let mut server = pairs[1].server(&mut b_buf, 0).unwrap();
+    handshake(&mut client, &mut server);
+    let mut gate = Admission::new();
+    let pending = gate.begin(7, 0, 16).unwrap();
+    let active = gate.authenticate(pending, &server).unwrap();
+    let mut frames = [0u8; 40];
     for i in 0..2 {
-        let base=i*20;
-        frames[base..base+2].copy_from_slice(&1u16.to_le_bytes());
-        frames[base+2..base+4].copy_from_slice(&1u16.to_le_bytes());
-        frames[base+4..base+8].copy_from_slice(&4u32.to_le_bytes());
-        frames[base+8..base+16].copy_from_slice(&(i as u64+1).to_le_bytes());
-        frames[base+16..base+20].copy_from_slice(&[1,2,3,4]);
+        let base = i * 20;
+        frames[base..base + 2].copy_from_slice(&1u16.to_le_bytes());
+        frames[base + 2..base + 4].copy_from_slice(&1u16.to_le_bytes());
+        frames[base + 4..base + 8].copy_from_slice(&4u32.to_le_bytes());
+        frames[base + 8..base + 16].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+        frames[base + 16..base + 20].copy_from_slice(&[1, 2, 3, 4]);
     }
     client.send_plaintext(&frames).unwrap();
     for now in 1..=16 {
         client.pump(now).unwrap();
-        transfer(&mut client,&mut server);
+        transfer(&mut client, &mut server);
         server.pump(now).unwrap();
-        if server.plaintext()==frames.as_slice() {break;}
+        if server.plaintext() == frames.as_slice() {
+            break;
+        }
     }
-    assert_eq!(server.plaintext(),frames.as_slice());
-    assert_eq!(gate.dispatch_echo(active,&mut server),Ok(20));
-    assert_eq!(server.plaintext(),&frames[20..]);
-    assert_eq!(gate.dispatch_echo(active,&mut server),Err(AdmissionError::Busy));
+    assert_eq!(server.plaintext(), frames.as_slice());
+    assert_eq!(gate.dispatch_echo(active, &mut server), Ok(20));
+    assert_eq!(server.plaintext(), &frames[20..]);
+    assert_eq!(
+        gate.dispatch_echo(active, &mut server),
+        Err(AdmissionError::Busy)
+    );
     for now in 17..=40 {
         server.pump(now).unwrap();
-        transfer(&mut server,&mut client);
+        transfer(&mut server, &mut client);
         client.pump(now).unwrap();
-        if client.plaintext()==&frames[..20] {break;}
+        if client.plaintext() == &frames[..20] {
+            break;
+        }
     }
-    assert_eq!(client.plaintext(),&frames[..20]);
+    assert_eq!(client.plaintext(), &frames[..20]);
     client.consume_plaintext(20).unwrap();
-    gate.confirm_tls_output_drained(active,&server).unwrap();
-    assert_eq!(gate.dispatch_echo(active,&mut server),Ok(20));
+    gate.confirm_tls_output_drained(active, &server).unwrap();
+    assert_eq!(gate.dispatch_echo(active, &mut server), Ok(20));
     assert!(server.plaintext().is_empty());
 }
 #[test]
 fn v019_sec_n_native_tcp_adapter_preserves_partial_socket_io_and_ciphertext() {
     use crate::admission::Admission;
-    use crate::native_tcp::{self,NativeSocket,SocketError};
+    use crate::native_tcp::{self, NativeSocket, SocketError};
     struct NativeBytes {
         incoming: Vec<u8>,
         received: usize,
@@ -629,146 +693,198 @@ fn v019_sec_n_native_tcp_adapter_preserves_partial_socket_io_and_ciphertext() {
         chunk: usize,
     }
     impl NativeSocket for NativeBytes {
-        fn poll_native(&mut self, _now_ms:u64)->Result<(),SocketError>{Ok(())}
-        fn read_ciphertext(&mut self,out:&mut [u8])->Result<usize,SocketError>{
-            if self.received==self.incoming.len(){return Err(SocketError::Again);}
-            let count=out.len().min(self.chunk).min(self.incoming.len()-self.received);
-            out[..count].copy_from_slice(&self.incoming[self.received..self.received+count]);
-            self.received+=count;
+        fn poll_native(&mut self, _now_ms: u64) -> Result<(), SocketError> {
+            Ok(())
+        }
+        fn read_ciphertext(&mut self, out: &mut [u8]) -> Result<usize, SocketError> {
+            if self.received == self.incoming.len() {
+                return Err(SocketError::Again);
+            }
+            let count = out
+                .len()
+                .min(self.chunk)
+                .min(self.incoming.len() - self.received);
+            out[..count].copy_from_slice(&self.incoming[self.received..self.received + count]);
+            self.received += count;
             Ok(count)
         }
-        fn queue_ciphertext(&mut self,bytes:&[u8])->Result<usize,SocketError>{
-            let count=self.chunk.min(bytes.len());
+        fn queue_ciphertext(&mut self, bytes: &[u8]) -> Result<usize, SocketError> {
+            let count = self.chunk.min(bytes.len());
             self.emitted.extend_from_slice(&bytes[..count]);
             Ok(count)
         }
     }
-    let pairs=v019_local_pairings();
-    let mut c_buf=Buffers::new();
-    let mut s_buf=Buffers::new();
-    let mut client=pairs[0].client(&mut c_buf,0).unwrap();
-    let mut server=pairs[1].server(&mut s_buf,0).unwrap();
-    handshake(&mut client,&mut server);
-    let mut gate=Admission::new();
-    let p=gate.begin(7,0,16).unwrap();
-    let active=gate.authenticate(p,&server).unwrap();
-    let mut frame=[0u8;20];
+    let pairs = v019_local_pairings();
+    let mut c_buf = Buffers::new();
+    let mut s_buf = Buffers::new();
+    let mut client = pairs[0].client(&mut c_buf, 0).unwrap();
+    let mut server = pairs[1].server(&mut s_buf, 0).unwrap();
+    handshake(&mut client, &mut server);
+    let mut gate = Admission::new();
+    let p = gate.begin(7, 0, 16).unwrap();
+    let active = gate.authenticate(p, &server).unwrap();
+    let mut frame = [0u8; 20];
     frame[..2].copy_from_slice(&1u16.to_le_bytes());
     frame[2..4].copy_from_slice(&1u16.to_le_bytes());
     frame[4..8].copy_from_slice(&4u32.to_le_bytes());
     frame[8..16].copy_from_slice(&13u64.to_le_bytes());
-    frame[16..20].copy_from_slice(&[9,8,7,6]);
+    frame[16..20].copy_from_slice(&[9, 8, 7, 6]);
     client.send_plaintext(&frame).unwrap();
     client.pump(1).unwrap();
-    let encrypted=client.pending_tls().to_vec();
+    let encrypted = client.pending_tls().to_vec();
     client.consume_tls(encrypted.len()).unwrap();
-    let mut socket=NativeBytes{incoming:encrypted,received:0,emitted:Vec::new(),chunk:7};
-    let mut scratch=[0u8;64];
-    let mut echoes=0;
+    let mut socket = NativeBytes {
+        incoming: encrypted,
+        received: 0,
+        emitted: Vec::new(),
+        chunk: 7,
+    };
+    let mut scratch = [0u8; 64];
+    let mut echoes = 0;
     for now in 1..=120 {
-        let progress=native_tcp::turn(&mut socket,&mut gate,active,&mut server,&mut scratch,now).unwrap();
-        echoes+=usize::from(progress.echo_queued!=0);
-        if socket.received==socket.incoming.len()
-            && !server.has_pending_plaintext() && server.pending_tls().is_empty()
-            && echoes!=0 {break;}
+        let progress = native_tcp::turn(
+            &mut socket,
+            &mut gate,
+            active,
+            &mut server,
+            &mut scratch,
+            now,
+        )
+        .unwrap();
+        echoes += usize::from(progress.echo_queued != 0);
+        if socket.received == socket.incoming.len()
+            && !server.has_pending_plaintext()
+            && server.pending_tls().is_empty()
+            && echoes != 0
+        {
+            break;
+        }
     }
-    assert_eq!(echoes,1,"partial records never generate two replies");
-    assert_eq!(socket.received,socket.incoming.len());
+    assert_eq!(echoes, 1, "partial records never generate two replies");
+    assert_eq!(socket.received, socket.incoming.len());
     client.receive_tls(&socket.emitted).unwrap();
     client.pump(121).unwrap();
-    assert_eq!(client.plaintext(),frame.as_slice());
+    assert_eq!(client.plaintext(), frame.as_slice());
     gate.begin_drain(active).unwrap();
     gate.finish_drain(active).unwrap(); // mock-only, no physical TX/DMA proof
 }
 
 #[test]
 fn v019_sec_n_d_terminal_network_credit_requires_native_device_quiescence() {
-    use crate::admission::{Admission,Error as AdmissionError};
-    use crate::native_tcp::{self,NativeSocket,SocketError,Error as NativeError};
-    struct EvidenceSocket { closed:bool, nic_done:bool }
+    use crate::admission::{Admission, Error as AdmissionError};
+    use crate::native_tcp::{self, Error as NativeError, NativeSocket, SocketError};
+    struct EvidenceSocket {
+        closed: bool,
+        nic_done: bool,
+    }
     impl NativeSocket for EvidenceSocket {
-        fn terminal_tx_quiescent(&self)->bool { self.closed && self.nic_done }
-        fn poll_native(&mut self,_:u64)->Result<(),SocketError> {Ok(())}
-        fn read_ciphertext(&mut self,_:&mut [u8])->Result<usize,SocketError>{
+        fn terminal_tx_quiescent(&self) -> bool {
+            self.closed && self.nic_done
+        }
+        fn poll_native(&mut self, _: u64) -> Result<(), SocketError> {
+            Ok(())
+        }
+        fn read_ciphertext(&mut self, _: &mut [u8]) -> Result<usize, SocketError> {
             Err(SocketError::Again)
         }
-        fn queue_ciphertext(&mut self,_:&[u8])->Result<usize,SocketError>{
+        fn queue_ciphertext(&mut self, _: &[u8]) -> Result<usize, SocketError> {
             Err(SocketError::Again)
         }
     }
-    let pair=v019_local_pairings();
-    let mut client_buf=Buffers::new();
-    let mut server_buf=Buffers::new();
-    let mut client=pair[0].client(&mut client_buf,0).unwrap();
-    let mut server=pair[1].server(&mut server_buf,0).unwrap();
-    handshake(&mut client,&mut server);
-    let mut gate=Admission::new();
-    let pending=gate.begin(7,0,16).unwrap();
-    let active=gate.authenticate(pending,&server).unwrap();
+    let pair = v019_local_pairings();
+    let mut client_buf = Buffers::new();
+    let mut server_buf = Buffers::new();
+    let mut client = pair[0].client(&mut client_buf, 0).unwrap();
+    let mut server = pair[1].server(&mut server_buf, 0).unwrap();
+    handshake(&mut client, &mut server);
+    let mut gate = Admission::new();
+    let pending = gate.begin(7, 0, 16).unwrap();
+    let active = gate.authenticate(pending, &server).unwrap();
 
-    let mut socket=EvidenceSocket{closed:false,nic_done:false};
-    assert_eq!(native_tcp::finish_session(&socket,&mut gate,active,&server),
-        Err(NativeError::Admission(AdmissionError::Busy)));
-    socket.closed=true;
-    assert_eq!(native_tcp::finish_session(&socket,&mut gate,active,&server),
-        Err(NativeError::Admission(AdmissionError::Busy)));
-    socket.nic_done=true;
-    let mut other_buf=Buffers::new();
-    let other=pair[1].server(&mut other_buf,0).unwrap();
-    assert_eq!(native_tcp::finish_session(&socket,&mut gate,active,&other),
-        Err(NativeError::Admission(AdmissionError::Unauthenticated)));
-    assert_eq!(gate.active_count(),1);
-    native_tcp::finish_session(&socket,&mut gate,active,&server).unwrap();
-    assert_eq!(gate.active_count(),0);
-    assert_eq!(native_tcp::finish_session(&socket,&mut gate,active,&server),
-        Err(NativeError::Admission(AdmissionError::Stale)));
+    let mut socket = EvidenceSocket {
+        closed: false,
+        nic_done: false,
+    };
+    assert_eq!(
+        native_tcp::finish_session(&socket, &mut gate, active, &server),
+        Err(NativeError::Admission(AdmissionError::Busy))
+    );
+    socket.closed = true;
+    assert_eq!(
+        native_tcp::finish_session(&socket, &mut gate, active, &server),
+        Err(NativeError::Admission(AdmissionError::Busy))
+    );
+    socket.nic_done = true;
+    let mut other_buf = Buffers::new();
+    let other = pair[1].server(&mut other_buf, 0).unwrap();
+    assert_eq!(
+        native_tcp::finish_session(&socket, &mut gate, active, &other),
+        Err(NativeError::Admission(AdmissionError::Unauthenticated))
+    );
+    assert_eq!(gate.active_count(), 1);
+    native_tcp::finish_session(&socket, &mut gate, active, &server).unwrap();
+    assert_eq!(gate.active_count(), 0);
+    assert_eq!(
+        native_tcp::finish_session(&socket, &mut gate, active, &server),
+        Err(NativeError::Admission(AdmissionError::Stale))
+    );
 }
 #[test]
 fn v019_sec_n_d_tls_pending_reply_prevents_even_quiescent_socket_retirement() {
-    use crate::admission::{Admission,Error as AdmissionError};
-    use crate::native_tcp::{self,NativeSocket,SocketError,Error as NativeError};
+    use crate::admission::{Admission, Error as AdmissionError};
+    use crate::native_tcp::{self, Error as NativeError, NativeSocket, SocketError};
     struct Terminal;
     impl NativeSocket for Terminal {
-        fn terminal_tx_quiescent(&self)->bool { true }
-        fn poll_native(&mut self,_:u64)->Result<(),SocketError> {Ok(())}
-        fn read_ciphertext(&mut self,_:&mut [u8])->Result<usize,SocketError>{
+        fn terminal_tx_quiescent(&self) -> bool {
+            true
+        }
+        fn poll_native(&mut self, _: u64) -> Result<(), SocketError> {
+            Ok(())
+        }
+        fn read_ciphertext(&mut self, _: &mut [u8]) -> Result<usize, SocketError> {
             Err(SocketError::Again)
         }
-        fn queue_ciphertext(&mut self,_:&[u8])->Result<usize,SocketError>{
+        fn queue_ciphertext(&mut self, _: &[u8]) -> Result<usize, SocketError> {
             Err(SocketError::Again)
         }
     }
-    let pair=v019_local_pairings();
-    let mut client_buf=Buffers::new();
-    let mut server_buf=Buffers::new();
-    let mut client=pair[0].client(&mut client_buf,0).unwrap();
-    let mut server=pair[1].server(&mut server_buf,0).unwrap();
-    handshake(&mut client,&mut server);
-    let mut gate=Admission::new();
-    let pending=gate.begin(7,0,16).unwrap();
-    let key=gate.authenticate(pending,&server).unwrap();
-    let mut frame=[0u8;16];
+    let pair = v019_local_pairings();
+    let mut client_buf = Buffers::new();
+    let mut server_buf = Buffers::new();
+    let mut client = pair[0].client(&mut client_buf, 0).unwrap();
+    let mut server = pair[1].server(&mut server_buf, 0).unwrap();
+    handshake(&mut client, &mut server);
+    let mut gate = Admission::new();
+    let pending = gate.begin(7, 0, 16).unwrap();
+    let key = gate.authenticate(pending, &server).unwrap();
+    let mut frame = [0u8; 16];
     frame[..2].copy_from_slice(&1u16.to_le_bytes());
     frame[2..4].copy_from_slice(&1u16.to_le_bytes());
     frame[8..16].copy_from_slice(&33u64.to_le_bytes());
     client.send_plaintext(&frame).unwrap();
     for now in 1..16 {
         client.pump(now).unwrap();
-        transfer(&mut client,&mut server);
+        transfer(&mut client, &mut server);
         server.pump(now).unwrap();
-        if server.plaintext()==frame.as_slice() {break;}
+        if server.plaintext() == frame.as_slice() {
+            break;
+        }
     }
-    assert_eq!(server.plaintext(),frame.as_slice());
-    gate.dispatch_echo(key,&mut server).unwrap();
-    assert_eq!(native_tcp::finish_session(&Terminal,&mut gate,key,&server),
-        Err(NativeError::Admission(AdmissionError::Busy)));
+    assert_eq!(server.plaintext(), frame.as_slice());
+    gate.dispatch_echo(key, &mut server).unwrap();
+    assert_eq!(
+        native_tcp::finish_session(&Terminal, &mut gate, key, &server),
+        Err(NativeError::Admission(AdmissionError::Busy))
+    );
     server.pump(16).unwrap();
     assert!(!server.pending_tls().is_empty());
-    assert_eq!(native_tcp::finish_session(&Terminal,&mut gate,key,&server),
-        Err(NativeError::Admission(AdmissionError::Busy)));
+    assert_eq!(
+        native_tcp::finish_session(&Terminal, &mut gate, key, &server),
+        Err(NativeError::Admission(AdmissionError::Busy))
+    );
     server.consume_tls(server.pending_tls().len()).unwrap();
     // On real native TCP this consumed ciphertext is still separately
     // accounted; Terminal here simulates an independently verified device.
-    native_tcp::finish_session(&Terminal,&mut gate,key,&server).unwrap();
-    assert_eq!(gate.active_count(),0);
+    native_tcp::finish_session(&Terminal, &mut gate, key, &server).unwrap();
+    assert_eq!(gate.active_count(), 0);
 }

@@ -76,7 +76,8 @@ impl<'a> Process<'a> {
             prepared.fds[target] = Some(handle);
         }
         self.objects.free_into(&mut prepared.nulls[..null_count])?;
-        self.objects.free_into(&mut prepared.consoles[..console_count])?;
+        self.objects
+            .free_into(&mut prepared.consoles[..console_count])?;
         Ok(prepared)
     }
     /// Validate before process admission/publication. No references are acquired.
@@ -139,9 +140,17 @@ impl<'a> Process<'a> {
                 handle,
                 child_owner,
                 Description {
-                    object: if is_stdin { Object::Null } else { Object::Output },
+                    object: if is_stdin {
+                        Object::Null
+                    } else {
+                        Object::Output
+                    },
                     offset: 0,
-                    flags: if is_stdin { super::O_RDONLY } else { super::O_WRONLY },
+                    flags: if is_stdin {
+                        super::O_RDONLY
+                    } else {
+                        super::O_WRONLY
+                    },
                 },
             )?;
             child.fds[map.target as usize] = Some(handle);

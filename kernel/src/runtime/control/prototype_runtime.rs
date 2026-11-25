@@ -458,12 +458,12 @@ pub(super) fn step(worker: &mut Worker) {
         }
         return;
     }
-    if cpu::slot() == 2 {
-        // CPU2 is a business CPU in V0.20. Never enter the retired
-        // second control-worker path, including on stale mailbox wakeups.
+    if cpu::slot() != 0 {
+        // CPU1-3 are business CPUs in V0.20. Never enter the control-worker
+        // path on a business core, including on stale mailbox wakeups.
         return;
     }
-    assert_eq!(cpu::slot(), 1);
+    assert_eq!(cpu::slot(), 0);
     if !worker.probed {
         unsafe {
             core::arch::asm!("ic iallu", "dsb ish", "isb", options(nostack));
@@ -742,7 +742,7 @@ impl Coordinator {
         assert!(frequency >= 1000);
         let origin = timer::ticks();
         CLOCK_ORIGIN.store(origin, Ordering::Release);
-        let mut owner = Cores::new_fixed(CoreSet::from_bits(15)).expect("V0.19 fixed CPU1 role");
+        let mut owner = Cores::new_fixed(CoreSet::from_bits(15)).expect("V0.20 fixed CPU0 role");
         let threads = [2, 3].map(|slot| {
             Some(
                 owner

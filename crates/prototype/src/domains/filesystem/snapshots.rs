@@ -672,12 +672,25 @@ impl<const C: usize> FileSystem<C> {
         s: &mut Scratch,
     ) -> Result<RequestRecord, Error> {
         let refs = self.frozen.iter().flatten().any(|v| v.key == key);
-        if key.slot < 6 && self.snapshots.periodic_delete_requires_tree_proof(
-            j, d, s, &mut self.tx, request, key, refs, automatic
-        ).map_err(snapshot_error)? {
+        if key.slot < 6
+            && self
+                .snapshots
+                .periodic_delete_requires_tree_proof(
+                    j,
+                    d,
+                    s,
+                    &mut self.tx,
+                    request,
+                    key,
+                    refs,
+                    automatic,
+                )
+                .map_err(snapshot_error)?
+        {
             self.validate_snapshot_roots(j, d, s)?;
         }
-        self.snapshots.delete(j, d, s, &mut self.tx, request, key, refs, automatic)
+        self.snapshots
+            .delete(j, d, s, &mut self.tx, request, key, refs, automatic)
             .map_err(snapshot_error)
     }
 
@@ -958,7 +971,11 @@ impl<const C: usize> FileSystem<C> {
                         key: request_key,
                         expected_live_view_epoch: 0,
                     },
-                    key, true, j, d, s,
+                    key,
+                    true,
+                    j,
+                    d,
+                    s,
                 )?;
                 self.snapshots
                     .ack(j, d, s, &mut self.tx, request_key, result.result_digest)

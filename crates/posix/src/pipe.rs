@@ -105,8 +105,7 @@ impl Pipes {
         if owner == 0 {
             return Err(Errno::Inval);
         }
-        let (index, pipe) = self
-            .entries[..self.limit]
+        let (index, pipe) = self.entries[..self.limit]
             .iter_mut()
             .enumerate()
             .find(|(_, p)| p.open == [false; 2] && p.generation < GENERATION_MAX)
@@ -344,7 +343,10 @@ mod tests {
             let mut bytes = [0; 2];
             assert_eq!(pipes.read(20, read, &mut bytes), Ok(2));
             assert_eq!(bytes, [index as u8, 0xa5]);
-            assert_eq!(pipes.flags(20, write), Ok(crate::O_WRONLY | crate::O_NONBLOCK));
+            assert_eq!(
+                pipes.flags(20, write),
+                Ok(crate::O_WRONLY | crate::O_NONBLOCK)
+            );
             // Leave bytes and notifications queued when the final holder exits.
             assert_eq!(pipes.write(20, write, b"stale"), Ok(5));
         }

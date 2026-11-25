@@ -20,11 +20,15 @@ fn u32_at(b: &[u8], at: usize) -> Result<u32, Error> {
 }
 fn u64_at(b: &[u8], at: usize) -> Result<u64, Error> {
     let a = b.get(at..at + 8).ok_or(Error::Invalid)?;
-    Ok(u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]))
+    Ok(u64::from_le_bytes([
+        a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
+    ]))
 }
 fn hash_at(b: &[u8], at: usize) -> Result<[u8; 32], Error> {
-    b.get(at..at + 32).ok_or(Error::Invalid)?
-        .try_into().map_err(|_| Error::Invalid)
+    b.get(at..at + 32)
+        .ok_or(Error::Invalid)?
+        .try_into()
+        .map_err(|_| Error::Invalid)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,7 +100,9 @@ impl DecisionRecordV3 {
             _ => return Err(Error::Invalid),
         };
         let advice_present = match bytes[101] {
-            0 => false, 1 => true, _ => return Err(Error::Invalid),
+            0 => false,
+            1 => true,
+            _ => return Err(Error::Invalid),
         };
         let entry = Self {
             boot_epoch: u64_at(bytes, 8)?,
@@ -132,19 +138,30 @@ impl DecisionRecordV3 {
             plan_digest: hash_at(bytes, 192)?,
             candidate_set_hash: hash_at(bytes, 224)?,
         };
-        if !entry.structural_valid() { return Err(Error::Invalid); }
+        if !entry.structural_valid() {
+            return Err(Error::Invalid);
+        }
         Ok(entry)
     }
     fn structural_valid(&self) -> bool {
-        if self.boot_epoch == 0 || self.controller_epoch == 0
-            || self.decision_seq == 0 || self.plan_seq == 0
-            || self.snapshot_seq == 0 || self.target_generation == 0
-            || self.ledger_generation == 0 || self.core_generation == 0
-            || self.rules_generation == 0 || self.rule_id == 0
-            || self.action_index >= 16 || !(1..=15).contains(&self.domain_id)
-            || self.action_kind != 1 || self.mode > 2
-            || self.decision_expires_ns == 0 || self.choice_policy > 2
-            || self.allowed_mask == 0 || self.selected_index >= 32
+        if self.boot_epoch == 0
+            || self.controller_epoch == 0
+            || self.decision_seq == 0
+            || self.plan_seq == 0
+            || self.snapshot_seq == 0
+            || self.target_generation == 0
+            || self.ledger_generation == 0
+            || self.core_generation == 0
+            || self.rules_generation == 0
+            || self.rule_id == 0
+            || self.action_index >= 16
+            || !(1..=15).contains(&self.domain_id)
+            || self.action_kind != 1
+            || self.mode > 2
+            || self.decision_expires_ns == 0
+            || self.choice_policy > 2
+            || self.allowed_mask == 0
+            || self.selected_index >= 32
             || self.fallback_index >= 32
             || self.allowed_mask & (1u32 << self.selected_index) == 0
             || self.allowed_mask & (1u32 << self.fallback_index) == 0
@@ -156,33 +173,41 @@ impl DecisionRecordV3 {
         }
         match self.source {
             DecisionSource::RuleOnly => {
-                self.disposition == 0 && !self.advice_present
+                self.disposition == 0
+                    && !self.advice_present
                     && self.trial_permit_id == 0
                     && self.choice_policy <= 1
                     && self.selected_index == self.fallback_index
                     && self.recommended_index == u16::MAX
-                    && self.advisor_epoch == 0 && self.advice_seq == 0
+                    && self.advisor_epoch == 0
+                    && self.advice_seq == 0
                     && self.advice_model_generation == 0
                     && matches!(self.reason_code, 1 | 2 | 3 | 4 | 6 | 7)
             }
             DecisionSource::AiAssisted => {
-                self.mode == 2 && self.disposition == 1 && self.advice_present
+                self.mode == 2
+                    && self.disposition == 1
+                    && self.advice_present
                     && !matches!(self.domain_id, 6 | 11 | 12 | 14)
                     && self.choice_policy == 1
                     && self.trial_permit_id == 0
-                    && self.advisor_epoch != 0 && self.advice_seq != 0
+                    && self.advisor_epoch != 0
+                    && self.advice_seq != 0
                     && self.advice_model_generation != 0
                     && self.recommended_index < 32
                     && self.selected_index == self.recommended_index
                     && self.reason_code == 8
             }
             DecisionSource::AuthorizedTrial => {
-                self.disposition == 3 && !self.advice_present
-                    && self.choice_policy == 2 && self.trial_permit_id != 0
+                self.disposition == 3
+                    && !self.advice_present
+                    && self.choice_policy == 2
+                    && self.trial_permit_id != 0
                     && self.selected_index == self.fallback_index
                     && self.allowed_mask.count_ones() == 1
                     && self.recommended_index == u16::MAX
-                    && self.advisor_epoch == 0 && self.advice_seq == 0
+                    && self.advisor_epoch == 0
+                    && self.advice_seq == 0
                     && self.advice_model_generation == 0
                     && self.reason_code == 5
             }
@@ -205,8 +230,11 @@ impl DecisionRecordV3 {
         if candidate_count == 0 || candidate_count > 32 {
             return false;
         }
-        let full = if candidate_count == 32 { u32::MAX }
-            else { (1u32 << candidate_count) - 1 };
+        let full = if candidate_count == 32 {
+            u32::MAX
+        } else {
+            (1u32 << candidate_count) - 1
+        };
         self.allowed_mask & !full == 0
             && usize::from(self.selected_index) < candidate_count
             && usize::from(self.fallback_index) < candidate_count
@@ -223,11 +251,21 @@ mod tests {
         b[0..4].copy_from_slice(&DECISION_MAGIC.to_le_bytes());
         b[4..6].copy_from_slice(&DECISION_VERSION.to_le_bytes());
         b[6..8].copy_from_slice(&(DECISION_BYTES as u16).to_le_bytes());
-        for (at,value) in [
-            (8, 1u64), (16, 2), (24, 3), (32, 4), (40, 5),
-            (48, 17), (56, 6), (64, 7), (72, 8), (80, 9),
+        for (at, value) in [
+            (8, 1u64),
+            (16, 2),
+            (24, 3),
+            (32, 4),
+            (40, 5),
+            (48, 17),
+            (56, 6),
+            (64, 7),
+            (72, 8),
+            (80, 9),
             (144, 200),
-        ] { b[at..at+8].copy_from_slice(&value.to_le_bytes()); }
+        ] {
+            b[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
         b[88..92].copy_from_slice(&10u32.to_le_bytes());
         b[92..94].copy_from_slice(&0u16.to_le_bytes());
         b[94..96].copy_from_slice(&1u16.to_le_bytes());
@@ -237,7 +275,9 @@ mod tests {
         b[108..112].copy_from_slice(&2u32.to_le_bytes());
         b[152..156].copy_from_slice(&0b11u32.to_le_bytes());
         b[156..158].copy_from_slice(&1u16.to_le_bytes());
-        b[160] = 1; b[192] = 2; b[224] = 3;
+        b[160] = 1;
+        b[192] = 2;
+        b[224] = 3;
         b
     }
     #[test]
@@ -248,17 +288,21 @@ mod tests {
         assert!(record.matches_candidate_count(2));
         assert!(!record.matches_candidate_count(1));
         assert!(record.matches_rule(RuleMatch {
-            rule_id: 10, choice_policy: 0,
-            allowed_mask: 0b11, fallback_index: 1,
+            rule_id: 10,
+            choice_policy: 0,
+            allowed_mask: 0b11,
+            fallback_index: 1,
         }));
         assert!(!record.matches_rule(RuleMatch {
-            rule_id: 11, choice_policy: 0,
-            allowed_mask: 0b11, fallback_index: 1,
+            rule_id: 11,
+            choice_policy: 0,
+            allowed_mask: 0b11,
+            fallback_index: 1,
         }));
     }
     #[test]
     fn canonical_assisted_and_trial_records_still_require_external_authority() {
-        let mut ai=baseline();
+        let mut ai = baseline();
         ai[98] = 2; // ASSISTED
         ai[99] = 1; // AI_ASSISTED
         ai[100] = 1; // ADOPTED
@@ -276,32 +320,41 @@ mod tests {
         ai[94..96].copy_from_slice(&12u16.to_le_bytes());
         assert_eq!(DecisionRecordV3::decode(&ai), Err(Error::Denied));
 
-        let mut trial=baseline();
+        let mut trial = baseline();
         trial[99] = 2;
         trial[100] = 3;
         trial[108..112].copy_from_slice(&5u32.to_le_bytes());
         trial[136..144].copy_from_slice(&14u64.to_le_bytes());
         trial[152..156].copy_from_slice(&0b10u32.to_le_bytes());
         trial[158..160].copy_from_slice(&2u16.to_le_bytes());
-        let parsed=DecisionRecordV3::decode(&trial).unwrap();
+        let parsed = DecisionRecordV3::decode(&trial).unwrap();
         assert_eq!(parsed.source, DecisionSource::AuthorizedTrial);
         assert!(!parsed.matches_rule(RuleMatch {
-            rule_id: 10, choice_policy: 2,
-            allowed_mask: 0b10, fallback_index: 1,
+            rule_id: 10,
+            choice_policy: 2,
+            allowed_mask: 0b10,
+            fallback_index: 1,
         }));
     }
     #[test]
     fn malformed_lengths_retired_disposition_and_rule_bypass_fail_closed() {
         assert!(DecisionRecordV3::decode(&baseline()[..255]).is_err());
         for (offset, value) in [
-            (4, 1u8), (6, 1), (99, 3), (100, 2), (101, 2),
-            (106, 1), (152, 0), (156, 3), (160, 0),
+            (4, 1u8),
+            (6, 1),
+            (99, 3),
+            (100, 2),
+            (101, 2),
+            (106, 1),
+            (152, 0),
+            (156, 3),
+            (160, 0),
         ] {
-            let mut b=baseline();
-            b[offset]=value;
+            let mut b = baseline();
+            b[offset] = value;
             assert!(DecisionRecordV3::decode(&b).is_err(), "byte {offset}");
         }
-        let mut b=baseline();
+        let mut b = baseline();
         b[108..112].copy_from_slice(&7u32.to_le_bytes());
         assert!(DecisionRecordV3::decode(&b).is_ok());
         // reason7 requires an independently frozen Disposition; a parsed

@@ -1,4 +1,6 @@
 #![no_std]
+// Isolated legacy dual-node code pending phased removal (ledger #26); off by default.
+#[cfg(feature = "legacy-cluster")]
 pub mod cluster;
 pub mod contig_frames;
 pub mod control_plane;

@@ -92,6 +92,7 @@ jobs:
         run: |
           cargo fmt --all -- --check
           cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
+          cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,legacy-coreset -- -D warnings
           cargo test --locked --offline -p cyxia-kernel-core --test dispatch
           cargo test --locked --offline -p cyxia-platform-virt
           python3 -B -m unittest discover -s tests/host -p test_verify_smp.py -v
@@ -105,6 +106,10 @@ jobs:
               python3 tools/verify_smp.py --elf "$RUNNER_TEMP/smp-target/aarch64-unknown-none-softfloat/$profile/cyxia-kernel" --output "$RUNNER_TEMP/native-evidence/$profile-$iteration"
             done
           done
+      - name: Build and boot retired legacy CoreSet profile
+        run: |
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,legacy-coreset --target-dir "$RUNNER_TEMP/smp-legacy-target"
+          python3 tools/verify_smp.py --legacy-coreset --elf "$RUNNER_TEMP/smp-legacy-target/aarch64-unknown-none-softfloat/debug/cyxia-kernel" --output "$RUNNER_TEMP/native-evidence/legacy-coreset-1"
       - name: Require single-vCPU rejection
         shell: python
         run: |

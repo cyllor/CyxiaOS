@@ -31,27 +31,38 @@ pub struct Manager<const C: usize, const D: usize> {
     last_time: u64,
 }
 impl<const C: usize, const D: usize> Manager<C, D> {
-    /// Production V0.19 constructor: forbid historical mutable control-core
-    /// topology from entering the trusted manager.
+    /// Production V0.20 constructor: forbid historical mutable control-core
+    /// topology from entering the trusted manager. The fixed control core is
+    /// CPU0 (fixed.rs re-exports the cpu0_v0199 constants).
     pub fn new_fixed(
-        ownership: Ownership<C>, publisher: Identity, epochs: Epochs,
-        limits: Limits, policy_limits: [policy::Limits; D],
+        ownership: Ownership<C>,
+        publisher: Identity,
+        epochs: Epochs,
+        limits: Limits,
+        policy_limits: [policy::Limits; D],
     ) -> Result<Self, Error> {
-        if !ownership.fixed_control() { return Err(Error::Invalid); }
+        if !ownership.fixed_control() {
+            return Err(Error::Invalid);
+        }
         Self::new(ownership, publisher, epochs, limits, policy_limits)
     }
     /// V0.19.9 reference topology: true CPU0 controller with CPU1-3
     /// business cores. Native EL0 scheduling and IRQ migration must be
     /// independently boot-tested before this constructor is selected there.
     pub fn new_v0199_cpu0(
-        ownership: Ownership<C>, publisher: Identity, epochs: Epochs,
-        limits: Limits, policy_limits: [policy::Limits; D],
-    ) -> Result<Self,Error> {
+        ownership: Ownership<C>,
+        publisher: Identity,
+        epochs: Epochs,
+        limits: Limits,
+        policy_limits: [policy::Limits; D],
+    ) -> Result<Self, Error> {
         if !ownership.native_cpu0_v0199()
             || !ownership.fixed_control()
             || super::cpu0_v0199::validate_snapshot(ownership.snapshot()).is_err()
-        {return Err(Error::Invalid);}
-        Self::new(ownership,publisher,epochs,limits,policy_limits)
+        {
+            return Err(Error::Invalid);
+        }
+        Self::new(ownership, publisher, epochs, limits, policy_limits)
     }
     pub fn new(
         ownership: Ownership<C>,
@@ -90,10 +101,13 @@ impl<const C: usize, const D: usize> Manager<C, D> {
     ) -> Result<super::fixed::Review, Error> {
         self.check_time(now)?;
         let snapshot = self.snapshot();
-        let (control, cpu)=if self.ownership.native_cpu0_v0199() {
-            (super::cpu0_v0199::CONTROL_MASK,super::cpu0_v0199::CONTROL_CPU)
+        let (control, cpu) = if self.ownership.native_cpu0_v0199() {
+            (
+                super::cpu0_v0199::CONTROL_MASK,
+                super::cpu0_v0199::CONTROL_CPU,
+            )
         } else {
-            (super::fixed::CONTROL_MASK,super::fixed::CONTROL_CPU)
+            (super::fixed::CONTROL_MASK, super::fixed::CONTROL_CPU)
         };
         if !self.ownership.fixed_control()
             || snapshot.control != control
@@ -103,12 +117,15 @@ impl<const C: usize, const D: usize> Manager<C, D> {
         {
             return Err(Error::Denied);
         }
-        pair.review(rules, super::advisory::TrustedScope {
-            epochs: self.epochs,
-            domain,
-            target: subject,
-            now_ns: now,
-        })
+        pair.review(
+            rules,
+            super::advisory::TrustedScope {
+                epochs: self.epochs,
+                domain,
+                target: subject,
+                now_ns: now,
+            },
+        )
     }
     pub const fn epochs(&self) -> Epochs {
         self.epochs
@@ -126,25 +143,26 @@ impl<const C: usize, const D: usize> Manager<C, D> {
     fn actor(&self, actor: Identity, cpu: usize) -> Result<(), Error> {
         // SEC-S04: a protected local publisher identity, never an AI proposal
         // or a claimed network identity, is the only admissible submitter.
-        let caller = crate::security::syscall::ProtectedRole::from_kernel(actor.id, actor.generation);
+        let caller =
+            crate::security::syscall::ProtectedRole::from_kernel(actor.id, actor.generation);
         let owner = crate::security::syscall::ProtectedRole::from_kernel(
-            self.publisher.id, self.publisher.generation,
+            self.publisher.id,
+            self.publisher.generation,
         );
         let authorization = if self.ownership.native_cpu0_v0199() {
             crate::security::syscall::can_publish_cpu0_v0199(
-                caller, owner, cpu, self.snapshot().control,
+                caller,
+                owner,
+                cpu,
+                self.snapshot().control,
             )
         } else if self.ownership.fixed_control() {
-            crate::security::syscall::can_publish_fixed(
-                caller, owner, cpu, self.snapshot().control,
-            )
+            crate::security::syscall::can_publish_fixed(caller, owner, cpu, self.snapshot().control)
         } else {
             // Historical transition test fixtures are not native V0.19.
             crate::security::syscall::can_publish(caller, owner)
         };
-        if authorization.is_err()
-            || !self.snapshot().permits(cpu, Plane::Control)
-        {
+        if authorization.is_err() || !self.snapshot().permits(cpu, Plane::Control) {
             Err(Error::Denied)
         } else {
             Ok(())

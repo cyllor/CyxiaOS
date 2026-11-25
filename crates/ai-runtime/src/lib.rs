@@ -746,7 +746,10 @@ pub fn cosmic_unix_policy(free: u32, requested: u32) -> Result<(bool, u64), Erro
     if free > COSMIC_UNIX_MODEL_CAPACITY || requested == 0 || requested > 2 {
         return Err(Error::Invalid);
     }
-    Ok((model::memory((free as usize).min(PAGES), requested as usize), COSMIC_UNIX_MODEL_ID))
+    Ok((
+        model::memory((free as usize).min(PAGES), requested as usize),
+        COSMIC_UNIX_MODEL_ID,
+    ))
 }
 
 /// Metadata-only shared object admission. Creating an empty memfd consumes one
@@ -762,11 +765,18 @@ const SHARED_OBJECT_MODEL: (u64, u32) = if cfg!(feature = "cosmic-notifications-
 pub const SHARED_OBJECT_MODEL_ID: u64 = SHARED_OBJECT_MODEL.0;
 pub const SHARED_OBJECT_MODEL_CAPACITY: u32 = SHARED_OBJECT_MODEL.1;
 pub fn shared_object_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
-    if free > SHARED_OBJECT_MODEL_CAPACITY || requested == 0 || requested > SHARED_OBJECT_MODEL_CAPACITY {
+    if free > SHARED_OBJECT_MODEL_CAPACITY
+        || requested == 0
+        || requested > SHARED_OBJECT_MODEL_CAPACITY
+    {
         return Err(Error::Invalid);
     }
     let features = [1, free as i32, requested as i32, 0];
-    let score: i32 = weights::SHARED_OBJECT.into_iter().zip(features).map(|(w, x)| w * x).sum();
+    let score: i32 = weights::SHARED_OBJECT
+        .into_iter()
+        .zip(features)
+        .map(|(w, x)| w * x)
+        .sum();
     Ok((score >= 0, SHARED_OBJECT_MODEL_ID))
 }
 
@@ -777,11 +787,18 @@ pub fn shared_object_policy(free: u32, requested: u32) -> Result<(bool, u64), Er
 pub const COSMIC_SHARED_MAPPING_MODEL_ID: u64 = 0x200c;
 pub const COSMIC_SHARED_MAPPING_CAPACITY: u32 = 32;
 pub fn cosmic_shared_mapping_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
-    if free > COSMIC_SHARED_MAPPING_CAPACITY || requested == 0 || requested > COSMIC_SHARED_MAPPING_CAPACITY {
+    if free > COSMIC_SHARED_MAPPING_CAPACITY
+        || requested == 0
+        || requested > COSMIC_SHARED_MAPPING_CAPACITY
+    {
         return Err(Error::Invalid);
     }
     let features = [1, free as i32, requested as i32, 0];
-    let score: i32 = weights::SHARED_OBJECT.into_iter().zip(features).map(|(w, x)| w * x).sum();
+    let score: i32 = weights::SHARED_OBJECT
+        .into_iter()
+        .zip(features)
+        .map(|(w, x)| w * x)
+        .sum();
     Ok((score >= 0, COSMIC_SHARED_MAPPING_MODEL_ID))
 }
 
@@ -868,7 +885,10 @@ pub const FULL_OS_POOL_ANON_MODEL_ID: u64 = 0x2007;
 /// 32-page reserve and 2,048-page request bound; out-of-domain inputs are rejected.
 /// Admission confers no authority: the kernel must commit exclusive physical
 /// backing at mmap, zero it before publication, and enforce mapping permissions.
-pub fn full_os_pool_anonymous_memory_policy(free: u32, requested: u32) -> Result<(bool, u64), Error> {
+pub fn full_os_pool_anonymous_memory_policy(
+    free: u32,
+    requested: u32,
+) -> Result<(bool, u64), Error> {
     if free > 16384 || requested == 0 || requested > 2048 {
         return Err(Error::Invalid);
     }

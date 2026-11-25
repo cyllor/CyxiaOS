@@ -616,9 +616,7 @@ impl FileSystem {
     }
     /// A read already computed these features for the learning window; scoring
     /// the same node table twice per read is redundant.
-    fn proposal_from(
-        &mut self, x: [[i32; 4]; NODES], valid: [bool; NODES],
-    ) -> CacheDecision {
+    fn proposal_from(&mut self, x: [[i32; 4]; NODES], valid: [bool; NODES]) -> CacheDecision {
         let ai_selected = valid.iter().filter(|valid| **valid).count() > CACHE_LINES;
         if ai_selected {
             self.policy.cache_proposals = self.policy.cache_proposals.saturating_add(1);

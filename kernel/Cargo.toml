@@ -57,6 +57,9 @@ v0199-control-bringup-1g = ["v0199-control-bringup", "prototype-memory"]
 v0199-epoch-disk-selftest = ["v0199-cpu0-role-selftest", "prototype-memory", "dep:sha2"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]
 ai-control-selftest = ["smp-selftest"]
+# Retired dynamic C/B/T/Q control-core migration mechanism, retained only as
+# an opt-in historical fixture; never part of the fixed-CPU0 default profile.
+legacy-coreset = []
 # Four-core EL1 Ethernet driver bring-up only; no TLS/cluster certification.
 net-selftest = ["smp-selftest", "prototype-memory"]
 model-v13-selftest = ["smp-selftest", "prototype-memory"]
@@ -64,7 +67,8 @@ storage-v13-selftest = ["smp-selftest", "prototype-memory"]
 tcp-v13-selftest = ["smp-selftest", "prototype-memory", "dep:cyxia-cluster-transport"]
 prototype-runtime = ["smp-selftest", "prototype-memory"]
 # Continuous AI core scheduling and protected authenticated cluster service together.
-unified-runtime = ["prototype-runtime", "dep:cyxia-cluster-transport", "dep:sha2", "dep:cyxia-peer-billing"]
+# The legacy diagnostic path keeps the historical prototype wire codec available.
+unified-runtime = ["prototype-runtime", "dep:cyxia-cluster-transport", "dep:sha2", "dep:cyxia-peer-billing", "cyxia-prototype/legacy-cluster"]
 prototype-memory = ["cyxia-platform-virt/prototype-memory"]
 graphics = []
 ported = []

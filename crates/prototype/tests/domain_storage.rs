@@ -1,12 +1,12 @@
 use cyxia_prototype::{
     boot::BootSession,
-    cluster::volume::{Cursor, Volume},
     domains::{
         Action, Error, ObjectKey, PolicyStamp,
         filesystem::{FIRST_ORDINARY_BLOCK, FileSystem, OpenMode, validate_volume},
         io::{Class, ORDINARY_BYTES, Request, Scheduler, Submission},
     },
     journal::{self, AfterImage, BlockDevice, Journal},
+    local_volume::{Cursor, Volume},
     storage::{INODE_START, Inode, TOTAL_BLOCKS},
 };
 use std::collections::BTreeMap;

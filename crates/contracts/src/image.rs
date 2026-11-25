@@ -8,9 +8,15 @@ pub enum ImageAbi {
 
 impl ImageAbi {
     pub const fn machine(self) -> u16 {
-        match self { Self::Aarch64 => 183, Self::X86_64 => 62 }
+        match self {
+            Self::Aarch64 => 183,
+            Self::X86_64 => 62,
+        }
     }
     pub const fn entry_alignment(self) -> u64 {
-        match self { Self::Aarch64 => 4, Self::X86_64 => 1 }
+        match self {
+            Self::Aarch64 => 4,
+            Self::X86_64 => 1,
+        }
     }
 }

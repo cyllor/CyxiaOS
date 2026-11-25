@@ -115,7 +115,10 @@ fn reservation_identity_never_reallocates_a_consumed_or_cancelled_ticket() {
         Err(Error::Stale)
     );
     assert_eq!(ipc.send(key(2), ep, 10, b"x", 0, &mut b), Err(Error::Stale));
-    assert_eq!(ipc.wait_send(key(2), ep, 10, b"x", 0, &mut b), Err(Error::Stale));
+    assert_eq!(
+        ipc.wait_send(key(2), ep, 10, b"x", 0, &mut b),
+        Err(Error::Stale)
+    );
     let next = ipc.reserve_send(key(2), ep, 11, 0, &mut b).unwrap();
     assert_ne!(a, next);
     assert_eq!(
@@ -135,14 +138,23 @@ fn reservation_identity_never_reallocates_a_consumed_or_cancelled_ticket() {
     assert_eq!(ipc.stats(ep).unwrap().depth, 1);
     ipc.receive_batch(key(1), ep, 0, &mut b).unwrap();
     assert_eq!(b.messages, vec![(1, 11, b"once".to_vec())]);
-    assert_eq!(ipc.send(key(2), ep, 11, b"replay", 0, &mut b), Err(Error::Stale));
-    assert_eq!(ipc.wait_send(key(2), ep, 11, b"replay", 0, &mut b), Err(Error::Stale));
+    assert_eq!(
+        ipc.send(key(2), ep, 11, b"replay", 0, &mut b),
+        Err(Error::Stale)
+    );
+    assert_eq!(
+        ipc.wait_send(key(2), ep, 11, b"replay", 0, &mut b),
+        Err(Error::Stale)
+    );
     assert_eq!(ipc.stats(ep).unwrap().depth, 0);
     // Same numeric request under a different authenticated actor is distinct.
     assert_eq!(ipc.send(key(3), ep, 11, b"peer", 0, &mut b), Ok(2));
-    let waiter=ipc.wait_send(key(2), ep, 12, b"wait", 0, &mut b).unwrap();
-    assert_eq!(ipc.send(key(2), ep, 12, b"wait", 0, &mut b), Err(Error::Conflict));
-    assert!(matches!(ipc.wait_result(waiter),Ok(WaitResult::Sent(_))));
+    let waiter = ipc.wait_send(key(2), ep, 12, b"wait", 0, &mut b).unwrap();
+    assert_eq!(
+        ipc.send(key(2), ep, 12, b"wait", 0, &mut b),
+        Err(Error::Conflict)
+    );
+    assert!(matches!(ipc.wait_result(waiter), Ok(WaitResult::Sent(_))));
 }
 
 #[test]

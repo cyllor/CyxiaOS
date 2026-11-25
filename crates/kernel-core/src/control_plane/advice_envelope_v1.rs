@@ -24,11 +24,16 @@ fn le32(bytes: &[u8], at: usize) -> Result<u32, Error> {
 }
 fn le64(bytes: &[u8], at: usize) -> Result<u64, Error> {
     let s = bytes.get(at..at + 8).ok_or(Error::Invalid)?;
-    Ok(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+    Ok(u64::from_le_bytes([
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+    ]))
 }
 fn digest(bytes: &[u8], at: usize) -> Result<[u8; 32], Error> {
-    bytes.get(at..at + 32).ok_or(Error::Invalid)?
-        .try_into().map_err(|_| Error::Invalid)
+    bytes
+        .get(at..at + 32)
+        .ok_or(Error::Invalid)?
+        .try_into()
+        .map_err(|_| Error::Invalid)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,12 +153,16 @@ impl AdviceEnvelopeV1 {
             || scope.sampled_ns > scope.now_ns
             || self.expires_ns <= scope.now_ns
             || self.expires_ns <= scope.sampled_ns
-            || !scope.sampled_ns.checked_add(MAX_ADVICE_LIFETIME_NS)
-                .is_some_and(|end| self.expires_ns <= end)
+            || scope
+                .sampled_ns
+                .checked_add(MAX_ADVICE_LIFETIME_NS)
+                .is_none_or(|end| self.expires_ns > end)
         {
             return Err(Error::Denied);
         }
-        let candidate = *scope.candidates.get(usize::from(self.recommended_index))
+        let candidate = *scope
+            .candidates
+            .get(usize::from(self.recommended_index))
             .ok_or(Error::Invalid)?;
         Ok(Advice {
             epochs: scope.epochs,
@@ -177,8 +186,14 @@ mod tests {
         b[4..6].copy_from_slice(&ADVICE_VERSION.to_le_bytes());
         b[6..8].copy_from_slice(&(ADVICE_BYTES as u16).to_le_bytes());
         for (at, v) in [
-            (8, 7u64), (16, 1), (24, 42), (32, 17),
-            (40, 5), (48, 9), (56, 11), (64, 200),
+            (8, 7u64),
+            (16, 1),
+            (24, 42),
+            (32, 17),
+            (40, 5),
+            (48, 9),
+            (56, 11),
+            (64, 200),
             (72, 6),
         ] {
             b[at..at + 8].copy_from_slice(&v.to_le_bytes());
@@ -192,16 +207,25 @@ mod tests {
         b
     }
     fn scope<'a>(candidates: &'a [u16]) -> TrustedAdviceScope<'a> {
-        let mut model_hash = [0u8; 32]; model_hash[0] = 1;
-        let mut candidate_set_hash = [0u8; 32]; candidate_set_hash[0] = 2;
+        let mut model_hash = [0u8; 32];
+        model_hash[0] = 1;
+        let mut candidate_set_hash = [0u8; 32];
+        candidate_set_hash[0] = 2;
         TrustedAdviceScope {
             epochs: Epochs {
-                boot: 1, controller: 3, model: 6, resources: 9, cores: 11,
+                boot: 1,
+                controller: 3,
+                model: 6,
+                resources: 9,
+                cores: 11,
             },
             advisor_epoch: 7,
             snapshot_seq: 42,
             domain: 3,
-            target: Identity { id: 17, generation: 5 },
+            target: Identity {
+                id: 17,
+                generation: 5,
+            },
             sampled_ns: 100,
             now_ns: 150,
             action_kind: 1,
@@ -232,11 +256,14 @@ mod tests {
         let mut bad = bytes();
         bad[4] = 2;
         assert!(AdviceEnvelopeV1::decode(&bad).is_err());
-        bad = bytes(); bad[86..88].copy_from_slice(&33u16.to_le_bytes());
+        bad = bytes();
+        bad[86..88].copy_from_slice(&33u16.to_le_bytes());
         assert!(AdviceEnvelopeV1::decode(&bad).is_err());
-        bad = bytes(); bad[84..86].copy_from_slice(&3u16.to_le_bytes());
+        bad = bytes();
+        bad[84..86].copy_from_slice(&3u16.to_le_bytes());
         assert!(AdviceEnvelopeV1::decode(&bad).is_err());
-        bad = bytes(); bad[82..84].copy_from_slice(&2u16.to_le_bytes());
+        bad = bytes();
+        bad[82..84].copy_from_slice(&2u16.to_le_bytes());
         assert!(AdviceEnvelopeV1::decode(&bad).is_err());
 
         let frame = AdviceEnvelopeV1::decode(&bytes()).unwrap();

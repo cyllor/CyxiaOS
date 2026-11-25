@@ -1,7 +1,14 @@
 use super::{EMPTY_KEY, MAX_GROUPS, MAX_THREADS, UNSET, valid_key};
 use crate::domains::{Action, Error, ObjectKey, PolicyStamp, WINDOW_NS};
 
-pub const CPU_BUDGET_NS: u64 = WINDOW_NS * 9 / 10;
+/// Per-business-core reserve for IRQ / unattributed kernel work / necessary
+/// maintenance. Design rule (V0.20 §3): 每业务核 100 ms 窗内硬承诺 ≤90 ms，
+/// 另留 10 ms 供 IRQ/未归属内核工作/必要维护；借用协议尚未实现.
+pub const IRQ_MAINTENANCE_RESERVE_NS: u64 = WINDOW_NS / 10;
+/// Hard per-window business commitment ceiling: the window minus the explicit
+/// IRQ/maintenance reserve (90 ms of each 100 ms window).
+pub const CPU_BUDGET_NS: u64 = WINDOW_NS - IRQ_MAINTENANCE_RESERVE_NS;
+const _: () = assert!(CPU_BUDGET_NS + IRQ_MAINTENANCE_RESERVE_NS == WINDOW_NS);
 pub const CONTROL_BUDGET_NS: u64 = WINDOW_NS * 7 / 10;
 pub const FAIR_WAIT_NS: u64 = WINDOW_NS;
 // CPU execution and shared monotonic time are independent native clocks. Only
@@ -1090,13 +1097,18 @@ impl Scheduler {
         }
         // Like new admission, migration must leave enough wall-window
         // capacity for every runnable minimum, not just aggregate CPU quota.
-        let destination_minimum: u64 = self.threads.iter().flatten()
+        let destination_minimum: u64 = self
+            .threads
+            .iter()
+            .flatten()
             .filter(|peer| usize::from(peer.spec.cpu) == cpu && peer.state == RunState::Runnable)
             .map(|peer| peer.spec.minimum_ns.saturating_sub(peer.spent))
             .sum();
         let incoming_minimum = if t.state == RunState::Runnable {
             t.spec.minimum_ns.saturating_sub(t.spent)
-        } else { 0 };
+        } else {
+            0
+        };
         if destination_minimum.saturating_add(incoming_minimum) > WINDOW_NS - now % WINDOW_NS {
             return Err(Error::Budget);
         }
@@ -1258,7 +1270,8 @@ impl Scheduler {
         self.time(now)?;
         // A credit is not issuable unless the exact aligned expiry is
         // representable. Otherwise complete_control cannot settle its key.
-        let end = (now / WINDOW_NS).checked_add(1)
+        let end = (now / WINDOW_NS)
+            .checked_add(1)
             .and_then(|window| window.checked_mul(WINDOW_NS))
             .ok_or(Error::Overflow)?;
         let remaining_ns = end - now;
@@ -1413,5 +1426,22 @@ impl Scheduler {
     }
     pub fn active(&self, cpu: usize) -> Option<Dispatch> {
         self.cpus.get(cpu).and_then(|c| c.active)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn window_splits_into_ninety_ms_business_and_ten_ms_reserve() {
+        assert_eq!(WINDOW_NS, 100_000_000);
+        assert_eq!(CPU_BUDGET_NS, 90_000_000);
+        assert_eq!(IRQ_MAINTENANCE_RESERVE_NS, 10_000_000);
+        assert_eq!(CPU_BUDGET_NS + IRQ_MAINTENANCE_RESERVE_NS, WINDOW_NS);
+    }
+    #[test]
+    fn cpu_budget_matches_historical_nine_tenths_of_window() {
+        // The explicit reserve must not move the historical 9/10 commitment.
+        assert_eq!(CPU_BUDGET_NS, WINDOW_NS * 9 / 10);
     }
 }

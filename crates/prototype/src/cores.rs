@@ -209,7 +209,7 @@ pub struct Cores {
     // Persists independently of thread lifetimes, affinity and ownership.
     window_spent: [u16; MAX_CPUS],
     last_normal_proposal_ms: Option<u64>,
-    /// V0.19 native-only fixed role; legacy dynamic test fixtures use false.
+    /// V0.20 native-only fixed role; legacy dynamic test fixtures use false.
     fixed_control: bool,
 }
 impl Cores {
@@ -241,19 +241,21 @@ impl Cores {
             fixed_control: false,
         })
     }
-    /// V0.19 native topology: CPU1 alone owns the AI control plane.
-    /// Failure never promotes a business core. CPU0 is EL1 broker, not a
-    /// second AI control core. The old Cores::new remains a historical
-    /// transition-test fixture; this is the only native construction path.
+    /// V0.20 native topology: CPU0 alone owns the control plane; CPU1-3 are
+    /// the ordinary business cores. Failure never promotes a business core to
+    /// control. The old Cores::new remains a historical transition-test
+    /// fixture; this is the only native construction path.
     pub fn new_fixed(online: CoreSet) -> Result<Self, Error> {
-        if !online.contains(1) || online.bits() & !0b10 == 0 {
+        if !online.contains(0) || online.bits() & !0b0001 == 0 {
             return Err(Error::Invalid);
         }
-        let mut owner = Self::new(online, CoreSet::from_bits(0b10))?;
+        let mut owner = Self::new(online, CoreSet::from_bits(0b0001))?;
         owner.fixed_control = true;
         Ok(owner)
     }
-    pub const fn fixed_control(&self) -> bool { self.fixed_control }
+    pub const fn fixed_control(&self) -> bool {
+        self.fixed_control
+    }
     pub const fn snapshot(&self) -> Snapshot {
         self.state
     }
@@ -341,9 +343,11 @@ impl Cores {
         now_ms: u64,
         retiring: Option<ThreadHandle>,
     ) -> Result<Ticket, Error> {
-        // V0.19 does not grant any control-core add/remove/transfer operation,
+        // V0.20 does not grant any control-core add/remove/transfer operation,
         // even when a model supplies a formerly legal mask and epoch.
-        if self.fixed_control { return Err(Error::Invalid); }
+        if self.fixed_control {
+            return Err(Error::Invalid);
+        }
         if expected_core_gen != self.state.core_generation
             || expected_ledger_gen != self.state.ledger_generation
         {
@@ -865,31 +869,49 @@ mod tests {
 }
 
 #[cfg(test)]
-mod v019_fixed_tests {
+mod v020_fixed_tests {
     use super::*;
-    #[test] fn cpu1_is_only_control_and_old_scale_is_rejected_without_state_change() {
-        let mut cores=Cores::new_fixed(CoreSet::from_bits(0b1111)).unwrap();
-        let before=cores.snapshot();
-        assert_eq!(before.control.bits(),0b10);
-        assert_eq!(before.business.bits(),0b1101);
+    #[test]
+    fn cpu0_is_only_control_and_old_scale_is_rejected_without_state_change() {
+        let mut cores = Cores::new_fixed(CoreSet::from_bits(0b1111)).unwrap();
+        let before = cores.snapshot();
+        assert_eq!(before.control.bits(), 0b0001);
+        assert_eq!(before.business.bits(), 0b1110);
         assert!(cores.fixed_control());
-        for target in [0b110,0b10,0b100,0b1] {
-            assert_eq!(cores.begin(CoreSet::from_bits(target),
-                before.core_generation,before.ledger_generation,1),
-                Err(Error::Invalid));
-            assert_eq!(cores.snapshot(),before);
+        for target in [0b0010, 0b0100, 0b0011, 0b1110] {
+            assert_eq!(
+                cores.begin(
+                    CoreSet::from_bits(target),
+                    before.core_generation,
+                    before.ledger_generation,
+                    1
+                ),
+                Err(Error::Invalid)
+            );
+            assert_eq!(cores.snapshot(), before);
         }
     }
-    #[test] fn fixed_role_must_exist_and_cannot_be_replaced_after_fault() {
-        assert!(Cores::new_fixed(CoreSet::from_bits(0b1101)).is_err());
-        assert!(Cores::new_fixed(CoreSet::from_bits(0b10)).is_err());
-        let mut c=Cores::new_fixed(CoreSet::from_bits(0b1111)).unwrap();
-        let stop=c.suspect(1).unwrap();
-        assert_eq!(stop.cpu(),1);
-        assert!(!c.snapshot().permits(1,Plane::Control));
-        assert!(!c.snapshot().permits(2,Plane::Control));
-        assert_eq!(c.begin(CoreSet::from_bits(0b100),
-            c.snapshot().core_generation,c.snapshot().ledger_generation,2),
-            Err(Error::Invalid));
+    #[test]
+    fn fixed_role_must_exist_and_cannot_be_replaced_after_fault() {
+        // CPU0 (the control core) must be online, and at least one business
+        // core must remain; neither a missing CPU0 nor a lone CPU0 is valid.
+        assert!(Cores::new_fixed(CoreSet::from_bits(0b1110)).is_err());
+        assert!(Cores::new_fixed(CoreSet::from_bits(0b0001)).is_err());
+        let mut c = Cores::new_fixed(CoreSet::from_bits(0b1111)).unwrap();
+        let stop = c.suspect(0).unwrap();
+        assert_eq!(stop.cpu(), 0);
+        assert!(!c.snapshot().permits(0, Plane::Control));
+        // No business core is promoted to control after a CPU0 fault.
+        assert!(!c.snapshot().permits(1, Plane::Control));
+        assert!(!c.snapshot().permits(2, Plane::Control));
+        assert_eq!(
+            c.begin(
+                CoreSet::from_bits(0b0010),
+                c.snapshot().core_generation,
+                c.snapshot().ledger_generation,
+                2
+            ),
+            Err(Error::Invalid)
+        );
     }
 }

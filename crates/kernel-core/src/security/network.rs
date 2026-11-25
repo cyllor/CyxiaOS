@@ -25,16 +25,26 @@ impl VerifiedTls {
     /// actual transcript, peer signature, key exchange and pinned certificate.
     #[allow(dead_code)] // Constructed by the native authority adapter once integrated.
     pub(crate) const fn from_native_tls(
-        peer_pin: [u8; 32], version: u16, suite: u16,
-        early_data: bool, resumed: bool,
+        peer_pin: [u8; 32],
+        version: u16,
+        suite: u16,
+        early_data: bool,
+        resumed: bool,
     ) -> Self {
-        Self { peer_pin, version, suite, early_data, resumed }
+        Self {
+            peer_pin,
+            version,
+            suite,
+            early_data,
+            resumed,
+        }
     }
-    pub fn read_only_echo(self, pinned_peer: &[u8;32]) -> Result<ReadOnlyEcho, Error> {
+    pub fn read_only_echo(self, pinned_peer: &[u8; 32]) -> Result<ReadOnlyEcho, Error> {
         if self.peer_pin != *pinned_peer
             || self.version != TLS13
             || self.suite != TLS_AES_128_GCM_SHA256
-            || self.early_data || self.resumed
+            || self.early_data
+            || self.resumed
         {
             return Err(Error::Unauthorized);
         }
@@ -42,25 +52,35 @@ impl VerifiedTls {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReadOnlyEcho { _private: () }
+pub struct ReadOnlyEcho {
+    _private: (),
+}
 pub struct EchoRequest<'a> {
     pub request_id: u64,
     pub payload: &'a [u8],
 }
 pub fn parse_read_only_echo<'a>(
-    _: ReadOnlyEcho, packet: &'a [u8],
+    _: ReadOnlyEcho,
+    packet: &'a [u8],
 ) -> Result<EchoRequest<'a>, Error> {
-    if packet.len() < 16 { return Err(Error::Invalid); }
-    let version = u16::from_le_bytes([packet[0],packet[1]]);
-    let opcode = u16::from_le_bytes([packet[2],packet[3]]);
-    let length = u32::from_le_bytes([packet[4],packet[5],packet[6],packet[7]]);
+    if packet.len() < 16 {
+        return Err(Error::Invalid);
+    }
+    let version = u16::from_le_bytes([packet[0], packet[1]]);
+    let opcode = u16::from_le_bytes([packet[2], packet[3]]);
+    let length = u32::from_le_bytes([packet[4], packet[5], packet[6], packet[7]]);
     if version != 1 || opcode != 1 || length > MAX_ECHO as u32 {
         return Err(Error::Invalid);
     }
     let total = 16usize.checked_add(length as usize).ok_or(Error::Invalid)?;
-    if packet.len() != total { return Err(Error::Invalid); }
+    if packet.len() != total {
+        return Err(Error::Invalid);
+    }
     let request_id = u64::from_le_bytes(packet[8..16].try_into().map_err(|_| Error::Invalid)?);
-    Ok(EchoRequest { request_id, payload: &packet[16..] })
+    Ok(EchoRequest {
+        request_id,
+        payload: &packet[16..],
+    })
 }
 #[derive(Clone, Copy, Debug)]
 struct Source {
@@ -71,6 +91,14 @@ struct Source {
     inflight: u8,
     active: u8, // successful sessions are still owned by this source
 }
+/// Legacy host-contract rate limiter (V0.19 single-domain host model).
+/// This is NOT the production admission ledger. Single-machine native EL0
+/// network services must use `cyxia_net_transport::admission::Admission`
+/// as the sole authoritative connection-credit ledger (32 sources,
+/// 4 pending, 16 active, bound to the verified TLS session generation).
+/// Decision: docs/implementation/v19-security-six-tracks.md,
+/// "生产级接线门槛". Never wire both ledgers on one production connection;
+/// dual credit accounting on the same session is forbidden.
 pub struct RateLimiter {
     sources: [Option<Source>; MAX_SOURCES],
     global_tokens: u64,
@@ -79,16 +107,26 @@ pub struct RateLimiter {
     pending: u8,
     active: u8,
 }
-impl Default for RateLimiter { fn default() -> Self { Self::new() } }
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl RateLimiter {
     pub const fn new() -> Self {
         Self {
-            sources: [None; MAX_SOURCES], global_tokens: BURST,
-            global_ns: 0, rate: 16, pending: 0, active: 0,
+            sources: [None; MAX_SOURCES],
+            global_tokens: BURST,
+            global_ns: 0,
+            rate: 16,
+            pending: 0,
+            active: 0,
         }
     }
     fn refill(tokens: u64, elapsed_ns: u64, rate: u16) -> u64 {
-        tokens.saturating_add(elapsed_ns.saturating_mul(u64::from(rate))).min(BURST)
+        tokens
+            .saturating_add(elapsed_ns.saturating_mul(u64::from(rate)))
+            .min(BURST)
     }
     /// The caller supplies the protected configured rate, never a peer/model
     /// field. Settle old rates before any change, without replenishing bursts.
@@ -108,34 +146,69 @@ impl RateLimiter {
         Ok(())
     }
     fn can_evict(entry: Source, now_ns: u64, rate: u16) -> bool {
-        entry.inflight == 0 && entry.active == 0
+        entry.inflight == 0
+            && entry.active == 0
             && now_ns >= entry.last_ns
             && Self::refill(entry.tokens, now_ns - entry.last_ns, rate.min(8)) == BURST
     }
     /// V0.19.9 protected post-cookie admission. All capacity/debt checks run
     /// before either token is debited or a new source is published.
     pub fn request_handshake_ns(&mut self, ip: u32, now_ns: u64, rate: u16) -> Result<(), Error> {
-        if ip == 0 { return Err(Error::Invalid); }
+        if ip == 0 {
+            return Err(Error::Invalid);
+        }
         self.settle(now_ns, rate)?;
         if self.pending >= MAX_PENDING || self.global_tokens < TOKEN {
             return Err(Error::Capacity);
         }
-        let (at, current) = if let Some(at) = self.sources.iter().position(|r| r.is_some_and(|r| r.ip == ip)) {
+        let (at, current) = if let Some(at) = self
+            .sources
+            .iter()
+            .position(|r| r.is_some_and(|r| r.ip == ip))
+        {
             (at, self.sources[at].ok_or(Error::Stale)?)
         } else {
-            let at = self.sources.iter().position(Option::is_none)
-                .or_else(|| self.sources.iter().enumerate()
-                    .filter_map(|(at, row)| row.filter(|entry| Self::can_evict(*entry, now_ns, rate))
-                        .map(|entry| (at, entry.last_request)))
-                    .min_by_key(|&(at, last)| (last, at)).map(|(at, _)| at))
+            let at = self
+                .sources
+                .iter()
+                .position(Option::is_none)
+                .or_else(|| {
+                    self.sources
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(at, row)| {
+                            row.filter(|entry| Self::can_evict(*entry, now_ns, rate))
+                                .map(|entry| (at, entry.last_request))
+                        })
+                        .min_by_key(|&(at, last)| (last, at))
+                        .map(|(at, _)| at)
+                })
                 .ok_or(Error::Capacity)?;
-            (at, Source { ip, tokens: BURST, last_ns: now_ns, last_request: now_ns, inflight: 0, active: 0 })
+            (
+                at,
+                Source {
+                    ip,
+                    tokens: BURST,
+                    last_ns: now_ns,
+                    last_request: now_ns,
+                    inflight: 0,
+                    active: 0,
+                },
+            )
         };
-        if current.inflight != 0 { return Err(Error::Capacity); }
+        if current.inflight != 0 {
+            return Err(Error::Capacity);
+        }
         let per = Self::refill(current.tokens, now_ns - current.last_ns, rate.min(8));
-        if per < TOKEN { return Err(Error::Capacity); }
+        if per < TOKEN {
+            return Err(Error::Capacity);
+        }
         self.sources[at] = Some(Source {
-            tokens: per - TOKEN, last_ns: now_ns, last_request: now_ns, inflight: 1, ..current
+            tokens: per - TOKEN,
+            last_ns: now_ns,
+            last_request: now_ns,
+            inflight: 1,
+            ..current
         });
         self.global_tokens -= TOKEN;
         self.pending += 1;
@@ -149,16 +222,24 @@ impl RateLimiter {
     pub fn finish_handshake(&mut self, ip: u32, success: bool) -> Result<(), Error> {
         // Caller supplies the independently authenticated source from the
         // native TCP endpoint, NEVER a source claimed in TLS plaintext.
-        let source = self.sources.iter_mut().flatten().find(|s| s.ip == ip)
+        let source = self
+            .sources
+            .iter_mut()
+            .flatten()
+            .find(|s| s.ip == ip)
             .ok_or(Error::Stale)?;
-        if source.inflight == 0 || self.pending == 0 { return Err(Error::Stale); }
+        if source.inflight == 0 || self.pending == 0 {
+            return Err(Error::Stale);
+        }
         // A completed rejected/full handshake no longer owns a pending slot;
         // it must never take a free active slot or silently leave a stale
         // pending credit behind. Native caller closes any unadmitted TLS.
         source.inflight -= 1;
         self.pending -= 1;
         if success {
-            if self.active >= MAX_ACTIVE { return Err(Error::Capacity); }
+            if self.active >= MAX_ACTIVE {
+                return Err(Error::Capacity);
+            }
             source.active = source.active.checked_add(1).ok_or(Error::Exhausted)?;
             self.active += 1;
         }
@@ -168,9 +249,15 @@ impl RateLimiter {
     /// Generic "close one" APIs let one failed peer steal another peer's
     /// active capacity. This caller remains trusted by the native endpoint.
     pub fn close_active_from(&mut self, ip: u32) -> Result<(), Error> {
-        let source = self.sources.iter_mut().flatten().find(|s| s.ip == ip)
+        let source = self
+            .sources
+            .iter_mut()
+            .flatten()
+            .find(|s| s.ip == ip)
             .ok_or(Error::Stale)?;
-        if source.active == 0 || self.active == 0 { return Err(Error::Stale); }
+        if source.active == 0 || self.active == 0 {
+            return Err(Error::Stale);
+        }
         source.active -= 1;
         self.active -= 1;
         Ok(())
@@ -180,7 +267,10 @@ impl RateLimiter {
     pub fn evict_idle_ns(&mut self, ip: u32, now_ns: u64) -> Result<(), Error> {
         let rate = self.rate;
         self.settle(now_ns, rate)?;
-        let slot = self.sources.iter_mut().find(|r| r.is_some_and(|r| r.ip == ip))
+        let slot = self
+            .sources
+            .iter_mut()
+            .find(|r| r.is_some_and(|r| r.ip == ip))
             .ok_or(Error::Stale)?;
         let entry = slot.as_ref().ok_or(Error::Stale)?;
         if entry.active != 0 || !Self::can_evict(*entry, now_ns, rate) {
@@ -192,71 +282,108 @@ impl RateLimiter {
     pub fn evict_idle(&mut self, ip: u32, second: u64) -> Result<(), Error> {
         self.evict_idle_ns(ip, second.checked_mul(TOKEN).ok_or(Error::Invalid)?)
     }
-    pub const fn pending(&self) -> u8 { self.pending }
-    pub const fn active(&self) -> u8 { self.active }
+    pub const fn pending(&self) -> u8 {
+        self.pending
+    }
+    pub const fn active(&self) -> u8 {
+        self.active
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn proof() -> VerifiedTls {
-        VerifiedTls::from_native_tls([3;32], TLS13, TLS_AES_128_GCM_SHA256, false, false)
+        VerifiedTls::from_native_tls([3; 32], TLS13, TLS_AES_128_GCM_SHA256, false, false)
     }
-    fn cap() -> ReadOnlyEcho { proof().read_only_echo(&[3;32]).unwrap() }
+    fn cap() -> ReadOnlyEcho {
+        proof().read_only_echo(&[3; 32]).unwrap()
+    }
     fn packet(payload: &[u8]) -> [u8; 20] {
-        let mut bytes = [0u8;20];
+        let mut bytes = [0u8; 20];
         bytes[0..2].copy_from_slice(&1u16.to_le_bytes());
         bytes[2..4].copy_from_slice(&1u16.to_le_bytes());
         bytes[4..8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         bytes[8..16].copy_from_slice(&7u64.to_le_bytes());
-        bytes[16..16+payload.len()].copy_from_slice(payload);
+        bytes[16..16 + payload.len()].copy_from_slice(payload);
         bytes
     }
-    #[test] fn sec_n01_wrong_pin_or_suite_refuses_service() {
-        assert_eq!(proof().read_only_echo(&[4;32]), Err(Error::Unauthorized));
-        let bad = VerifiedTls::from_native_tls([3;32], 0x0303, TLS_AES_128_GCM_SHA256, false, false);
-        assert_eq!(bad.read_only_echo(&[3;32]), Err(Error::Unauthorized));
+    #[test]
+    fn sec_n01_wrong_pin_or_suite_refuses_service() {
+        assert_eq!(proof().read_only_echo(&[4; 32]), Err(Error::Unauthorized));
+        let bad =
+            VerifiedTls::from_native_tls([3; 32], 0x0303, TLS_AES_128_GCM_SHA256, false, false);
+        assert_eq!(bad.read_only_echo(&[3; 32]), Err(Error::Unauthorized));
     }
-    #[test] fn sec_n02_early_data_and_resumption_refused() {
-        for (early,resumed) in [(true,false),(false,true)] {
-            let bad = VerifiedTls::from_native_tls([3;32], TLS13, TLS_AES_128_GCM_SHA256, early, resumed);
-            assert_eq!(bad.read_only_echo(&[3;32]), Err(Error::Unauthorized));
+    #[test]
+    fn sec_n02_early_data_and_resumption_refused() {
+        for (early, resumed) in [(true, false), (false, true)] {
+            let bad = VerifiedTls::from_native_tls(
+                [3; 32],
+                TLS13,
+                TLS_AES_128_GCM_SHA256,
+                early,
+                resumed,
+            );
+            assert_eq!(bad.read_only_echo(&[3; 32]), Err(Error::Unauthorized));
         }
     }
-    #[test] fn sec_n03_handshake_capacity_not_unbounded() {
-        let mut limiter=RateLimiter::new();
-        for i in 1..=4 { limiter.request_handshake(i,0,16).unwrap(); }
-        assert_eq!(limiter.pending(),4);
-        assert_eq!(limiter.request_handshake(5,0,16),Err(Error::Capacity));
+    #[test]
+    fn sec_n03_handshake_capacity_not_unbounded() {
+        let mut limiter = RateLimiter::new();
+        for i in 1..=4 {
+            limiter.request_handshake(i, 0, 16).unwrap();
+        }
+        assert_eq!(limiter.pending(), 4);
+        assert_eq!(limiter.request_handshake(5, 0, 16), Err(Error::Capacity));
     }
-    #[test] fn sec_n04_burst_not_reset_by_repeating_source() {
-        let mut limiter=RateLimiter::new();
+    #[test]
+    fn sec_n04_burst_not_reset_by_repeating_source() {
+        let mut limiter = RateLimiter::new();
         for _ in 0..4 {
-            limiter.request_handshake(1,0,16).unwrap();
-            limiter.finish_handshake(1,false).unwrap();
+            limiter.request_handshake(1, 0, 16).unwrap();
+            limiter.finish_handshake(1, false).unwrap();
         }
-        assert_eq!(limiter.request_handshake(1,0,16),Err(Error::Capacity));
-        assert_eq!(limiter.evict_idle(1,0),Err(Error::Busy));
+        assert_eq!(limiter.request_handshake(1, 0, 16), Err(Error::Capacity));
+        assert_eq!(limiter.evict_idle(1, 0), Err(Error::Busy));
     }
-    #[test] fn sec_n05_echo_rejects_tail_or_opcode() {
-        let mut bytes = packet(&[1,2,3,4]);
-        assert_eq!(parse_read_only_echo(cap(),&bytes).unwrap().payload,&[1,2,3,4]);
-        bytes[2]=2;
-        assert!(matches!(parse_read_only_echo(cap(),&bytes),Err(Error::Invalid)));
-        bytes[2]=1;
-        assert!(matches!(parse_read_only_echo(cap(),&bytes[..19]),Err(Error::Invalid)));
+    #[test]
+    fn sec_n05_echo_rejects_tail_or_opcode() {
+        let mut bytes = packet(&[1, 2, 3, 4]);
+        assert_eq!(
+            parse_read_only_echo(cap(), &bytes).unwrap().payload,
+            &[1, 2, 3, 4]
+        );
+        bytes[2] = 2;
+        assert!(matches!(
+            parse_read_only_echo(cap(), &bytes),
+            Err(Error::Invalid)
+        ));
+        bytes[2] = 1;
+        assert!(matches!(
+            parse_read_only_echo(cap(), &bytes[..19]),
+            Err(Error::Invalid)
+        ));
     }
-    #[test] fn sec_n06_service_right_is_read_only_by_construction() {
-        let bytes = packet(&[1,2,3,4]);
-        let request=parse_read_only_echo(cap(),&bytes).unwrap();
-        assert_eq!(request.request_id,7);
+    #[test]
+    fn sec_n06_service_right_is_read_only_by_construction() {
+        let bytes = packet(&[1, 2, 3, 4]);
+        let request = parse_read_only_echo(cap(), &bytes).unwrap();
+        assert_eq!(request.request_id, 7);
     }
-    #[test] fn sec_n07_oversized_payload_is_rejected_pre_dispatch() {
-        let mut bytes = [0u8;16];
-        bytes[0]=1; bytes[2]=1; bytes[4..8].copy_from_slice(&4097u32.to_le_bytes());
-        assert!(matches!(parse_read_only_echo(cap(),&bytes),Err(Error::Invalid)));
+    #[test]
+    fn sec_n07_oversized_payload_is_rejected_pre_dispatch() {
+        let mut bytes = [0u8; 16];
+        bytes[0] = 1;
+        bytes[2] = 1;
+        bytes[4..8].copy_from_slice(&4097u32.to_le_bytes());
+        assert!(matches!(
+            parse_read_only_echo(cap(), &bytes),
+            Err(Error::Invalid)
+        ));
     }
-    #[test] fn v019_sec_n03_full_active_pool_releases_new_failed_handshake() {
+    #[test]
+    fn v019_sec_n03_full_active_pool_releases_new_failed_handshake() {
         let mut limiter = RateLimiter::new();
         for ip in 1..=16 {
             limiter.request_handshake(ip, u64::from(ip), 16).unwrap();
@@ -271,7 +398,8 @@ mod tests {
         assert_eq!(limiter.pending(), 0);
         assert_eq!(limiter.close_active_from(17), Err(Error::Stale));
     }
-    #[test] fn v019_sec_n04_one_source_cannot_steal_other_active_credit() {
+    #[test]
+    fn v019_sec_n04_one_source_cannot_steal_other_active_credit() {
         let mut limiter = RateLimiter::new();
         limiter.request_handshake(7, 0, 4).unwrap();
         limiter.finish_handshake(7, true).unwrap();
@@ -282,7 +410,8 @@ mod tests {
         assert_eq!(limiter.active(), 0);
         assert_eq!(limiter.close_active_from(7), Err(Error::Stale));
     }
-    #[test] fn v019_sec_n04_connected_source_is_never_evicted_or_replenished_by_forgetting() {
+    #[test]
+    fn v019_sec_n04_connected_source_is_never_evicted_or_replenished_by_forgetting() {
         let mut limiter = RateLimiter::new();
         limiter.request_handshake(7, 0, 4).unwrap();
         limiter.finish_handshake(7, true).unwrap();
@@ -291,52 +420,68 @@ mod tests {
         limiter.evict_idle(7, 10).unwrap();
         assert_eq!(limiter.active(), 0);
     }
-    #[test] fn v0199_rejected_new_sources_never_occupy_table_and_refill_is_fractional() {
-        let mut limiter=RateLimiter::new();
+    #[test]
+    fn v0199_rejected_new_sources_never_occupy_table_and_refill_is_fractional() {
+        let mut limiter = RateLimiter::new();
         for ip in 1..=4 {
-            limiter.request_handshake_ns(ip,0,16).unwrap();
-            limiter.finish_handshake(ip,false).unwrap();
+            limiter.request_handshake_ns(ip, 0, 16).unwrap();
+            limiter.finish_handshake(ip, false).unwrap();
         }
         for ip in 5..=40 {
-            assert_eq!(limiter.request_handshake_ns(ip,0,16),Err(Error::Capacity));
+            assert_eq!(
+                limiter.request_handshake_ns(ip, 0, 16),
+                Err(Error::Capacity)
+            );
         }
-        assert_eq!(limiter.sources.iter().flatten().count(),4);
-        assert_eq!(limiter.request_handshake_ns(41,62_499_999,16),Err(Error::Capacity));
-        limiter.request_handshake_ns(41,62_500_000,16).unwrap();
-        assert_eq!(limiter.pending(),1);
-        assert_eq!(limiter.request_handshake_ns(42,62_499_999,16),Err(Error::Invalid));
+        assert_eq!(limiter.sources.iter().flatten().count(), 4);
+        assert_eq!(
+            limiter.request_handshake_ns(41, 62_499_999, 16),
+            Err(Error::Capacity)
+        );
+        limiter.request_handshake_ns(41, 62_500_000, 16).unwrap();
+        assert_eq!(limiter.pending(), 1);
+        assert_eq!(
+            limiter.request_handshake_ns(42, 62_499_999, 16),
+            Err(Error::Invalid)
+        );
     }
-    #[test] fn v0199_single_source_pending_and_rate_change_preserve_debt() {
-        let mut limiter=RateLimiter::new();
-        limiter.request_handshake_ns(1,0,4).unwrap();
-        assert_eq!(limiter.request_handshake_ns(1,0,4),Err(Error::Capacity));
-        limiter.finish_handshake(1,false).unwrap();
-        for ip in 2..=4 {
-            limiter.request_handshake_ns(ip,0,4).unwrap();
-            limiter.finish_handshake(ip,false).unwrap();
-        }
-        assert_eq!(limiter.request_handshake_ns(5,125_000_000,32),Err(Error::Capacity));
-        limiter.request_handshake_ns(5,140_625_000,32).unwrap();
-    }
-    #[test] fn v0199_lru_reuses_only_refilled_unreferenced_sources() {
-        let mut limiter=RateLimiter::new();
-        limiter.request_handshake(1,0,16).unwrap();
-        limiter.finish_handshake(1,true).unwrap();
-        for ip in 2..=32 {
-            limiter.request_handshake(ip,u64::from(ip),16).unwrap();
-            limiter.finish_handshake(ip,false).unwrap();
-        }
-        limiter.request_handshake(33,33,16).unwrap();
-        assert!(limiter.sources.iter().flatten().any(|s| s.ip==1));
-        assert!(!limiter.sources.iter().flatten().any(|s| s.ip==2));
-        assert_eq!(limiter.sources.iter().flatten().count(),32);
-    }
-    #[test] fn sec_n08_no_model_is_needed_for_rate_limit_and_echo() {
+    #[test]
+    fn v0199_single_source_pending_and_rate_change_preserve_debt() {
         let mut limiter = RateLimiter::new();
-        limiter.request_handshake(7,0,4).unwrap();
-        limiter.finish_handshake(7,true).unwrap();
-        assert_eq!(limiter.active(),1);
+        limiter.request_handshake_ns(1, 0, 4).unwrap();
+        assert_eq!(limiter.request_handshake_ns(1, 0, 4), Err(Error::Capacity));
+        limiter.finish_handshake(1, false).unwrap();
+        for ip in 2..=4 {
+            limiter.request_handshake_ns(ip, 0, 4).unwrap();
+            limiter.finish_handshake(ip, false).unwrap();
+        }
+        assert_eq!(
+            limiter.request_handshake_ns(5, 125_000_000, 32),
+            Err(Error::Capacity)
+        );
+        limiter.request_handshake_ns(5, 140_625_000, 32).unwrap();
+    }
+    #[test]
+    fn v0199_lru_reuses_only_refilled_unreferenced_sources() {
+        let mut limiter = RateLimiter::new();
+        limiter.request_handshake(1, 0, 16).unwrap();
+        limiter.finish_handshake(1, true).unwrap();
+        for ip in 2..=32 {
+            limiter.request_handshake(ip, u64::from(ip), 16).unwrap();
+            limiter.finish_handshake(ip, false).unwrap();
+        }
+        limiter.request_handshake(33, 33, 16).unwrap();
+        assert!(limiter.sources.iter().flatten().any(|s| s.ip == 1));
+        assert!(!limiter.sources.iter().flatten().any(|s| s.ip == 2));
+        assert_eq!(limiter.sources.iter().flatten().count(), 32);
+    }
+    #[test]
+    fn sec_n08_no_model_is_needed_for_rate_limit_and_echo() {
+        let mut limiter = RateLimiter::new();
+        limiter.request_handshake(7, 0, 4).unwrap();
+        limiter.finish_handshake(7, true).unwrap();
+        assert_eq!(limiter.active(), 1);
         limiter.close_active_from(7).unwrap();
-        assert_eq!(limiter.active(),0);
+        assert_eq!(limiter.active(), 0);
     }
 }

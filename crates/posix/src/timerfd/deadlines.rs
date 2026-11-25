@@ -10,7 +10,10 @@ struct Deadline {
 }
 impl Deadline {
     const EMPTY: Self = Self {
-        handle: Handle { slot: 0, generation: 0 },
+        handle: Handle {
+            slot: 0,
+            generation: 0,
+        },
         time: 0,
     };
 }
