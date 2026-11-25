@@ -122,6 +122,8 @@ class Bringup:
         require(len(survivors)==len(starts)==len(faults)==8,'missing isolated-survivor progress evidence')
         old_roots=set()
         recovery_cpu_ns=0
+        recovery_slices=rows('V0199_RESTART_RECOVERY_SLICES')
+        require(len(recovery_slices)==8,'missing checkpointed recovery debits')
         for i,role in enumerate(ROLES):
             at=304+i*12
             rid,old,new,old_root,new_root,old_cap,new_cap,esr,far,cost,scrubbed,ready=words[at:at+12]
@@ -133,7 +135,10 @@ class Bringup:
             old_roots.add(old_root)
             require(esr>>26==0x20 and esr&0x3f==7 and far==0x2f000,
                     'not a real EL0 guard instruction abort')
-            require(0<cost<=8_000_000,'recovery was not debited in its own reservation')
+            slices,largest=words[56+i],words[64+i]
+            require(0<slices and 0<largest<=2_000_000 and largest<=cost<=slices*largest
+                    and recovery_slices[i]==(role,slices,largest),
+                    'recovery slice debit or reservation mismatch')
             recovery_cpu_ns+=cost
             require((old_cap==new_cap==0) or (old_cap and new_cap and old_cap!=new_cap),
                     'old issued capability was reused')
@@ -211,6 +216,8 @@ class Bringup:
                     control_window_upper_bound_ns=upper,coordination_gap_crossings=crossings,
                     class_cpu_ns=classes,accounting_interval_ns=[start_ns,end_ns],
                     initial_role_load_cpu_ns=list(words[32:40]),initial_load_slices=list(words[48:56]),
+                    recovery_slice_counts=list(words[56:64]),maximum_recovery_slice_ns=max(words[64:72]),
+                    total_recovery_cpu_ns=recovery_cpu_ns,
                     maximum_initial_load_slice_ns=max(r[2] for r in loads),final_uart_tail_cpu_ns=elapsed-prefix,
                     exact_per_window_split=False,complete_production_accounting=False,
                     durable_role_restarts=False,
