@@ -378,6 +378,50 @@ mod tests {
         assert!(!gate.may_write(3,5));assert!(gate.may_write(4,5));
     }
     #[test]
+    fn snapshot_restore_restart_preserves_pending_and_ambiguous_open_custody(){
+        use crate::control_plane::Identity;
+        use super::super::snapshot_restore_gate::{RestoreGate,View,SnapshotKey,RestoreKey,Commit,Phase,Recovered};
+        let idx=index();let sec=security();
+        let recovery=Identity{id:4,generation:2};let opener=Identity{id:11,generation:3};
+        let view=View{fs_uuid:[1;16],live_epoch:3,protection_generation:5,root_hash:[6;32],retention_watermark:9};
+        let key=RestoreKey{principal:Identity{id:9,generation:1},request_seq:7};
+        let snapshot=SnapshotKey{fs_uuid:view.fs_uuid,snapshot_id:4,slot:0,generation:1,root_hash:[8;32]};
+        let mut first=RestoreGate::from_frozen(view,recovery,opener,|_|Ok(())).unwrap();
+        let p=first.prepare(recovery,key,snapshot,[7;32],&idx,&sec,|_|Ok(())).unwrap();
+        first.submit(recovery,p,||Err(Error::Unknown)).unwrap_err();
+        let owner2=Identity{generation:3,..recovery};
+        let opener2=Identity{generation:4,..opener};
+        let mut gate=RestoreGate::recover_frozen(view,owner2,opener2,Recovered::CommitUnknown(p),&idx,&sec,|v,state|{
+            assert_eq!(v,view);assert_eq!(state,Recovered::CommitUnknown(p));Ok(())
+        }).unwrap();
+        assert_eq!(gate.phase(),Phase::Unknown);
+        assert_eq!(gate.submit(owner2,p,||panic!("no repeated writer after restart")),Err(Error::Busy));
+        assert_eq!(gate.prepare(owner2,key,snapshot,[7;32],&idx,&sec,|_|panic!()),Err(Error::Unknown));
+        assert_eq!(gate.prepare(owner2,RestoreKey{request_seq:8,..key},snapshot,[7;32],&idx,&sec,|_|panic!()),Err(Error::Busy));
+        let restored=View{live_epoch:4,root_hash:[8;32],..view};
+        let c=Commit{key,txid:1,log_epoch:1,commit_lsn:3,view:restored,request_hash:[7;32]};
+        assert_eq!(gate.confirm(recovery,p,c,&idx,&sec,&idx,&sec,|_,_|panic!()),Err(Error::Unauthorized));
+        assert_eq!(gate.confirm(owner2,p,c,&idx,&sec,&idx,&sec,|_,_|Ok(())),Ok(restored));
+        assert_eq!(gate.reopen(opener2,restored,|_,_|Err(Error::Unknown)),Err(Error::Unknown));
+        assert_eq!(gate.phase(),Phase::ReopeningUnknown);
+        assert!(!gate.may_write(4,5));
+        assert_eq!(gate.reopen(opener2,restored,|_,_|panic!()),Err(Error::Busy));
+        assert!(matches!(RestoreGate::recover_frozen(restored,owner2,opener2,
+            Recovered::RestoredFrozen(p,Commit{view:View{retention_watermark:8,..restored},..c}),
+            &idx,&sec,|_,_|panic!()),Err(Error::Conflict)));
+        assert!(matches!(RestoreGate::recover_frozen(restored,owner2,opener2,Recovered::ReopeningUnknown(p,c),
+            &idx,&sec,|_,_|Err(Error::Unknown)),Err(Error::Unknown)));
+        let mut gate=RestoreGate::recover_frozen(restored,owner2,opener2,Recovered::ReopeningUnknown(p,c),
+            &idx,&sec,|_,_|Ok(())).unwrap();
+        assert!(!gate.may_write(4,5));
+        assert_eq!(gate.reconcile_reopen(opener,restored,|_,_|panic!()),Err(Error::Unauthorized));
+        assert_eq!(gate.reconcile_reopen(opener2,restored,|_,_|Err(Error::Unknown)),Err(Error::Unknown));
+        assert_eq!(gate.reconcile_reopen(opener2,restored,|v,commit|{
+            assert_eq!(v,restored);assert_eq!(commit,c);Ok(())
+        }),Ok(()));
+        assert!(gate.may_write(4,5));assert!(!gate.may_write(3,5));
+    }
+    #[test]
     fn snapshot_restore_preserves_current_system_state_exactly() {
         let old_index=index();
         let old_security=security();
