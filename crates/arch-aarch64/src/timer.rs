@@ -22,6 +22,7 @@ pub fn frequency() -> u64 {
 }
 
 /// Shared monotonic physical-timer ticks. This is not a per-vCPU CPU clock.
+#[inline(always)]
 pub fn ticks() -> u64 {
     let value;
     unsafe {
@@ -41,6 +42,7 @@ pub const fn cpu_frequency() -> u64 {
 }
 
 /// Read the current CPU's execution counter.
+#[inline(always)]
 pub fn cpu_ticks() -> u64 {
     let value;
     unsafe {
@@ -55,12 +57,19 @@ pub fn cpu_ticks() -> u64 {
 }
 
 /// Convert a per-vCPU PMU delta into nanoseconds without using the wall clock.
+#[inline(always)]
 pub fn cpu_ns(delta: u64) -> u64 {
-    ((u128::from(delta) * 1_000_000_000) / u128::from(cpu_frequency())).min(u128::from(u64::MAX))
-        as u64
+    // The locked QEMU accounting counter already counts nanoseconds.
+    // Exact identity conversion avoids wide arithmetic on every native
+    // entry/exit, including debug builds. This is NOT an assumption that
+    // physical A53 cycle counters run at 1GHz; other accounting backends
+    // require independent calibration and validation.
+    const _: () = assert!(cpu_frequency() == 1_000_000_000);
+    delta
 }
 
 /// Return actual execution time since `start` on the same vCPU.
+#[inline(always)]
 pub fn cpu_elapsed_ns(start: u64) -> u64 {
     // A regressed per-vCPU counter is not zero execution time. A poisoned
     // accounting source cannot be used for another budget grant. Panic goes
@@ -114,6 +123,7 @@ pub unsafe fn init_cpu_accounting() {
 
 /// # Safety
 /// Caller owns the physical timer interrupt and has installed its handler.
+#[inline(always)]
 pub unsafe fn arm(deadline: u64) {
     unsafe {
         asm!(
