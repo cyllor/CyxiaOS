@@ -110,10 +110,15 @@ struct Running {
 // architectural frequency is fixed for this boot; a second profile entry
 // rechecks it rather than silently reusing a different scale.
 static TIMER_FREQUENCY:AtomicU64=AtomicU64::new(0);
+static TIMER_INTEGRAL_NS_PER_TICK:AtomicU64=AtomicU64::new(0);
 fn init_timer_frequency(){
     let f=timer::frequency();assert!(f!=0);
     let old=TIMER_FREQUENCY.swap(f,Ordering::Relaxed);
     assert!(old==0||old==f);
+    // The same serialized CPU0 owner initializes and uses this exact
+    // cached integer scale. Non-integral frequencies retain wide conversion.
+    let scale=if 1_000_000_000%f==0{1_000_000_000/f}else{0};
+    TIMER_INTEGRAL_NS_PER_TICK.store(scale,Ordering::Relaxed);
 }
 #[inline]
 fn timer_frequency()->u64{
@@ -121,23 +126,18 @@ fn timer_frequency()->u64{
 }
 #[inline]
 fn ns_from_ticks(t:u64)->u64{
+    let scale=TIMER_INTEGRAL_NS_PER_TICK.load(Ordering::Relaxed);
+    if scale!=0{return t.checked_mul(scale).expect("monotonic ns");}
     let f=timer_frequency();
-    // Exact integer conversion. For the pinned 62.5 MHz generic timer
-    // this is t*16, not a soft-float 128-bit division on each dispatch.
-    // Retain the checked wide fallback for other non-divisor frequencies.
-    if 1_000_000_000%f==0{
-        return t.checked_mul(1_000_000_000/f).expect("monotonic ns");
-    }
     u64::try_from(u128::from(t)*1_000_000_000/u128::from(f)).expect("monotonic ns")
 }
 #[inline]
 fn now_ns()->u64{ns_from_ticks(timer::ticks())}
 #[inline]
 fn ticks_for(ns:u64)->u64{
+    let scale=TIMER_INTEGRAL_NS_PER_TICK.load(Ordering::Relaxed);
+    if scale!=0{return ns.div_ceil(scale).max(1);}
     let f=timer_frequency();
-    if 1_000_000_000%f==0{
-        return ns.div_ceil(1_000_000_000/f).max(1);
-    }
     u64::try_from((u128::from(ns)*u128::from(f)).div_ceil(1_000_000_000))
         .expect("timer ticks").max(1)
 }
