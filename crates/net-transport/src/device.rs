@@ -30,6 +30,18 @@ pub trait Port {
     ) -> Result<Option<usize>, Error> {
         self.receive(frame)
     }
+    /// Length-aware receive for consumers that can accept at most `limit`
+    /// bytes. A byte-stream port overrides this and must never dequeue more
+    /// than `limit`; a frame port (the default) cannot split a frame, so it
+    /// returns whole frames and the caller must fail closed on `n > limit`
+    /// rather than drop bytes silently.
+    fn receive_up_to(
+        &mut self,
+        frame: &mut [u8; MTU],
+        _limit: usize,
+    ) -> Result<Option<usize>, Error> {
+        self.receive(frame)
+    }
     fn flush(&mut self) -> Result<(), Error> {
         Ok(())
     }
@@ -314,5 +326,31 @@ impl<P: Port> Device for Ethernet<P> {
         caps.max_transmission_unit = MTU;
         caps.max_burst_size = Some(self.port.burst_capacity());
         caps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FramePort(usize);
+    impl Port for FramePort {
+        fn send(&mut self, _: &[u8]) -> Result<(), Error> {
+            Ok(())
+        }
+        fn receive(&mut self, frame: &mut [u8; MTU]) -> Result<Option<usize>, Error> {
+            frame[..self.0].fill(0xAB);
+            Ok(Some(self.0))
+        }
+    }
+
+    #[test]
+    fn default_receive_up_to_returns_whole_frames_for_frame_ports() {
+        // A frame port cannot split a frame: the caller sees n > limit and
+        // must fail closed instead of truncating.
+        let mut port = FramePort(64);
+        let mut frame = [0u8; MTU];
+        assert_eq!(port.receive_up_to(&mut frame, 16), Ok(Some(64)));
+        assert!(frame[..64].iter().all(|b| *b == 0xAB));
     }
 }

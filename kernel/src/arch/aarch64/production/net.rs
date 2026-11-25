@@ -13,8 +13,12 @@
 //!
 //! HONEST SCOPE (do not read more into the words below):
 //! * Polling only: IRQs stay masked at EL1, the accept loop is bounded by
-//!   `NET_POLL_TURNS` turns paced at `TURN_PACE_MS`, and every guest entry is
-//!   bounded by the private timer backstop inside `run_until_park`.
+//!   `NET_POLL_TURNS` turns paced at `TURN_PACE_MS`, every guest entry is
+//!   bounded by the private timer backstop, and the relay by `GUEST_SVC_BUDGET`
+//!   SVCs. A guest that does not park ends the relay (`V020_W11_NET_GUEST_END`
+//!   a=902/900/901); a remote peer can never halt the boot.
+//! * READ is length-aware (never dequeues more than the guest asked for); a
+//!   closed/reset/failed stream reaches the guest as EOF + disconnected POLL.
 //! * Entropy for the guest's rustls session and the smoltcp seed is the
 //!   deterministic FIXTURE PRNG (`sec_n_broker::fixture_entropy`), NOT a
 //!   production CSPRNG; this is acceptable only because no TLS session completes.
@@ -50,8 +54,6 @@ const NET_POLL_TURNS: u32 = 20_000;
 const TURN_PACE_MS: u64 = 1;
 /// Bounded SVC budget for the guest relay run (the fixture's proven bound).
 const GUEST_SVC_BUDGET: u64 = 200_000;
-/// Largest ingress chunk handed to the guest per 0x43 READ (≤ its request).
-const RELAY_CHUNK: usize = 1024;
 const LOCAL_IP: [u8; 4] = [10, 0, 2, 15];
 const PREFIX_LEN: u8 = 24;
 const LISTEN_PORT: u16 = 7;
@@ -83,7 +85,8 @@ struct StreamPort<'s, 'a> {
 }
 impl StreamPort<'_, '_> {
     fn turn(&mut self) {
-        // A failed turn poisons the stream; later operations then fail closed.
+        // A failed turn poisons the stream: the following receive/send then
+        // returns Closed, which the broker surfaces to the guest as EOF.
         let _ = self.tcp.poll(sec_n_broker::now_ms());
     }
 }
@@ -97,8 +100,17 @@ impl Port for StreamPort<'_, '_> {
         }
     }
     fn receive(&mut self, frame: &mut [u8; device::MTU]) -> Result<Option<usize>, device::Error> {
+        self.receive_up_to(frame, device::MTU)
+    }
+    /// Byte stream: dequeue at most `limit` bytes; the unread suffix stays in
+    /// the smoltcp RX buffer for the next READ. Closed/reset/failed => Device.
+    fn receive_up_to(
+        &mut self,
+        frame: &mut [u8; device::MTU],
+        limit: usize,
+    ) -> Result<Option<usize>, device::Error> {
         self.turn();
-        match self.tcp.receive_tls(&mut frame[..RELAY_CHUNK]) {
+        match self.tcp.receive_tls(&mut frame[..limit.min(device::MTU)]) {
             Ok(0) | Err(tcp::Error::WouldBlock) => Ok(None),
             Ok(n) => Ok(Some(n)),
             Err(_) => Err(device::Error::Device),
@@ -137,20 +149,34 @@ fn pin_peer(stream: &mut Stream<'_>) -> bool {
     }
 }
 
-/// Bounded polling accept: returns true once the pinned peer is Established.
-fn accept(stream: &mut Stream<'_>) -> bool {
+/// Why the bounded accept ended without a connection (serial reason code).
+#[derive(Clone, Copy)]
+enum AcceptFailure {
+    /// No peer reached Established within NET_POLL_TURNS turns.
+    Timeout = 1,
+    /// A TCP/device turn failed (stream poisoned).
+    Stream = 2,
+    /// A non-gateway source was aborted.
+    Peer = 3,
+}
+
+/// Bounded polling accept: Ok once the pinned peer is Established.
+fn accept(stream: &mut Stream<'_>) -> Result<(), AcceptFailure> {
     for _ in 0..NET_POLL_TURNS {
         let now = sec_n_broker::now_ms();
-        if stream.poll_ingress_phase(now, &mut || {}).is_err() || !pin_peer(stream) {
-            return false;
+        stream
+            .poll_ingress_phase(now, &mut || {})
+            .map_err(|_| AcceptFailure::Stream)?;
+        if !pin_peer(stream) {
+            return Err(AcceptFailure::Peer);
         }
         match stream.poll_egress_phase(now, &mut || {}) {
-            Ok(State::Established) => return true,
+            Ok(State::Established) => return Ok(()),
             Ok(_) => pace(),
-            Err(_) => return false,
+            Err(_) => return Err(AcceptFailure::Stream),
         }
     }
-    false
+    Err(AcceptFailure::Timeout)
 }
 
 /// Build the listening stream over the device. One-shot: the SERVED swap is
@@ -192,7 +218,9 @@ fn open_stream<'a>(
 }
 
 /// Relay the established stream to a fresh local-echo guest until it parks.
-fn relay(stream: &mut Stream<'_>) -> u64 {
+/// A guest that does not park (budget, fault) ends the relay; it never halts
+/// the production boot.
+fn relay(stream: &mut Stream<'_>) -> Result<u64, sec_n_broker::GuestStop> {
     let layout = sec_n_broker::load_guest();
     report(
         "V020_W11_NET_GUEST",
@@ -203,7 +231,7 @@ fn relay(stream: &mut Stream<'_>) -> u64 {
     sec_n_broker::reset_guest_data(&layout);
     sec_n_broker::stage_shared(sec_n_broker::LOCAL_NODE, true, 1);
     let mut port = StreamPort { tcp: stream };
-    sec_n_broker::run_until_park(&layout, &mut port, GUEST_SVC_BUDGET)
+    sec_n_broker::try_run_until_park(&layout, &mut port, GUEST_SVC_BUDGET)
 }
 
 /// One-shot SEC-N service run on CPU0 (after the advice chain).
@@ -221,22 +249,39 @@ pub(super) fn serve(info: &BootInfo) -> NetOutcome {
     // the device (net_device.rs contract).
     let mut storage = [Storage::EMPTY];
     let Some(mut stream) = open_stream(&mut dev, &mut storage) else {
+        report("V020_W11_NET_STREAM_ERROR", 0, 0, 0);
         return NetOutcome {
             device: true,
             ..NetOutcome::default()
         };
     };
     report("V020_W11_NET_LISTEN", u64::from(LISTEN_PORT), 0, 0);
-    if !accept(&mut stream) {
+    if let Err(failure) = accept(&mut stream) {
         stream.abort();
-        report("V020_W11_NET_NO_PEER", u64::from(NET_POLL_TURNS), 0, 0);
+        report(
+            "V020_W11_NET_NO_PEER",
+            failure as u64,
+            u64::from(NET_POLL_TURNS),
+            0,
+        );
         return NetOutcome {
             device: true,
             ..NetOutcome::default()
         };
     }
-    let dispatched = relay(&mut stream);
+    let (dispatched, stop_code) = match relay(&mut stream) {
+        Ok(dispatched) => (dispatched, 0),
+        Err(stop) => (stop.dispatched, stop.code),
+    };
     stream.close(sec_n_broker::now_ms());
+    // a = 0 parked / 900 fault / 901 foreign SVC / 902 budget; b = closed-stream
+    // events surfaced to the guest as EOF.
+    report(
+        "V020_W11_NET_GUEST_END",
+        stop_code,
+        sec_n_broker::stream_closed(),
+        0,
+    );
     let outcome = NetOutcome {
         device: true,
         tcp_established: true,

@@ -23,7 +23,8 @@
 //!   FrameMeta window); they are NOT FrameMeta-registered this wave (open item).
 //! * Broker state (CONN_EPOCH, CONNECTED, STALL_AFTER_POLL, POLL_COUNT, OP_COUNTS,
 //!   CLOSE_SEEN, YIELD_RUN, ENTROPY_STATE, QUIESCENCE_REFUSED, HANDSHAKE_POLLS,
-//!   POLLED_CONNECTED, LEASE_COUNTED, INFERRED_LEASES, RELAYED_BYTES)
+//!   POLLED_CONNECTED, LEASE_COUNTED, INFERRED_LEASES, RELAYED_BYTES,
+//!   STREAM_CLOSED)
 //!   (static mut): CPU0-only, read/written only by the functions below and the
 //!   by-value accessors; no reference escapes.
 //! * load_guest()/map_page()/seal_page()/sync_code(): raw addr_of! arithmetic over
@@ -61,6 +62,7 @@ const SVC_VERSION: u64 = 4;
 const PAYLOAD: usize = 4096;
 const ST_OK: u64 = 0;
 const ST_AGAIN: u64 = 1;
+const ST_EOF: u64 = 2;
 const ST_FAILED: u64 = 3;
 pub(crate) const OP_ENTROPY: u64 = 1;
 const OP_TIME: u64 = 2;
@@ -149,6 +151,7 @@ static mut POLLED_CONNECTED: bool = false;
 static mut LEASE_COUNTED: bool = false;
 static mut INFERRED_LEASES: u64 = 0;
 static mut RELAYED_BYTES: u64 = 0;
+static mut STREAM_CLOSED: u64 = 0;
 
 fn le16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
@@ -398,6 +401,7 @@ pub(crate) fn stage_shared(local: [u8; 32], connected: bool, conn_epoch: u64) {
         LEASE_COUNTED = false;
         INFERRED_LEASES = 0;
         RELAYED_BYTES = 0;
+        STREAM_CLOSED = 0;
     }
 }
 
@@ -551,15 +555,24 @@ fn broker_poll() {
 }
 
 /// Bounded ingress via the port. A port with nothing to deliver answers AGAIN.
+/// Length-aware: the port is asked for at most the guest's `len`, so a stream
+/// port never dequeues bytes the guest cannot take. A port that still returns
+/// more (a frame port) or fails ends the connection; bytes are never dropped
+/// silently.
 fn broker_read<P: Port>(port: &mut P, len: u64) {
+    let limit = len as usize;
+    if limit == 0 {
+        return reply(0, ST_AGAIN); // nothing deliverable: dequeue nothing.
+    }
     let mut frame = [0u8; device::MTU];
-    match port.receive(&mut frame) {
-        Ok(Some(n)) if n <= len as usize => {
+    match port.receive_up_to(&mut frame, limit) {
+        Ok(Some(n)) if n <= limit => {
             shared_put(OFF_PAYLOAD, &frame[..n]);
             unsafe { RELAYED_BYTES += n as u64 };
             reply(n as u64, ST_OK);
         }
-        _ => reply(0, ST_AGAIN),
+        Ok(None) | Err(device::Error::WouldBlock) => reply(0, ST_AGAIN),
+        Ok(Some(_)) | Err(device::Error::Device | device::Error::Frame) => disconnect(),
     }
 }
 
@@ -569,8 +582,20 @@ fn broker_write<P: Port>(port: &mut P, len: u64) {
     shared_bytes(OFF_PAYLOAD, &mut buf[..n]);
     match port.send(&buf[..n]) {
         Ok(()) => reply(n as u64, ST_OK),
-        Err(_) => reply(0, ST_AGAIN),
+        Err(device::Error::WouldBlock | device::Error::Frame) => reply(0, ST_AGAIN),
+        Err(device::Error::Device) => disconnect(),
     }
+}
+
+/// The port reported a closed/reset/failed stream: the connection is over.
+/// POLL now answers disconnected and this request answers EOF, so the guest's
+/// generation-bound socket sees Closed and parks instead of spinning on AGAIN.
+fn disconnect() {
+    unsafe {
+        CONNECTED = false;
+        STREAM_CLOSED += 1;
+    }
+    reply(0, ST_EOF);
 }
 
 /// One bounded EL0 entry. Returns the trapped context kind/esr. Mirrors smp.rs
@@ -585,23 +610,50 @@ fn step(ctx: &mut user::Context, root: u64) {
     }
 }
 
-/// Run the guest until it parks (CLOSE then a sustained YIELD run) or a bounded
-/// SVC budget is spent. Returns the number of SVC dispatches performed.
+/// Why a bounded guest run ended without parking.
+#[derive(Clone, Copy)]
+pub(crate) struct GuestStop {
+    /// 900 unexpected EL0 fault, 901 non-0x43 SVC, 902 SVC budget exhausted.
+    pub(crate) code: u64,
+    /// SVC dispatches performed before the stop (read by production only; the
+    /// fixture halts on `code`).
+    #[cfg_attr(not(feature = "v020-production"), allow(dead_code))]
+    pub(crate) dispatched: u64,
+}
+
+/// Run the guest until it parks (CLOSE then a sustained YIELD run) or fails
+/// closed. Fixture semantics: any stop is fatal with its code (production uses
+/// `try_run_until_park` and never halts on a guest stop).
+#[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn run_until_park<P: Port>(layout: &Layout, port: &mut P, budget: u64) -> u64 {
+    match try_run_until_park(layout, port, budget) {
+        Ok(dispatched) => dispatched,
+        Err(stop) => fatal(stop.code),
+    }
+}
+
+/// Run the guest until it parks or a bounded SVC budget is spent, returning the
+/// stop instead of halting the boot. Returns the number of SVC dispatches.
+pub(crate) fn try_run_until_park<P: Port>(
+    layout: &Layout,
+    port: &mut P,
+    budget: u64,
+) -> Result<u64, GuestStop> {
     let root = phys(core::ptr::addr_of!(GUEST_ROOT) as u64);
     let mut ctx = fresh_context(layout);
     let mut dispatched = 0u64;
+    let stop = |code, dispatched| Err(GuestStop { code, dispatched });
     for _ in 0..budget {
         step(&mut ctx, root);
         if ctx.kind == 9 {
             continue; // private PPI preemption; resume.
         }
         if ctx.kind != 8 || ctx.esr >> 26 != 0x15 {
-            fatal(900); // unexpected EL0 fault (not an SVC).
+            return stop(900, dispatched); // unexpected EL0 fault (not an SVC).
         }
         let iss = ctx.esr & 0xffff;
         if iss != 0x43 {
-            fatal(901); // only SVC 0x43 is admitted for this guest.
+            return stop(901, dispatched); // only SVC 0x43 is admitted for this guest.
         }
         broker(port);
         dispatched += 1;
@@ -609,10 +661,10 @@ pub(crate) fn run_until_park<P: Port>(layout: &Layout, port: &mut P, budget: u64
         // (the broker ABI carries results in the shared page, not x0).
         let parked = unsafe { CLOSE_SEEN && YIELD_RUN >= 64 };
         if parked {
-            return dispatched;
+            return Ok(dispatched);
         }
     }
-    fatal(902); // guest never parked within the bounded budget.
+    stop(902, dispatched) // guest never parked within the bounded budget.
 }
 
 // ---- by-value broker state accessors (no reference to a static escapes) ----
@@ -626,6 +678,11 @@ pub(crate) fn inferred_leases() -> u64 {
 #[cfg(feature = "v020-production")]
 pub(crate) fn relayed_bytes() -> u64 {
     unsafe { RELAYED_BYTES }
+}
+/// Closed/reset/failed stream events surfaced to the guest as EOF.
+#[cfg(feature = "v020-production")]
+pub(crate) fn stream_closed() -> u64 {
+    unsafe { STREAM_CLOSED }
 }
 #[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn op_counts() -> [u64; 16] {
