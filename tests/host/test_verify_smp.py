@@ -25,6 +25,27 @@ def fixture():
     return ('\n'.join(lines)+'\n').encode(), words
 
 
+class OverrunDiagnosticTests(unittest.TestCase):
+    def test_original_failure_preserves_exact_charge(self):
+        self.assertEqual(v.overrun_diagnostic(b'V0199_BOOTSTRAP_OVERRUN a=2 b=443074 c=250000\n'),
+            dict(role=2,actual_ns=443074,reserved_ns=250000,cpu_excess_ns=193074))
+
+    def test_phase_evidence_and_wall_only_overrun(self):
+        raw=(b'V0199_DECISION_OVERRUN_PHASES a=10000 b=70000 c=90000\n'
+             b'V0199_DECISION_OVERRUN_TRAP a=8 b=1409286144 c=64\n'
+             b'V0199_BOOTSTRAP_OVERRUN a=2 b=100000 c=250000\n')
+        result=v.overrun_diagnostic(raw)
+        self.assertEqual(result['cpu_excess_ns'],0)
+        self.assertEqual(result['after_dispatch_ns'],90000)
+        self.assertEqual(result['syscall_x8'],64)
+        for bad in (raw+raw,raw.replace(b'c=90000',b'c=200000'),
+                    raw.replace(b'a=2 b=100000',b'a=6 b=100000'),
+                    raw.replace(b'c=250000',b'c=0'),
+                    raw.replace(b'V0199_DECISION_OVERRUN_TRAP',b'missing')):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):
+                v.overrun_diagnostic(bad)
+
+
 class SmpJudgeTests(unittest.TestCase):
     def test_complete_synthetic_fixture(self):
         text,words=fixture();self.assertEqual(v.validate(text,struct.pack('<512Q',*words),4)['permission_fault_probes'],20)
