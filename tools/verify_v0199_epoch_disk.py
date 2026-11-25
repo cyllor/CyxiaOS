@@ -172,8 +172,19 @@ class EpochFixture:
     def verify_qemu(self,binary,version):
         verify_smp.require(version.splitlines()[0].startswith('QEMU emulator version 10.2.2')
                            and verify_smp.sha(binary)==self.qemu_hash,'pinned QEMU mismatch')
-    @staticmethod
-    def profile(elf):
+    def profile(self,elf):
+        # Independently bind the actual loaded diagnostic code to the
+        # immutable executable bytes of this exact verified kernel ELF.
+        start=verify_smp.symbol(elf,'smp_user_start')['pa']
+        end=verify_smp.symbol(elf,'smp_user_end')['pa']
+        verify_smp.require(start%BLOCK==0 and 0<end-start<=BLOCK,'D02 ELF code extent')
+        matches=[]
+        for seg in verify_smp.inspect_elf(elf)['loads']:
+            delta=start-seg['pa']
+            if 0<=delta and delta+end-start<=seg['size']:
+                matches.append(elf[seg['offset']+delta:seg['offset']+delta+end-start])
+        verify_smp.require(len(matches)==1,'D02 code not uniquely backed by ELF')
+        self.d02_code=(start,end-start,hashlib.sha256(matches[0]).digest())
         return verify_smp.profile(elf)
     @staticmethod
     def metadata():
@@ -387,7 +398,8 @@ class EpochFixture:
                 and sample2<=accept2<sample2+100_000_000 and accept2<=completed2,
                 'D02 token windows or report custody mismatch')
         require(w[395]%BLOCK==0 and 0x40000000<=w[395]<0x44000000
-                and 0<w[396]<=BLOCK,'invalid D02 diagnostic package extent')
+                and 0<w[396]<=BLOCK and (w[395],w[396])==self.d02_code[:2],
+                'invalid D02 diagnostic package extent or ELF mismatch')
         require(serial.count(b'V0199_D02_EFFECT a=2 b=4 c=3\n')==1,'missing actual D02 UART evidence')
         require(all(v==0 for v in w[397:]),'nonzero reserved evidence')
         expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c={flushes}\n'.encode()
@@ -534,7 +546,8 @@ class EpochFixture:
                 and custody.count(decision)==custody.count(report)==1,'D02 actual report/feedback mismatch')
         code_path=out/'d02-package.bin'
         qmp.execute('pmemsave',{'val':w[395],'size':w[396],'filename':str(code_path)})
-        require(hashlib.sha256(code_path.read_bytes()).digest()==package,'D02 actual package hash mismatch')
+        require(hashlib.sha256(code_path.read_bytes()).digest()==package==self.d02_code[2],
+                'D02 actual package differs from exact ELF bytes')
         for i,pa in enumerate(pages):
             path=out/f'd02-retired-page-{i}.bin'
             qmp.execute('pmemsave',{'val':pa,'size':BLOCK,'filename':str(path)})
