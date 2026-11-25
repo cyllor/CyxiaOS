@@ -73,6 +73,15 @@ pub(super) fn install_disk_control_pool(va:u64){
 fn disk_pool()->u64{
     let va=DISK_CONTROL_BASE.load(Ordering::Acquire);assert_ne!(va,0);va
 }
+/// Exclusive diagnostic metadata tail, after all role backing, page
+/// tables and copy scratch. No additional physical pool is allocated.
+#[cfg(feature="v0199-epoch-disk-selftest")]
+pub(super) fn disk_fixture_metadata(bytes:usize)->(u64,usize){
+    assert_eq!(cpu::slot(),0);
+    let offset=(DISK_COPY_OFFSET+COPY).next_multiple_of(PAGE);
+    assert!(bytes!=0&&bytes%PAGE==0&&offset.checked_add(bytes).unwrap()<=8*1024*1024);
+    (disk_pool().checked_add(offset as u64).unwrap(),offset)
+}
 const _:()=assert!(core::mem::size_of::<Backing>()==IMAGE+ROLE_STACK_BYTES);
 const _:()=assert!(core::mem::size_of::<Tables>()==3*PAGE);
 
@@ -603,7 +612,7 @@ fn turn(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running,budget:&mut Budg
             user::enter_pinned_until_retired(&mut r.context,root,asid);
             // The dedicated SMP timer IRQ handler has already disabled
             // CNT(P)_CTL before returning kind9. Sync traps still need it.
-            if r.context.kind!=9{cpu::disable_timer();}
+            if cfg!(feature="unified-runtime")||r.context.kind!=9{cpu::disable_timer();}
         }
         if class==Class::Decision{after_exit=timer::cpu_elapsed_ns(began);}
         // Settle immediately after a timer exit instead of re-entering in
