@@ -197,6 +197,71 @@ impl ValidatedCandidate{
         verify_current(self.learner,self.validator,self.claim_sequence,self.claim_head,self.binding)
     }
 }
+/// Independent Shadow observation of one complete aligned 100ms
+/// window. The protected metering/evidence owner must authenticate every
+/// scoring trace and prove that Shadow never published any action.
+#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+pub struct ShadowWindow{
+    pub window:u64,pub domains:u16,pub optional_cpu_ns:u64,
+    pub evidence:[u8;32],
+}
+pub struct ShadowGate{
+    manager:Identity,boot:u64,active_generation:u64,binding:ValidationEvidence,
+    claim_head:[u8;32],next_window:u64,windows:u64,domains:u16,head:[u8;32],closed:bool,
+}
+/// Preflight evidence for the manager's separate D15 TrialPermit grant.
+/// This is not an action authorization or an Active model transition.
+#[derive(Debug)]
+pub struct ShadowReady{
+    pub boot:u64,pub active_generation:u64,pub binding:ValidationEvidence,
+    pub claim_head:[u8;32],pub evidence:[u8;32],pub target:Identity,
+}
+impl ShadowGate{
+    pub fn start(proof:ValidatedCandidate,manager:Identity,boot:u64,active_generation:u64,
+        active:[u8;32],candidate:&CandidateModel,first_window:u64,
+        verify_current:impl FnOnce(Identity,Identity,u64,[u8;32],ValidationEvidence)->Result<(),Error>,
+    )->Result<Self,Error>{
+        if boot==0||active_generation==0||first_window.checked_add(10).is_none(){return Err(Error::Invalid);}
+        proof.authorize_shadow(manager,active,candidate,verify_current)?;
+        let mut h=Sha256::new();h.update(b"CYX/SHADOW/v0199");
+        h.update(boot.to_le_bytes());h.update(active_generation.to_le_bytes());
+        h.update(proof.binding.candidate);h.update(proof.claim_head);h.update(first_window.to_le_bytes());
+        Ok(Self{manager,boot,active_generation,binding:proof.binding,claim_head:proof.claim_head,
+            next_window:first_window,windows:0,domains:0,head:h.finalize().into(),closed:false})
+    }
+    pub fn abort(&mut self){self.closed=true;}
+    pub fn record_window(&mut self,manager:Identity,boot:u64,active_generation:u64,
+        active:[u8;32],candidate:[u8;32],now:u64,e:ShadowWindow,
+        verify_native:impl FnOnce(&ShadowWindow)->Result<(),Error>)->Result<(),Error>{
+        if manager!=self.manager{return Err(Error::Denied);}
+        if self.closed{return Err(Error::NotReady);}
+        if boot!=self.boot||active_generation!=self.active_generation||active!=self.binding.parent
+            ||candidate!=self.binding.candidate{return Err(Error::Stale);}
+        let end=e.window.checked_add(1).and_then(|w|w.checked_mul(100_000_000)).ok_or(Error::Clock)?;
+        if e.window!=self.next_window||now<end||e.domains==0||e.domains&!0x7fff!=0
+            ||e.optional_cpu_ns==0||e.optional_cpu_ns>8_500_000||e.evidence==[0;32]{return Err(Error::Denied);}
+        // Must check actual optional-class shared ledger and that every
+        // scoring operation was read-only. A claimed scalar is not proof.
+        verify_native(&e)?;
+        let mut h=Sha256::new();h.update(self.head);h.update(e.window.to_le_bytes());
+        h.update(e.domains.to_le_bytes());h.update(e.optional_cpu_ns.to_le_bytes());h.update(e.evidence);
+        self.head=h.finalize().into();self.domains|=e.domains;self.windows+=1;self.next_window+=1;
+        Ok(())
+    }
+    pub fn seal_canary_preflight(self,manager:Identity,boot:u64,generation:u64,
+        active:[u8;32],target:Identity,
+        verify_target_and_history:impl FnOnce(Identity,[u8;32])->Result<(),Error>,
+    )->Result<ShadowReady,Error>{
+        if manager!=self.manager||boot!=self.boot||generation!=self.active_generation
+            ||active!=self.binding.parent||!target.valid(){return Err(Error::Denied);}
+        if self.closed||self.windows<10||self.domains!=0x7fff{return Err(Error::NotReady);}
+        // Must be the one actual offline-registered noncritical D15
+        // target. This does not create or spend a TrialPermit.
+        verify_target_and_history(target,self.head)?;
+        Ok(ShadowReady{boot:self.boot,active_generation:self.active_generation,binding:self.binding,
+            claim_head:self.claim_head,evidence:self.head,target})
+    }
+}
 pub struct HoldoutClaim<'a>{
     pub sequence:u64,
     pub prior_history:[u8;32],
@@ -427,6 +492,31 @@ mod tests{
         assert!(matches!(checked_feedback(&bad,&baseline),Err(Error::Invalid)));
         let mut bad=base;bad.decision[108..112].copy_from_slice(&7u32.to_le_bytes());
         assert!(matches!(checked_feedback(&bad,&baseline),Err(Error::Denied)));
+    }
+    #[test]
+    fn shadow_requires_complete_windows_and_all_families_before_canary_preflight(){
+        let learner=Identity{id:10,generation:1};let validator=Identity{id:9,generation:1};
+        let manager=Identity{id:3,generation:1};let target=Identity{id:15,generation:1};
+        let model=CandidateModel{bytes:[0;MODEL_BYTES],parent:[2;32],data:[3;32],schemas:SCHEMAS,learner};
+        let binding=ValidationEvidence{candidate:Sha256::digest(model.bytes).into(),parent:model.parent,
+            training:model.data,holdout:[4;32]};
+        let proof=||ValidatedCandidate{binding,learner,validator,manager,claim_sequence:1,claim_head:[5;32]};
+        let new=||ShadowGate::start(proof(),manager,1,7,model.parent,&model,2,|_,_,_,_,_|Ok(())).unwrap();
+        assert!(matches!(new().seal_canary_preflight(manager,1,7,model.parent,target,|_,_|panic!()),Err(Error::NotReady)));
+        let mut g=new();
+        let e=ShadowWindow{window:2,domains:1,optional_cpu_ns:100,evidence:[6;32]};
+        assert_eq!(g.record_window(manager,1,7,model.parent,binding.candidate,299_999_999,e,|_|panic!()),Err(Error::Denied));
+        assert_eq!(g.record_window(manager,1,8,model.parent,binding.candidate,300_000_000,e,|_|panic!()),Err(Error::Stale));
+        assert_eq!(g.record_window(manager,1,7,model.parent,binding.candidate,300_000_000,
+            ShadowWindow{optional_cpu_ns:8_500_001,..e},|_|panic!()),Err(Error::Denied));
+        for w in 2..12{
+            let e=ShadowWindow{window:w,domains:if w==11{0x7fff}else{1},..e};
+            g.record_window(manager,1,7,model.parent,binding.candidate,(w+1)*100_000_000,e,|_|Ok(())).unwrap();
+        }
+        let ready=g.seal_canary_preflight(manager,1,7,model.parent,target,|t,h|{
+            assert_eq!(t,target);assert_ne!(h,[0;32]);Ok(())
+        }).unwrap();
+        assert_eq!(ready.binding,binding);
     }
     #[test]
     fn shadow_preflight_binds_exact_candidate_and_independent_manager(){
