@@ -31,12 +31,16 @@ const APPLY_PAYLOAD:&[u8]=b"V0199_D15_APPLIED actual ordinary UART frame 0123456
 struct FixtureOwners{
     console:Owner,timers:cyxia_kernel_core::control_plane::d07_owner_v0199::Owner,
     snapshots:SnapshotStore,desired:DesiredBank,feedback:FeedbackInbox,
+    tasks:cyxia_kernel_core::control_plane::d02_owner_v0199::Owner,
+    spawn_proof:[u8;super::v0199_d02_fixture::PROOF_BYTES],
 }
 static INITIAL:FixtureOwners=FixtureOwners{
     console:Owner::empty(),
     timers:cyxia_kernel_core::control_plane::d07_owner_v0199::Owner::empty(),
     snapshots:SnapshotStore::empty(),desired:DesiredBank::empty(),
     feedback:match FeedbackInbox::new(SUP,LEARN){Ok(x)=>x,Err(_)=>panic!("fixture identity")},
+    tasks:cyxia_kernel_core::control_plane::d02_owner_v0199::Owner::empty(),
+    spawn_proof:[0;super::v0199_d02_fixture::PROOF_BYTES],
 };
 static INITIALIZED:AtomicBool=AtomicBool::new(false);
 const _:()=assert!(core::mem::size_of::<FixtureOwners>()<=1024*1024);
@@ -59,6 +63,9 @@ fn fixture_owners()->&'static mut FixtureOwners{
         core::mem::offset_of!(FixtureOwners,desired) as u64,core::mem::size_of_val(&all.desired) as u64,
         core::mem::offset_of!(FixtureOwners,feedback) as u64,core::mem::size_of_val(&all.feedback) as u64];
     for(i,v)in row.into_iter().enumerate(){SMP_EVIDENCE.words[360+i].store(v,Ordering::Relaxed);}
+    for(i,v)in [core::mem::offset_of!(FixtureOwners,tasks) as u64,core::mem::size_of_val(&all.tasks) as u64,
+        core::mem::offset_of!(FixtureOwners,spawn_proof) as u64,core::mem::size_of_val(&all.spawn_proof) as u64,
+        0].into_iter().enumerate(){SMP_EVIDENCE.words[374+i].store(v,Ordering::Relaxed);}
     all
 }
 struct NativeClock;
@@ -134,7 +141,7 @@ pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     let mut tx=Tx(unsafe{cyxia_driver_pl011::Pl011::attach(UartResource{base:PhysAddr(base),len:4096})}.unwrap());
     unsafe{timer::init_cpu_accounting();}
     let mut clock=NativeClock;
-    let FixtureOwners{console:owner,timers,snapshots,desired,feedback:inbox}=fixture_owners();
+    let FixtureOwners{console:owner,timers,snapshots,desired,feedback:inbox,tasks,spawn_proof}=fixture_owners();
     owner.bind(boot,TARGET,1,||if base==super::super::HIGH+0x09000000{Ok(())}else{Err(Error::Denied)}).unwrap();
     let baseline=crate::machine::enqueue_v0199(owner,BASE_PAYLOAD,now()).unwrap();
     let (_,baseline_calls,baseline_max,baseline_cpu)=drain(owner,&mut tx,&mut clock);
@@ -238,4 +245,5 @@ pub(super) fn run(boot:u64,confirmed_boot:Option<u64>){
     // Use the same protected snapshot/decision sequences and feedback
     // custody; never duplicate the boot-scoped key for a second domain.
     super::v0199_d07_fixture::run(boot,&mut gate,snapshots,inbox,desired,timers);
+    super::v0199_d02_fixture::run(boot,&mut gate,snapshots,inbox,desired,tasks,spawn_proof);
 }
