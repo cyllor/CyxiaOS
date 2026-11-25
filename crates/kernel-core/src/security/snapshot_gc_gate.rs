@@ -280,7 +280,20 @@ mod tests{
         assert!(!recovered.reusable(7000));assert!(recovered.reusable(7003));
         assert_eq!(recovered.handoff_once(SUP,7003,|_,_|panic!()),Err(Error::Unauthorized));
         assert_eq!(recovered.handoff_once(sup2,7000,|_,_|panic!()),Err(Error::Stale));
-        recovered.handoff_once(sup2,7003,|_,_|Ok(())).unwrap();
+        assert_eq!(recovered.handoff_once(sup2,7003,|_,_|Err(Error::Unknown)),Err(Error::Unknown));
         assert!(!recovered.reusable(7003));
+        assert_eq!(recovered.handoff_once(sup2,7003,|_,_|panic!()),Err(Error::Unknown));
+        assert_eq!(recovered.reconcile_handoff(sup2,7003,true,|_,_,_|Err(Error::Unknown)),Err(Error::Unknown));
+        let mut rebooted=Gate::recover_committed(owner2,sup2,c,&before,batch.blocks(),commit,&after,1,
+            |_,_,_|Ok(())).unwrap();
+        assert_eq!(rebooted.recover_handoff_unknown(sup2,1,|_,_,_,_|panic!()),Err(Error::Conflict));
+        rebooted.recover_handoff_unknown(sup2,2,|_,_,done,unknown|{
+            assert_eq!((done,unknown),(1,2));Ok(())
+        }).unwrap();
+        assert!(!rebooted.reusable(7003));
+        rebooted.reconcile_handoff(sup2,7003,true,|block,receipt,transferred|{
+            assert_eq!((block,receipt,transferred),(7003,commit,true));Ok(())
+        }).unwrap();
+        assert_eq!(rebooted.handoff_once(sup2,7003,|_,_|panic!()),Err(Error::Stale));
     }
 }
