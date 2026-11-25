@@ -33,6 +33,37 @@ def require(ok: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def overrun_diagnostic(serial: bytes) -> dict:
+    """Failure-only extraction from framed UART; never a native PASS."""
+    def row(tag):
+        hits = re.findall(rb'^' + tag + rb' a=(\d+) b=(\d+) c=(\d+)\n', serial, re.M)
+        require(len(hits) == 1, 'missing/duplicate complete ' + tag.decode() + ' record')
+        values = tuple(map(int, hits[0]))
+        require(all(v < 2**64 for v in values), 'oversized diagnostic field')
+        return values
+
+    role, actual, reserved = row(b'V0199_BOOTSTRAP_OVERRUN')
+    require(reserved > 0, 'zero reserved CPU quota')
+    result = dict(role=role, actual_ns=actual, reserved_ns=reserved,
+                  cpu_excess_ns=max(0, actual-reserved))
+    phases = b'V0199_DECISION_OVERRUN_PHASES'
+    trap = b'V0199_DECISION_OVERRUN_TRAP'
+    if phases in serial or trap in serial:
+        before, after, dispatched = row(phases)
+        kind, esr, syscall = row(trap)
+        require(role in (2, 8) and before <= actual
+                and (after == 0 or before <= after <= actual)
+                and (dispatched == 0 or after != 0 and after <= dispatched <= actual),
+                'inconsistent decision overrun phases')
+        require(serial.index(phases) < serial.index(trap)
+                < serial.index(b'V0199_BOOTSTRAP_OVERRUN'),
+                'out-of-order overrun diagnostics')
+        result.update(before_enter_ns=before, after_exit_ns=after,
+                      after_dispatch_ns=dispatched, trap_kind=kind,
+                      trap_esr=esr, syscall_x8=syscall)
+    return result
+
+
 def sha(path: Path) -> str:
     h = hashlib.sha256()
     with path.open('rb') as stream:
@@ -216,6 +247,7 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                 require(len(raw) <= 2 * 1024 * 1024, 'serial budget exceeded')
                 for frame in decoder.feed(data): decoded.extend(frame)
                 if b'V0199_BOOTSTRAP_OVERRUN' in decoded:
+                    report['cpu0_overrun'] = overrun_diagnostic(bytes(decoded))
                     raise ValueError('native CPU0 execution overrun (see framed UART)')
                 if b'FAIL' in decoded or b'SMP_ERROR' in decoded: raise ValueError('guest failure')
                 completion = b'SMP_SELFTEST_PASS cpus=4\n' if acceptance is None else acceptance.completion
