@@ -213,8 +213,15 @@ pub struct ShadowGate{
 /// This is not an action authorization or an Active model transition.
 #[derive(Debug)]
 pub struct ShadowReady{
-    pub boot:u64,pub active_generation:u64,pub binding:ValidationEvidence,
-    pub claim_head:[u8;32],pub evidence:[u8;32],pub target:Identity,
+    boot:u64,active_generation:u64,binding:ValidationEvidence,
+    claim_head:[u8;32],evidence:[u8;32],target:Identity,
+}
+impl ShadowReady{
+    /// Read-only evidence projection; only the independent gate can
+    /// construct this token. A manager still needs a real trial permit.
+    pub fn scope(&self)->(u64,u64,ValidationEvidence,[u8;32],[u8;32],Identity){
+        (self.boot,self.active_generation,self.binding,self.claim_head,self.evidence,self.target)
+    }
 }
 impl ShadowGate{
     pub fn start(proof:ValidatedCandidate,manager:Identity,boot:u64,active_generation:u64,
