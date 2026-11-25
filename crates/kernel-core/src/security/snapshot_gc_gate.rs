@@ -53,7 +53,7 @@ pub struct Commit{
 }
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Phase{Prepared,Unknown,Committed}
-pub struct Gate{owner:Identity,supervisor:Identity,batch:Batch,phase:Phase,commit:Option<Commit>,handed_off:u128}
+pub struct Gate{owner:Identity,supervisor:Identity,batch:Batch,phase:Phase,commit:Option<Commit>,handed_off:u128,handoff_unknown:u128}
 impl Gate{
     /// Select only explicitly enumerated, sorted candidate blocks. The
     /// media owner supplies the eligible business region/ownership proof;
@@ -75,7 +75,7 @@ impl Gate{
         verify_frozen_complete(census,maps,candidates)?;
         let mut blocks=[0;BATCH];blocks[..candidates.len()].copy_from_slice(candidates);
         Ok(Self{owner,supervisor,batch:Batch{census,blocks,len:candidates.len() as u16},
-            phase:Phase::Prepared,commit:None,handed_off:0})
+            phase:Phase::Prepared,commit:None,handed_off:0,handoff_unknown:0})
     }
     /// Restore the prior exact candidate batch after a lost commit or
     /// reboot, never as a fresh Prepared writer. The history verifier
@@ -163,10 +163,11 @@ impl Gate{
     /// Eligibility is not a new allocation grant. Transfer each block to
     /// the actual allocator at most once after checking current bitmap
     /// generation, allocator ownership and physical quiescence. The callback
-    /// is an atomic metadata handoff: Err must leave ownership unchanged.
+    /// is an atomic metadata handoff: non-UNKNOWN Err proves no effect;
+    /// UNKNOWN is sticky until independent allocator reconciliation.
     pub fn reusable(&self,block:u32)->bool{
         self.phase==Phase::Committed&&self.batch.blocks().binary_search(&block)
-            .is_ok_and(|i|self.handed_off&(1u128<<i)==0)
+            .is_ok_and(|i|(self.handed_off|self.handoff_unknown)&(1u128<<i)==0)
     }
     pub fn handoff_once(&mut self,actor:Identity,block:u32,
         transfer_native:impl FnOnce(u32,Commit)->Result<(),Error>)->Result<(),Error>{
@@ -175,8 +176,42 @@ impl Gate{
         let i=self.batch.blocks().binary_search(&block).map_err(|_|Error::Invalid)?;
         let bit=1u128<<i;
         if self.handed_off&bit!=0{return Err(Error::Stale);}
-        transfer_native(block,self.commit.ok_or(Error::Unknown)?)?;
-        self.handed_off|=bit;Ok(())
+        if self.handoff_unknown&bit!=0{return Err(Error::Unknown);}
+        let commit=self.commit.ok_or(Error::Unknown)?;
+        // Transfer callback is permitted to lose its reply. UNKNOWN is
+        // not the same as a proven atomic no-effect rejection.
+        self.handoff_unknown|=bit;
+        match transfer_native(block,commit){
+            Ok(())=>{self.handed_off|=bit;self.handoff_unknown&=!bit;Ok(())}
+            Err(Error::Unknown)=>Err(Error::Unknown),
+            Err(e)=>{self.handoff_unknown&=!bit;Err(e)}
+        }
+    }
+    /// Reconcile without another allocator handoff. Only the independent
+    /// current allocator census can establish transfer or prove no effect.
+    pub fn reconcile_handoff(&mut self,actor:Identity,block:u32,transferred:bool,
+        verify_current:impl FnOnce(u32,Commit,bool)->Result<(),Error>)->Result<(),Error>{
+        if actor!=self.supervisor{return Err(Error::Unauthorized);}
+        if self.phase!=Phase::Committed{return Err(Error::Busy);}
+        let i=self.batch.blocks().binary_search(&block).map_err(|_|Error::Invalid)?;
+        let bit=1u128<<i;
+        if self.handoff_unknown&bit==0{return Err(Error::Stale);}
+        verify_current(block,self.commit.ok_or(Error::Unknown)?,transferred)?;
+        if transferred{self.handed_off|=bit;}
+        self.handoff_unknown&=!bit;Ok(())
+    }
+    /// A complete recovered handoff census must resolve or preserve every
+    /// ambiguous bit before any new transfer. Masks are internal custody,
+    /// not a new persistent format.
+    pub fn recover_handoff_unknown(&mut self,actor:Identity,mask:u128,
+        verify_retained:impl FnOnce(&Batch,Commit,u128,u128)->Result<(),Error>)->Result<(),Error>{
+        if actor!=self.supervisor{return Err(Error::Unauthorized);}
+        if self.phase!=Phase::Committed||self.handoff_unknown!=0{return Err(Error::Busy);}
+        let n=self.batch.blocks().len();
+        let allowed=if n==128{u128::MAX}else{(1u128<<n)-1};
+        if mask&!allowed!=0||mask&self.handed_off!=0{return Err(Error::Conflict);}
+        verify_retained(&self.batch,self.commit.ok_or(Error::Unknown)?,self.handed_off,mask)?;
+        self.handoff_unknown=mask;Ok(())
     }
 }
 const _:()=assert!(core::mem::size_of::<Gate>()<2048);
