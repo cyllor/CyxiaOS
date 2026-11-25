@@ -258,7 +258,18 @@ mod tests{
         let receipt=proof.receipt();
         assert_eq!((disk.writes,disk.flushes),(4,2));
         assert_eq!(gate.confirm(ticket,receipt,&after,|_,_|panic!()),Err(Error::Unauthorized));
-        let sb_raw=sb.encode().unwrap();
+        let mut sb_raw=[0u8;B];
+        for(at,v)in [(0,0x43594653u32),(8,4096),(12,131072),(56,4098),(60,4102),(64,4118),(68,256)]{
+            sb_raw[at..at+4].copy_from_slice(&v.to_le_bytes());
+        }
+        sb_raw[4..6].copy_from_slice(&1u16.to_le_bytes());
+        sb_raw[6..8].copy_from_slice(&80u16.to_le_bytes());
+        sb_raw[16..32].copy_from_slice(&old.fs_uuid);
+        sb_raw[32..40].copy_from_slice(&1u64.to_le_bytes());
+        sb_raw[48..56].copy_from_slice(&1u64.to_le_bytes());
+        let crc=super::super::file_media_v0199::crc32c_zeroed(&sb_raw,76).unwrap();
+        sb_raw[76..80].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(SuperblockV1::decode(&sb_raw),Ok(sb));
         assert_eq!(gate.confirm_from_redo(ticket,receipt,redo.image(),&sb_raw,2,7000,
             &redo.begin,&[&redo.redo],&redo.commit,|_,_|Err(Error::Unknown)),Err(Error::Unknown));
         assert_eq!(gate.boot_epoch(),None);
