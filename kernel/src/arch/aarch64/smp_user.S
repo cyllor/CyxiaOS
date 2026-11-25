@@ -14,6 +14,8 @@ smp_user_start:
  b.eq smp_registers
  cmp x2, #6
  b.eq smp_v3_probe
+ cmp x2, #7
+ b.eq smp_d02_business
  b smp_probe
 smp_busy:
  ldr x10, [x1]
@@ -195,6 +197,29 @@ smp_v3_copy:
  b.ne smp_v3_call
  add x4, x10, #4096
 smp_v3_call:
+ svc #0
+ b .
+// Dedicated D02 diagnostic business task, fresh private data and stack.
+ // A real ABI3 EXIT (not a historical immediate) terminates the task.
+smp_d02_business:
+ ldr x10, [x1]
+ cmp x10, x0
+ b.ne smp_cookie_bad
+ ldr x11, [x1, #8]
+ cbnz x11, smp_cookie_bad
+ mov x12, #16
+1:
+ add x11, x11, #1
+ str x11, [x1, #8]
+ subs x12, x12, #1
+ b.ne 1b
+ mov x0, #0
+ mov x1, #0
+ mov x2, #0
+ mov x3, #0
+ mov x4, #0
+ mov x5, #0
+ mov x8, #1
  svc #0
  b .
 .global smp_user_end
