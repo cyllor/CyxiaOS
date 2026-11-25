@@ -33,7 +33,11 @@ const TURN_EXIT_GUARD_NS:u64=100_000;
 // before the initial eight-role milestone. A validated manifest borrow
 // alone did not eliminate the overrun. Shorten only the diagnostic
 // execution slice and retain all measured trap/dispatch overhead.
-const DECISION_SLICE_NS:u64=50_000;
+// PR90 capture-2: role2 443074ns / 250000ns. Keep the same
+// reservation, reduce the diagnostic EL0 wall slice and reserve more
+// exit/dispatch headroom. This is not a physical WCET claim.
+const DECISION_SLICE_NS:u64=20_000;
+const DECISION_EXIT_GUARD_NS:u64=150_000;
 const E_AUTH:i64=-1;const E_FORMAT:i64=-2;const E_UNSUPPORTED:i64=-11;
 const EFAULT:i64=-12;const EAGAIN:i64=-13;
 const MAGIC:u64=0x4359_5838_424f_4f54;
@@ -540,14 +544,22 @@ fn turn(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running,budget:&mut Budg
     // additional work must be independently admitted under the same 0.5ms
     // combined decision/publication limit for this domain and window.
     let trap_limit=if class==Class::Decision{1}else{32};
+    let exit_guard=if class==Class::Decision{DECISION_EXIT_GUARD_NS}else{TURN_EXIT_GUARD_NS};
+    // Failure localization: these are cumulative PMU offsets from the
+    // same prepaid turn, not new accounting grants. Their own cost is
+    // included in final settlement. Zero means the phase was not reached.
+    let mut before_enter=0;let mut after_exit=0;let mut after_dispatch=0;
     for _ in 0..trap_limit{
         let actual=timer::cpu_elapsed_ns(began);
         let wall=now_ns();
         let cpu_left=quota.saturating_sub(actual);
         let wall_left=token.deadline_ns().saturating_sub(wall);
-        if cpu_left<=TURN_EXIT_GUARD_NS||wall_left<=TURN_EXIT_GUARD_NS{break;}
-        let mut interval=(cpu_left-TURN_EXIT_GUARD_NS).min(wall_left-TURN_EXIT_GUARD_NS);
-        if class==Class::Decision{interval=interval.min(DECISION_SLICE_NS);}
+        if cpu_left<=exit_guard||wall_left<=exit_guard{break;}
+        let mut interval=(cpu_left-exit_guard).min(wall_left-exit_guard);
+        if class==Class::Decision{
+            interval=interval.min(DECISION_SLICE_NS);
+            before_enter=timer::cpu_elapsed_ns(began);
+        }
         unsafe{
             timer::arm(timer::ticks().checked_add(ticks_for(interval)).unwrap());
             let root=member.ttbr0_root;
@@ -557,6 +569,7 @@ fn turn(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running,budget:&mut Budg
             user::enter_pinned_until_retired(&mut r.context,root,role_asid(index,r.bank));
             cpu::disable_timer();
         }
+        if class==Class::Decision{after_exit=timer::cpu_elapsed_ns(began);}
         // Settle immediately after a timer exit instead of re-entering in
         // the same prepaid turn; all measured cost is retained by the ledger.
         if r.context.kind==9{r.preemptions+=1;break;}
@@ -569,11 +582,16 @@ fn turn(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running,budget:&mut Budg
         }
         if r.context.kind!=8 || r.context.esr>>26!=0x15{fatal(600+index as u64);}
         parked=dispatch(index,m,r);
+        if class==Class::Decision{after_dispatch=timer::cpu_elapsed_ns(began);}
         if parked{break;}
     }
     let receipt=budget.settle(token,began);
     r.charges=r.charges.checked_add(receipt.actual_ns).unwrap();r.turns+=1;
     if receipt.overrun||receipt.crossed_window{
+        if class==Class::Decision{
+            report("V0199_DECISION_OVERRUN_PHASES",before_enter,after_exit,after_dispatch);
+            report("V0199_DECISION_OVERRUN_TRAP",r.context.kind as u64,r.context.esr,r.context.regs[8]);
+        }
         report("V0199_BOOTSTRAP_OVERRUN",member.role.id() as u64,receipt.actual_ns,quota);
         fatal(620+index as u64);
     }
