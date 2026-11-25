@@ -253,6 +253,31 @@ impl BudgetMeter {
         report("V0199_INITIAL_LOAD",u64::from(ROLES[index].id()),total,largest);
         pair
     }
+    // Recovery of a stopped role is resumable between independently
+    // verified copy/relocation/seal/scrub checkpoints. Reserve from the
+    // same 8ms recovery class, never from another role or the business CPUs.
+    fn reserve_recovery_slice(&mut self,until:u64)->(Turn,u64){
+        loop{
+            let (now,began)=self.sample_gap();if now>=until{fatal(682);}
+            let remaining=8_000_000u64.saturating_sub(self.ledger.spent(Class::Recovery));
+            if remaining<2_000_000||now%WINDOW_NS>WINDOW_NS-5_000_000{
+                self.idle_retry();continue;
+            }
+            match self.ledger.reserve_kernel_with_wall(0,Class::Recovery,2_000_000,50_000_000,now){
+                Ok(t)=>return(t,began),
+                Err(Error::Exhausted|Error::Busy)=>self.idle_retry(),
+                Err(e)=>panic!("recovery slice: {e:?}"),
+            }
+        }
+    }
+    fn settle_recovery_slice(&mut self,role:Role,t:Turn,began:u64)->u64{
+        let receipt=self.settle(t,began);
+        if receipt.overrun||receipt.crossed_window{
+            report("V0199_BOOTSTRAP_OVERRUN",role.id() as u64,receipt.actual_ns,t.reserved_ns());
+            fatal(683);
+        }
+        receipt.actual_ns
+    }
     /// Reserve before an individual bounded coordination operation. For
     /// final evidence, do not burn an entire window in a long UART burst.
     fn coordinated<T>(&mut self,work:impl FnOnce()->T)->T{
@@ -650,15 +675,20 @@ fn turn(index:usize,m:&ValidatedRoleManifest<'_>,r:&mut Running,budget:&mut Budg
 /// the old image be made writable again. These static frames are never
 /// attached to DMA or another address space in this diagnostic profile.
 fn retire_root(index:usize,bank:usize){
+    retire_root_checkpointed(index,bank,||{});
+}
+fn retire_root_checkpointed(index:usize,bank:usize,mut checkpoint:impl FnMut()){
     let t=tables(index,bank);
     unsafe{core::ptr::write_volatile(core::ptr::addr_of_mut!((*t).root.0[0]),0);}
     tlbi();
+    checkpoint();
     // Root disconnected and context returned; all former leaf entries are
     // now inaccessible. This is not proof of a general production DMA join.
     unsafe{
         core::ptr::write_bytes(core::ptr::addr_of_mut!((*t).mid.0).cast::<u8>(),0,PAGE);
         core::ptr::write_bytes(core::ptr::addr_of_mut!((*t).leaf.0).cast::<u8>(),0,PAGE);
     }
+    checkpoint();
     let b=backing(index) as u64;
     for offset in (0..IMAGE).step_by(PAGE){
         let pa=phys(b+offset as u64);
@@ -670,10 +700,12 @@ fn retire_root(index:usize,bank:usize){
             unsafe{core::ptr::write_volatile(leaf,0);}tlbi();
             unsafe{core::ptr::write_volatile(leaf,rw);}tlbi();
         }
+        checkpoint();
     }
     let bytes=unsafe{core::slice::from_raw_parts_mut(b as *mut u8,IMAGE+ROLE_STACK_BYTES)};
-    bytes.fill(0);
-    assert!(bytes.iter().all(|&v|v==0));
+    for page in bytes.chunks_exact_mut(PAGE){
+        page.fill(0);assert!(page.iter().all(|&v|v==0));checkpoint();
+    }
 }
 fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT],
     budget:&mut BudgetMeter)
@@ -744,28 +776,31 @@ fn restart_each(manifest:&mut NativeRoleManifest,running:&mut[Running;ROLE_COUNT
             SMP_EVIDENCE.words[400+i*9+1+j].store(delta,Ordering::Relaxed);
         }
         report("V0199_RESTART_SURVIVORS",old.role.id() as u64,progressed,total_delta);
-        let (credit,start)=loop{
-            let (now,start)=budget.sample_gap();if now>=until{fatal(682);}
-            if now%WINDOW_NS>WINDOW_NS-10_000_000{budget.idle_retry();continue;}
-            match budget.ledger.reserve_kernel_with_wall(0,Class::Recovery,8_000_000,50_000_000,now){
-                Ok(t)=>break (t,start),
-                Err(Error::Exhausted|Error::Busy)=>{budget.idle_retry();continue;},
-                Err(e)=>panic!("recovery reservation: {e:?}"),
+        let (mut credit,mut start)=budget.reserve_recovery_slice(until);
+        let mut actual=0u64;let mut slices=0u64;let mut largest=0u64;
+        let mut checkpoint=||{
+            if timer::cpu_elapsed_ns(start)>=450_000
+                || credit.deadline_ns().saturating_sub(now_ns())<2_000_000{
+                let cost=budget.settle_recovery_slice(old.role,credit,start);
+                actual=actual.checked_add(cost).unwrap();slices+=1;largest=largest.max(cost);
+                (credit,start)=budget.reserve_recovery_slice(until);
             }
         };
-        retire_root(i,old_bank);
-        let (member,new)=load(i,next,1);
+        // Old context remains stopped and new mappings are not published
+        // during pauses. Every BBM operation completes before yielding.
+        retire_root_checkpointed(i,old_bank,&mut checkpoint);
+        let (member,new)=load_checkpointed(i,next,1,&mut checkpoint);
+        drop(checkpoint);
         assert!(member.ttbr0_root!=old_root&&member.actor.generation==next);
         assert_eq!(unsafe{(*tables(i,old_bank)).root.0[0]},0);
         assert!(old_cap.selector==0||new.cap.selector!=old_cap.selector);
         manifest.members[i]=member;
         let checked=manifest.validated().expect("replacement inventory");
-        let receipt=budget.settle(credit,start);
-        let actual=receipt.actual_ns;
-        if receipt.overrun||receipt.crossed_window{
-            report("V0199_BOOTSTRAP_OVERRUN",old.role.id() as u64,receipt.actual_ns,8_000_000);
-            fatal(683);
-        }
+        let cost=budget.settle_recovery_slice(old.role,credit,start);
+        actual=actual.checked_add(cost).unwrap();slices+=1;largest=largest.max(cost);
+        SMP_EVIDENCE.words[56+i].store(slices,Ordering::Relaxed);
+        SMP_EVIDENCE.words[64+i].store(largest,Ordering::Relaxed);
+        report("V0199_RESTART_RECOVERY_SLICES",old.role.id() as u64,slices,largest);
         life.reset_complete(1,next).unwrap();
         running[i]=new;
         while running[i].clocks<2||running[i].role_calls<2{
