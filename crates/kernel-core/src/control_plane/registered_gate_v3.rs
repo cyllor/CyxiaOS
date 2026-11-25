@@ -118,7 +118,17 @@ pub struct AssistedScope<'a>{
     pub offline_model_authorized:bool,
 }
 #[derive(Clone,Copy)]
-struct ClaimedWork { frame:super::apply_work_v1::WorkFrame, origin:apply_report_v1::ReportOrigin, accepted_ns:u64 }
+enum WorkCustody{
+    Accepted,
+    // Not an accepted execution. A protected recovery owner has sealed
+    // this exact no-effect report; subsequent fetch must never execute it.
+    NeverAccepted{report_digest:[u8;32]},
+}
+#[derive(Clone,Copy)]
+struct ClaimedWork{
+    frame:super::apply_work_v1::WorkFrame,origin:apply_report_v1::ReportOrigin,
+    recorded_ns:u64,custody:WorkCustody,
+}
 #[derive(Clone,Copy)]
 struct TrialProof{permit_id:u64,permit_hash:[u8;32],hold:Option<super::trial_permit_v1::Hold>,cost_settled:bool}
 struct Pending {
@@ -896,7 +906,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         if p.claimed[index].is_some(){return Err(Error::Busy);}
         for claim in p.claimed.iter().flatten(){
             let prior=super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
-            if prior.plan_version!=scope.plan_version||scope.now_ns<claim.accepted_ns{
+            if prior.plan_version!=scope.plan_version||scope.now_ns<claim.recorded_ns{
                 return Err(Error::Stale);
             }
         }
@@ -910,8 +920,55 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         // Unknown external operations are not allowed in this admission
         // callback; actual execution occurs only after the retained claim.
         verify_and_accept(&work)?;
-        p.claimed[index]=Some(ClaimedWork{frame,origin,accepted_ns:scope.now_ns});
+        p.claimed[index]=Some(ClaimedWork{frame,origin,recorded_ns:scope.now_ns,custody:WorkCustody::Accepted});
         Ok(frame)
+    }
+
+    /// Terminal custody for a published action that provably never crossed
+    /// the executor admission point. Only the authenticated independent
+    /// terminal owner may seal it. The callback must atomically fence its
+    /// native desired slot, verify all reservations/queue/device obligations
+    /// and establish the exact no-effect terminal. Expiry alone is not proof.
+    /// No new ApplyWork is delivered and no executor accept callback runs.
+    /// A later ordinary claim is blocked by the same retained action slot.
+    pub fn seal_unaccepted_terminal(&mut self,supervisor:Identity,plan_wire:&[u8],
+        copied:BoundReport<'_>,scope:TrustedApplyScope,binding:ExecutorBindingV1,
+        verify_no_effect:impl FnOnce(&super::apply_work_v1::ApplyWorkV1<'_>,&ApplyReportV1<'_>)->Result<(),Error>,
+    )->Result<(),Error>{
+        if !supervisor.valid()||self.terminal_owner!=Some(supervisor){return Err(Error::Denied);}
+        let plan=PlanV2::decode(plan_wire)?;
+        let r=ApplyReportV1::decode(copied.bytes)?;
+        use apply_report_v1::ActionStatus;
+        if !matches!(r.state,ActionStatus::Rejected|ActionStatus::Cancelled)
+            ||r.result>=0||r.completed_ns>scope.now_ns||scope.now_ns==0
+            ||scope.boot_epoch!=self.boot_epoch||plan.header.controller_epoch!=self.controller_epoch
+            ||scope.plan_version<=plan.header.base_plan_version{return Err(Error::Denied);}
+        let boot=self.boot_epoch;
+        let index=usize::from(r.action_index);
+        let p=self.lookup_mut(plan.header.plan_seq).ok_or(Error::Stale)?;
+        // Unknown publication may itself have committed. Resolve that
+        // independently before trying this narrower no-effect path.
+        if p.status!=PendingStatus::AdapterAccepted{return Err(Error::NotReady);}
+        if sha256(plan_wire)!=p.plan_digest||index>=p.count{return Err(Error::Denied);}
+        let frame=super::apply_work_v1::WorkFrame::from_plan(&plan,index,boot,scope.plan_version,binding,copied.origin)?;
+        let work=super::apply_work_v1::ApplyWorkV1::decode(frame.bytes())?;
+        if !work.matches_report(r){return Err(Error::Denied);}
+        let report_digest=sha256(copied.bytes);
+        if let Some(prior)=p.claimed[index]{
+            return match prior.custody{
+                WorkCustody::NeverAccepted{report_digest:old}
+                    if old==report_digest&&prior.frame==frame&&prior.origin==copied.origin=>Ok(()),
+                _=>Err(Error::Busy),
+            };
+        }
+        for claim in p.claimed.iter().flatten(){
+            let prior=super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
+            if prior.plan_version!=scope.plan_version||scope.now_ns<claim.recorded_ns{return Err(Error::Stale);}
+        }
+        verify_no_effect(&work,&r)?;
+        p.claimed[index]=Some(ClaimedWork{frame,origin:copied.origin,recorded_ns:scope.now_ns,
+            custody:WorkCustody::NeverAccepted{report_digest}});
+        Ok(())
     }
 
     pub fn publisher_scope(&self,actor:Identity)->Result<(u64,u64),Error>{
@@ -985,15 +1042,20 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         {return Err(Error::Denied);}
         if pending.trial.is_some_and(|t|!t.cost_settled){return Err(Error::NotReady);}
         // A valid current executor binding alone is insufficient. Every
-        // report must refer to an already accepted exact ApplyWork key;
-        // a stale or never-accepted report cannot reach the effect verifier.
+        // report refers either to an exact accepted ApplyWork or to an
+        // independently sealed never-accepted no-effect terminal.
         for copied in report_frames{
             let r=ApplyReportV1::decode(copied.bytes)?;
             let i=usize::from(r.action_index);
             let claim=pending.claimed.get(i).and_then(|v|v.as_ref()).ok_or(Error::NotReady)?;
             let work=super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
-            if claim.origin!=copied.origin||!work.matches_report(r)
-                ||r.completed_ns<claim.accepted_ns{return Err(Error::Denied);}
+            if claim.origin!=copied.origin||!work.matches_report(r){return Err(Error::Denied);}
+            match claim.custody{
+                WorkCustody::Accepted if r.completed_ns<claim.recorded_ns=>return Err(Error::Denied),
+                WorkCustody::NeverAccepted{report_digest} if sha256(copied.bytes)!=report_digest
+                    =>return Err(Error::Denied),
+                _=>(),
+            }
         }
         // Retain the exact causal sidecar from registration, not a new
         // model-supplied explanation. A missing pair never becomes a label.
@@ -1475,6 +1537,58 @@ mod tests {
         second[32..40].copy_from_slice(&18u64.to_le_bytes());
         let reports=[BoundReport{bytes:&first,origin},BoundReport{bytes:&second,origin}];
         assert_eq!(gate.settle_verified_apply_reports(SUPERVISOR,&plan,&reports,&[b0,b1],verified_scope(),|_,_|Ok(())).unwrap().action_count,2);
+    }
+    #[test]
+    fn unaccepted_terminal_is_sealed_without_claiming_execution_and_retained_with_feedback(){
+        let mut rules=profile_bytes();rules[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        let catalog=Profile::parse(&rules).unwrap();
+        let original=plan_bytes();let mut plan=[0u8;360];
+        plan[..212].copy_from_slice(&original);plan[212..].copy_from_slice(&original[64..]);
+        plan[8..12].copy_from_slice(&360u32.to_le_bytes());
+        plan[12..14].copy_from_slice(&2u16.to_le_bytes());
+        plan[212+24..212+32].copy_from_slice(&5u64.to_le_bytes());
+        plan[212+40..212+48].copy_from_slice(&18u64.to_le_bytes());
+        let r0=decision(&plan,&rules);let mut r1=r0;
+        r1[24..32].copy_from_slice(&5u64.to_le_bytes());
+        r1[48..56].copy_from_slice(&18u64.to_le_bytes());
+        r1[92..94].copy_from_slice(&1u16.to_le_bytes());
+        let [a]=frozen(&[2,4],&[2,0]);let [mut b]=frozen(&[2,4],&[2,0]);b.target.id=18;
+        let ctx=trusted(&rules);let mut gate=RegisteredDecisionGate::new_with_terminal_owner(CONTROLLER,PUBLISHER,SUPERVISOR,1,2).unwrap();
+        let actions=[a,b];
+        gate.register_rule_only(CONTROLLER,&plan,&[r0,r1],&catalog,&actions,ctx).unwrap();
+        gate.publish_once(PUBLISHER,&plan,&[r0,r1],&catalog,&actions,ctx,||Ok(())).unwrap();
+        claim_test_work(&mut gate,&plan);
+        let origin=apply_report_v1::ReportOrigin::Kernel;
+        let binding=ExecutorBindingV1{target:Identity{id:18,generation:1},..verified_binding()};
+        let first=executor_report(1);let mut second=first;
+        second[24..26].copy_from_slice(&1u16.to_le_bytes());
+        second[28..30].copy_from_slice(&4u16.to_le_bytes());
+        second[32..40].copy_from_slice(&18u64.to_le_bytes());
+        second[64..68].copy_from_slice(&(-7i32).to_le_bytes());
+        let cancelled=BoundReport{bytes:&second,origin};
+        let scope=verified_scope();
+        assert_eq!(gate.seal_unaccepted_terminal(PUBLISHER,&plan,cancelled,scope,binding,|_,_|panic!()),Err(Error::Denied));
+        let mut fabricated=second;fabricated[28..30].copy_from_slice(&1u16.to_le_bytes());fabricated[64..68].fill(0);
+        assert_eq!(gate.seal_unaccepted_terminal(SUPERVISOR,&plan,BoundReport{bytes:&fabricated,origin},
+            scope,binding,|_,_|panic!()),Err(Error::Denied));
+        assert_eq!(gate.seal_unaccepted_terminal(SUPERVISOR,&plan,cancelled,scope,binding,|_,_|Err(Error::NotReady)),Err(Error::NotReady));
+        gate.seal_unaccepted_terminal(SUPERVISOR,&plan,cancelled,scope,binding,|w,r|{
+            assert_eq!(w.action_index,1);assert_eq!(r.state,apply_report_v1::ActionStatus::Cancelled);Ok(())
+        }).unwrap();
+        assert_eq!(gate.seal_unaccepted_terminal(SUPERVISOR,&plan,cancelled,scope,binding,|_,_|panic!()),Ok(()));
+        assert_eq!(gate.claim_apply_work(&plan,1,scope,binding,origin,|_|panic!()),Err(Error::Busy));
+        let frames=[BoundReport{bytes:&first,origin},BoundReport{bytes:&fabricated,origin}];
+        assert_eq!(gate.settle_verified_apply_reports(SUPERVISOR,&plan,&frames,&[verified_binding(),binding],scope,|_,_|panic!()),Err(Error::Denied));
+        let frames=[BoundReport{bytes:&first,origin},cancelled];
+        let mut inbox=super::super::feedback_v0199::FeedbackInbox::new(SUPERVISOR,Identity{id:10,generation:1}).unwrap();
+        assert_eq!(gate.settle_verified_apply_reports_with_feedback(SUPERVISOR,&plan,&frames,&[verified_binding(),binding],scope,None,
+            |_,_|Ok(()),|_|Err(Error::Exhausted)),Err(Error::Exhausted));
+        gate.settle_verified_apply_reports_with_feedback(SUPERVISOR,&plan,&frames,&[verified_binding(),binding],scope,None,
+            |_,_|Ok(()),|batch|inbox.retain(SUPERVISOR,batch)).unwrap();
+        assert_eq!(inbox.len(),2);
+        let row=inbox.read(Identity{id:10,generation:1},1).unwrap().unwrap();
+        assert_eq!(row.report_bytes(),&second);
+        assert_eq!(row.causal_label,super::super::feedback_v0199::CausalLabel::NoAdoption);
     }
     #[test]
     fn native_apply_reports_require_supervisor_and_real_completion_proof(){
