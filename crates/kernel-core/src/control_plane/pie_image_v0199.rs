@@ -489,6 +489,12 @@ mod tests {
         image.stage_private_image(
             &mut out,0x4000_0000,0x4000_0000,0x5000_0000,&reloc
         ).unwrap();
+        // The native checkpointed path must yield the very same fully
+        // validated private image, without exposing a partial mapping.
+        let mut checkpointed=vec![0xbbu8;0x4000];let mut checkpoints=0;
+        image.stage_private_image_checkpointed(&mut checkpointed,0x4000_0000,0x4000_0000,
+            0x5000_0000,&reloc,||checkpoints+=1).unwrap();
+        assert!(checkpoints>=4);assert_eq!(checkpointed,out);
         assert_eq!(&out[0x1000..0x1004],&[0x1f,0x20,0x03,0xd5]);
         assert!(out[0x1004..0x2000].iter().all(|b|*b==0));
         assert_eq!(
@@ -501,6 +507,9 @@ mod tests {
             &mut short,0x4000_0000,0x4000_0000,0x5000_0000,&reloc
         ).is_err());
         assert!(short.iter().all(|b|*b==0xaa)); // validation precedes writes
+        assert!(image.stage_private_image_checkpointed(&mut short,0x4000_0000,0x4000_0000,
+            0x5000_0000,&reloc,||panic!("invalid staging must never start")).is_err());
+        assert!(short.iter().all(|b|*b==0xaa));
         let mut bad=reloc;bad[0].offset=0x1000;
         let mut previous=vec![0x55u8;0x4000];
         assert!(image.stage_private_image(
