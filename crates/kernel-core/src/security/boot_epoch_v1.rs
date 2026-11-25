@@ -3,7 +3,7 @@
 //! locations and exclusive transaction space. A single state block is not
 //! a complete startup grant. Diagnostic media never become production
 //! credentials merely because their CRC/FLUSH checks pass.
-use super::{Error,durable_role_epoch_v0199::{Change,PreparedEpoch,CommitEvidence},
+use super::{Error,durable_role_epoch_v0199::{Change,PreparedEpoch,CommitEvidence,DurableEpochGate,RedoPlacement},
     file_index_v0199::SecurityStateStoreV2,
     file_media_v0199::{SUPER_BYTES as BLOCK,DATA_START,BLOCK_COUNT,SuperblockV1,
         crc32c_payload,crc32c_zeroed,verify_state_redo_v1},
@@ -108,7 +108,16 @@ impl BootPairRedo{
         seal(&mut self.commit,3,128,txid,sb.log_epoch,lsn)?;
         Ok(())
     }
-    pub fn append(&mut self,io:&mut impl EpochBlockIo,sb:SuperblockV1,first:u32,
+    pub fn append_once(&mut self,io:&mut impl EpochBlockIo,gate:&mut DurableEpochGate,
+        sb:SuperblockV1,first:u32,state_home:u32,boot_home:u32,txid:u64,lsn:u64,ticket:PreparedEpoch,
+        verify_reserved_extent:impl FnOnce(&RedoPlacement)->Result<(),Error>,
+    )->Result<BootPairCommit,Error>{
+        let state=gate.after_image(ticket)?;
+        gate.claim_redo_once(ticket,RedoPlacement{fs_uuid:sb.fs_uuid,log_epoch:sb.log_epoch,
+            first,state_home,boot_home:Some(boot_home),txid,commit_lsn:lsn},verify_reserved_extent)?;
+        self.append(io,sb,first,state_home,boot_home,txid,lsn,ticket,&state)
+    }
+    fn append(&mut self,io:&mut impl EpochBlockIo,sb:SuperblockV1,first:u32,
         state_home:u32,boot_home:u32,txid:u64,lsn:u64,ticket:PreparedEpoch,state:&[u8;BLOCK])
         ->Result<BootPairCommit,Error>{
         let decoded=SecurityStateStoreV2::decode(state)?;
@@ -168,20 +177,19 @@ mod tests{
         assert!(matches!(DurableEpochGate::recovered_pair(&state,&wrong,slots,|_|panic!()),Err(Error::Conflict)));
         let mut gate=DurableEpochGate::recovered_pair(&state,&boot,slots,|_|Ok(())).unwrap();
         let ticket=gate.prepare(Change::AllocateBoot,|_|panic!()).unwrap();
-        let image=gate.after_image(ticket).unwrap();
         let mut pair=BootPairRedo::new();
         let sb=SuperblockV1{fs_uuid:[1;16],generation:1,checkpoint_lsn:0,log_epoch:1};
         let mut disk=Disk{log:[[0;BLOCK];6],writes:0,flushes:0,fail_second:true};
-        assert!(matches!(pair.append(&mut disk,sb,2,7000,7002,1,4,ticket,&image),Err(Error::Unknown)));
+        assert!(matches!(pair.append_once(&mut disk,&mut gate,sb,2,7000,7002,1,4,ticket,|_|Ok(())),Err(Error::Unknown)));
         assert_eq!(gate.boot_epoch(),None);assert_eq!((disk.writes,disk.flushes),(6,2));
-        assert!(matches!(pair.append(&mut disk,sb,2,7000,7002,1,4,ticket,&image),Err(Error::Conflict)));
+        assert!(matches!(pair.append_once(&mut disk,&mut gate,sb,2,7000,7002,1,4,ticket,|_|panic!()),Err(Error::Busy)));
         // Separate successful native-owner fixture. Do not retry the
         // ambiguous transaction on another device under the old gate.
         let mut gate=DurableEpochGate::recovered_pair(&state,&boot,slots,|_|Ok(())).unwrap();
         let ticket=gate.prepare(Change::AllocateBoot,|_|panic!()).unwrap();
         let image=gate.after_image(ticket).unwrap();
         let mut disk=Disk{log:[[0;BLOCK];6],writes:0,flushes:0,fail_second:false};
-        let proof=pair.append(&mut disk,sb,2,7000,7002,1,4,ticket,&image).unwrap();
+        let proof=pair.append_once(&mut disk,&mut gate,sb,2,7000,7002,1,4,ticket,|_|Ok(())).unwrap();
         let receipt=proof.receipt();
         assert_eq!(gate.confirm(ticket,receipt,&image,|_,_|panic!()),Err(Error::Unauthorized));
         let mut super_raw=[0;BLOCK];
