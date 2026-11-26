@@ -96,9 +96,9 @@ pub struct Owner {
     change_count: usize,
     poisoned: bool,
 }
-/// Exact ceil-to-grid with explicit slack and due checks; u128 avoids
-/// rounding overflow. The representable slack endpoint is saturated,
-/// not wrapped. Hard/lease/recovery requests must declare zero slack.
+/// Exact ceil-to-grid with explicit slack and due checks. Calculate the
+/// remaining grid distance without wide division or rounding overflow.
+/// Hard/lease/recovery requests must declare zero slack.
 pub fn programmed_ns(
     class: TimerClass,
     slack: u64,
@@ -118,9 +118,10 @@ pub fn programmed_ns(
     if deadline <= now || us == 0 {
         return Ok(deadline);
     }
-    let q = u128::from(us) * 1000;
-    let rounded = u128::from(deadline).div_ceil(q) * q;
-    Ok(rounded.min(u128::from(deadline.saturating_add(slack))) as u64)
+    let q = u64::from(us) * 1000;
+    let remainder = deadline % q;
+    let delta = if remainder == 0 { 0 } else { q - remainder };
+    Ok(deadline.saturating_add(delta.min(slack)))
 }
 impl Owner {
     pub const fn empty() -> Self {
@@ -659,6 +660,28 @@ mod tests {
             programmed_ns(TimerClass::Soft, u64::MAX, u64::MAX - 1, 1, 1000),
             Ok(u64::MAX)
         );
+    }
+    #[test]
+    fn soft_coalescing_matches_wide_reference_at_overflow_boundaries() {
+        for us in [0u16, 50, 200, 1000] {
+            for deadline in [1, 49_999, 50_000, 50_001, u64::MAX - 1, u64::MAX] {
+                for slack in [0, 1, 100_000, u64::MAX] {
+                    for now in [0, deadline] {
+                        let expected = if us == 0 || deadline <= now {
+                            deadline
+                        } else {
+                            let q = u128::from(us) * 1000;
+                            let rounded = u128::from(deadline).div_ceil(q) * q;
+                            rounded.min(u128::from(deadline.saturating_add(slack))) as u64
+                        };
+                        assert_eq!(
+                            programmed_ns(TimerClass::Soft, slack, deadline, now, us),
+                            Ok(expected)
+                        );
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn applied_requires_actual_soft_arm_and_exact_delivery() {

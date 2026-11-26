@@ -227,23 +227,16 @@ impl Owner {
     /// Independent native observation: known created and UNKNOWN occupied
     /// slots are distinct. No guessed request-rate or blocked ratio.
     pub fn counts(&self) -> (usize, usize, usize) {
-        (
-            self.rows
-                .iter()
-                .flatten()
-                .filter(|r| r.state == State::Queued)
-                .count(),
-            self.rows
-                .iter()
-                .flatten()
-                .filter(|r| r.occupied && matches!(r.state, State::Created(_)))
-                .count(),
-            self.rows
-                .iter()
-                .flatten()
-                .filter(|r| r.state == State::Unknown)
-                .count(),
-        )
+        let (mut pending, mut live, mut unknown) = (0, 0, 0);
+        for row in self.rows.iter().flatten() {
+            match row.state {
+                State::Queued => pending += 1,
+                State::Created(_) if row.occupied => live += 1,
+                State::Unknown => unknown += 1,
+                _ => {}
+            }
+        }
+        (pending, live, unknown)
     }
     pub fn query(&self, caller: Identity, id: u64) -> Result<State, Error> {
         Ok(self.rows[self.row(caller, id)?].unwrap().state)
@@ -682,6 +675,36 @@ mod tests {
             digest: [1; 32],
         }
     }
+    #[test]
+    fn counts_distinguish_retained_unknown_and_exited_tasks() {
+        let mut o = Owner::empty();
+        o.bind(1, 1, || Ok(())).unwrap();
+        o.register_group(GROUP, || Ok(())).unwrap();
+        for id in 1..=3 {
+            o.submit(req(id), 100, |_| Ok(())).unwrap();
+        }
+        let task = Identity {
+            id: 100,
+            generation: 1,
+        };
+        o.service_one(
+            101,
+            0,
+            |_| Ok(()),
+            |_| Completion {
+                outcome: Outcome::Created(task),
+                completed_ns: 101,
+            },
+        )
+        .unwrap();
+        o.start_one(102, 0, |_| Ok(())).unwrap().unwrap();
+        assert_eq!(o.counts(), (1, 1, 1));
+        o.exited(task, 103, || Ok(())).unwrap();
+        assert_eq!(o.counts(), (1, 0, 1));
+        o.cancel_queued(CALLER, 3, 104, |_| Ok(())).unwrap();
+        assert_eq!(o.counts(), (0, 0, 1));
+    }
+
     #[test]
     fn reauthorization_rejection_does_not_start_constructor() {
         let mut o = Owner::empty();

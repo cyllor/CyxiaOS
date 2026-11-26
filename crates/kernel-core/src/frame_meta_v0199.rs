@@ -154,6 +154,8 @@ pub struct Inventory {
 pub struct Ledger<'a> {
     base: u64,
     rows: &'a mut [FrameMeta],
+    // Ordinary first-fit hint, never an ownership or capacity authority.
+    next_free: usize,
     arena: u32,
     firmware_extra: u32,
     fixed: [MemoryRegion; MAX_STATIC_REGIONS],
@@ -293,6 +295,7 @@ impl<'a> Ledger<'a> {
         let l = Self {
             base,
             rows,
+            next_free: 0,
             arena,
             firmware_extra,
             fixed: records,
@@ -349,6 +352,7 @@ impl<'a> Ledger<'a> {
         let l = Self {
             base,
             rows,
+            next_free: 0,
             arena: 0,
             firmware_extra: 0,
             fixed,
@@ -396,6 +400,7 @@ impl<'a> Ledger<'a> {
         let l = Self {
             base,
             rows,
+            next_free: 0,
             arena: 0,
             firmware_extra: 0,
             fixed,
@@ -485,6 +490,7 @@ impl<'a> Ledger<'a> {
         let l = Self {
             base,
             rows,
+            next_free: 0,
             arena: 0,
             firmware_extra: 0,
             fixed: [MemoryRegion::EMPTY; MAX_STATIC_REGIONS],
@@ -602,7 +608,8 @@ impl<'a> Ledger<'a> {
         if !owner.valid() {
             return Err(Error::Unauthorized);
         }
-        for (i, r) in self.rows.iter_mut().enumerate() {
+        for (i, r) in self.rows.iter_mut().enumerate().skip(self.next_free) {
+            self.next_free = i + 1;
             if r.flags & STATE != FREE {
                 continue;
             }
@@ -724,6 +731,7 @@ impl<'a> Ledger<'a> {
         }
         verify_and_zero(pa)?;
         *r = FrameMeta::unowned(FREE, h.generation);
+        self.next_free = self.next_free.min(h.index as usize);
         Ok(())
     }
 
@@ -1038,6 +1046,42 @@ mod tests {
             class,
         }
     }
+    #[test]
+    fn reservation_first_fit_rewinds_only_after_successful_reclaim() {
+        let mut rows = std::vec![FrameMeta::ZERO;COUNT];
+        let ram = MemoryRegion {
+            kind: RegionKind::Ram,
+            ..region(0, RAM_BYTES)
+        };
+        let fixed = [
+            region(0, 64 * 1024 * 1024),
+            region(64 * 1024 * 1024, TABLE_BYTES as u64),
+            region(74 * 1024 * 1024, POOL_BYTES),
+            region(82 * 1024 * 1024, POOL_BYTES),
+        ];
+        let mut ledger = Ledger::initialize(&mut rows, ram, fixed, &[]).unwrap();
+        let owner = Owner {
+            slot: 1,
+            generation: 1,
+        };
+        let a = ledger.reserve(owner).unwrap();
+        let b = ledger.reserve(owner).unwrap();
+        assert_eq!(b.index(), a.index() + 1);
+        ledger.quarantine(a).unwrap();
+        assert_eq!(
+            ledger.reclaim(a, |_| Err(Error::Unknown)),
+            Err(Error::Unknown)
+        );
+        let c = ledger.reserve(owner).unwrap();
+        assert_eq!(c.index(), b.index() + 1);
+        ledger.reclaim(a, |_| Ok(())).unwrap();
+        let again = ledger.reserve(owner).unwrap();
+        assert_eq!(again.index(), a.index());
+        assert_eq!(again.generation(), a.generation() + 1);
+        assert_eq!(ledger.reserve(owner).unwrap().index(), c.index() + 1);
+        assert_eq!(ledger.inventory().unwrap().reserved, 4);
+    }
+
     #[test]
     fn static_registration_golden_control_pool_shape() {
         // Exact native control-pool shape: one 8MiB physically contiguous

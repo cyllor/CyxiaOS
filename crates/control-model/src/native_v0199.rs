@@ -381,6 +381,7 @@ pub fn score_operations(
         recommended_index: 0,
         scores: [0; 32],
     };
+    let mut shared = None;
     for (i, &c) in candidates.iter().enumerate() {
         if candidates[..i]
             .iter()
@@ -389,7 +390,13 @@ pub fn score_operations(
             return Err(Error::Candidate);
         }
         let features = operations_features(s, c)?;
-        out.scores[i] = model.score(&features.values);
+        out.scores[i] = if candidates.len() == 1 {
+            model.score(&features.values)
+        } else {
+            shared
+                .get_or_insert_with(|| model.prepare_prefix(&features.values))
+                .score(&features.values)
+        };
         if out.scores[i] > out.scores[usize::from(out.recommended_index)] {
             out.recommended_index = i as u16;
         }
@@ -533,6 +540,30 @@ mod tests {
         s.domain = 16;
         assert_eq!(operations_features(&s, c), Err(Error::Format));
     }
+    #[test]
+    fn operations_scores_match_full_inference_for_every_weight_candidate() {
+        let s = sample(1);
+        let candidates = [1, 2, 4, 8].map(|a1| Candidate {
+            a1,
+            a2: None,
+            cpu: [None; 4],
+        });
+        let mut p = [0u8; integer_model::MODEL_BYTES];
+        p[0] = 64;
+        p[41] = 64;
+        p[2048] = 64;
+        p[2560] = 64;
+        let result = score_operations(&s, &candidates, &p).unwrap();
+        let model = integer_model::Model::parse(&p).unwrap();
+        for (i, &candidate) in candidates.iter().enumerate() {
+            let f = operations_features(&s, candidate).unwrap();
+            assert_eq!(result.scores[i], model.score(&f.values));
+        }
+        assert_eq!(result.count, 4);
+        assert_eq!(result.recommended_index, 3);
+        assert_eq!(result.scores[3], 512);
+    }
+
     #[test]
     fn security_redaction_and_integer_inference_are_advisory_only() {
         let mut s = sample(12);

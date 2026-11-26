@@ -4,6 +4,8 @@ on:
     branches: [V0.20.1]
     paths:
       - 'crates/kernel-core/**'
+      - 'crates/control-model/**'
+      - 'crates/prototype/src/model.rs'
       - '.github/workflows/v0201-kernel-algorithms.yml'
   workflow_dispatch:
 permissions:
@@ -18,7 +20,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seam: ['contig_frames::tests', 'console::tests']
+        include:
+          - package: cyxia-kernel-core
+            seam: 'contig_frames::tests'
+          - package: cyxia-kernel-core
+            seam: 'console::tests'
+          - package: cyxia-kernel-core
+            seam: 'frames::tests'
+          - package: cyxia-kernel-core
+            seam: 'frame_meta_v0199::tests'
+          - package: cyxia-kernel-core
+            seam: 'd02_owner_v0199::tests'
+          - package: cyxia-kernel-core
+            seam: 'd07_owner_v0199::tests'
+          - package: cyxia-control-model
+            seam: 'native_v0199'
+          - package: cyxia-prototype
+            seam: 'model::prefix_tests'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -27,8 +45,9 @@ jobs:
         run: rustup toolchain install 1.95.0 --profile minimal --no-self-update
       - name: Run module regression
         env:
+          PACKAGE: ${{ matrix.package }}
           SEAM: ${{ matrix.seam }}
-        run: cargo +1.95.0 test --locked -p cyxia-kernel-core "$SEAM"
+        run: cargo +1.95.0 test --locked -p "$PACKAGE" "$SEAM"
   integration:
     needs: modules
     runs-on: ubuntu-24.04
