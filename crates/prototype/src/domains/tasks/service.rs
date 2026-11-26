@@ -125,6 +125,7 @@ pub struct ServiceStep {
     pub remaining: usize,
 }
 pub struct ServiceBatch {
+    // Strictly increasing issued IDs in a compact prefix; empty tail.
     capabilities: [Option<Capability>; CAPABILITIES],
     serial: u64,
     stamp: PolicyStamp,
@@ -178,13 +179,12 @@ impl ServiceBatch {
         if rights == 0 || rights & !3 != 0 {
             return Err(Error::Auth);
         }
-        let slot = self
-            .capabilities
-            .iter_mut()
-            .find(|c| c.is_none())
-            .ok_or(Error::Capacity)?;
+        let at = self.capabilities.partition_point(Option::is_some);
+        if at == CAPABILITIES {
+            return Err(Error::Capacity);
+        }
         let id = self.serial.checked_add(1).ok_or(Error::Overflow)?;
-        *slot = Some(Capability {
+        self.capabilities[at] = Some(Capability {
             id,
             owner,
             object,
@@ -194,37 +194,43 @@ impl ServiceBatch {
         self.serial = id;
         Ok(id)
     }
+    fn capability_index(&self, id: u64) -> Result<usize, Error> {
+        self.capabilities
+            .binary_search_by(|c| c.map_or(core::cmp::Ordering::Greater, |c| c.id.cmp(&id)))
+            .map_err(|_| Error::Auth)
+    }
     pub fn revoke(&mut self, owner: ObjectKey, cap: u64) -> Result<(), Error> {
-        let slot = self
-            .capabilities
-            .iter_mut()
-            .find(|c| c.is_some_and(|c| c.id == cap && c.owner == owner))
-            .ok_or(Error::Auth)?;
-        *slot = None;
+        let at = self.capability_index(cap)?;
+        if self.capabilities[at].is_none_or(|c| c.owner != owner) {
+            return Err(Error::Auth);
+        }
+        let count = self.capabilities.partition_point(Option::is_some);
+        self.capabilities.copy_within(at + 1..count, at);
+        self.capabilities[count - 1] = None;
         Ok(())
     }
-    pub fn revoke_object(&mut self, object: ObjectKey) {
-        for c in &mut self.capabilities {
-            if c.is_some_and(|c| c.object == object) {
-                *c = None;
+    fn retain_capabilities(&mut self, mut keep: impl FnMut(Capability) -> bool) {
+        let count = self.capabilities.partition_point(Option::is_some);
+        let mut next = 0;
+        for i in 0..count {
+            let cap = self.capabilities[i].expect("occupied capability prefix");
+            if keep(cap) {
+                self.capabilities[next] = Some(cap);
+                next += 1;
             }
         }
+        self.capabilities[next..count].fill(None);
+    }
+    pub fn revoke_object(&mut self, object: ObjectKey) {
+        self.retain_capabilities(|c| c.object != object);
     }
     pub fn revoke_owner(&mut self, owner: ObjectKey) {
-        for c in &mut self.capabilities {
-            if c.is_some_and(|c| c.owner == owner) {
-                *c = None;
-            }
-        }
+        self.retain_capabilities(|c| c.owner != owner);
     }
     /// Revoke a complete view-scoped service without affecting capabilities
     /// for other services. Pending vectors resolve these identities again.
     pub fn revoke_service(&mut self, service: ObjectKey) {
-        for capability in &mut self.capabilities {
-            if capability.is_some_and(|capability| capability.service == service) {
-                *capability = None;
-            }
-        }
+        self.retain_capabilities(|c| c.service != service);
     }
     pub fn policy(&self, now: u64) -> u8 {
         if self.stamp.live(now) {
@@ -302,13 +308,7 @@ impl ServiceBatch {
         Ok(vector)
     }
     fn resolve(&self, caller: ObjectKey, item: ServiceItem) -> Result<Capability, Error> {
-        let cap = self
-            .capabilities
-            .iter()
-            .flatten()
-            .find(|c| c.id == item.cap)
-            .copied()
-            .ok_or(Error::Auth)?;
+        let cap = self.capabilities[self.capability_index(item.cap)?].ok_or(Error::Auth)?;
         if cap.owner != caller || cap.rights & (1u8 << (item.op - 1)) == 0 {
             return Err(Error::Auth);
         }

@@ -160,3 +160,34 @@ fn an_empty_upstream_signal_cannot_hide_an_actual_queued_competitor() {
     io.acknowledge(background).unwrap();
     io.cancel(foreground).unwrap();
 }
+
+#[test]
+fn wave4_io_ordinary_limits_keep_recovery_capacity_and_completion_custody() {
+    let mut s = Scheduler::new(8, 8);
+    s.recovery_reserve(2, 2).unwrap();
+    let ordinary = Request {
+        pages: 6,
+        descriptors: 6,
+        ..request(Class::Foreground)
+    };
+    let ticket = s.enqueue(ordinary, 0).unwrap();
+    assert_eq!(s.enqueue(request(Class::Background), 0), Err(Error::Again));
+    let recovery = Request {
+        pages: 2,
+        descriptors: 2,
+        ..request(Class::Recovery)
+    };
+    let r = s.enqueue(recovery, 0).unwrap();
+    assert_eq!(s.usage().pages, 8);
+    assert_eq!(s.usage().descriptors, 8);
+    assert_eq!(
+        s.dispatch(1, |_, _| true, |_, _| Submission::Accepted),
+        Ok(Some(r))
+    );
+    s.complete(r, Ok(()), 1).unwrap();
+    assert_eq!(s.usage().pages, 8);
+    s.acknowledge(r).unwrap();
+    assert_eq!(s.enqueue(request(Class::Background), 1), Err(Error::Again));
+    s.cancel(ticket).unwrap();
+    assert!(s.enqueue(request(Class::Background), 1).is_ok());
+}

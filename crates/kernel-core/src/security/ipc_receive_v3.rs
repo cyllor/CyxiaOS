@@ -179,29 +179,30 @@ impl<const N: usize> DirectionalEndpoint<N> {
             return Err(Error::Stale);
         }
         let message = Message::copied(actor, request, generation, payload)?;
-        // Retained pending messages and a DONE-but-unacknowledged
-        // receive are not evictable even after later sends succeed.
-        if let Some(old) = self
-            .queue
-            .iter()
-            .flatten()
-            .chain(self.reservation.as_ref().map(|r| &r.ticket.message))
-            .find(|m| m.request_id() == request)
-        {
-            return if *old == message {
-                Ok(())
-            } else {
-                Err(Error::Conflict)
-            };
-        }
-        if request == self.send_hi {
-            return if self.last_send == Some(message) {
-                Ok(())
-            } else {
-                Err(Error::Conflict)
-            };
-        }
-        if request < self.send_hi {
+        // Every retained message was accepted before or at send_hi.
+        // A strictly newer ID cannot be a replay. Older IDs still need
+        // exact custody checks, including a DONE receive awaiting ACK.
+        if request <= self.send_hi {
+            if let Some(old) = self
+                .queue
+                .iter()
+                .flatten()
+                .chain(self.reservation.as_ref().map(|r| &r.ticket.message))
+                .find(|m| m.request_id() == request)
+            {
+                return if *old == message {
+                    Ok(())
+                } else {
+                    Err(Error::Conflict)
+                };
+            }
+            if request == self.send_hi {
+                return if self.last_send == Some(message) {
+                    Ok(())
+                } else {
+                    Err(Error::Conflict)
+                };
+            }
             return Err(Error::Stale);
         }
         if self.len >= limit {
@@ -524,6 +525,58 @@ pub mod svc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_send_fast_path_preserves_retained_replay_and_full_queue() {
+        let sender = Identity {
+            id: 6,
+            generation: 2,
+        };
+        let receiver = Identity {
+            id: 2,
+            generation: 3,
+        };
+        let mut q = DirectionalEndpoint::<2>::new(
+            Endpoint {
+                id: 9,
+                generation: 4,
+                receiver,
+            },
+            sender,
+        )
+        .unwrap();
+        q.send(sender, 4, 2, b"a").unwrap();
+        q.send(sender, 4, 4, b"b").unwrap();
+        assert_eq!(q.send(sender, 4, 6, b"c"), Err(Error::Again));
+        assert_eq!(q.send(sender, 4, 2, b"a"), Ok(()));
+        assert_eq!(q.send(sender, 4, 2, b"x"), Err(Error::Conflict));
+        let first = q
+            .reserve_receive(receiver, 4, 1, FRAME_BYTES, true, 0, 1, || Ok(()))
+            .unwrap();
+        q.finish_copy(first, true).unwrap();
+        q.send(sender, 4, 6, b"c").unwrap();
+        assert_eq!(q.send(sender, 4, 2, b"a"), Ok(()));
+        assert_eq!(q.send(sender, 4, 2, b"x"), Err(Error::Conflict));
+        assert_eq!(q.send(sender, 4, 3, b"x"), Err(Error::Stale));
+        assert_eq!(q.send(sender, 4, 4, b"b"), Ok(()));
+        assert_eq!(q.pending(), 2);
+        q.ack(receiver, 4, 1, || Ok(())).unwrap();
+        assert_eq!(q.send(sender, 4, 2, b"a"), Err(Error::Stale));
+        let second = q
+            .reserve_receive(receiver, 4, 2, FRAME_BYTES, true, 0, 2, || Ok(()))
+            .unwrap();
+        assert_eq!(&second.message().bytes()[HEADER_BYTES..], b"b");
+        q.finish_copy(second, true).unwrap();
+        q.ack(receiver, 4, 2, || Ok(())).unwrap();
+        q.send(sender, 4, u64::MAX, b"d").unwrap();
+        assert_eq!(q.send(sender, 4, u64::MAX, b"d"), Ok(()));
+        assert_eq!(q.send(sender, 4, u64::MAX, b"x"), Err(Error::Conflict));
+        assert_eq!(q.send(sender, 4, 0, b"x"), Err(Error::Format));
+        let third = q
+            .reserve_receive(receiver, 4, 3, FRAME_BYTES, true, 0, 3, || Ok(()))
+            .unwrap();
+        assert_eq!(&third.message().bytes()[HEADER_BYTES..], b"c");
+    }
+
     #[test]
     fn fault_retry_done_recopy_ack_and_recovery_preserve_exact_queue() {
         let sender = Identity {

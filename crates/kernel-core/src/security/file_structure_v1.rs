@@ -426,6 +426,13 @@ fn scan_homes(
             }
         }
     }
+    // 0 = unseen, 1 = current parent walk, 2 = verified path to root.
+    // The marks are local to this complete scan, never retained across a
+    // mount, a read failure or a changed inode table.
+    const VISITING: u8 = 1;
+    const ROOTED: u8 = 2;
+    let mut reach = [0u8; INODES];
+    reach[0] = ROOTED;
     for id in 1..INODES {
         if w.inodes[id].kind == 0 || is_system(id, system) {
             if w.references[id] != 0 {
@@ -436,11 +443,15 @@ fn scan_homes(
         if w.references[id] != 1 {
             return Err(Error::Conflict);
         }
-        // Every non-system live object has exactly one reference and
-        // a bounded parent walk to root, not a disconnected cycle.
+        // Validate each parent edge once; encountering a visiting node
+        // proves a disconnected cycle. Even already-rooted inodes still
+        // pass the independent reference-count check above.
         let mut cur = id;
-        let mut reached = false;
-        for _ in 0..INODES {
+        while reach[cur] != ROOTED {
+            if reach[cur] == VISITING {
+                return Err(Error::Conflict);
+            }
+            reach[cur] = VISITING;
             let child = w.inodes[cur];
             let parent = child.parent as usize;
             if parent >= INODES
@@ -450,14 +461,14 @@ fn scan_homes(
             {
                 return Err(Error::Conflict);
             }
-            if parent == 0 {
-                reached = true;
-                break;
-            }
             cur = parent;
         }
-        if !reached {
-            return Err(Error::Conflict);
+        // A verified, acyclic path is immutable under the caller's mount
+        // exclusion. Mark the newly visited portion without recursion.
+        cur = id;
+        while reach[cur] == VISITING {
+            reach[cur] = ROOTED;
+            cur = w.inodes[cur].parent as usize;
         }
     }
     Ok(StructureEvidence {
@@ -582,6 +593,88 @@ mod tests {
         }
         Ok(())
     }
+    fn chain_fixture(block: u32, out: &mut [u8; BLOCK], cycle: bool) -> Result<(), Error> {
+        fixture(block, out, 0)?;
+        if (BITMAP_START..INODE_START).contains(&block) {
+            let base = (block - BITMAP_START) * BLOCK as u32 * 8;
+            for b in DATA_START + 15..DATA_START + 265 {
+                if (base..base + BLOCK as u32 * 8).contains(&b) {
+                    let i = b - base;
+                    out[(i / 8) as usize] |= 1 << (i % 8);
+                }
+            }
+        } else if (INODE_START..DATA_START).contains(&block) {
+            for (i, slot) in out.chunks_exact_mut(INODE_BYTES).enumerate() {
+                let id = (block - INODE_START) * 16 + i as u32;
+                if id == 1 && !cycle {
+                    put32(slot, 36, 6);
+                    seal(slot, 252);
+                } else if id >= 6 {
+                    inode(slot, 2, 1, 128, DATA_START + 15 + id - 6, 1);
+                    let parent = if id == 255 {
+                        if cycle { 6 } else { 0 }
+                    } else {
+                        id + 1
+                    };
+                    put32(slot, 36, parent);
+                    seal(slot, 252);
+                }
+            }
+        } else if block == DATA_START && !cycle {
+            put32(&mut out[..128], 0, 255);
+            seal(&mut out[..128], 124);
+        } else if (DATA_START + 15..DATA_START + 265).contains(&block) {
+            let id = block - (DATA_START + 15) + 6;
+            let child = if id == 6 {
+                if cycle { 255 } else { 1 }
+            } else {
+                id - 1
+            };
+            let b = &mut out[..128];
+            put32(b, 0, child);
+            put16(b, 4, 1);
+            put64(b, 8, 1);
+            b[16] = b'x';
+            seal(b, 124);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deep_parent_chain_and_disconnected_cycle_are_distinguished() {
+        let mut w = Workspace::new();
+        let sb = SuperblockV1 {
+            fs_uuid: [1; 16],
+            generation: 1,
+            checkpoint_lsn: 0,
+            log_epoch: 1,
+        };
+        for cycle in [false, true, false] {
+            let result = scan(
+                sb,
+                &sys(),
+                &mut w,
+                |block, out| chain_fixture(block, out, cycle),
+                |_, _, _| {
+                    assert!(!cycle);
+                    Ok(())
+                },
+            );
+            if cycle {
+                assert_eq!(result, Err(Error::Conflict));
+            } else {
+                assert_eq!(
+                    result,
+                    Ok(StructureEvidence {
+                        live_inodes: 256,
+                        data_blocks: 265,
+                        directory_entries: 251,
+                    })
+                );
+            }
+        }
+    }
+
     #[test]
     fn all_256_inodes_bitmap_and_reachable_directory_entries_are_checked() {
         let mut w = Workspace::new();

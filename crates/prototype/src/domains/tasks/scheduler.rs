@@ -603,43 +603,36 @@ impl Scheduler {
         if self.cpus[cpu].spent >= CPU_BUDGET_NS {
             return Ok(None);
         }
-        let eligible = |t: &&Thread| {
-            usize::from(t.spec.cpu) == cpu
-                && t.state == RunState::Runnable
-                && t.spent < t.spec.budget_ns
-        };
-        let minimum = self
-            .threads
-            .iter()
-            .flatten()
-            .filter(eligible)
-            .any(|t| t.spent < t.spec.minimum_ns);
-        let guard = !minimum
-            && self
-                .threads
-                .iter()
-                .flatten()
-                .filter(eligible)
-                .any(|t| now.saturating_sub(t.ready_since) >= FAIR_WAIT_NS);
-        let mut chosen: Option<usize> = None;
+        // Preserve the same strict tiers and tie breaks without separate
+        // scans to discover whether any minimum or overdue thread exists.
+        let mut chosen: Option<(usize, u8)> = None;
         for (i, t) in self
             .threads
             .iter()
             .enumerate()
             .filter_map(|(i, t)| t.as_ref().map(|t| (i, t)))
         {
-            if !eligible(&t)
-                || (minimum && t.spent >= t.spec.minimum_ns)
-                || (guard && now.saturating_sub(t.ready_since) < FAIR_WAIT_NS)
+            if usize::from(t.spec.cpu) != cpu
+                || t.state != RunState::Runnable
+                || t.spent >= t.spec.budget_ns
             {
                 continue;
             }
-            let Some(previous) = chosen else {
-                chosen = Some(i);
+            let rank = if t.spent < t.spec.minimum_ns {
+                0
+            } else if now.saturating_sub(t.ready_since) >= FAIR_WAIT_NS {
+                1
+            } else {
+                2
+            };
+            let Some((previous, previous_rank)) = chosen else {
+                chosen = Some((i, rank));
                 continue;
             };
             let p = self.threads[previous].as_ref().ok_or(Error::Stale)?;
-            let prefer = if minimum || guard {
+            let prefer = if rank != previous_rank {
+                rank < previous_rank
+            } else if rank != 2 {
                 (t.ready_since, t.last_dispatch, t.spec.key.id)
                     < (p.ready_since, p.last_dispatch, p.spec.key.id)
             } else {
@@ -652,12 +645,14 @@ impl Scheduler {
                 (left, t.last_dispatch, t.spec.key.id) < (right, p.last_dispatch, p.spec.key.id)
             };
             if prefer {
-                chosen = Some(i);
+                chosen = Some((i, rank));
             }
         }
-        let Some(i) = chosen else {
+        let Some((i, rank)) = chosen else {
             return Ok(None);
         };
+        let minimum = rank == 0;
+        let guard = rank == 1;
         let t = self.threads[i].as_mut().ok_or(Error::Stale)?;
         let end = (now / WINDOW_NS)
             .checked_add(1)

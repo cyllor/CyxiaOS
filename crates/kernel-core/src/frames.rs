@@ -131,6 +131,9 @@ pub struct FramePool<'a> {
     capacity: usize,
     free: usize,
     next_zeroed: usize,
+    // Conservative lower bound on the first clean frame; only successful
+    // cleaning can create a new clean page below this cursor.
+    next_clean: usize,
     // Conservative lower bound on the first dirty frame. Revocation may
     // lower it; cleaning advances it without changing first-fit ordering.
     next_dirty: usize,
@@ -231,6 +234,7 @@ impl<'a> FramePool<'a> {
             capacity: free,
             free,
             next_zeroed: 0,
+            next_clean: 0,
             next_dirty: 0,
             recorder: None,
         })
@@ -255,7 +259,9 @@ impl<'a> FramePool<'a> {
 
     /// First-fit clean-page allocation retains the historical selection order.
     pub fn alloc_clean(&mut self, owner: TaskId) -> Result<FrameHandle, FrameError> {
-        for (index, m) in self.meta.iter_mut().enumerate() {
+        while self.next_clean < self.meta.len() {
+            let index = self.next_clean;
+            let m = &mut self.meta[index];
             if m.state == State::Clean {
                 let Some(g) = m.generation.checked_add(1) else {
                     if let Some(r) = self.recorder {
@@ -264,6 +270,7 @@ impl<'a> FramePool<'a> {
                     m.state = State::Retired;
                     self.capacity -= 1;
                     self.free -= 1;
+                    self.next_clean += 1;
                     continue;
                 };
                 if let Some(r) = self.recorder {
@@ -273,12 +280,14 @@ impl<'a> FramePool<'a> {
                 m.owner = Some(owner);
                 m.state = State::Owned;
                 self.free -= 1;
+                self.next_clean += 1;
                 return Ok(FrameHandle {
                     index,
                     address: m.address,
                     generation: g,
                 });
             }
+            self.next_clean += 1;
         }
         if self
             .meta
@@ -420,6 +429,7 @@ impl<'a> FramePool<'a> {
                     r.cleaned(m.address)?;
                 }
                 m.state = State::Clean;
+                self.next_clean = self.next_clean.min(self.next_dirty);
                 self.next_dirty += 1;
                 return Ok(true);
             }
@@ -482,6 +492,34 @@ mod tests {
     }
 
     #[test]
+    fn clean_first_fit_revisits_reclaimed_lower_pages() {
+        let ram = [MemoryRegion {
+            start: PhysAddr(0x1000),
+            len: 4 * 4096,
+            kind: RegionKind::Ram,
+        }];
+        let mut metadata = [FrameMeta::EMPTY; 4];
+        let mut pool = FramePool::from_memory(&ram, &[], &mut metadata).unwrap();
+        let owner = TaskId::new(1).unwrap();
+        let mut zero = ToggleZero(false);
+        for _ in 0..4 {
+            assert!(pool.clean_one(&mut zero).unwrap());
+        }
+        let a = pool.alloc_clean(owner).unwrap();
+        let b = pool.alloc_clean(owner).unwrap();
+        assert_eq!((a.index(), b.index()), (0, 1));
+        pool.begin_revoke(a, owner).unwrap();
+        pool.finish_revoke(a, unsafe { RevokeComplete::after_unmap(a) })
+            .unwrap();
+        assert!(pool.clean_one(&mut zero).unwrap());
+        assert_eq!(pool.alloc_clean(owner).unwrap().index(), 0);
+        assert_eq!(pool.alloc_clean(owner).unwrap().index(), 2);
+        assert_eq!(pool.alloc_clean(owner).unwrap().index(), 3);
+        assert_eq!(pool.alloc_clean(owner), Err(FrameError::Exhausted));
+        assert_eq!(pool.snapshot().free, 0);
+    }
+
+    #[test]
     fn exhausted_generations_retire_capacity_in_both_allocation_paths() {
         for zeroed in [false, true] {
             let mut metadata = [FrameMeta {
@@ -495,6 +533,7 @@ mod tests {
                 capacity: 1,
                 free: 1,
                 next_zeroed: 0,
+                next_clean: 0,
                 next_dirty: 0,
                 recorder: None,
             };
@@ -544,6 +583,7 @@ mod tests {
             capacity: 2,
             free: 0,
             next_zeroed: 0,
+            next_clean: 0,
             next_dirty: 0,
             recorder: None,
         };
@@ -773,6 +813,7 @@ mod tests {
             capacity: 1,
             free: 1,
             next_zeroed: 0,
+            next_clean: 0,
             next_dirty: 0,
             recorder: None,
         };
