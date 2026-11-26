@@ -8,6 +8,12 @@ on:
       - 'crates/prototype/**'
       - 'crates/driver-virtio/**'
       - 'crates/net-transport/**'
+      - 'kernel/**'
+      - 'tools/**'
+      - 'user/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - '.github/workflows/v0201-kernel-algorithms.yml'
   workflow_dispatch:
 permissions:
@@ -58,6 +64,14 @@ jobs:
             features: tls
           - package: cyxia-kernel-core
             seam: 'snapshot_store_v3::tests'
+          - package: cyxia-kernel-core
+            seam: 'file_receipt_store_v0199::tests'
+          - package: cyxia-prototype
+            seam: 'wave5_capability_'
+          - package: cyxia-prototype
+            seam: 'wave5_network_'
+          - package: cyxia-prototype
+            seam: 'wave5_irq_'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -102,3 +116,62 @@ jobs:
         run: cargo +1.95.0 test --locked -p cyxia-kernel-core
       - name: Default workspace regression
         run: cargo +1.95.0 test --locked
+  arm-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build AArch64 production skeleton (build evidence only)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat --target aarch64-unknown-none
+          rustup override set 1.95.0
+          cargo fetch --locked
+          mkdir -p artifacts/v0201-arm
+          git rev-parse HEAD > artifacts/v0201-arm/commit.txt
+          rustc -vV > artifacts/v0201-arm/toolchain.txt
+          python3 -B -c 'import sys; sys.path.insert(0, "tools"); import verify_v0199_sec_n as s; s.build_guest()' 2>&1 | tee artifacts/v0201-arm/build-guest.log
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production 2>&1 | tee artifacts/v0201-arm/build.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v0201-arm/kernel.elf
+          readelf -h artifacts/v0201-arm/kernel.elf > artifacts/v0201-arm/elf.txt
+          (cd artifacts/v0201-arm && sha256sum kernel.elf > elf.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-arm-build-${{ github.sha }}
+          path: artifacts/v0201-arm/
+          retention-days: 7
+  x86-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build x86-64 platform fixture (build evidence only)
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target x86_64-unknown-none
+          rustup override set 1.95.0
+          cargo fetch --locked
+          mkdir -p artifacts/v0201-x86
+          git rev-parse HEAD > artifacts/v0201-x86/commit.txt
+          rustc -vV > artifacts/v0201-x86/toolchain.txt
+          python3 -B tools/build.py --output artifacts/v0201-x86/image 2>&1 | tee artifacts/v0201-x86/build.log
+          test -s artifacts/v0201-x86/image/kernel.elf
+          readelf -h artifacts/v0201-x86/image/kernel.elf > artifacts/v0201-x86/elf.txt
+          sha256sum artifacts/v0201-x86/image/kernel.elf > artifacts/v0201-x86/kernel.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-x86-build-${{ github.sha }}
+          path: artifacts/v0201-x86/
+          retention-days: 7

@@ -103,6 +103,7 @@ fn scan_receipts_inner(
     let mut stream_counts = [0u8; STREAM_COUNT];
     let mut inflight = [false; STREAM_COUNT];
     let mut group_counts = [0u8; GROUP_COUNT];
+    let mut request_ids = [0u64; RECEIPTS];
     for slot in 0..RECEIPTS {
         let at = slot * RECEIPT_BYTES;
         let raw = &data[at..at + RECEIPT_BYTES];
@@ -113,19 +114,10 @@ fn scan_receipts_inner(
         if record.fs_uuid != expected_fs_uuid {
             return Err(Error::Invalid);
         }
-        // Earlier records were either all-zero or fully decoded, including
-        // their CRC. Rechecking their canonical LE identity bytes avoids
-        // O(N^2) repeated CRC work without allocating a second receipt table.
-        for previous in 0..slot {
-            let offset = previous * RECEIPT_BYTES;
-            let earlier = &data[offset..offset + RECEIPT_BYTES];
-            if earlier[172..180] == [0; 8] {
-                continue;
-            }
-            if earlier[172..180] == raw[172..180] || earlier[8..64] == raw[8..64] {
-                return Err(Error::Invalid);
-            }
-        }
+        // Decode enforces the canonical, injective local ID of
+        // (group, stream, sequence). Equal full keys therefore imply equal
+        // IDs, and IDs must also be unique across retained generations.
+        request_ids[summary.occupied] = record.request_id;
         if let Some(index) = index {
             let group_at = record.group_id as usize;
             let stream_at = group_at * STREAMS_PER_GROUP + record.stream_slot as usize;
@@ -170,6 +162,13 @@ fn scan_receipts_inner(
         if receipt_home(slot).ok_or(Error::Invalid)?.second.is_some() {
             summary.across_block += 1;
         }
+    }
+    // All keys here are fully decoded. Sort only the occupied prefix;
+    // the original receipt slots, CRCs and index image remain untouched.
+    let keys = &mut request_ids[..summary.occupied];
+    keys.sort_unstable();
+    if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(Error::Invalid);
     }
     if let Some(index) = index {
         // Distinct in-range request IDs plus exact cardinality proves every
@@ -414,6 +413,35 @@ mod tests {
         assert!(scan_receipts(&data, [1; 16]).is_ok());
         assert!(scan_receipts(&data[..RECEIPT_STORE_BYTES - 1], [1; 16]).is_err());
     }
+    #[test]
+    fn full_store_rejects_duplicate_local_id_across_different_generations() {
+        let mut data = [0u8; RECEIPT_STORE_BYTES];
+        for (slot, raw) in data.chunks_exact_mut(RECEIPT_BYTES).enumerate() {
+            let seq = (RECEIPTS - slot) as u64;
+            raw.copy_from_slice(&receipt(local_request_id(0, 0, seq).unwrap(), seq));
+        }
+        let expected = ReceiptStoreSummary {
+            occupied: RECEIPTS,
+            unresolved: RECEIPTS,
+            across_block: 4,
+        };
+        assert_eq!(scan_receipts(&data, [1; 16]), Ok(expected));
+        let mut duplicate = receipt(local_request_id(0, 0, 1).unwrap(), 1);
+        duplicate[24..32].copy_from_slice(&2u64.to_le_bytes());
+        duplicate[36..40].copy_from_slice(&2u32.to_le_bytes());
+        duplicate[48..56].copy_from_slice(&2u64.to_le_bytes());
+        reseal(&mut duplicate);
+        assert!(FileReceiptV4::decode(&duplicate).is_ok());
+        data[..RECEIPT_BYTES].copy_from_slice(&duplicate);
+        assert_eq!(scan_receipts(&data, [1; 16]), Err(Error::Invalid));
+        let seq = RECEIPTS as u64;
+        data[..RECEIPT_BYTES]
+            .copy_from_slice(&receipt(local_request_id(0, 0, seq).unwrap(), seq));
+        assert_eq!(scan_receipts(&data, [1; 16]), Ok(expected));
+        data[RECEIPT_STORE_BYTES - 1] ^= 1;
+        assert_eq!(scan_receipts(&data, [1; 16]), Err(Error::Invalid));
+    }
+
     fn strict_index(issued: u64, retired: u64) -> [u8; BLOCK_BYTES] {
         use super::super::file_index_v0199::{
             CRC_OFFSET, INDEX_HEADER, INDEX_MAGIC, INDEX_VERSION, STREAM_BASE,

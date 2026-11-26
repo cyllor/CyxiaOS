@@ -1798,3 +1798,59 @@ fn wave4_vm_commit_is_all_or_nothing_and_keeps_progress_partition() {
     assert_eq!(m.fault(key(3), 0x20000, true, &mut b), Ok(6));
     assert_eq!(m.fault(key(3), 0x21000, true, &mut b), Ok(7));
 }
+
+#[test]
+fn wave5_capability_index_preserves_ids_and_revocation_scopes() {
+    let mut s = ServiceBatch::new();
+    let mut ids = [0u64; 256];
+    for (i, id) in ids.iter_mut().enumerate() {
+        *id = s.grant(key(1), key(1000 + i as u64), key(50), 2).unwrap();
+    }
+    assert_eq!(s.grant(key(1), key(2), key(50), 2), Err(Error::Capacity));
+    assert_eq!(s.revoke(key(2), ids[0]), Err(Error::Auth));
+    s.revoke(key(1), ids[0]).unwrap();
+    s.revoke_object(key(1128));
+    let fresh = s.grant(key(1), key(2000), key(51), 2).unwrap();
+    let foreign = s.grant(key(2), key(3000), key(52), 2).unwrap();
+    assert!(fresh > ids[255] && foreign > fresh);
+    let items = [ids[0], ids[127], ids[128], ids[255], fresh, foreign].map(|cap| ServiceItem {
+        op: TASK_QUERY_BY_CAP,
+        flags: 0,
+        cap,
+        object_gen: 1,
+        tag: cap,
+    });
+    let mut v = s.submit(key(1), &items, 1000, 0).unwrap();
+    let mut b = Services::default();
+    while !v.complete() {
+        s.step(&mut v, 1, &mut b).unwrap();
+    }
+    let results: Vec<_> = v.results().iter().map(|r| r.status).collect();
+    assert_eq!(
+        results,
+        [
+            ItemStatus::Error(Error::Auth),
+            ItemStatus::Value(1129),
+            ItemStatus::Error(Error::Auth),
+            ItemStatus::Value(1257),
+            ItemStatus::Value(2002),
+            ItemStatus::Error(Error::Auth),
+        ]
+    );
+    s.revoke_service(key(50));
+    s.revoke_owner(key(2));
+    let mut v = s.submit(key(1), &items, 1000, 2).unwrap();
+    while !v.complete() {
+        s.step(&mut v, 3, &mut b).unwrap();
+    }
+    assert_eq!(v.results()[4].status, ItemStatus::Value(2002));
+    for (i, r) in v.results().iter().enumerate() {
+        if i != 4 {
+            assert_eq!(r.status, ItemStatus::Error(Error::Auth));
+        }
+    }
+    let item = items[5];
+    let mut v = s.submit(key(2), &[item], 1000, 4).unwrap();
+    s.step(&mut v, 5, &mut b).unwrap();
+    assert_eq!(v.results()[0].status, ItemStatus::Error(Error::Auth));
+}
