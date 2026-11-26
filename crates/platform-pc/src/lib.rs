@@ -11,8 +11,9 @@ pub mod pci;
 pub mod rtc;
 pub mod uart;
 pub use boot::{
-    BootError, MAX_MMAP_BYTES, MAX_PHYSICAL_MEMORY, MAX_RUNTIME_PHYSICAL_MEMORY, MB_INFO_BYTES, MULTIBOOT_BOOT_MAGIC,
-    PcBootInfo, memory_map_location, memory_map_location_with_limit, parse_multiboot, parse_multiboot_with_limit,
+    BootError, MAX_MMAP_BYTES, MAX_PHYSICAL_MEMORY, MAX_RUNTIME_PHYSICAL_MEMORY, MB_INFO_BYTES,
+    MULTIBOOT_BOOT_MAGIC, PcBootInfo, memory_map_location, memory_map_location_with_limit,
+    parse_multiboot, parse_multiboot_with_limit,
 };
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]

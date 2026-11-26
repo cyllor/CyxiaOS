@@ -121,7 +121,10 @@ impl Instance {
         }
     }
     fn observe_watch(&mut self, slot: usize, readiness: u32, wakes: u32) -> bool {
-        let notified = self.watches[slot].as_mut().unwrap().observe(readiness, wakes);
+        let notified = self.watches[slot]
+            .as_mut()
+            .unwrap()
+            .observe(readiness, wakes);
         self.refresh_ready(slot);
         notified
     }
@@ -344,12 +347,7 @@ impl super::OpenDescriptions {
         }
         table.propagate_nested(wakes);
     }
-    pub(crate) fn observe_local(
-        &self,
-        handle: Handle,
-        readiness: u32,
-        wakes: u32,
-    ) {
+    pub(crate) fn observe_local(&self, handle: Handle, readiness: u32, wakes: u32) {
         let mut table = self.inner.borrow_mut();
         if wakes != 0 {
             table.publish_poll_change();
@@ -397,13 +395,19 @@ impl Process<'_> {
     /// the foreground has observed filesystem changes and expired due timers.
     /// Its caller must still validate the user output range and check timeout
     /// and signal priority on every wake attempt.
-    pub fn epoll_wait_needs_sample(&self, fd: i32, identity: u64, epoch: u64) -> Result<bool, Errno> {
+    pub fn epoll_wait_needs_sample(
+        &self,
+        fd: i32,
+        identity: u64,
+        epoch: u64,
+    ) -> Result<bool, Errno> {
         let description = self.description(fd)?;
         if description.identity() != identity {
             return Err(Errno::Badf);
         }
         let table = self.objects.inner.borrow();
-        let Object::Epoll(index) = table.entry(description)?.value.ok_or(Errno::Badf)?.object else {
+        let Object::Epoll(index) = table.entry(description)?.value.ok_or(Errno::Badf)?.object
+        else {
             return Err(Errno::Badf);
         };
         Ok(table.epoll_invalidation_epoch == u64::MAX
@@ -604,12 +608,19 @@ impl Process<'_> {
                     match description.object {
                         Object::Epoll(_) => {}
                         Object::Timer(timer) if use_deadlines => {
-                            if timer.deadline.is_some() && let Some(read_clock) = clock.take() {
+                            if timer.deadline.is_some()
+                                && let Some(read_clock) = clock.take()
+                            {
                                 self.objects.expire_timers(read_clock);
                             }
-                            let scheduled = self.objects.inner.borrow().timer_deadlines
+                            let scheduled = self
+                                .objects
+                                .inner
+                                .borrow()
+                                .timer_deadlines
                                 .scheduled(watch.description.slot);
-                            readiness[slot] = u32::from(timer.deadline.is_some() && !scheduled) * IN;
+                            readiness[slot] =
+                                u32::from(timer.deadline.is_some() && !scheduled) * IN;
                         }
                         object => {
                             let owner = self.objects.owner(watch.description)?;
@@ -723,30 +734,59 @@ mod tests {
         let targets: [i32; OPEN_MAX - 4] = core::array::from_fn(|slot| {
             let fd = owner.eventfd(1, 0).unwrap();
             owner
-                .epoll_ctl(epfd, 1, fd, Event { events: IN | EDGE, data: slot as u64 })
+                .epoll_ctl(
+                    epfd,
+                    1,
+                    fd,
+                    Event {
+                        events: IN | EDGE,
+                        data: slot as u64,
+                    },
+                )
                 .unwrap();
             fd
         });
-        owner.epoll_ctl(epfd, 2, targets[0], Event::default()).unwrap();
+        owner
+            .epoll_ctl(epfd, 2, targets[0], Event::default())
+            .unwrap();
         for &fd in &targets[1..targets.len() - 1] {
             owner.close(&mut fs, fd).unwrap();
         }
         let other_epfd = other.epoll_create(0).unwrap();
         let other_fd = other.eventfd(1, 0).unwrap();
         other
-            .epoll_ctl(other_epfd, 1, other_fd, Event { events: IN, data: 999 })
+            .epoll_ctl(
+                other_epfd,
+                1,
+                other_fd,
+                Event {
+                    events: IN,
+                    data: 999,
+                },
+            )
             .unwrap();
 
         let source_readiness = |source| match source {
             Source::Local { read, .. } => Ok(u32::from(read) * IN),
             _ => panic!("expected a real eventfd watch"),
         };
-        objects.observe_backend(Backend::Local, |source| Some((source_readiness(source).unwrap(), 0)));
+        objects.observe_backend(Backend::Local, |source| {
+            Some((source_readiness(source).unwrap(), 0))
+        });
         assert_eq!(objects.inner.borrow().backend_slots_visited.get(), 2);
         let readiness = owner.epoll_sample(epfd, source_readiness).unwrap();
         let mut events = [Event::default(); 1];
-        assert_eq!(owner.epoll_collect(epfd, &readiness, &mut events).unwrap(), 1);
-        assert_eq!(events[0], Event { events: IN, data: (targets.len() - 1) as u64 });
+        assert_eq!(
+            owner.epoll_collect(epfd, &readiness, &mut events).unwrap(),
+            1
+        );
+        assert_eq!(
+            events[0],
+            Event {
+                events: IN,
+                data: (targets.len() - 1) as u64
+            }
+        );
     }
 
     #[test]
@@ -762,9 +802,28 @@ mod tests {
         for _ in 0..2 {
             let ep = p.epoll_create(0).unwrap();
             root = ep;
-            p.epoll_ctl(ep, 1, event, Event { events: IN, data: 42 }).unwrap();
+            p.epoll_ctl(
+                ep,
+                1,
+                event,
+                Event {
+                    events: IN,
+                    data: 42,
+                },
+            )
+            .unwrap();
             let ep = other.epoll_create(0).unwrap();
-            other.epoll_ctl(ep, 1, unrelated, Event { events: IN, data: 99 }).unwrap();
+            other
+                .epoll_ctl(
+                    ep,
+                    1,
+                    unrelated,
+                    Event {
+                        events: IN,
+                        data: 99,
+                    },
+                )
+                .unwrap();
         }
         let sample = |source| match source {
             Source::Local { read, write } => Ok(u32::from(read) * IN | u32::from(write) * OUT),
@@ -783,14 +842,29 @@ mod tests {
             objects.observe_backend(Backend::Local, |source| Some((sample(source).unwrap(), 0)));
             let mut events = [Event::default(); 1];
             assert_eq!(p.epoll_collect(root, &readiness, &mut events), Ok(1));
-            assert_eq!(events[0], Event { events: IN, data: 42 });
+            assert_eq!(
+                events[0],
+                Event {
+                    events: IN,
+                    data: 42
+                }
+            );
         }
         let table = objects.inner.borrow();
-        std::println!("EPOLL_STABLE_GRAPH rounds={ROUNDS} elapsed_ns={} graph_builds={} nested_lookups={}",
-            started.elapsed().as_nanos(), table.topology_builds.get(), table.nested_lookups.get());
-        assert!(table.topology_builds.get() <= 1, "unchanged graph was rebuilt on readiness sampling");
-        assert!(table.nested_lookups.get() <= ROUNDS * 4,
-            "flat epolls rescanned unrelated watches for nested propagation");
+        std::println!(
+            "EPOLL_STABLE_GRAPH rounds={ROUNDS} elapsed_ns={} graph_builds={} nested_lookups={}",
+            started.elapsed().as_nanos(),
+            table.topology_builds.get(),
+            table.nested_lookups.get()
+        );
+        assert!(
+            table.topology_builds.get() <= 1,
+            "unchanged graph was rebuilt on readiness sampling"
+        );
+        assert!(
+            table.nested_lookups.get() <= ROUNDS * 4,
+            "flat epolls rescanned unrelated watches for nested propagation"
+        );
     }
 
     #[test]
@@ -799,19 +873,39 @@ mod tests {
         let mut process = Process::new(&objects, 1).unwrap();
         let shared = process.epoll_create(0).unwrap();
         let other_root = process.epoll_create(0).unwrap();
-        let inherited = crate::spawn::Mapping { source: shared, target: 3 };
-        let mut other = process.spawn_descriptors(&FileSystem::new(), None, &[inherited], 2).unwrap();
+        let inherited = crate::spawn::Mapping {
+            source: shared,
+            target: 3,
+        };
+        let mut other = process
+            .spawn_descriptors(&FileSystem::new(), None, &[inherited], 2)
+            .unwrap();
         let bad_child = other.epoll_create(0).unwrap();
         let bad_root = other.epoll_create(0).unwrap();
         let mut pipes = crate::pipe::Pipes::new();
         let [pipe, _] = other.install_pipe(pipes.pair(2).unwrap(), 0).unwrap();
         let first = process.eventfd(1, 0).unwrap();
         let second = process.eventfd(1, 0).unwrap();
-        let level = Event { events: IN, data: 1 };
+        let level = Event {
+            events: IN,
+            data: 1,
+        };
         process.epoll_ctl(shared, 1, first, level).unwrap();
-        process.epoll_ctl(other_root, 1, shared, Event { events: IN | EDGE, data: 1 }).unwrap();
+        process
+            .epoll_ctl(
+                other_root,
+                1,
+                shared,
+                Event {
+                    events: IN | EDGE,
+                    data: 1,
+                },
+            )
+            .unwrap();
         other.epoll_ctl(bad_child, 1, pipe, level).unwrap();
-        other.epoll_ctl(bad_root, 1, inherited.target, level).unwrap();
+        other
+            .epoll_ctl(bad_root, 1, inherited.target, level)
+            .unwrap();
         other.epoll_ctl(bad_root, 1, bad_child, level).unwrap();
         let sample = |source| match source {
             Source::Local { read, .. } => Ok(u32::from(read) * IN),
@@ -820,17 +914,42 @@ mod tests {
         };
         let mut events = [Event::default(); 1];
         let readiness = process.epoll_sample(other_root, sample).unwrap();
-        assert_eq!(process.epoll_collect(other_root, &readiness, &mut events), Ok(1));
+        assert_eq!(
+            process.epoll_collect(other_root, &readiness, &mut events),
+            Ok(1)
+        );
         let readiness = process.epoll_sample(other_root, sample).unwrap();
-        assert_eq!(process.epoll_collect(other_root, &readiness, &mut events), Ok(0));
+        assert_eq!(
+            process.epoll_collect(other_root, &readiness, &mut events),
+            Ok(0)
+        );
 
         // Sampling this newly added watch commits a fresh edge while the
         // first watch keeps the shared child level-readable throughout.
-        process.epoll_ctl(shared, 1, second, Event { events: IN, data: 2 }).unwrap();
+        process
+            .epoll_ctl(
+                shared,
+                1,
+                second,
+                Event {
+                    events: IN,
+                    data: 2,
+                },
+            )
+            .unwrap();
         assert_eq!(other.epoll_sample(bad_root, sample), Err(Errno::Io));
         let readiness = process.epoll_sample(other_root, sample).unwrap();
-        assert_eq!(process.epoll_collect(other_root, &readiness, &mut events), Ok(1));
-        assert_eq!(events[0], Event { events: IN, data: 1 });
+        assert_eq!(
+            process.epoll_collect(other_root, &readiness, &mut events),
+            Ok(1)
+        );
+        assert_eq!(
+            events[0],
+            Event {
+                events: IN,
+                data: 1
+            }
+        );
     }
 
     #[test]
@@ -842,24 +961,69 @@ mod tests {
         let root = p.epoll_create(0).unwrap();
         let child = p.epoll_create(0).unwrap();
         let event = p.eventfd(0, 0).unwrap();
-        p.epoll_ctl(root, 1, child, Event { events: IN | EDGE, data: 10 }).unwrap();
-        p.epoll_ctl(child, 1, event, Event { events: IN, data: 11 }).unwrap();
+        p.epoll_ctl(
+            root,
+            1,
+            child,
+            Event {
+                events: IN | EDGE,
+                data: 10,
+            },
+        )
+        .unwrap();
+        p.epoll_ctl(
+            child,
+            1,
+            event,
+            Event {
+                events: IN,
+                data: 11,
+            },
+        )
+        .unwrap();
 
         let unrelated = other.epoll_create(0).unwrap();
         let unrelated_child = other.epoll_create(0).unwrap();
         let unrelated_event = other.eventfd(1, 0).unwrap();
-        other.epoll_ctl(unrelated, 1, unrelated_child, Event { events: IN, data: 20 }).unwrap();
-        other.epoll_ctl(unrelated_child, 1, unrelated_event, Event { events: IN, data: 21 }).unwrap();
+        other
+            .epoll_ctl(
+                unrelated,
+                1,
+                unrelated_child,
+                Event {
+                    events: IN,
+                    data: 20,
+                },
+            )
+            .unwrap();
+        other
+            .epoll_ctl(
+                unrelated_child,
+                1,
+                unrelated_event,
+                Event {
+                    events: IN,
+                    data: 21,
+                },
+            )
+            .unwrap();
         assert_eq!(ready(&mut other, unrelated, 1)[0].events, IN);
         assert_eq!(ready(&mut p, root, 1)[0].events, 0);
 
         for _ in 0..2 {
             objects.inner.borrow().nested_watches_visited.set(0);
-            p.write(&mut fs, &mut Sink, event, &1u64.to_le_bytes()).unwrap();
+            p.write(&mut fs, &mut Sink, event, &1u64.to_le_bytes())
+                .unwrap();
             assert_eq!(objects.inner.borrow().nested_watches_visited.get(), 1);
             let mut out = [Event::default(); 1];
             assert_eq!(p.epoll_collect(root, &[0; OPEN_MAX], &mut out), Ok(1));
-            assert_eq!(out[0], Event { events: IN, data: 10 });
+            assert_eq!(
+                out[0],
+                Event {
+                    events: IN,
+                    data: 10
+                }
+            );
             assert_eq!(p.epoll_collect(root, &[0; OPEN_MAX], &mut out), Ok(0));
         }
     }
@@ -872,13 +1036,40 @@ mod tests {
         let outer = p.epoll_create(0).unwrap();
         let inner = p.epoll_create(0).unwrap();
         let fd = p.eventfd(1, 0).unwrap();
-        p.epoll_ctl(inner, 1, fd, Event { events: IN, data: 11 }).unwrap();
+        p.epoll_ctl(
+            inner,
+            1,
+            fd,
+            Event {
+                events: IN,
+                data: 11,
+            },
+        )
+        .unwrap();
         assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
-        p.epoll_ctl(outer, 1, inner, Event { events: IN, data: 22 }).unwrap();
+        p.epoll_ctl(
+            outer,
+            1,
+            inner,
+            Event {
+                events: IN,
+                data: 22,
+            },
+        )
+        .unwrap();
         assert_eq!(ready(&mut p, outer, 1)[0].data, 22);
         p.epoll_ctl(outer, 2, inner, Event::default()).unwrap();
         assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
-        p.epoll_ctl(outer, 1, inner, Event { events: IN, data: 33 }).unwrap();
+        p.epoll_ctl(
+            outer,
+            1,
+            inner,
+            Event {
+                events: IN,
+                data: 33,
+            },
+        )
+        .unwrap();
         assert_eq!(ready(&mut p, outer, 1)[0].data, 33);
         // Closing an FD does not retire its aliased open description.
         let alias = p.dup(inner).unwrap();
@@ -888,13 +1079,35 @@ mod tests {
         assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
         let replacement = p.epoll_create(0).unwrap();
         assert_eq!(replacement, inner);
-        p.epoll_ctl(replacement, 1, fd, Event { events: IN, data: 44 }).unwrap();
+        p.epoll_ctl(
+            replacement,
+            1,
+            fd,
+            Event {
+                events: IN,
+                data: 44,
+            },
+        )
+        .unwrap();
         // The recycled slot must not remain reachable through an old edge.
-        p.epoll_sample(outer, |_| panic!("sampled retired epoll descendant")).unwrap();
+        p.epoll_sample(outer, |_| panic!("sampled retired epoll descendant"))
+            .unwrap();
         assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
-        p.epoll_ctl(outer, 1, replacement, Event { events: IN, data: 55 }).unwrap();
+        p.epoll_ctl(
+            outer,
+            1,
+            replacement,
+            Event {
+                events: IN,
+                data: 55,
+            },
+        )
+        .unwrap();
         assert_eq!(ready(&mut p, outer, 1)[0].data, 55);
-        assert_eq!(p.epoll_ctl(replacement, 1, outer, Event::default()), Err(Errno::Loop));
+        assert_eq!(
+            p.epoll_ctl(replacement, 1, outer, Event::default()),
+            Err(Errno::Loop)
+        );
         assert_eq!(ready(&mut p, outer, 1)[0].data, 55);
         p.close_all(&mut fs).unwrap();
         assert_eq!(objects.snapshot().live, 0);
@@ -907,8 +1120,26 @@ mod tests {
         let outer = p.epoll_create(0).unwrap();
         let inner = p.epoll_create(0).unwrap();
         let fd = p.eventfd(1, 0).unwrap();
-        p.epoll_ctl(inner, 1, fd, Event { events: IN, data: 11 }).unwrap();
-        p.epoll_ctl(outer, 1, inner, Event { events: IN, data: 22 }).unwrap();
+        p.epoll_ctl(
+            inner,
+            1,
+            fd,
+            Event {
+                events: IN,
+                data: 11,
+            },
+        )
+        .unwrap();
+        p.epoll_ctl(
+            outer,
+            1,
+            inner,
+            Event {
+                events: IN,
+                data: 22,
+            },
+        )
+        .unwrap();
         let sampled = core::cell::Cell::new(0usize);
         p.epoll_sample(outer, |_| {
             sampled.set(sampled.get() + 1);
@@ -919,7 +1150,8 @@ mod tests {
         p.epoll_ctl(outer, 2, inner, Event::default()).unwrap();
         // DEL drops the graph edge, so the detached child must leave the
         // reachable set instead of being sampled through the outer descriptor.
-        p.epoll_sample(outer, |_| panic!("sampled a detached epoll descendant")).unwrap();
+        p.epoll_sample(outer, |_| panic!("sampled a detached epoll descendant"))
+            .unwrap();
         assert_eq!(ready(&mut p, outer, 1)[0].events, 0);
         // The child stays independently usable through its own descriptor.
         assert_eq!(ready(&mut p, inner, 1)[0].data, 11);
@@ -1148,8 +1380,26 @@ mod tests {
         let [reader, _writer] = p.install_pipe(handles, 0).unwrap();
         let event = p.eventfd(1, 0).unwrap();
         let ep = p.epoll_create(0).unwrap();
-        p.epoll_ctl(ep, 1, reader, Event { events: IN, data: 1 }).unwrap();
-        p.epoll_ctl(ep, 1, event, Event { events: IN, data: 2 }).unwrap();
+        p.epoll_ctl(
+            ep,
+            1,
+            reader,
+            Event {
+                events: IN,
+                data: 1,
+            },
+        )
+        .unwrap();
+        p.epoll_ctl(
+            ep,
+            1,
+            event,
+            Event {
+                events: IN,
+                data: 2,
+            },
+        )
+        .unwrap();
         let mut sampled = 0;
         objects.observe_backend(Backend::Pipe, |source| {
             let Source::Pipe { .. } = source else {
@@ -1182,28 +1432,66 @@ mod tests {
         let other = p.eventfd(0, 0).unwrap();
         let epfd = p.epoll_create(0).unwrap();
         for (fd, data) in [(event, 1), (alias, 2), (other, 3)] {
-            p.epoll_ctl(epfd, 1, fd, Event { events: IN | EDGE, data }).unwrap();
+            p.epoll_ctl(
+                epfd,
+                1,
+                fd,
+                Event {
+                    events: IN | EDGE,
+                    data,
+                },
+            )
+            .unwrap();
         }
         p.close(&mut fs, event).unwrap();
-        p.write(&mut fs, &mut Sink, alias, &1u64.to_le_bytes()).unwrap();
+        p.write(&mut fs, &mut Sink, alias, &1u64.to_le_bytes())
+            .unwrap();
         assert_eq!(objects.inner.borrow().local_slots_visited.get(), 2);
         let events = ready(&mut p, epfd, 3);
-        assert_eq!(&events[..3], &[
-            Event { events: IN, data: 1 },
-            Event { events: IN, data: 2 },
-            Event::default(),
-        ]);
+        assert_eq!(
+            &events[..3],
+            &[
+                Event {
+                    events: IN,
+                    data: 1
+                },
+                Event {
+                    events: IN,
+                    data: 2
+                },
+                Event::default(),
+            ]
+        );
         let retired = p.description(alias).unwrap();
         p.close(&mut fs, alias).unwrap();
         let replacement = p.eventfd(0, 0).unwrap();
         let live = p.description(replacement).unwrap();
         assert_eq!(live.slot, retired.slot);
         assert_ne!(live.generation, retired.generation);
-        p.epoll_ctl(epfd, 1, replacement, Event { events: IN, data: 4 }).unwrap();
+        p.epoll_ctl(
+            epfd,
+            1,
+            replacement,
+            Event {
+                events: IN,
+                data: 4,
+            },
+        )
+        .unwrap();
         objects.observe_local(retired, IN, IN);
-        assert_eq!(p.epoll_collect(epfd, &[0; OPEN_MAX], &mut [Event::default(); 1]), Ok(0));
-        p.write(&mut fs, &mut Sink, replacement, &1u64.to_le_bytes()).unwrap();
-        assert_eq!(ready(&mut p, epfd, 2)[0], Event { events: IN, data: 4 });
+        assert_eq!(
+            p.epoll_collect(epfd, &[0; OPEN_MAX], &mut [Event::default(); 1]),
+            Ok(0)
+        );
+        p.write(&mut fs, &mut Sink, replacement, &1u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            ready(&mut p, epfd, 2)[0],
+            Event {
+                events: IN,
+                data: 4
+            }
+        );
         assert_eq!(objects.inner.borrow().local_slots_visited.get(), 3);
     }
 

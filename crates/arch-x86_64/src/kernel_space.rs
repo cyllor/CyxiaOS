@@ -31,7 +31,8 @@ fn physical(pointer: *const Table) -> u64 {
 /// BSP on temporary high+low identity root, IF clear; all supplied physical
 /// ranges valid and exclusively reserved, no AP/user can access these tables.
 pub unsafe fn install(layout: KernelLayout<'_>) -> Result<u64, Error> {
-    if layout.ram_bytes == 0 || layout.ram_bytes > RUNTIME_RAM_BYTES || layout.ram_bytes % 4096 != 0 {
+    if layout.ram_bytes == 0 || layout.ram_bytes > RUNTIME_RAM_BYTES || layout.ram_bytes % 4096 != 0
+    {
         return Err(Error::Address);
     }
     for &(a, b) in core::iter::once(&layout.text)

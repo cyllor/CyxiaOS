@@ -163,8 +163,13 @@ fn counter_ns(counter: u64, period: u64) -> u64 {
 fn deadline_count(delta: u64, hz: u64) -> u32 {
     // Any product exceeding u64::MAX already exceeds u32::MAX * 1e9,
     // so its rounded/clamped result is known without a u128 division.
-    delta.checked_mul(hz)
-        .map(|product| product.div_ceil(1_000_000_000).clamp(1, u64::from(u32::MAX)) as u32)
+    delta
+        .checked_mul(hz)
+        .map(|product| {
+            product
+                .div_ceil(1_000_000_000)
+                .clamp(1, u64::from(u32::MAX)) as u32
+        })
         .unwrap_or(u32::MAX)
 }
 pub fn now_ns() -> u64 {
@@ -800,19 +805,32 @@ fn mapping_batch_owned(owner: u64) -> bool {
         && ALIAS_BATCH_OWNER.load(Ordering::Acquire) == owner
 }
 #[unsafe(no_mangle)]
-extern "C" fn x86_runtime_mapping_batch_change(owner: u64, physical: u64, old: u64, new: u64) -> bool {
+extern "C" fn x86_runtime_mapping_batch_change(
+    owner: u64,
+    physical: u64,
+    old: u64,
+    new: u64,
+) -> bool {
     mapping_batch_owned(owner) && mapping_change_locked(physical, old, new)
 }
 /// One pinned caller, one already-held alias lease, at most one leaf table.
 /// Every page retains the same phase/count checks and successful-prefix rule.
 #[unsafe(no_mangle)]
-extern "C" fn x86_runtime_mapping_batch_run(owner: u64, physical: u64, pages: u64, old: u64, new: u64) -> u64 {
+extern "C" fn x86_runtime_mapping_batch_run(
+    owner: u64,
+    physical: u64,
+    pages: u64,
+    old: u64,
+    new: u64,
+) -> u64 {
     if pages == 0 || pages > 512 || !mapping_batch_owned(owner) {
         return 0;
     }
     let mut changed = 0;
     for index in 0..pages {
-        let Some(page) = physical.checked_add(index * 4096) else { break };
+        let Some(page) = physical.checked_add(index * 4096) else {
+            break;
+        };
         if !mapping_change_locked(page, old, new) {
             break;
         }
@@ -837,7 +855,8 @@ impl Backend for CodePermissions {
         code_phase(physical).expect("validated code permission range")
     }
     fn record(&mut self, physical: u64, phase: Phase) {
-        CODE_PHASES.set((physical / 4096) as usize, phase)
+        CODE_PHASES
+            .set((physical / 4096) as usize, phase)
             .expect("validated code permission range");
     }
     fn aliases(&self, physical: u64) -> (u64, u64) {

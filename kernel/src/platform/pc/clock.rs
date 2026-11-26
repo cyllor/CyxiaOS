@@ -23,7 +23,9 @@ pub fn init() {
     }
 }
 pub fn realtime_seconds() -> Result<u64, Errno> {
-    if crate::machine::runtime::cpu_slot() != 0 { return Err(Errno::Again); }
+    if crate::machine::runtime::cpu_slot() != 0 {
+        return Err(Errno::Again);
+    }
     let mut sample = rtc::read_seconds(&mut Hardware, 0x32);
     if sample == Err(rtc::Error::Busy) {
         // A normal RTC update may outlast the decoder's immediate samples.
@@ -36,7 +38,9 @@ pub fn realtime_seconds() -> Result<u64, Errno> {
             }
             core::hint::spin_loop();
             sample = rtc::read_seconds(&mut Hardware, 0x32);
-            if sample != Err(rtc::Error::Busy) { break; }
+            if sample != Err(rtc::Error::Busy) {
+                break;
+            }
         }
     }
     sample.map_err(|e| match e {

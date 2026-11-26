@@ -1,5 +1,18 @@
 //! Native integer-kernel engineering fixtures, not a continuously running CACP.
-//! CPU1 runs the EL0 image; CPU0 only copies immutable fixtures and records traps.
+//! Historical model-v13 evidence profile: the EL0 image is hosted on CPU1, the
+//! pre-cutover control root. The current native control authority is fixed CPU0
+//! (cpu0_v0199::CONTROL_CPU = 0); this separate fixture is retained for old
+//! evidence replay, not as a live control topology.
+//!
+//! RETIRED (V0.20 CPU0 cutover): this fixture fundamentally requires the
+//! pre-cutover CPU1 control token, so it is not part of the fixed-CPU0 default
+//! profile. The composition root (smp.rs) gates model-v13-selftest behind the
+//! explicit legacy-coreset retirement umbrella: without it the profile fails
+//! closed at compile time rather than silently opening no CPU1 control gate and
+//! hanging forever on `wait(|| DONE)`. Only under legacy-coreset is the historical
+//! CPU1 control gate restored so this worker can be dispatched and DONE set; the
+//! body below is retained unchanged for that opt-in pre-cutover replay, never as
+//! a live control topology.
 use super::*;
 #[path = "../../../../user/prototype-control/abi.rs"]
 mod abi;
@@ -37,8 +50,9 @@ fn bytes(at: usize, value: &[u8]) {
 pub(super) unsafe fn init() {
     let image = Image::parse(&PROTOTYPE_SERVICE_ELF).expect("prototype EL0 image");
     unsafe {
-        // Only CPU1's control root receives the model. Remove legacy fixture
-        // code/data/stack aliases before any secondary is released.
+        // The historical fixture installs the model into CPU1's pre-cutover
+        // control root. Remove legacy fixture code/data/stack aliases before
+        // any secondary is released.
         let leaf = &mut *core::ptr::addr_of_mut!(LEAVES).cast::<Page>().add(3);
         leaf.0.fill(0);
         let arena = core::ptr::addr_of_mut!(IMAGE).cast::<u8>();
@@ -107,6 +121,11 @@ pub(super) fn step() {
     if !START.load(Ordering::Acquire) || DONE.load(Ordering::Acquire) {
         return;
     }
+    // Pre-cutover invariant: this fixture's model is mapped into CPU1's control
+    // root, so its worker may only run on CPU1. It is dispatched only under the
+    // explicit legacy-coreset replay umbrella (see module note); the fixed-CPU0
+    // default profile fails closed at compile time and never reaches this worker.
+    // The assert remains a fail-closed guard against a wrong-CPU dispatch.
     assert_eq!(cpu::slot(), 1);
     unsafe {
         core::arch::asm!("ic iallu", "dsb ish", "isb", options(nostack));

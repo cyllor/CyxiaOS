@@ -4,6 +4,50 @@ use super::*;
 use crate::snapshot::{
     self, FileReqKey, Gate, Request, RequestRecord, RequestState, RestoreMode, SnapshotKey, State,
 };
+use crate::storage::{DIRECTORY_SLOT_SIZE, INODE_SIZE};
+
+const INODES_PER_PAGE: usize = BLOCK_SIZE / INODE_SIZE;
+const SNAPSHOT_INODE_PAGES: usize = (BUSINESS_INODE_COUNT as usize).div_ceil(INODES_PER_PAGE);
+const DIRECTORY_SLOTS_PER_PAGE: usize = BLOCK_SIZE / DIRECTORY_SLOT_SIZE;
+const _: () = assert!(SNAPSHOT_INODE_PAGES < TX_CAPACITY);
+
+struct SnapshotInodes {
+    key: SnapshotKey,
+    first: u32,
+    loaded: [bool; SNAPSHOT_INODE_PAGES],
+}
+
+impl SnapshotInodes {
+    fn new(key: SnapshotKey, first: u32) -> Self {
+        Self {
+            key,
+            first,
+            loaded: [false; SNAPSHOT_INODE_PAGES],
+        }
+    }
+
+    fn read<D: BlockDevice>(
+        &mut self,
+        id: u32,
+        pages: &mut [[u8; BLOCK_SIZE]],
+        j: &mut Journal,
+        d: &mut D,
+        s: &mut Scratch,
+    ) -> Result<Inode, Error> {
+        if id >= BUSINESS_INODE_COUNT {
+            return Err(Error::Auth);
+        }
+        let index = id as usize / INODES_PER_PAGE;
+        let page = &mut pages[index];
+        if !self.loaded[index] {
+            j.read_block(d, self.first + index as u32, page, s)
+                .map_err(journal_error)?;
+            self.loaded[index] = true;
+        }
+        let offset = id as usize % INODES_PER_PAGE * INODE_SIZE;
+        Inode::decode(id, &page[offset..offset + INODE_SIZE]).map_err(|_| Error::Format)
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct Frozen {
@@ -218,112 +262,99 @@ impl<const C: usize> FileSystem<C> {
         }
         Ok(())
     }
-    fn snapshot_inode<D: BlockDevice>(
-        &mut self,
-        key: SnapshotKey,
-        id: usize,
-        j: &mut Journal,
-        d: &mut D,
-        s: &mut Scratch,
-    ) -> Result<Inode, Error> {
-        if id >= BUSINESS_INODE_COUNT as usize {
-            return Err(Error::Auth);
-        }
-        let entry = self
-            .snapshots
-            .active(key)
-            .map_err(|e| snapshot_error::<D::Error>(e.into()))?;
-        j.read_block(
-            d,
-            entry.inode_first_block + id as u32 / 16,
-            &mut self.tx[0],
-            s,
-        )
-        .map_err(journal_error)?;
-        Inode::decode(id as u32, &self.tx[0][id % 16 * 256..(id % 16 + 1) * 256])
-            .map_err(|_| Error::Format)
-    }
     #[allow(clippy::too_many_arguments)]
-    fn snapshot_entry<D: BlockDevice>(
+    fn snapshot_scan<D: BlockDevice>(
         &mut self,
-        key: SnapshotKey,
-        parent: usize,
-        inode: Inode,
-        index: usize,
+        inodes: &mut SnapshotInodes,
+        directory: &Frozen,
+        start: usize,
+        name: Option<&str>,
         j: &mut Journal,
         d: &mut D,
         s: &mut Scratch,
-    ) -> Result<Option<Entry>, Error> {
-        if inode.kind != InodeKind::Directory {
+    ) -> Result<Option<(Entry, Inode)>, Error> {
+        if directory.inode.kind != InodeKind::Directory {
             return Err(Error::NotDirectory);
         }
-        if index >= inode.size as usize / 128 {
-            return Ok(None);
+        // The workspace keeps one directory page alongside the inode pages
+        // loaded for this operation, including when entries visit IDs out of order.
+        let (directory_page, inode_pages) = self.tx.split_first_mut().unwrap();
+        let mut loaded_directory_page = None;
+        for index in start..directory.inode.size as usize / DIRECTORY_SLOT_SIZE {
+            let page = index / DIRECTORY_SLOTS_PER_PAGE;
+            if loaded_directory_page != Some(page) {
+                j.read_block(
+                    d,
+                    physical(&directory.inode, page as u32)?,
+                    directory_page,
+                    s,
+                )
+                .map_err(journal_error)?;
+                loaded_directory_page = Some(page);
+            }
+            let offset = index % DIRECTORY_SLOTS_PER_PAGE * DIRECTORY_SLOT_SIZE;
+            let raw =
+                match DirectoryEntry::decode(&directory_page[offset..offset + DIRECTORY_SLOT_SIZE])
+                {
+                    Ok(raw) if raw == DirectoryEntry::EMPTY => continue,
+                    Ok(raw) => raw,
+                    Err(_) => return self.guard_integrity(Err(Error::Format), j, d, s),
+                };
+            let target = inodes.read(raw.inode_id, inode_pages, j, d, s)?;
+            if target.kind == InodeKind::Free
+                || target.generation != raw.inode_generation
+                || target.parent_inode as usize != directory.inode_id
+                || target.parent_generation != directory.inode.generation
+            {
+                return Err(Error::Stale);
+            }
+            if name.is_some_and(|name| name != raw.name) {
+                continue;
+            }
+            let mut bytes = [0; 63];
+            let length = raw.name.len();
+            bytes[..length].copy_from_slice(raw.name.as_bytes());
+            return Ok(Some((
+                Entry {
+                    object: ObjectKey {
+                        id: u64::from(raw.inode_id),
+                        generation: raw.inode_generation,
+                    },
+                    kind: target.kind,
+                    name: bytes,
+                    name_len: length as u8,
+                    next_cookie: index as u16 + 1,
+                },
+                target,
+            )));
         }
-        j.read_block(d, physical(&inode, index as u32 / 32)?, &mut self.tx[0], s)
-            .map_err(journal_error)?;
-        let raw =
-            match DirectoryEntry::decode(&self.tx[0][index % 32 * 128..(index % 32 + 1) * 128]) {
-                Ok(entry) => entry,
-                Err(_) => return self.guard_integrity(Err(Error::Format), j, d, s),
-            };
-        if raw == DirectoryEntry::EMPTY {
-            return Ok(None);
-        }
-        let (id, generation) = (raw.inode_id as usize, raw.inode_generation);
-        let mut name = [0; 63];
-        let length = raw.name.len();
-        name[..length].copy_from_slice(raw.name.as_bytes());
-        let target = self.snapshot_inode(key, id, j, d, s)?;
-        if target.kind == InodeKind::Free
-            || target.generation != generation
-            || target.parent_inode as usize != parent
-            || target.parent_generation != inode.generation
-        {
-            return Err(Error::Stale);
-        }
-        Ok(Some(Entry {
-            object: ObjectKey {
-                id: id as u64,
-                generation,
-            },
-            kind: target.kind,
-            name,
-            name_len: length as u8,
-            next_cookie: index as u16 + 1,
-        }))
+        Ok(None)
     }
     fn snapshot_resolve<D: BlockDevice>(
         &mut self,
-        key: SnapshotKey,
+        inodes: &mut SnapshotInodes,
         path: &str,
         j: &mut Journal,
         d: &mut D,
         s: &mut Scratch,
-    ) -> Result<(usize, Inode), Error> {
+    ) -> Result<Frozen, Error> {
         Self::path(path)?;
         if !canonical(path) {
             return Err(Error::Format);
         }
-        let mut id = 0;
-        let mut inode = self.snapshot_inode(key, 0, j, d, s)?;
+        let mut directory = Frozen {
+            key: inodes.key,
+            inode_id: 0,
+            inode: inodes.read(0, &mut self.tx[1..], j, d, s)?,
+        };
         for part in path.split('/').filter(|v| !v.is_empty()) {
-            if inode.kind != InodeKind::Directory {
-                return Err(Error::NotDirectory);
-            }
-            let mut found = None;
-            for index in 0..inode.size as usize / 128 {
-                if let Some(e) = self.snapshot_entry(key, id, inode, index, j, d, s)?
-                    && e.name[..usize::from(e.name_len)] == *part.as_bytes()
-                {
-                    found = Some(e.object.id as usize);
-                    break;
-                }
-            }
-            id = found.ok_or(Error::NotFound)?;
-            inode = self.snapshot_inode(key, id, j, d, s)?;
+            let (entry, target) = self
+                .snapshot_scan(inodes, &directory, 0, Some(part), j, d, s)?
+                .ok_or(Error::NotFound)?;
+            directory.inode_id = entry.object.id as usize;
+            directory.inode = target;
         }
-        Ok((id, inode))
+        Ok(directory)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn snapshot_open<D: BlockDevice>(
@@ -378,9 +409,10 @@ impl<const C: usize> FileSystem<C> {
             .snapshots
             .validate_image(j, d, s, &mut self.tx, key.slot as usize)
             .map_err(snapshot_error);
-        self.guard_integrity(integrity, j, d, s)?;
-        self.snapshot_resolve(key, prefix, j, d, s)?;
-        let (id, inode) = self.snapshot_resolve(key, path, j, d, s)?;
+        let descriptor = self.guard_integrity(integrity, j, d, s)?;
+        let mut inodes = SnapshotInodes::new(key, descriptor.inode_first_block);
+        self.snapshot_resolve(&mut inodes, prefix, j, d, s)?;
+        let frozen = self.snapshot_resolve(&mut inodes, path, j, d, s)?;
         let handles = if recovery { 112..128 } else { 0..112 };
         let views = if recovery { 56..64 } else { 0..56 };
         let slot = handles
@@ -395,16 +427,12 @@ impl<const C: usize> FileSystem<C> {
             .handle_generation
             .checked_add(1)
             .ok_or(Error::Overflow)?;
-        self.frozen[view] = Some(Frozen {
-            key,
-            inode_id: id,
-            inode,
-        });
+        self.frozen[view] = Some(frozen);
         self.handles[slot] = Some(Open {
-            inode: id,
-            object_generation: inode.generation,
+            inode: frozen.inode_id,
+            object_generation: frozen.inode.generation,
             generation: self.handle_generation,
-            mode: if inode.kind == InodeKind::Directory {
+            mode: if frozen.inode.kind == InodeKind::Directory {
                 OpenMode::Directory
             } else {
                 OpenMode::Read
@@ -426,14 +454,13 @@ impl<const C: usize> FileSystem<C> {
         s: &mut Scratch,
     ) -> Result<Option<Entry>, Error> {
         let frozen = self.frozen[view].ok_or(Error::Stale)?;
-        for index in usize::from(cookie)..frozen.inode.size as usize / 128 {
-            if let Some(entry) =
-                self.snapshot_entry(frozen.key, frozen.inode_id, frozen.inode, index, j, d, s)?
-            {
-                return Ok(Some(entry));
-            }
-        }
-        Ok(None)
+        let image = self
+            .snapshots
+            .active(frozen.key)
+            .map_err(|e| snapshot_error::<D::Error>(e.into()))?;
+        let mut inodes = SnapshotInodes::new(frozen.key, image.inode_first_block);
+        self.snapshot_scan(&mut inodes, &frozen, usize::from(cookie), None, j, d, s)
+            .map(|result| result.map(|(entry, _)| entry))
     }
     pub(super) fn snapshot_read<D: BlockDevice>(
         &mut self,
@@ -672,12 +699,25 @@ impl<const C: usize> FileSystem<C> {
         s: &mut Scratch,
     ) -> Result<RequestRecord, Error> {
         let refs = self.frozen.iter().flatten().any(|v| v.key == key);
-        if key.slot < 6 && self.snapshots.periodic_delete_requires_tree_proof(
-            j, d, s, &mut self.tx, request, key, refs, automatic
-        ).map_err(snapshot_error)? {
+        if key.slot < 6
+            && self
+                .snapshots
+                .periodic_delete_requires_tree_proof(
+                    j,
+                    d,
+                    s,
+                    &mut self.tx,
+                    request,
+                    key,
+                    refs,
+                    automatic,
+                )
+                .map_err(snapshot_error)?
+        {
             self.validate_snapshot_roots(j, d, s)?;
         }
-        self.snapshots.delete(j, d, s, &mut self.tx, request, key, refs, automatic)
+        self.snapshots
+            .delete(j, d, s, &mut self.tx, request, key, refs, automatic)
             .map_err(snapshot_error)
     }
 
@@ -958,7 +998,11 @@ impl<const C: usize> FileSystem<C> {
                         key: request_key,
                         expected_live_view_epoch: 0,
                     },
-                    key, true, j, d, s,
+                    key,
+                    true,
+                    j,
+                    d,
+                    s,
                 )?;
                 self.snapshots
                     .ack(j, d, s, &mut self.tx, request_key, result.result_digest)

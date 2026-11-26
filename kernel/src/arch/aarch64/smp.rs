@@ -1,7 +1,9 @@
 //! Opt-in native multicore execution gate, deliberately separate from the
 //! existing CPU0 desktop/shell. Only this bounded workload is certified here.
-//! The base control-role program is a deterministic fixture. The explicit
-//! ai-control-selftest feature substitutes the independent EL0 model service.
+//! The base control-role program is a deterministic fixture. The retired
+//! ai-control-selftest / model-v13-selftest fixtures replay pre-cutover
+//! CPU1-control history and build only under the explicit legacy-coreset
+//! feature; design §2 fixes control EL0 to CPU0 (cpu0_v0199::CONTROL_MASK).
 //! The independent net-selftest branch adds CPU0-owned DMA for EL1 Ethernet
 //! bring-up and does not run the core-transition proof fixture. No remote
 //! resources, RCU readers or production workers exist in this profile. The
@@ -12,9 +14,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_arch_aarch64::{cpu, mmu, timer, user};
 use cyxia_contracts::{BootInfo, GicResource, PhysAddr};
 use cyxia_driver_gicv2::{Gic, IrqAck};
+#[cfg(feature = "legacy-coreset")]
+use cyxia_kernel_core::control_plane::cores::{Proof, ScaleProposal};
 use cyxia_kernel_core::control_plane::{
     Error, Plane,
-    cores::{Limits, Ownership, Proof, ScaleProposal},
+    cores::{Limits, Ownership},
     dispatch::{Gate, Token},
 };
 #[cfg(feature = "ai-control-selftest")]
@@ -23,37 +27,153 @@ mod controller;
 #[cfg(feature = "model-v13-selftest")]
 #[path = "../../runtime/control/prototype_model.rs"]
 mod prototype_model;
+// RETIREMENT MARKER (design §2: control EL0 runs only on CPU0). Both fixtures
+// above are pre-cutover history, not live control topologies: controller::run
+// drives Ownership with control=CPU1 and dynamic CPU1<->CPU2 migration, and
+// prototype_model installs its EL0 image into CPU1's control root (space 3)
+// and asserts cpu::slot()==1. Re-hosting them on CPU0 would falsify the
+// retired mechanism they exercise, so they are gated behind the explicit
+// legacy-coreset retirement umbrella instead of silently building a CPU1
+// control gate. The default smp-selftest profile never compiles them.
+#[cfg(all(feature = "ai-control-selftest", not(feature = "legacy-coreset")))]
+compile_error!(
+    "ai-control-selftest is retired pre-cutover CPU1-control history; enable legacy-coreset explicitly to replay it"
+);
+#[cfg(all(feature = "model-v13-selftest", not(feature = "legacy-coreset")))]
+compile_error!(
+    "model-v13-selftest is retired pre-cutover CPU1-control history; enable legacy-coreset explicitly to replay it"
+);
 #[cfg(feature = "prototype-runtime")]
 #[path = "../../runtime/control/prototype_runtime.rs"]
 pub(crate) mod prototype_runtime;
+#[cfg(feature = "v0199-advice-e2e-selftest")]
+#[path = "v0199_advice_e2e.rs"]
+mod v0199_advice_e2e;
+// V0.20 production boot + in-vector SVC dispatch skeleton (wave 10 T1). It is a
+// child of smp so it can reuse the proven secondary-start path, private spaces
+// and execute()/context() mechanism. boot.rs routes v020-production directly to
+// production::run(info); smp::run's fixture dispatch is never reached under it.
+#[cfg(feature = "v020-production")]
+#[path = "production.rs"]
+pub(crate) mod production;
 #[cfg(feature = "v0199-cpu0-role-selftest")]
 #[path = "v0199_role_selftest.rs"]
 mod v0199_role_selftest;
-#[cfg(any(feature = "v0199-control-bringup",feature = "v0199-epoch-disk-selftest"))]
+// The advice-chain E2E fixture owns the CPU0 EL0 turn loop and the shared
+// execute()/context() mechanism; it must not be combined with another profile
+// that also hijacks CPU0 or rewrites the dispatch/execute path.
+#[cfg(all(
+    feature = "v0199-advice-e2e-selftest",
+    any(
+        feature = "v0199-cpu0-role-selftest",
+        feature = "ai-control-selftest",
+        feature = "legacy-coreset",
+        feature = "prototype-runtime",
+        feature = "unified-runtime",
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "storage-v13-selftest",
+        feature = "tcp-v13-selftest",
+    )
+))]
+compile_error!("v0199-advice-e2e-selftest requires the plain smp-selftest profile");
+#[cfg(any(
+    feature = "v0199-control-bringup",
+    feature = "v0199-epoch-disk-selftest"
+))]
 #[path = "v0199_control_bringup.rs"]
 mod v0199_control_bringup;
-#[cfg(feature = "v0199-epoch-disk-selftest")]
-#[path = "v0199_ram_inventory.rs"]
-mod v0199_ram_inventory;
-#[cfg(feature = "v0199-epoch-disk-selftest")]
-#[path = "v0199_d15_fixture.rs"]
-mod v0199_d15_fixture;
-#[cfg(feature = "v0199-epoch-disk-selftest")]
-#[path = "v0199_d07_fixture.rs"]
-mod v0199_d07_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_d02_fixture.rs"]
 mod v0199_d02_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_d07_fixture.rs"]
+mod v0199_d07_fixture;
+#[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_d15_fixture.rs"]
+mod v0199_d15_fixture;
+#[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_epoch_disk.rs"]
 mod v0199_epoch_disk;
-#[cfg(all(feature = "v0199-control-bringup", feature = "v0199-epoch-disk-selftest"))]
+#[cfg(feature = "v0199-format-selftest")]
+#[path = "v0199_format_fixture.rs"]
+mod v0199_format_fixture;
+// Dedicated scratch VirtIO-blk plumbing, shared by the format fixture and the
+// v020 opt-in media-staging lane (production/media_staging.rs).
+#[cfg(any(
+    feature = "v0199-format-selftest",
+    feature = "v020-production-media-staging"
+))]
+#[path = "scratch_blk.rs"]
+mod scratch_blk;
+// SEC-N local-echo guest loader + SVC 0x43 broker, shared by the SEC-N fixture
+// and the v020-production boot (production/net.rs).
+#[cfg(any(feature = "v0199-sec-n-selftest", feature = "v020-production"))]
+#[path = "sec_n_broker.rs"]
+mod sec_n_broker;
+#[cfg(feature = "v0199-sec-n-selftest")]
+#[path = "v0199_sec_n_fixture.rs"]
+mod v0199_sec_n_fixture;
+// The SEC-N deployment fixture owns the CPU0 EL0 turn loop (its own private guest
+// TTBR0); it must not be combined with another profile that also hijacks CPU0 or
+// rewrites the dispatch/execute path.
+#[cfg(all(
+    feature = "v0199-sec-n-selftest",
+    any(
+        feature = "v0199-cpu0-role-selftest",
+        feature = "v0199-advice-e2e-selftest",
+        feature = "v0199-control-bringup",
+        feature = "v0199-epoch-disk-selftest",
+        feature = "v0199-format-selftest",
+        feature = "ai-control-selftest",
+        feature = "legacy-coreset",
+        feature = "prototype-runtime",
+        feature = "unified-runtime",
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "storage-v13-selftest",
+        feature = "tcp-v13-selftest",
+    )
+))]
+compile_error!("v0199-sec-n-selftest requires the plain smp-selftest profile");
+#[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_ram_inventory.rs"]
+mod v0199_ram_inventory;
+#[cfg(all(
+    feature = "v0199-control-bringup",
+    feature = "v0199-epoch-disk-selftest"
+))]
 compile_error!("epoch scratch disk and role bringup require separate evidence profiles");
+#[cfg(all(
+    feature = "v0199-format-selftest",
+    any(
+        feature = "v0199-control-bringup",
+        feature = "v0199-epoch-disk-selftest"
+    )
+))]
+compile_error!(
+    "format scratch disk requires a separate evidence profile from role bringup and epoch scratch"
+);
 #[cfg(feature = "register-v15-selftest")]
 #[path = "../../diagnostics/register_evidence.rs"]
 mod register_evidence;
 const C: usize = cyxia_contracts::BOOT_CPUS;
-const PRIVATE_SPACES: usize = C * 2 + if cfg!(feature = "v0199-cpu0-role-selftest") { 8 } else { 0 };
+const PRIVATE_SPACES: usize = C * 2
+    + if cfg!(feature = "v0199-cpu0-role-selftest") {
+        8
+    } else {
+        0
+    }
+    + if cfg!(feature = "v0199-advice-e2e-selftest") {
+        8
+    } else {
+        0
+    }
+    + if cfg!(feature = "v020-production") {
+        8
+    } else {
+        0
+    };
 const STACK_BYTES: usize = 4096 + 65536;
 const CODE: u64 = 0x10000;
 const DATA: u64 = 0x20000;
@@ -65,7 +185,12 @@ static CYXIA_SMP_PROFILE: [u64; 6] = [1, 4, 8, 1, 0, 0];
 const REQUIRED: usize = 4; // Test configuration only; never an AI core-count rule.
 
 core::arch::global_asm!(include_str!("../../../../crates/arch-aarch64/src/secondary.S"), max_cpus=const C);
-core::arch::global_asm!(include_str!("smp_user.S"));
+core::arch::global_asm!(
+    include_str!("smp_user.S"),
+    d02_enabled = const cfg!(feature = "v0199-epoch-disk-selftest") as u8,
+);
+#[cfg(feature = "v0199-advice-e2e-selftest")]
+core::arch::global_asm!(include_str!("v0199_advice_user.S"));
 #[repr(C, align(4096))]
 struct Page([u64; 512]);
 impl Page {
@@ -171,6 +296,10 @@ unsafe extern "C" {
     static smp_user_start: u8;
     static smp_user_end: u8;
     static ram_l3: u8;
+    #[cfg(feature = "v0199-advice-e2e-selftest")]
+    static v0199_advice_user_start: u8;
+    #[cfg(feature = "v0199-advice-e2e-selftest")]
+    static v0199_advice_user_end: u8;
 }
 fn index(slot: usize, plane: Plane) -> usize {
     slot * 2 + usize::from(plane == Plane::Control)
@@ -691,6 +820,9 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         }
         let role = usize::from(token.plane == Plane::Control);
         let i = index(slot, token.plane);
+        // Retired pre-cutover replay: a control token here is the old CPU1
+        // control gate, reachable only under the explicit legacy-coreset
+        // umbrella (see the retirement compile_error at the module head).
         #[cfg(feature = "model-v13-selftest")]
         if role == 1 {
             prototype_model::step();
@@ -792,6 +924,10 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
     STOPPED.fetch_or(1 << slot, Ordering::Release);
     super::halt()
 }
+/// Legacy dynamic-transition resource limits (CPU1 control). Only the legacy
+/// ai-control-selftest / legacy-coreset profiles use these; the default fixed
+/// CPU0 fixture builds its own cpu0_v0199 limits.
+#[cfg(any(feature = "ai-control-selftest", feature = "legacy-coreset"))]
 fn limits() -> Limits {
     Limits {
         resource_epoch: 1,
@@ -804,6 +940,7 @@ fn limits() -> Limits {
         cooldown_ticks: 0,
     }
 }
+#[cfg_attr(feature = "v020-production", allow(dead_code))]
 fn plane(mask: u64, slot: usize) -> Plane {
     if mask & (1 << slot) != 0 {
         Plane::Control
@@ -819,7 +956,10 @@ fn close_gate(gate: &Gate) {
         Err(_) => panic!("stale dispatch configuration"),
     });
 }
-#[cfg(not(feature = "ai-control-selftest"))]
+/// Retired legacy dynamic CoreSet transition exercise. It is kept for history
+/// behind the non-default legacy-coreset feature and NEVER runs in the default
+/// fixed-CPU0 smp-selftest fixture.
+#[cfg(feature = "legacy-coreset")]
 fn transition(ownership: &mut Ownership<C>, target: u64, sequence: u64) {
     transition_request(
         ownership,
@@ -832,6 +972,7 @@ fn transition(ownership: &mut Ownership<C>, target: u64, sequence: u64) {
         },
     );
 }
+#[cfg(feature = "legacy-coreset")]
 fn transition_request(ownership: &mut Ownership<C>, proposal: ScaleProposal) {
     let target = proposal.desired_control;
     let old = ownership.snapshot();
@@ -899,6 +1040,10 @@ pub(crate) fn boot_progress() -> [u64; 5] {
         IRQS[3].load(Ordering::Acquire),
     ]
 }
+// Under v020-production boot.rs routes directly to production::run(info), so the
+// fixture dispatch below is intentionally bypassed (still live for every other
+// smp-selftest profile).
+#[cfg_attr(feature = "v020-production", allow(dead_code))]
 pub fn run(info: &BootInfo) -> ! {
     #[cfg(feature = "unified-runtime")]
     crate::boot_recovery::formal::el1();
@@ -973,10 +1118,15 @@ pub fn run(info: &BootInfo) -> ! {
     for (slot, gate) in GATES.iter().enumerate().take(REQUIRED).skip(1) {
         gate.open(Token {
             generation: 1,
-            plane: if cfg!(feature = "v0199-cpu0-role-selftest") {
-                Plane::Business
-            } else {
+            // Fixed CPU0 topology (design §2): CPU1-3 are all business. Only
+            // the explicit legacy-coreset retirement umbrella opens the old
+            // CPU1 control gate; ai-control-selftest / model-v13-selftest
+            // require that feature (retirement compile_error at module head)
+            // and never run in the default profile.
+            plane: if cfg!(feature = "legacy-coreset") {
                 plane(2, slot)
+            } else {
+                Plane::Business
             },
         })
         .unwrap();
@@ -997,41 +1147,206 @@ pub fn run(info: &BootInfo) -> ! {
     prototype_model::run();
     #[cfg(feature = "v0199-epoch-disk-selftest")]
     v0199_epoch_disk::run(info);
+    #[cfg(feature = "v0199-format-selftest")]
+    v0199_format_fixture::run(info);
+    #[cfg(feature = "v0199-sec-n-selftest")]
+    v0199_sec_n_fixture::run(info);
     #[cfg(feature = "v0199-control-bringup")]
     v0199_control_bringup::run();
-    #[cfg(all(feature = "v0199-cpu0-role-selftest", not(any(feature = "v0199-control-bringup", feature = "v0199-epoch-disk-selftest"))))]
+    #[cfg(all(
+        feature = "v0199-cpu0-role-selftest",
+        not(any(
+            feature = "v0199-control-bringup",
+            feature = "v0199-epoch-disk-selftest",
+            feature = "v0199-format-selftest"
+        ))
+    ))]
     v0199_role_selftest::run();
-    #[cfg(not(any(
-        feature = "v0199-cpu0-role-selftest",
-        feature = "net-selftest",
-        feature = "model-v13-selftest",
-        feature = "prototype-runtime",
-        feature = "storage-v13-selftest",
-        feature = "tcp-v13-selftest"
-    )))]
-    let ownership =
-        Ownership::<C>::new(15, 2, [1; C], core::array::from_fn(|i| 1 << i), limits()).unwrap();
+    #[cfg(feature = "v0199-advice-e2e-selftest")]
+    v0199_advice_e2e::run();
     #[cfg(feature = "ai-control-selftest")]
-    controller::run(ownership);
+    {
+        let ownership =
+            Ownership::<C>::new(15, 2, [1; C], core::array::from_fn(|i| 1 << i), limits()).unwrap();
+        controller::run(ownership)
+    }
+    // Retired legacy dynamic CoreSet transition exercise; never the default.
+    #[cfg(feature = "legacy-coreset")]
+    {
+        let ownership =
+            Ownership::<C>::new(15, 2, [1; C], core::array::from_fn(|i| 1 << i), limits()).unwrap();
+        fixture(ownership)
+    }
+    // Default V0.20 acceptance: validate the fixed CPU0 control topology.
     #[cfg(not(any(
         feature = "v0199-cpu0-role-selftest",
+        feature = "v0199-advice-e2e-selftest",
         feature = "ai-control-selftest",
         feature = "net-selftest",
         feature = "model-v13-selftest",
         feature = "prototype-runtime",
         feature = "storage-v13-selftest",
-        feature = "tcp-v13-selftest"
+        feature = "tcp-v13-selftest",
+        feature = "v0199-sec-n-selftest",
+        feature = "legacy-coreset"
     )))]
-    fixture(ownership)
+    fixed_cpu0_fixture()
 }
+/// Default V0.20 smp-selftest fixture: validate the FIXED CPU0 control
+/// topology (C={CPU0}, B={CPU1,CPU2,CPU3}) while CPU1-3 run only business EL0
+/// fixtures. Positive: control on CPU0, business on CPU1-3. Negative: business
+/// on CPU0 denied, control on CPU1-3 denied, no second control core. On a CPU0
+/// fault the ledger fails closed (control quarantined, no business promotion)
+/// while in-flight business obligations keep running until deterministic
+/// cleanup. The retired dynamic CoreSet transition exercise never runs here.
 #[cfg(not(any(
+    feature = "v0199-cpu0-role-selftest",
+    feature = "v0199-advice-e2e-selftest",
     feature = "ai-control-selftest",
     feature = "net-selftest",
     feature = "model-v13-selftest",
     feature = "prototype-runtime",
     feature = "storage-v13-selftest",
-    feature = "tcp-v13-selftest"
+    feature = "tcp-v13-selftest",
+    feature = "v0199-sec-n-selftest",
+    feature = "legacy-coreset"
 )))]
+fn fixed_cpu0_fixture() -> ! {
+    use cyxia_kernel_core::control_plane::cpu0_v0199 as profile;
+    let fixed_limits = Limits {
+        resource_epoch: 1,
+        min_control_cores: 1,
+        min_control_capacity: 1,
+        min_business_capacity: 3,
+        committed_business_capacity: 3,
+        protected_control: profile::CONTROL_MASK,
+        protected_business: profile::BUSINESS_MASK,
+        cooldown_ticks: 0,
+    };
+    let mut ownership = Ownership::<REQUIRED>::new_v0199_cpu0(
+        profile::ONLINE,
+        [1; REQUIRED],
+        core::array::from_fn(|i| 1 << i),
+        fixed_limits,
+    )
+    .expect("fixed CPU0 control ownership");
+    let snapshot = ownership.snapshot();
+    // Positive: exactly one CPU0 control core and three business cores.
+    profile::validate_snapshot(snapshot).expect("single CPU0 + three business cores");
+    assert_eq!(snapshot.control, 0b0001);
+    assert_eq!(snapshot.business, 0b1110);
+    assert!(snapshot.permits(0, Plane::Control));
+    // Negative: CPU0 can never run ordinary business, and no business core
+    // (CPU1-3) may run control.
+    assert!(!snapshot.permits(0, Plane::Business));
+    for slot in 1..REQUIRED {
+        assert!(snapshot.permits(slot, Plane::Business));
+        assert!(!snapshot.permits(slot, Plane::Control));
+    }
+    // Negative: a second control core or business-on-CPU0 snapshot is denied.
+    let mut second_control = snapshot;
+    second_control.control = 0b0011;
+    assert!(profile::validate_snapshot(second_control).is_err());
+    let mut business_on_cpu0 = snapshot;
+    business_on_cpu0.business = 0b1111;
+    assert!(profile::validate_snapshot(business_on_cpu0).is_err());
+    report(
+        "SMP_FIXED_CPU0",
+        snapshot.control,
+        snapshot.business,
+        snapshot.generation,
+    );
+    // CPU1-3 run only business fixtures; wait for bounded business progress.
+    wait(|| (1..REQUIRED).all(|slot| PROGRESS[slot * 2].load(Ordering::Acquire) >= 4));
+    // Fail closed on a CPU0 fault: quarantine the control core, never promote
+    // a business core to control. In-flight business obligations keep running.
+    let _ticket = ownership.fault(0, timer::ticks()).unwrap();
+    let quarantined = ownership.snapshot();
+    assert_ne!(quarantined.quarantined & 1, 0);
+    assert!(!quarantined.permits(0, Plane::Control));
+    for slot in 1..REQUIRED {
+        assert!(!quarantined.permits(slot, Plane::Control));
+        assert!(quarantined.permits(slot, Plane::Business));
+    }
+    report(
+        "SMP_CONTROL_STALL",
+        quarantined.quarantined,
+        quarantined.control,
+        quarantined.business,
+    );
+    // Deterministic cleanup: close every business gate and stop the workers.
+    for gate in GATES.iter().take(REQUIRED).skip(1) {
+        close_gate(gate);
+    }
+    wait(|| (1..REQUIRED).all(|i| GATES[i].quiescent()));
+    QUIT.store(true, Ordering::Release);
+    wait(|| STOPPED.load(Ordering::Acquire) == 14);
+    check_failures();
+    for slot in 1..REQUIRED {
+        assert!(IRQS[slot].load(Ordering::Acquire) > 0);
+        report(
+            "SMP_CPU_EVIDENCE",
+            slot as u64,
+            IRQS[slot].load(Ordering::Acquire),
+            PROGRESS[slot * 2].load(Ordering::Acquire),
+        );
+    }
+    // QMP-readable evidence page for the fixed CPU0 topology.
+    let final_snapshot = ownership.snapshot();
+    for (i, value) in [
+        0x4359_5853_4d50_3031,
+        1,
+        0,
+        15,
+        14,
+        0b0001,
+        0b1110,
+        0,
+        final_snapshot.quarantined,
+        final_snapshot.control,
+        final_snapshot.business,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        SMP_EVIDENCE.words[i].store(value, Ordering::Relaxed);
+    }
+    for slot in 0..REQUIRED {
+        let start = 16 + slot * 8;
+        let values = [
+            AFFINITIES[slot].load(Ordering::Acquire),
+            PROGRESS[slot * 2].load(Ordering::Acquire),
+            PROGRESS[slot * 2 + 1].load(Ordering::Acquire),
+            IRQS[slot].load(Ordering::Acquire),
+            FAULT_PROBES[slot].load(Ordering::Acquire),
+            FAILURES[slot].load(Ordering::Acquire),
+            unsafe { (*core::ptr::addr_of!(DATA_PAGES).cast::<Page>().add(slot * 2)).0[1] },
+            unsafe {
+                (*core::ptr::addr_of!(DATA_PAGES)
+                    .cast::<Page>()
+                    .add(slot * 2 + 1))
+                .0[1]
+            },
+        ];
+        for (offset, value) in values.into_iter().enumerate() {
+            SMP_EVIDENCE.words[start + offset].store(value, Ordering::Relaxed);
+        }
+    }
+    SMP_EVIDENCE.words[2].store(1, Ordering::Release);
+    super::log(b"SMP_SCOPE model=fixed_cpu0 production_isolation=false physical_isolation=false\n");
+    super::log(b"SMP_SELFTEST_PASS cpus=4\n");
+    super::halt()
+}
+
+/// Retired legacy dynamic C/B/T/Q transition fixture (CPU1 control). Kept for
+/// history behind the non-default legacy-coreset feature; the default
+/// smp-selftest profile runs fixed_cpu0_fixture instead.
+#[cfg(feature = "legacy-coreset")]
 fn fixture(mut ownership: Ownership<C>) -> ! {
     wait(|| {
         PROGRESS[3].load(Ordering::Acquire) >= 4

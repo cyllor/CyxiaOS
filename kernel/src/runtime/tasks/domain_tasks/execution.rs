@@ -197,7 +197,7 @@ impl Creator<'_> {
             self.layout.generation,
             self.layout.business_mask,
             self.layout.healthy_mask,
-            0, // already masked by effective_layout
+            0,                                // already masked by effective_layout
             self.scheduler.quarantine_mask(), // protected live quarantine
         )
         .map_err(|_| Error::NotReady)?;
@@ -526,7 +526,7 @@ impl TaskBackend for Creator<'_> {
                 self.layout.generation,
                 self.layout.business_mask,
                 self.layout.healthy_mask,
-                0, // effective_layout already removes draining CPUs
+                0,                                // effective_layout already removes draining CPUs
                 self.scheduler.quarantine_mask(), // source: protected scheduler
             )
             .is_err()

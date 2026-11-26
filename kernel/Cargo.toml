@@ -49,22 +49,84 @@ smp-selftest = ["selftest"]
 # Dedicated V0.19.9 4-vCPU native CPU0 EL0 role/TTBR isolation fixture.
 # Not a certification of the 8 real control services or G4.
 v0199-cpu0-role-selftest = ["smp-selftest"]
+# Native advice-chain E2E fixture: real EL0 AdviceEnvelope v1 -> SVC 0x50 intake
+# -> RuleProfile review -> DecisionRecord/Disposition -> SVC 0x50 register and
+# SVC 0x41 publish via SvcV3Bridge -> executor ApplyReport -> supervisor terminal.
+# Fixture scope only; production in-vector syscall wiring is NOT established.
+v0199-advice-e2e-selftest = ["smp-selftest", "dep:sha2"]
+# Alternate opt-in name for the CPU0 ABI3 registration and publication fixture.
+v0199-cpu0-svc-selftest = ["v0199-advice-e2e-selftest"]
+# V0.20 production boot + in-vector SVC dispatch SKELETON (wave 10 T1). Elevates
+# the proven advice-e2e SvcV3Bridge dispatch (0x50 intake/register, 0x41 publish)
+# out of the fixture turn loop and into the production exception-vector path, and
+# loads the eight ABI3 PIE role packages through the existing build catalog.
+# Opt-in only: the default build and every existing fixture profile are unchanged.
+# HONEST SCOPE: this is a skeleton, NOT full production authority. The boot epoch
+# is staged (volatile), the executor is a bounded fixture target, no real model is
+# active, and the snapshot backend stays fail-closed (EAGAIN). See production.rs
+# scope markers (production_skeleton=true full_authority=false real_models=false).
+v020-production = ["smp-selftest", "dep:sha2", "sec-n-native"]
+# Wave 11 opt-in media-staging lane; adds only the prototype-memory topology.
+v020-production-media-staging = ["v020-production", "prototype-memory"]
+v020-production-authenticated-net = ["v020-production"]
+v020-production-media-reopen = ["v020-production-media-staging"]
+v020-production-media-signed = ["v020-production-media-staging"]
+v020-production-media-envelopes = ["v020-production-media-staging"]
+v020-production-media-unified = ["v020-production-media-envelopes"]
+v020-production-live-control = ["v020-production"]
+v020-production-snapshot-catalog = ["v020-production-media-unified", "v020-production-media-signed", "v020-production-live-control"]
+v020-production-file-read = ["v020-production-media-unified", "v020-production-media-signed", "v020-production-live-control"]
+v020-production-snapshot-read = ["v020-production-snapshot-catalog", "v020-production-file-read"]
+v020-production-file-sessions = ["v020-production-file-read"]
+v020-production-file-volatile-write = ["v020-production-file-read"]
+v020-production-frame-pool = ["v020-production"]
 # Explicit native ABI3 role bootstrap. Never a production G0/BootEpoch claim.
 v0199-control-bringup = ["v0199-cpu0-role-selftest"]
 # Same diagnostic program inventory with the normative RAM topology; not G0.
 v0199-control-bringup-1g = ["v0199-control-bringup", "prototype-memory"]
 # Separate native scratch journal, never a production mounted filesystem.
 v0199-epoch-disk-selftest = ["v0199-cpu0-role-selftest", "prototype-memory", "dep:sha2"]
+# Separate native all-zero scratch format fixture: the §9.2.1 formatter
+# contract runs against real VirtIO block with guest FLUSH-ordering proof.
+# Never a production format path, signed catalog or mounted filesystem.
+v0199-format-selftest = ["v0199-cpu0-role-selftest", "prototype-memory", "dep:sha2"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]
 ai-control-selftest = ["smp-selftest"]
+# Retired dynamic C/B/T/Q control-core migration mechanism, retained only as
+# an opt-in historical fixture; never part of the fixed-CPU0 default profile.
+legacy-coreset = []
 # Four-core EL1 Ethernet driver bring-up only; no TLS/cluster certification.
 net-selftest = ["smp-selftest", "prototype-memory"]
+# SEC-N single-machine native deployment PREP (dependency + glue + guest
+# readiness), not the boot-chain dispatch. Pulls the relocated native smoltcp
+# Ethernet/IPv4/TCP stack and its VirtIO port boundary (device/tcp) that the
+# future EL1 Echo broker owns. It deliberately does NOT enable the `tls`
+# feature: rustls/ring require AArch64 NEON, and the EL1 kernel stays
+# aarch64-unknown-none-softfloat (six-tracks record forbids adding NEON to the
+# soft-float ABI). The pinned TLS session generation + Admission-bound service
+# glue (net-transport::service) therefore compiles for the EL0 guest target
+# aarch64-unknown-none and host tests, never for this soft-float closure.
+# Default builds never compile cyxia-net-transport. The smp.rs dispatch that
+# actually deploys user/local-echo is a separate, still-open gate.
+sec-n-native = ["dep:cyxia-net-transport", "cyxia-net-transport/smoltcp"]
+# Gated SEC-N native Echo DEPLOYMENT fixture: loads the real cross-compiled
+# user/local-echo EL0 image into its own TTBR0/identity and services its SVC 0x43
+# broker from a bounded trait-level mock Port, proving the fail-closed deployment
+# negatives (identity mismatch, handshake-budget exhaustion, stale generation,
+# finish-without-quiescence). The real Admission ledger + rustls TLS run in the EL0
+# guest; the EL1 kernel stays soft-float (sec-n-native pulls smoltcp only, never
+# tls/rustls/ring). Real VirtIO-net device custody + a real pinned TLS peer (needed
+# for the positive Echo turn and finish retirement) remain the open device gap.
+# Requires the guest ELF to be built first (tools/verify_v0199_sec_n.py). Never a
+# production deployment; the default build is unaffected.
+v0199-sec-n-selftest = ["smp-selftest", "sec-n-native", "dep:sha2"]
 model-v13-selftest = ["smp-selftest", "prototype-memory"]
 storage-v13-selftest = ["smp-selftest", "prototype-memory"]
 tcp-v13-selftest = ["smp-selftest", "prototype-memory", "dep:cyxia-cluster-transport"]
 prototype-runtime = ["smp-selftest", "prototype-memory"]
 # Continuous AI core scheduling and protected authenticated cluster service together.
-unified-runtime = ["prototype-runtime", "dep:cyxia-cluster-transport", "dep:sha2", "dep:cyxia-peer-billing"]
+# The legacy diagnostic path keeps the historical prototype wire codec available.
+unified-runtime = ["prototype-runtime", "dep:cyxia-cluster-transport", "dep:sha2", "dep:cyxia-peer-billing", "cyxia-prototype/legacy-cluster"]
 prototype-memory = ["cyxia-platform-virt/prototype-memory"]
 graphics = []
 ported = []
@@ -106,6 +168,10 @@ cyxia-driver-virtio = { path = "../crates/driver-virtio" }
 cyxia-peer-billing = { path = "../crates/peer-billing", optional = true }
 sha2 = { version = "=0.10.9", default-features = false, optional = true }
 cyxia-cluster-transport = { path = "../crates/cluster-transport", optional = true }
+# Single-machine native transport (relocated smoltcp stack). Optional; only the
+# sec-n-native feature activates it, and only with the `smoltcp` feature so the
+# EL1 soft-float closure never pulls rustls/ring. See sec-n-native above.
+cyxia-net-transport = { path = "../crates/net-transport", optional = true }
 cyxia-prototype = { path = "../crates/prototype", features = ["hardware-sha256"] }
 cyxia-arch-aarch64 = { path = "../crates/arch-aarch64" }
 cyxia-platform-virt = { path = "../crates/platform-virt" }

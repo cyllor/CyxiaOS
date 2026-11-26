@@ -2,10 +2,25 @@
 //! fixed integer MLP operator; no old data, topology or schema admission.
 //! Only W3/b3 can change. Each actual protected sample is processed once.
 //! Evidence custody and CPU credit must be supplied by the EL1 replay owner.
-use crate::{native_v0199::integer_model::{Model,MODEL_BYTES},reward_v2::softfloat::{F64,FloatError}};
-#[derive(Clone,Copy,Debug,Eq,PartialEq)]
-pub enum Error{Model,Evidence,Numeric,Validation,Order,State,Incomplete}
-impl From<FloatError> for Error{fn from(_:FloatError)->Self{Self::Numeric}}
+use crate::{
+    native_v0199::integer_model::{MODEL_BYTES, Model},
+    reward_v2::softfloat::{F64, FloatError},
+};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Error {
+    Model,
+    Evidence,
+    Numeric,
+    Validation,
+    Order,
+    State,
+    Incomplete,
+}
+impl From<FloatError> for Error {
+    fn from(_: FloatError) -> Self {
+        Self::Numeric
+    }
+}
 pub const LAST_WEIGHTS: usize = 2560;
 pub const LAST_BIAS: usize = 2768;
 
@@ -222,47 +237,82 @@ pub fn frozen_equal(left: &[u8; MODEL_BYTES], right: &[u8; MODEL_BYTES]) -> bool
     left[..LAST_WEIGHTS] == right[..LAST_WEIGHTS] && left[2576..LAST_BIAS] == right[2576..LAST_BIAS]
 }
 
-pub struct LastLayer<'a>{
-    original:&'a[u8;MODEL_BYTES],parameters:Parameters,completed:usize,expected:usize,failed:bool,
+pub struct LastLayer<'a> {
+    original: &'a [u8; MODEL_BYTES],
+    parameters: Parameters,
+    completed: usize,
+    expected: usize,
+    failed: bool,
 }
-impl<'a> LastLayer<'a>{
-    pub fn start(original:&'a[u8;MODEL_BYTES],expected:usize)->Result<Self,Error>{
-        if expected<120{return Err(Error::Incomplete);}
-        Ok(Self{original,parameters:Parameters::from_model(original)?,completed:0,expected,failed:false})
+impl<'a> LastLayer<'a> {
+    pub fn start(original: &'a [u8; MODEL_BYTES], expected: usize) -> Result<Self, Error> {
+        if expected < 120 {
+            return Err(Error::Incomplete);
+        }
+        Ok(Self {
+            original,
+            parameters: Parameters::from_model(original)?,
+            completed: 0,
+            expected,
+            failed: false,
+        })
     }
-    pub fn completed(&self)->usize{self.completed}
-    pub fn step(&mut self,input:&[i16;64],reward:F64)->Result<(),Error>{
-        if self.failed||self.completed>=self.expected{return Err(Error::State);}
-        let model=Model::parse(self.original).map_err(|_|Error::Model)?;
-        let h=model.trace(input).hidden2;
-        match self.parameters.step(&h,reward){
-            Ok(s)=>{self.parameters=s.next;self.completed+=1;Ok(())}
-            Err(e)=>{self.failed=true;Err(e)}
+    pub fn completed(&self) -> usize {
+        self.completed
+    }
+    pub fn step(&mut self, input: &[i16; 64], reward: F64) -> Result<(), Error> {
+        if self.failed || self.completed >= self.expected {
+            return Err(Error::State);
+        }
+        let model = Model::parse(self.original).map_err(|_| Error::Model)?;
+        let h = model.trace(input).hidden2;
+        match self.parameters.step(&h, reward) {
+            Ok(s) => {
+                self.parameters = s.next;
+                self.completed += 1;
+                Ok(())
+            }
+            Err(e) => {
+                self.failed = true;
+                Err(e)
+            }
         }
     }
-    pub fn finish(self)->Result<[u8;MODEL_BYTES],Error>{
-        if self.failed||self.completed!=self.expected{return Err(Error::Incomplete);}
-        let (w,b)=self.parameters.quantized()?;
-        let mut output=*self.original;
-        for (i,v) in w.into_iter().enumerate(){output[LAST_WEIGHTS+i]=v as u8;}
+    pub fn finish(self) -> Result<[u8; MODEL_BYTES], Error> {
+        if self.failed || self.completed != self.expected {
+            return Err(Error::Incomplete);
+        }
+        let (w, b) = self.parameters.quantized()?;
+        let mut output = *self.original;
+        for (i, v) in w.into_iter().enumerate() {
+            output[LAST_WEIGHTS + i] = v as u8;
+        }
         output[LAST_BIAS..].copy_from_slice(&b.to_le_bytes());
-        if !frozen_equal(self.original,&output){return Err(Error::Model);}
+        if !frozen_equal(self.original, &output) {
+            return Err(Error::Model);
+        }
         Ok(output)
     }
 }
 #[cfg(test)]
-mod tests{
+mod tests {
     use super::*;
     #[test]
-    fn current_last_layer_boundaries_and_exact_frozen_bytes(){
+    fn current_last_layer_boundaries_and_exact_frozen_bytes() {
         operator_selftest().unwrap();
-        let mut model=[0u8;MODEL_BYTES];model[0]=64;model[2048]=64;
-        let mut t=LastLayer::start(&model,120).unwrap();
-        let mut x=[0;64];x[0]=256;
-        for _ in 0..120{t.step(&x,F64::ONE).unwrap();}
-        let out=t.finish().unwrap();
-        assert!(frozen_equal(&model,&out));assert_ne!(model,out);
+        let mut model = [0u8; MODEL_BYTES];
+        model[0] = 64;
+        model[2048] = 64;
+        let mut t = LastLayer::start(&model, 120).unwrap();
+        let mut x = [0; 64];
+        x[0] = 256;
+        for _ in 0..120 {
+            t.step(&x, F64::ONE).unwrap();
+        }
+        let out = t.finish().unwrap();
+        assert!(frozen_equal(&model, &out));
+        assert_ne!(model, out);
         model[LAST_BIAS..].copy_from_slice(&32768i32.to_le_bytes());
-        assert!(matches!(LastLayer::start(&model,120),Err(Error::Model)));
+        assert!(matches!(LastLayer::start(&model, 120), Err(Error::Model)));
     }
 }

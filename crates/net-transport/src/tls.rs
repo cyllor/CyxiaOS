@@ -4,8 +4,8 @@
 extern crate alloc;
 
 use crate::IDLE_TIMEOUT_SECS;
-use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
 use ring::digest;
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName, Error as TlsError,
@@ -28,7 +28,14 @@ pub const RECORD_BUFFER: usize = 32768;
 pub const PLAINTEXT_BUFFER: usize = 16384;
 pub const MAX_CERTIFICATE: usize = 4096;
 /// Absolute guest-monotonic bound for a fresh mutually authenticated session.
-pub const HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
+/// SEC-N frozen value is 3000 ms, NOT the 30 s active-idle bound: baseline
+/// v0.19.9-implementation-spec.txt L1449 (待认证 TLS row: "单次 TLS 握手绝对
+/// 截止 3000 ms") and L9696 (SEC-N contract: "接收记录空闲 1s 与握手绝对 3s
+/// 独立"); SEC-N11 (L9805+) repeats "1s 记录/3s 握手、30s 空闲、300s 绝对".
+pub const HANDSHAKE_TIMEOUT_MS: u64 = 3_000;
+// Compile-time pins: the frozen baseline value must not drift silently, and
+// the handshake deadline must stay strictly inside the idle policy window.
+const _: () = assert!(HANDSHAKE_TIMEOUT_MS == 3_000);
 const _: () = assert!(HANDSHAKE_TIMEOUT_MS < IDLE_TIMEOUT_SECS * 1000);
 /// ALPNs are disjoint: the single-node read-only service is not the
 /// historical remote-placement/member protocol.
@@ -39,7 +46,10 @@ static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
 /// Unforgeable within a single native TLS service instance: never decoded
 /// from a network message. A matching peer pin alone is NOT connection identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EchoProof { session: u64, peer: [u8; 32] }
+pub struct EchoProof {
+    session: u64,
+    peer: [u8; 32],
+}
 
 pub const LEGACY_CLUSTER_ALPN: &[u8] = b"cyxia-cluster/1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -409,10 +419,20 @@ enum Connection {
     Client(UnbufferedClientConnection),
     Server(UnbufferedServerConnection),
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloseState {
+    Disabled,
+    Waiting,
+    PeerNotified,
+    ReplyEncoded,
+    Closed,
+}
+
 pub struct Session<'a> {
     connection: Connection,
     buffers: &'a mut Buffers,
     application: ApplicationProtocol,
+    close: CloseState,
     session_serial: u64,
     input: usize,
     output: usize,
@@ -427,6 +447,7 @@ pub struct Session<'a> {
     handshake_deadline: u64,
 }
 struct Step {
+    close: CloseState,
     discard: usize,
     output: usize,
     received: usize,
@@ -449,7 +470,8 @@ impl<'a> Session<'a> {
         let session_serial = NEXT_SESSION
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
             .map_err(|_| Error::Clock)?
-            .checked_add(1).ok_or(Error::Clock)?;
+            .checked_add(1)
+            .ok_or(Error::Clock)?;
         buffers.input.fill(0);
         buffers.output.fill(0);
         buffers.received.fill(0);
@@ -458,6 +480,7 @@ impl<'a> Session<'a> {
             connection,
             buffers,
             application,
+            close: CloseState::Disabled,
             session_serial,
             input: 0,
             output: 0,
@@ -484,13 +507,16 @@ impl<'a> Session<'a> {
     /// cannot be constructed by a peer, a model or an application wire frame.
     pub fn local_echo_proof(&self) -> Option<EchoProof> {
         let peer = self.authenticated_peer()?;
-        if self.application != ApplicationProtocol::LocalEcho { return None; }
+        if self.application != ApplicationProtocol::LocalEcho {
+            return None;
+        }
         let negotiated = match &self.connection {
             Connection::Client(connection) => connection.alpn_protocol(),
             Connection::Server(connection) => connection.alpn_protocol(),
         };
         (negotiated == Some(LOCAL_ECHO_ALPN)).then_some(EchoProof {
-            session: self.session_serial, peer,
+            session: self.session_serial,
+            peer,
         })
     }
     /// A checked local read-only application message can be created only
@@ -508,8 +534,37 @@ impl<'a> Session<'a> {
         }
         crate::echo::parse_request(message).map_err(|_| Error::Buffer)
     }
+    /// Enable reciprocal close_notify handling on this authenticated Echo session.
+    pub fn enable_normal_close(&mut self) -> Result<(), Error> {
+        if self.local_echo_proof().is_none() || self.close != CloseState::Disabled {
+            return Err(Error::Handshake);
+        }
+        self.close = CloseState::Waiting;
+        Ok(())
+    }
+
+    /// Both rustls close notifications and every buffered byte were accounted for.
+    pub fn normal_close_complete(&self) -> bool {
+        !self.failed
+            && self.close == CloseState::Closed
+            && self.input == 0
+            && self.received == 0
+            && self.sending == 0
+            && self.output == 0
+    }
+
+    pub(crate) fn retirement_tls_ready(&self) -> bool {
+        self.close == CloseState::Disabled || self.normal_close_complete()
+    }
+
+    fn peer_notified(&self) -> bool {
+        matches!(
+            self.close,
+            CloseState::PeerNotified | CloseState::ReplyEncoded | CloseState::Closed
+        )
+    }
     pub fn receive_tls(&mut self, bytes: &[u8]) -> Result<usize, Error> {
-        if self.failed {
+        if self.failed || (self.peer_notified() && !bytes.is_empty()) {
             return Err(Error::Closed);
         }
         let count = bytes.len().min(RECORD_BUFFER - self.input);
@@ -528,7 +583,7 @@ impl<'a> Session<'a> {
     /// permits another bounded read, including handshake messages fragmented
     /// across records. Callers retain any unread suffix in their transport.
     pub fn receive_capacity(&self) -> usize {
-        if self.failed || (self.sending != 0 && !self.needs_input) {
+        if self.failed || self.peer_notified() || (self.sending != 0 && !self.needs_input) {
             0
         } else {
             RECORD_BUFFER - self.input
@@ -552,7 +607,7 @@ impl<'a> Session<'a> {
         Ok(())
     }
     pub fn send_plaintext(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if self.failed {
+        if self.failed || self.peer_notified() {
             return Err(Error::Closed);
         }
         if !self.authenticated {
@@ -623,6 +678,7 @@ impl<'a> Session<'a> {
                 &mut self.buffers.received[accepted..],
                 &self.buffers.sending[..self.sending],
                 self.input,
+                self.close,
             ),
             Connection::Server(c) => step(
                 c.process_tls_records(incoming),
@@ -630,6 +686,7 @@ impl<'a> Session<'a> {
                 &mut self.buffers.received[accepted..],
                 &self.buffers.sending[..self.sending],
                 self.input,
+                self.close,
             ),
         };
         let progress = match result {
@@ -664,11 +721,18 @@ impl<'a> Session<'a> {
             && progress.received == 0
             && !progress.sent;
         self.output = progress.output;
-        self.received = accepted.checked_add(progress.received).ok_or(Error::Buffer)?;
+        self.received = accepted
+            .checked_add(progress.received)
+            .ok_or(Error::Buffer)?;
         if progress.sent {
             self.buffers.sending[..self.sending].fill(0);
             self.sending = 0;
         }
+        if progress.close == CloseState::PeerNotified && (self.input != 0 || self.received != 0) {
+            self.fail();
+            return Err(Error::Buffer);
+        }
+        self.close = progress.close;
         self.authenticated |= progress.authenticated;
         Ok(())
     }
@@ -703,8 +767,10 @@ fn step<T>(
     received: &mut [u8],
     sending: &[u8],
     input_len: usize,
+    close: CloseState,
 ) -> Result<Step, Error> {
     let mut result = Step {
+        close,
         discard: status.discard,
         output: 0,
         received: 0,
@@ -725,6 +791,14 @@ fn step<T>(
             if !sending.is_empty() && result.discard == input_len {
                 result.output = state.encrypt(sending, output).map_err(|_| Error::Buffer)?;
                 result.sent = true;
+            } else if sending.is_empty() && close == CloseState::PeerNotified {
+                result.output = state
+                    .queue_close_notify(output)
+                    .map_err(|_| Error::Buffer)?;
+                if result.output == 0 {
+                    return Err(Error::Closed);
+                }
+                result.close = CloseState::ReplyEncoded;
             }
         }
         ConnectionState::ReadTraffic(mut state) => {
@@ -738,6 +812,14 @@ fn step<T>(
                 result.received = record.payload.len();
                 result.discard += record.discard;
             }
+        }
+        ConnectionState::PeerClosed if close == CloseState::Waiting => {
+            result.close = CloseState::PeerNotified;
+        }
+        ConnectionState::Closed
+            if matches!(close, CloseState::ReplyEncoded | CloseState::Closed) =>
+        {
+            result.close = CloseState::Closed;
         }
         ConnectionState::Closed | ConnectionState::PeerClosed => return Err(Error::Closed),
         ConnectionState::ReadEarlyData(_) => return Err(Error::Handshake),
@@ -786,6 +868,177 @@ mod tests {
             provider,
         );
         assert!(matches!(result, Err(Error::Entropy)));
+    }
+
+    /// SEC-N07 (baseline v0.19.9 L9756): key material and packet bodies probed
+    /// through telemetry/logs must find no critical secret in any log or
+    /// AI-readable snapshot. Pin that production `Pairing` wires rustls' no-op
+    /// `NoKeyLog` in both roles and that no private key byte reaches any
+    /// diagnostic surface. `Pairing`, `Session` and `IdentitySigner` hold the
+    /// secret material and deliberately implement no `Debug` at all; the
+    /// duplex suite's `TestSecret` KeyLog is a test-only capture injected
+    /// after construction, never production wiring.
+    #[test]
+    fn n07_key_material_never_reaches_key_log_or_diagnostics() {
+        use alloc::format;
+        use rustls::KeyLog;
+
+        let a_cert = CertificateDer::from(&include_bytes!("../tests/fixtures/a-test-cert.der")[..]);
+        let b_cert = CertificateDer::from(&include_bytes!("../tests/fixtures/b-test-cert.der")[..]);
+        let a_key = include_bytes!("../tests/fixtures/a-test-key.der");
+        let b_key = include_bytes!("../tests/fixtures/b-test-key.der");
+        let mut pairings = [
+            Pairing::new_local_echo(
+                a_cert.clone(),
+                PrivatePkcs8KeyDer::from(&a_key[..]).into(),
+                node_id(&b_cert).unwrap(),
+                Arc::new(Time),
+            )
+            .unwrap(),
+            Pairing::new_local_echo(
+                b_cert.clone(),
+                PrivatePkcs8KeyDer::from(&b_key[..]).into(),
+                node_id(&a_cert).unwrap(),
+                Arc::new(Time),
+            )
+            .unwrap(),
+        ];
+        pairings.sort_by_key(|pairing| pairing.local_node());
+
+        // No key-log callback is wired in either role. The Debug name pins
+        // the concrete rustls no-op type; `will_log == false` is rustls'
+        // contract that `log` is then never called with any secret.
+        const NSS_LABELS: [&str; 7] = [
+            "CLIENT_RANDOM",
+            "CLIENT_EARLY_TRAFFIC_SECRET",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "SERVER_TRAFFIC_SECRET_0",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "EXPORTER_SECRET",
+        ];
+        for pairing in &pairings {
+            for key_log in [&pairing.client.key_log, &pairing.server.key_log] {
+                assert_eq!(format!("{:?}", key_log), "NoKeyLog");
+                for label in NSS_LABELS {
+                    assert!(!key_log.will_log(label), "key log must refuse {label}");
+                }
+            }
+        }
+
+        // Drive a real pinned mutual handshake to an authenticated Echo
+        // session, recording every wire byte, then scan all diagnostic
+        // output for the private seeds. Traffic secrets stay internal to
+        // rustls; with NoKeyLog pinned above there is no export path.
+        fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+        }
+        let mut wire = Vec::new();
+        let mut ab = Buffers::new();
+        let mut bb = Buffers::new();
+        let mut client = pairings[0].client(&mut ab, 0).unwrap();
+        let mut server = pairings[1].server(&mut bb, 0).unwrap();
+        for _ in 0..100 {
+            client.pump(0).unwrap();
+            server.pump(0).unwrap();
+            wire.extend_from_slice(client.pending_tls());
+            wire.extend_from_slice(server.pending_tls());
+            let n = server.receive_tls(client.pending_tls()).unwrap();
+            client.consume_tls(n).unwrap();
+            let n = client.receive_tls(server.pending_tls()).unwrap();
+            server.consume_tls(n).unwrap();
+            if client.authenticated_peer().is_some()
+                && server.authenticated_peer().is_some()
+                && client.pending_tls().is_empty()
+                && server.pending_tls().is_empty()
+            {
+                break;
+            }
+        }
+        let proof = client.local_echo_proof().expect("authenticated Echo proof");
+        assert!(server.authenticated_peer().is_some());
+        // The frozen 3 s bound gates only the pre-authentication handshake;
+        // an established session answers to the idle policy, not this clock.
+        client.pump(HANDSHAKE_TIMEOUT_MS + 1).unwrap();
+
+        // The 48-byte PKCS8 fixtures end in the raw 32-byte Ed25519 seed.
+        let secrets = [
+            &a_key[..],
+            &b_key[..],
+            &a_key[a_key.len() - 32..],
+            &b_key[b_key.len() - 32..],
+        ];
+        let diagnostics = [
+            format!("{:?}", proof),
+            format!("{:?}", ApplicationProtocol::LocalEcho),
+            format!("{:?}", ApplicationProtocol::LegacyCluster),
+            format!("{:?}", Error::Identity),
+            format!("{:?}", Error::Entropy),
+            format!("{:?}", Error::Time),
+            format!("{:?}", Error::Clock),
+            format!("{:?}", Error::Timeout),
+            format!("{:?}", Error::Buffer),
+            format!("{:?}", Error::WouldBlock),
+            format!("{:?}", Error::Handshake),
+            format!("{:?}", Error::Closed),
+            format!("{:?}", Error::Direction),
+            format!(
+                "{:?}",
+                Error::Protocol(TlsError::General("n07 diagnostic probe".into()))
+            ),
+            format!(
+                "{:?}",
+                Error::Protocol(TlsError::InvalidCertificate(
+                    CertificateError::ApplicationVerificationFailure
+                ))
+            ),
+        ];
+        for secret in secrets {
+            for diagnostic in &diagnostics {
+                assert!(
+                    !contains(diagnostic.as_bytes(), secret),
+                    "private key bytes reached diagnostic output"
+                );
+            }
+            assert!(
+                !contains(&wire, secret),
+                "private key bytes reached the TLS wire"
+            );
+        }
+    }
+
+    /// SEC-N11 frozen timing (baseline L1449/L9696): the handshake absolute
+    /// deadline is 3 s, independent of the 30 s active-idle bound. It fails
+    /// closed and permanently at exactly 3000 ms of guest-monotonic time.
+    #[test]
+    fn handshake_absolute_deadline_is_frozen_three_seconds() {
+        assert_eq!(HANDSHAKE_TIMEOUT_MS, 3_000);
+        let pairing = Pairing::new_local_echo(
+            CertificateDer::from(&include_bytes!("../tests/fixtures/a-test-cert.der")[..]),
+            PrivatePkcs8KeyDer::from(&include_bytes!("../tests/fixtures/a-test-key.der")[..])
+                .into(),
+            [0xff; 32],
+            Arc::new(Time),
+        )
+        .unwrap();
+        let mut buffers = Buffers::new();
+        let mut session = pairing.client(&mut buffers, 0).unwrap();
+        // One millisecond before the frozen deadline the handshake is still
+        // admitted; the deadline itself refuses and invalidates the session.
+        session.pump(HANDSHAKE_TIMEOUT_MS - 1).unwrap();
+        assert!(matches!(
+            session.pump(HANDSHAKE_TIMEOUT_MS),
+            Err(Error::Timeout)
+        ));
+        assert!(session.authenticated_peer().is_none());
+        assert!(session.plaintext().is_empty());
+        assert_eq!(session.receive_capacity(), 0);
+        assert!(matches!(
+            session.pump(HANDSHAKE_TIMEOUT_MS + 1),
+            Err(Error::Closed)
+        ));
     }
 }
 

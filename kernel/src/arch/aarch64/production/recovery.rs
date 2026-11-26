@@ -1,0 +1,323 @@
+//! Wave 11 volatile recovery gate and per-CPU exception summaries.
+//!
+//! Each authorized 0x41 checks the EL1-owned checkpoint pair facts. This boot
+//! starts with staged facts for the identical initial pair. After the successful
+//! publication and replay, a probe withdraws one validation witness. The next
+//! actual EL0 publish therefore takes the single-valid-copy RECOVERY_REQUIRED
+//! path. EL0 exception observations never supply checkpoint facts.
+//!
+//! UNSAFE BOUNDARY REGISTRATION:
+//! * CPU0 initializes GATE and SLOTS once before starting the secondaries.
+//!   READY publishes initialization. Only synchronous CPU0 code accesses GATE.
+//! * Each CPU exclusively owns its accumulator in SLOTS while running EL0.
+//!   CPU0 can take a worker's slot only after observing QUIT, its quiescent
+//!   business gate and its STOPPED release. That worker disabled its timer,
+//!   returned from its last EL0 turn and has no path back to EL0.
+//! * EVENTS and REJECTED publish each producer's own count. TAKEN records
+//!   completed transfers. CPU0 consumes the retained summaries for the seal.
+//!   The live-control service derives three volatile RECONCILE audit slots
+//!   from these transferred proofs. Role 11 acknowledges the audit slots.
+//!   The underlying RecoveryProof accumulators remain owned by CPU0.
+//! * CPU0 increments GATE_REJECTS on an in-vector RECOVERY_REQUIRED refusal,
+//!   and samples the parent advice gate via gate_ptr() between EL0 turns.
+
+use super::super::{FAULT_PROBES, GATES, QUIT, STOPPED, fatal, report};
+use super::{
+    ACCEPT_COUNT, BOOT, E_AUTH, PUB, ROLE_COUNT, SUPER, SVC_OUT, advice_carrier, evidence, gate_ptr,
+};
+use core::mem::MaybeUninit;
+use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use cyxia_kernel_core::security::Error;
+use cyxia_kernel_core::security::recovery_proof_v2::{
+    ACCUMULATOR_COUNT, CheckpointPairFacts, DegradedEvent, DegradedEventKind, RecoveryAccumulator,
+    RecoveryGate, RecoveryState,
+};
+use sha2::{Digest, Sha256};
+
+/// Protection generation of the staged boot (first generation).
+const PROTECTION_GENERATION: u64 = 1;
+const INITIAL_WRITER_GENERATION: u64 = 1;
+const SECONDARIES: u64 = ((1 << ACCUMULATOR_COUNT) - 1) & !1;
+const FATAL_RECORD_REJECTED: u64 = 0x5731_1320;
+const FATAL_INIT: u64 = 0x5731_1321;
+const FATAL_GATE: u64 = 0x5731_1322;
+const FATAL_NO_SLOT: u64 = 0x5731_1323;
+const FATAL_PROBE: u64 = 0x5731_1324;
+const FATAL_TAKEOVER: u64 = 0x5731_1325;
+
+#[repr(C, align(64))]
+struct Slot(MaybeUninit<RecoveryAccumulator>);
+
+struct StagedGate {
+    gate: RecoveryGate,
+    pair: CheckpointPairFacts,
+}
+
+static mut GATE: MaybeUninit<StagedGate> = MaybeUninit::uninit();
+static mut SLOTS: [Slot; ACCUMULATOR_COUNT] =
+    [const { Slot(MaybeUninit::uninit()) }; ACCUMULATOR_COUNT];
+static READY: AtomicBool = AtomicBool::new(false);
+static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
+static EVENTS: [AtomicU64; ACCUMULATOR_COUNT] = [const { AtomicU64::new(0) }; ACCUMULATOR_COUNT];
+static REJECTED: [AtomicU64; ACCUMULATOR_COUNT] = [const { AtomicU64::new(0) }; ACCUMULATOR_COUNT];
+static TAKEN: AtomicU64 = AtomicU64::new(0);
+static GATE_REJECTS: AtomicU64 = AtomicU64::new(0);
+
+/// The staged initial pair: both copies valid, same FS UUID, the fresh-image
+/// identical initial pair, relation provable. Every adverse fact is false.
+const fn staged_pair() -> CheckpointPairFacts {
+    CheckpointPairFacts {
+        first_valid: true,
+        second_valid: true,
+        same_fs_uuid: true,
+        identical_initial_pair: true,
+        same_generation_different_content: false,
+        relation_provable: true,
+        higher_generation_log: false,
+    }
+}
+
+/// Build the gate and the four accumulators. CPU0, once, before SMP bring-up.
+fn init(boot_epoch: u64) -> Result<(), Error> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 {
+        return Err(Error::Unauthorized);
+    }
+    if INIT_CLAIMED.swap(true, Ordering::AcqRel) {
+        return Err(Error::Busy);
+    }
+    let pair = staged_pair();
+    let gate = RecoveryGate::new(boot_epoch, PROTECTION_GENERATION, SUPER, &pair)?;
+    if gate.state() != RecoveryState::Verified {
+        return Err(Error::Invalid);
+    }
+    let mut accs = [const { MaybeUninit::<RecoveryAccumulator>::uninit() }; ACCUMULATOR_COUNT];
+    for (cpu, acc) in accs.iter_mut().enumerate() {
+        acc.write(RecoveryAccumulator::new(
+            boot_epoch,
+            cpu as u32,
+            INITIAL_WRITER_GENERATION,
+        )?);
+    }
+    // SAFETY: INIT_CLAIMED makes this the only initialization; it runs on CPU0
+    // before any secondary CPU starts or any EL0 role runs, so no other
+    // reference to GATE or SLOTS exists. Only raw addr_of_mut! places are used.
+    unsafe {
+        addr_of_mut!(GATE).write(MaybeUninit::new(StagedGate { gate, pair }));
+        for (cpu, acc) in accs.into_iter().enumerate() {
+            addr_of_mut!(SLOTS[cpu]).write(Slot(acc));
+        }
+    }
+    READY.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// run()'s entry hook: a failed init stops the boot fail-closed.
+pub(super) fn init_or_fatal() {
+    if init(BOOT).is_err() {
+        fatal(FATAL_INIT);
+    }
+}
+
+fn event_digest(cpu: u32, esr: u64, far: u64) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(esr.to_le_bytes());
+    h.update(far.to_le_bytes());
+    h.update(cpu.to_le_bytes());
+    h.finalize().into()
+}
+
+/// Record one EL0 fault into the faulting CPU's own accumulator. Runs in that
+/// CPU's exception context; `cpu` must be the current CPU slot.
+pub(crate) fn record_fault(cpu: u32, esr: u64, far: u64) {
+    let i = cyxia_arch_aarch64::cpu::slot();
+    if i >= ACCUMULATOR_COUNT {
+        // No accumulator exists for this CPU; never drop the event silently.
+        fatal(FATAL_NO_SLOT);
+    }
+    // REJECTED/EVENTS are indexed by the CURRENT CPU only, never by `cpu`.
+    if cpu as usize != i
+        || !READY.load(Ordering::Acquire)
+        || TAKEN.load(Ordering::Acquire) & (1 << i) != 0
+    {
+        REJECTED[i].fetch_add(1, Ordering::Release);
+        return;
+    }
+    // SAFETY: slot i was initialized before READY (Acquire above) and is only
+    // referenced by CPU i until its final STOPPED release; an
+    // exception handler does not re-enter itself on the same CPU here.
+    let acc = unsafe { (*addr_of_mut!(SLOTS[i])).0.assume_init_mut() };
+    let ev = DegradedEvent {
+        kind: DegradedEventKind::OtherCritical,
+        event_id: acc.proof().last_event_id.saturating_add(1),
+        event_digest: event_digest(cpu, esr, far),
+        object_id: 0,
+        object_generation: 1,
+        failure_code: (esr >> 26) as u32,
+    };
+    match acc.record(&ev) {
+        Ok(()) => EVENTS[i].store(acc.proof().total_count, Ordering::Release),
+        Err(_) => {
+            REJECTED[i].fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+/// Scoped access to the recovery gate: `None` before init or off CPU0. The
+/// `&mut` never escapes `f`, so no caller can hold an aliasing reference.
+fn with_gate<R>(f: impl FnOnce(&mut StagedGate) -> R) -> Option<R> {
+    if !READY.load(Ordering::Acquire) || cyxia_arch_aarch64::cpu::slot() != 0 {
+        return None;
+    }
+    // SAFETY: GATE was initialized before READY (Acquire above). Only CPU0
+    // (checked) reaches here, CPU0 code is synchronous, and `with_gate` is
+    // never called re-entrantly from inside `f`, so this is the only live
+    // reference for the duration of `f`.
+    let gate = unsafe { (*addr_of_mut!(GATE)).assume_init_mut() };
+    Some(f(gate))
+}
+
+/// Re-evaluate the EL1 facts at the side-effect boundary, including on retries.
+pub(super) fn publish_allowed() -> bool {
+    let state = with_gate(|staged| staged.gate.raise(&staged.pair));
+    if state == Some(RecoveryState::RecoveryRequired) {
+        GATE_REJECTS.fetch_add(1, Ordering::Relaxed);
+    }
+    state == Some(RecoveryState::Verified)
+}
+
+/// Withdraw the second staged validation witness, then issue the real 0x41.
+/// The probe changes the input only. The vector must latch the state itself.
+pub(super) fn publish_probe(pub_space: usize, pub_args: [u64; 6]) {
+    // SAFETY: CPU0 control plane; the gate reference is consumed immediately
+    // and no in-vector dispatch is running between these synchronous calls.
+    let published = unsafe { (&*gate_ptr()).published_count() };
+    assert_eq!(published, 1, "probe must run while the plan is published");
+    let rejects_before = GATE_REJECTS.load(Ordering::Relaxed);
+    assert_eq!(rejects_before, 0, "gate refused a publish before the probe");
+    with_gate(|staged| {
+        assert_eq!(staged.gate.state(), RecoveryState::Verified);
+        assert!(staged.pair.first_valid && staged.pair.second_valid);
+        staged.pair.second_valid = false;
+        staged.pair.identical_initial_pair = false;
+        staged.pair.relation_provable = false;
+    })
+    .unwrap_or_else(|| fatal(FATAL_GATE));
+    advice_carrier(pub_space, 0x41, pub_args);
+    let out = SVC_OUT[ROLE_COUNT + 3].load(Ordering::Relaxed);
+    assert_eq!(
+        out, E_AUTH as u64,
+        "0x41 must refuse the staged single-copy pair"
+    );
+    let rejects_after = GATE_REJECTS.load(Ordering::Relaxed);
+    assert_eq!(
+        rejects_after, 1,
+        "the refusal must come from the recovery gate"
+    );
+    // SAFETY: as above; the refused SVC already returned to this CPU0 loop.
+    let after = unsafe { (&*gate_ptr()).published_count() };
+    assert_eq!(after, 1, "refused publish must leave published_count at 1");
+    assert_eq!(
+        ACCEPT_COUNT.load(Ordering::Relaxed),
+        1,
+        "no new native accept"
+    );
+    let state = with_gate(|staged| staged.gate.state()).unwrap_or_else(|| fatal(FATAL_GATE));
+    if state != RecoveryState::RecoveryRequired {
+        fatal(FATAL_PROBE);
+    }
+    report("V020_PROD_RECOVERY_REJECT", PUB.id, out, after as u64);
+    report(
+        "V020_W11_RECOVERY_GATE_REJECTS",
+        rejects_before,
+        rejects_after,
+        state as u64,
+    );
+}
+
+/// EL1 consumes each stopped producer's retained proof on CPU0. The published
+/// event counts provide independent watermarks for the generation transition.
+pub(super) fn takeover_stopped() {
+    if cyxia_arch_aarch64::cpu::slot() != 0
+        || !READY.load(Ordering::Acquire)
+        || !QUIT.load(Ordering::Acquire)
+        || STOPPED.load(Ordering::Acquire) != SECONDARIES
+        || TAKEN.load(Ordering::Relaxed) != 0
+    {
+        fatal(FATAL_TAKEOVER);
+    }
+    let mut retained = 0u64;
+    let mut fixture_faults = 0u64;
+    for i in 1..ACCUMULATOR_COUNT {
+        if !GATES[i].quiescent() {
+            fatal(FATAL_TAKEOVER);
+        }
+        // SAFETY: init published SLOTS before READY. STOPPED above acquires
+        // the writer's final release after it permanently left EL0. This is
+        // the only CPU0 caller and its references end before the next turn.
+        let acc = unsafe { (*addr_of_mut!(SLOTS[i])).0.assume_init_mut() };
+        let watermark = EVENTS[i].load(Ordering::Acquire);
+        acc.takeover_stopped_writer(BOOT, i as u32, INITIAL_WRITER_GENERATION, watermark)
+            .unwrap_or_else(|_| fatal(FATAL_TAKEOVER));
+        retained = retained.saturating_add(acc.proof().total_count);
+        // smp::probes increments this only after checking the actual FAR/EC/FSC.
+        let checked = FAULT_PROBES[i].load(Ordering::Acquire);
+        if checked > acc.proof().total_count {
+            fatal(FATAL_TAKEOVER);
+        }
+        fixture_faults = fixture_faults.saturating_add(checked);
+        TAKEN.fetch_or(1 << i, Ordering::Release);
+    }
+    report(
+        "V020_W11_RECOVERY_HANDOFF",
+        TAKEN.load(Ordering::Acquire),
+        retained,
+        fixture_faults,
+    );
+}
+
+/// Snapshot CPU0 and all three transferred writers after their final stopped handoff.
+#[cfg(feature = "v020-production-live-control")]
+pub(super) fn handed_off_proofs()
+-> Option<[cyxia_kernel_core::security::recovery_proof_v2::RecoveryProofV2; ACCUMULATOR_COUNT]> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 || TAKEN.load(Ordering::Acquire) != SECONDARIES {
+        return None;
+    }
+    // CPU0 is the current owner of all accumulators. The release in
+    // takeover_stopped follows the worker stop and its generation advance.
+    Some(core::array::from_fn(|i| unsafe {
+        *(*addr_of_mut!(SLOTS[i])).0.assume_init_ref().proof()
+    }))
+}
+
+/// Seal the actual proof counts and the measured refusal / handoff outcomes.
+pub(super) fn publish() {
+    if REJECTED.iter().any(|r| r.load(Ordering::Acquire) != 0) {
+        fatal(FATAL_RECORD_REJECTED);
+    }
+    let mask = TAKEN.load(Ordering::Acquire);
+    if cyxia_arch_aarch64::cpu::slot() != 0 || mask != SECONDARIES {
+        fatal(FATAL_TAKEOVER);
+    }
+    let mut events = 0u64;
+    for i in 0..ACCUMULATOR_COUNT {
+        // SAFETY: CPU0 owns slot 0 and checked that all secondary slots have
+        // completed takeover. This seal cannot run concurrently with CPU0 EL0.
+        let acc = unsafe { (*addr_of_mut!(SLOTS[i])).0.assume_init_ref() };
+        events = events.saturating_add(acc.proof().total_count);
+    }
+    evidence::put(
+        evidence::W11_RECOVERY_ACCUMULATORS,
+        ACCUMULATOR_COUNT as u64,
+    );
+    evidence::put(evidence::W11_DEGRADED_EVENTS, events);
+    evidence::put(
+        evidence::W11_RECOVERY_REQUIRED_REJECTS,
+        GATE_REJECTS.load(Ordering::Relaxed),
+    );
+    evidence::put(evidence::W11_RECOVERY_PAIR_FACTS_STAGED, 1);
+    evidence::put(
+        evidence::W11_RECOVERY_WRITER_TAKEOVERS,
+        u64::from(mask.count_ones()),
+    );
+}

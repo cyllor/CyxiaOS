@@ -1,6 +1,8 @@
 /target/
+target/
 /artifacts/
 /.superpowers/
+/.qwen/
 __pycache__/
 *.pyc
 .DS_Store

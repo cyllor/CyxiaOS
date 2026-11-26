@@ -57,44 +57,55 @@ fn sgi_uses_the_registered_banked_target_mask_without_editing_spi_routing() {
 
 #[test]
 fn logical_cpu_registration_is_distinct_from_hardware_target_bit() {
-    let targets=CpuTargets::new();
-    targets.register(0,4).unwrap();
-    targets.register(1,1).unwrap();
-    targets.register(3,128).unwrap();
-    targets.register(3,128).unwrap();
-    assert_eq!(targets.target(0),Some(4));
-    assert_eq!(targets.target(1),Some(1));
-    assert_eq!(targets.target(2),None);
-    assert!(targets.register(2,4).is_err());
-    assert!(targets.register(1,2).is_err());
-    assert!(targets.register(2,3).is_err());
-    let mut dist=Box::new([0u32;1024]);
-    let mut interface=Box::new([0u32;1024]);
-    dist[1]=3;
-    dist[0x800/4]=0x04040404;
-    let gic=unsafe { Gic::new(GicResource {
-        distributor:PhysAddr(dist.as_mut_ptr() as u64),distributor_len:4096,
-        cpu:PhysAddr(interface.as_mut_ptr() as u64),cpu_len:4096
-    }) }.unwrap();
+    let targets = CpuTargets::new();
+    targets.register(0, 4).unwrap();
+    targets.register(1, 1).unwrap();
+    targets.register(3, 128).unwrap();
+    targets.register(3, 128).unwrap();
+    assert_eq!(targets.target(0), Some(4));
+    assert_eq!(targets.target(1), Some(1));
+    assert_eq!(targets.target(2), None);
+    assert!(targets.register(2, 4).is_err());
+    assert!(targets.register(1, 2).is_err());
+    assert!(targets.register(2, 3).is_err());
+    let mut dist = Box::new([0u32; 1024]);
+    let mut interface = Box::new([0u32; 1024]);
+    dist[1] = 3;
+    dist[0x800 / 4] = 0x04040404;
+    let gic = unsafe {
+        Gic::new(GicResource {
+            distributor: PhysAddr(dist.as_mut_ptr() as u64),
+            distributor_len: 4096,
+            cpu: PhysAddr(interface.as_mut_ptr() as u64),
+            cpu_len: 4096,
+        })
+    }
+    .unwrap();
     gic.enable(40).unwrap();
-    assert_eq!(gic.spi_target_mask(40),Ok(4));
+    assert_eq!(gic.spi_target_mask(40), Ok(4));
     // The test's plain register pages do not emulate write-one-to-clear.
-    dist[(0x100+4)/4]=0;
-    gic.route_masked_spi_target(40,targets.target(3).unwrap()).unwrap();
-    assert_eq!(gic.spi_target_mask(40),Ok(128));
-    assert!(gic.route_masked_spi_target(40,3).is_err());
-    assert_eq!(gic.spi_target_mask(40),Ok(128));
+    dist[(0x100 + 4) / 4] = 0;
+    gic.route_masked_spi_target(40, targets.target(3).unwrap())
+        .unwrap();
+    assert_eq!(gic.spi_target_mask(40), Ok(128));
+    assert!(gic.route_masked_spi_target(40, 3).is_err());
+    assert_eq!(gic.spi_target_mask(40), Ok(128));
 }
 
 #[test]
 fn concurrent_duplicate_target_registration_has_one_owner() {
-    let targets=CpuTargets::new();
+    let targets = CpuTargets::new();
     std::thread::scope(|scope| {
-        let a=scope.spawn(||targets.register(0,2));
-        let b=scope.spawn(||targets.register(1,2));
-        let first=a.join().unwrap().is_ok();
-        let second=b.join().unwrap().is_ok();
-        assert_ne!(first,second);
+        let a = scope.spawn(|| targets.register(0, 2));
+        let b = scope.spawn(|| targets.register(1, 2));
+        let first = a.join().unwrap().is_ok();
+        let second = b.join().unwrap().is_ok();
+        assert_ne!(first, second);
     });
-    assert_eq!((0..8).filter(|&slot|targets.target(slot)==Some(2)).count(),1);
+    assert_eq!(
+        (0..8)
+            .filter(|&slot| targets.target(slot) == Some(2))
+            .count(),
+        1
+    );
 }

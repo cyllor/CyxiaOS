@@ -303,6 +303,7 @@ fn protected_precleared_output_matches_the_general_api() {
 }
 
 #[test]
+#[cfg(feature = "legacy-d16-decode")]
 fn stopped_offer_owner_state_replays_without_becoming_an_ai_action() {
     let candidate = Candidate {
         action: Action::OfferCpu(100),
@@ -382,6 +383,7 @@ fn el0_rejects_noncanonical_candidate_and_reserved_bits() {
     );
 }
 
+#[cfg(feature = "legacy-d16-decode")]
 fn replay_candidates(input: &[u64; 512], source: &CandidateSet) -> CandidateSet {
     // The independent evidence verifier reconstructs the immutable set from
     // the recorded native input using this same production decoder.
@@ -402,6 +404,7 @@ fn replay_candidates(input: &[u64; 512], source: &CandidateSet) -> CandidateSet 
 }
 
 #[test]
+#[cfg(feature = "legacy-d16-decode")]
 fn native_placement_missingness_is_scored_and_bound_by_independent_replay() {
     let raw = features::RawFeatures {
         domain: [0, 0, 0, 120],
@@ -442,6 +445,7 @@ fn native_placement_missingness_is_scored_and_bound_by_independent_replay() {
 }
 
 #[test]
+#[cfg(feature = "legacy-d16-decode")]
 fn native_decoder_rejects_invalid_presence_and_absent_required_metrics() {
     let (input, bytes) = input();
     let model = model::Model::parse(&bytes).unwrap();

@@ -18,6 +18,9 @@ const SERVICES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/native-service
 include!(concat!(env!("OUT_DIR"), "/ported_catalog.rs"));
 #[path = "user/ai.rs"]
 pub(crate) mod ai;
+#[cfg(target_arch = "x86_64")]
+#[path = "user/capacity.rs"]
+pub(crate) mod capacity;
 #[cfg(feature = "ported")]
 #[path = "user/event.rs"]
 mod event;
@@ -29,9 +32,6 @@ mod files;
 mod linux;
 #[path = "user/objects.rs"]
 mod objects;
-#[cfg(target_arch = "x86_64")]
-#[path = "user/capacity.rs"]
-pub(crate) mod capacity;
 #[cfg(feature = "ported")]
 #[path = "user/pipes.rs"]
 mod pipes;
@@ -74,12 +74,20 @@ const SLOTS: usize = MAX_PROCESSES;
 const _: () = assert!(SLOTS <= u64::BITS as usize);
 const USER_POOL: u32 = POOL_PAGES;
 #[cfg(feature = "cosmic-workspace-applets-v1")]
-const _: () = assert!(cyxia_posix::OPEN_MAX == 128
-    && cyxia_posix::open_description::CAPACITY == 512
-    && cyxia_posix::unix::ENDPOINTS == 128 && cyxia_posix::unix::CONNECTIONS == 64
-    && cyxia_posix::shared_memory::OBJECTS
-        == if cfg!(feature = "cosmic-notifications-applet-v1") { 48 } else { 32 }
-    && cyxia_posix::shared_memory::MAPPINGS == cyxia_ai_runtime::COSMIC_SHARED_MAPPING_CAPACITY as usize);
+const _: () = assert!(
+    cyxia_posix::OPEN_MAX == 128
+        && cyxia_posix::open_description::CAPACITY == 512
+        && cyxia_posix::unix::ENDPOINTS == 128
+        && cyxia_posix::unix::CONNECTIONS == 64
+        && cyxia_posix::shared_memory::OBJECTS
+            == if cfg!(feature = "cosmic-notifications-applet-v1") {
+                48
+            } else {
+                32
+            }
+        && cyxia_posix::shared_memory::MAPPINGS
+            == cyxia_ai_runtime::COSMIC_SHARED_MAPPING_CAPACITY as usize
+);
 const _: () = assert!(core::mem::size_of::<Arena>() == MAPPED_PAGES as usize * 4096);
 // The session process layout must match the versioned session admission domain
 // (ai-runtime SESSION_PROCESS_SLOTS); a drift would silently mis-size the pools.
@@ -785,12 +793,17 @@ impl Runner {
             } else {
                 let thread = self.thread_at_mut(slot);
                 if thread.retry_syscall {
-                    thread.context.cancel_restart().expect("saved syscall return PC");
+                    thread
+                        .context
+                        .cancel_restart()
+                        .expect("saved syscall return PC");
                     thread.retry_syscall = false;
                 }
                 thread.retry_descriptor = None;
                 let error = self.sleep_interrupted(wait).err().unwrap_or(Errno::Intr);
-                self.thread_at_mut(slot).context.set_result((-(error as i64)) as u64);
+                self.thread_at_mut(slot)
+                    .context
+                    .set_result((-(error as i64)) as u64);
             }
             self.finish_wake(slot, time);
             return;
@@ -813,7 +826,9 @@ impl Runner {
                     }
                     Err(Errno::Again) => false,
                     Err(error) => {
-                        self.thread_at_mut(slot).context.set_result((-(error as i64)) as u64);
+                        self.thread_at_mut(slot)
+                            .context
+                            .set_result((-(error as i64)) as u64);
                         true
                     }
                 }
@@ -859,7 +874,9 @@ impl Runner {
                 }
                 Ok(_) => false,
                 Err(error) => {
-                    self.thread_at_mut(slot).context.set_result((-(error as i64)) as u64);
+                    self.thread_at_mut(slot)
+                        .context
+                        .set_result((-(error as i64)) as u64);
                     true
                 }
             },
@@ -874,11 +891,16 @@ impl Runner {
             } => {
                 let timed_out = time >= until;
                 let result = (|| -> Result<usize, Errno> {
-                    let resample = self.process.epoll_wait_needs_sample(descriptor, identity, epoch)?;
+                    let resample = self
+                        .process
+                        .epoll_wait_needs_sample(descriptor, identity, epoch)?;
                     let n = self.epoll_result(descriptor, address, count, resample || timed_out)?;
                     if n == 0 && resample && !timed_out {
                         let epoch = self.process.epoll_invalidation_epoch();
-                        let Some(Wait::Epoll { epoch: observed, .. }) = &mut self.thread_at_mut(slot).waiting else {
+                        let Some(Wait::Epoll {
+                            epoch: observed, ..
+                        }) = &mut self.thread_at_mut(slot).waiting
+                        else {
                             unreachable!("epoll waiter remained parked while sampling");
                         };
                         *observed = epoch;
@@ -892,7 +914,9 @@ impl Runner {
                     }
                     Ok(_) => false,
                     Err(error) => {
-                        self.thread_at_mut(slot).context.set_result((-(error as i64)) as u64);
+                        self.thread_at_mut(slot)
+                            .context
+                            .set_result((-(error as i64)) as u64);
                         true
                     }
                 }
@@ -933,11 +957,12 @@ impl Runner {
             #[cfg(feature = "graphics")]
             Wait::Display => false,
             Wait::Sleep(until) => time >= until,
-            Wait::Ipc(handle, interest) => match ipc.ready(self.status.pid, handle, interest)
-            {
+            Wait::Ipc(handle, interest) => match ipc.ready(self.status.pid, handle, interest) {
                 Ok(ready) => ready,
                 Err(error) => {
-                    self.thread_at_mut(slot).context.set_result((-(error as i64)) as u64);
+                    self.thread_at_mut(slot)
+                        .context
+                        .set_result((-(error as i64)) as u64);
                     true
                 }
             },
@@ -1901,9 +1926,10 @@ pub fn poll(shell: &mut cyxia_shell::Shell, out: &mut impl Write) {
 #[cfg(target_arch = "x86_64")]
 pub fn runnable() -> bool {
     let supervisor = unsafe { &*core::ptr::addr_of!(SUPERVISOR) };
-    supervisor.runners.iter().any(|runner| {
-        runner.status.state.active() && runner.has_runnable_thread()
-    })
+    supervisor
+        .runners
+        .iter()
+        .any(|runner| runner.status.state.active() && runner.has_runnable_thread())
 }
 /// CPU0 snapshot of cumulative process/worker receipts; never resets on PID reuse.
 pub fn ai_status(out: &mut impl Write) {
@@ -1945,9 +1971,22 @@ pub fn object_details(out: &mut impl Write) {
     crate::shared_memory::status(out);
     // Bounded by the actual production slot/FD tables.
     let supervisor = unsafe { &*core::ptr::addr_of!(SUPERVISOR) };
-    for runner in supervisor.runners.iter().filter(|r| r.status.state.active()) {
-        let live = (0..cyxia_posix::OPEN_MAX).filter(|&fd| runner.process.flags(fd as i32).is_ok()).count();
-        writeln!(out, "PROCESS_FDS pid={} live={} capacity={}\r", runner.status.pid, live, runner.process.fd_limit()).unwrap();
+    for runner in supervisor
+        .runners
+        .iter()
+        .filter(|r| r.status.state.active())
+    {
+        let live = (0..cyxia_posix::OPEN_MAX)
+            .filter(|&fd| runner.process.flags(fd as i32).is_ok())
+            .count();
+        writeln!(
+            out,
+            "PROCESS_FDS pid={} live={} capacity={}\r",
+            runner.status.pid,
+            live,
+            runner.process.fd_limit()
+        )
+        .unwrap();
     }
 }
 
@@ -1983,7 +2022,8 @@ impl Runner {
             process_arch::trace_entry_error(stage, pid, tid, format_args!("errno={error:?}"));
             error
         };
-        let fresh = self.space
+        let fresh = self
+            .space
             .begin()
             .map_err(|error| fail("build.begin", error))?;
         if fresh {
@@ -2029,7 +2069,9 @@ impl Runner {
     fn unmap_heap(&mut self, address: u64, pages: usize) -> Result<(), Errno> {
         #[cfg(target_arch = "x86_64")]
         return self.heap.unmap_with_revoke(address, pages, |start, count| {
-            self.space.revoke_range(start, count).expect("heap PTE revoke failed; retain backing");
+            self.space
+                .revoke_range(start, count)
+                .expect("heap PTE revoke failed; retain backing");
         });
         #[cfg(target_arch = "aarch64")]
         self.heap.unmap(address, pages)

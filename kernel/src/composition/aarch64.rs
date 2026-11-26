@@ -225,10 +225,22 @@ mod user_heap;
     feature = "graphics",
     feature = "storage-v13-selftest",
     feature = "v0199-epoch-disk-selftest",
+    feature = "v0199-format-selftest",
     feature = "tcp-v13-selftest",
     feature = "prototype-runtime",
     feature = "net-selftest",
+    feature = "v020-production",
+    feature = "v0199-sec-n-selftest",
     not(feature = "selftest")
 ))]
 #[path = "../platform/virt/virtio_platform.rs"]
 mod virtio_platform;
+// SEC-N production VirtIO-net device init. Gated behind the existing
+// sec-n-native closure (real smoltcp device/tcp stack, soft-float EL1). Its only
+// caller is the production boot path (arch/aarch64/production/net.rs), which
+// calls net_device::init and the TCP/Admission wiring (registration of record:
+// net_device.rs header). v020-production implies sec-n-native; other
+// sec-n-native profiles do not compile it (it would be dead code there).
+#[cfg(feature = "v020-production")]
+#[path = "../platform/virt/net_device.rs"]
+mod net_device;

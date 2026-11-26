@@ -154,6 +154,7 @@ class Bringup:
             phase=[f'V0199_RESTART_BEGIN a={role} b={old} c={old_root}',
                    f'V0199_RESTART_GUARD_FAULT a={role} b={esr} c={far}',
                    f'V0199_RESTART_SURVIVORS a={role} b={mask} c={sum(deltas)}',
+                   f'V0199_RESTART_RECOVERY_SLICES a={role} b={slices} c={largest}',
                    f'V0199_PACKAGE_RELOAD a={role} b={old_root} c={new_root}']
             positions=[serial.index((line+'\n').encode('ascii')) for line in phase]
             require(positions==sorted(set(positions)),'restart phases out of order')

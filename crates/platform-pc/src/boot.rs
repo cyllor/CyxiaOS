@@ -61,7 +61,11 @@ impl PoolSize {
         Self::bounded(bytes, bytes, PAGE_SIZE)
     }
     pub const fn bounded(minimum: u64, maximum: u64, unit: u64) -> Self {
-        Self { minimum, maximum, unit }
+        Self {
+            minimum,
+            maximum,
+            unit,
+        }
     }
 }
 
@@ -82,13 +86,21 @@ impl PcBootInfo {
     }
 
     pub fn free_ram_bytes(&self) -> u64 {
-        self.ram_regions().iter().map(|ram| {
-            let end = ram.start.0 + ram.len;
-            let reserved: u64 = self.reserved_regions().iter().map(|r| {
-                end.min(r.start.0 + r.len).saturating_sub(ram.start.0.max(r.start.0))
-            }).sum();
-            ram.len - reserved
-        }).sum()
+        self.ram_regions()
+            .iter()
+            .map(|ram| {
+                let end = ram.start.0 + ram.len;
+                let reserved: u64 = self
+                    .reserved_regions()
+                    .iter()
+                    .map(|r| {
+                        end.min(r.start.0 + r.len)
+                            .saturating_sub(ram.start.0.max(r.start.0))
+                    })
+                    .sum();
+                ram.len - reserved
+            })
+            .sum()
     }
 
     /// Prefer the full envelope, then try smaller envelopes in bounded steps.
@@ -100,9 +112,12 @@ impl PcBootInfo {
         keep_free: u64,
     ) -> Result<BootPoolPlan<N>, BootError> {
         if sizes.iter().any(|s| {
-            s.unit == 0 || !s.unit.is_multiple_of(PAGE_SIZE)
-                || !s.minimum.is_multiple_of(s.unit) || !s.maximum.is_multiple_of(s.unit)
-                || s.minimum > s.maximum || s.maximum > MAX_RUNTIME_PHYSICAL_MEMORY
+            s.unit == 0
+                || !s.unit.is_multiple_of(PAGE_SIZE)
+                || !s.minimum.is_multiple_of(s.unit)
+                || !s.maximum.is_multiple_of(s.unit)
+                || s.minimum > s.maximum
+                || s.maximum > MAX_RUNTIME_PHYSICAL_MEMORY
         }) {
             return Err(BootError::AddressRange);
         }
@@ -127,7 +142,12 @@ impl PcBootInfo {
                 free_bytes = left;
             }
             if free_bytes >= keep_free {
-                return Ok(BootPoolPlan { memory, ranges, percent, free_bytes });
+                return Ok(BootPoolPlan {
+                    memory,
+                    ranges,
+                    percent,
+                    free_bytes,
+                });
             }
         }
         Err(BootError::NoUsableMemory)
@@ -142,16 +162,32 @@ impl PcBootInfo {
         }
         for index in 0..self.ram_count {
             let ram = self.ram[index];
-            let ram_end = ram.start.0.checked_add(ram.len).ok_or(BootError::AddressRange)?;
+            let ram_end = ram
+                .start
+                .0
+                .checked_add(ram.len)
+                .ok_or(BootError::AddressRange)?;
             let mut candidate = ram.start.0.max(minimum);
             for reserved in self.reserved_regions() {
-                let end = candidate.checked_add(bytes).ok_or(BootError::AddressRange)?;
-                if reserved.start.0 >= end { break; }
+                let end = candidate
+                    .checked_add(bytes)
+                    .ok_or(BootError::AddressRange)?;
+                if reserved.start.0 >= end {
+                    break;
+                }
                 let reserved_end = reserved.start.0 + reserved.len;
-                if reserved_end > candidate { candidate = reserved_end; }
+                if reserved_end > candidate {
+                    candidate = reserved_end;
+                }
             }
-            let Some(end) = candidate.checked_add(bytes).filter(|&end| end <= ram_end) else { continue };
-            let range = MemoryRegion { start: PhysAddr(candidate), len: bytes, kind: RegionKind::Reserved };
+            let Some(end) = candidate.checked_add(bytes).filter(|&end| end <= ram_end) else {
+                continue;
+            };
+            let range = MemoryRegion {
+                start: PhysAddr(candidate),
+                len: bytes,
+                kind: RegionKind::Reserved,
+            };
             // Reserve on a copy: even capacity failure cannot publish a prefix.
             let mut next = *self;
             reserve(&mut next, candidate, end)?;
@@ -211,7 +247,10 @@ pub fn memory_map_location(header: &[u8]) -> Result<(u64, usize), BootError> {
 }
 
 /// Decode a loader map using the explicitly mapped production RAM window.
-pub fn memory_map_location_with_limit(header: &[u8], limit: u64) -> Result<(u64, usize), BootError> {
+pub fn memory_map_location_with_limit(
+    header: &[u8],
+    limit: u64,
+) -> Result<(u64, usize), BootError> {
     validate_limit(limit)?;
     if header.len() != MB_INFO_BYTES {
         return Err(BootError::HeaderLength);
@@ -326,8 +365,16 @@ pub fn parse_multiboot(
     kernel_start: u64,
     kernel_end: u64,
 ) -> Result<PcBootInfo, BootError> {
-    parse_multiboot_with_limit(magic, header, header_pa, mmap, mmap_pa, kernel_start,
-        kernel_end, MAX_PHYSICAL_MEMORY)
+    parse_multiboot_with_limit(
+        magic,
+        header,
+        header_pa,
+        mmap,
+        mmap_pa,
+        kernel_start,
+        kernel_end,
+        MAX_PHYSICAL_MEMORY,
+    )
 }
 
 /// Parse the same strict loader contract with an explicit supported RAM limit.
@@ -355,10 +402,7 @@ pub fn parse_multiboot_with_limit(
     }
     let header_end = bounded_range(header_pa, MB_INFO_BYTES as u64, limit)?;
     let mmap_end = bounded_range(mmap_pa, mmap.len() as u64, limit)?;
-    if kernel_start < LOW_MEMORY_END
-        || kernel_start >= kernel_end
-        || kernel_end > limit
-    {
+    if kernel_start < LOW_MEMORY_END || kernel_start >= kernel_end || kernel_end > limit {
         return Err(BootError::AddressRange);
     }
     if overlap(header_pa, header_end, mmap_pa, mmap_end)

@@ -32,9 +32,9 @@ impl Evidence {
             return;
         }
         let offset = match credit.cpu {
-            1 => 2,
+            0 => 2,
             2 => 26,
-            _ => return, // begin_control admits only C workers on CPUs 1/2.
+            _ => return, // begin_control admits only the CPU0 control worker; the CPU2 arm is retained legacy diagnostics.
         };
         if self.0[offset].load(Ordering::Relaxed) == 0 {
             // A stopped reader may see state=1. It must not call that a

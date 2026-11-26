@@ -17,7 +17,30 @@ pub struct ExceptionFrame {
 }
 #[unsafe(no_mangle)]
 extern "C" fn exception_dispatch(f: &mut ExceptionFrame, kind: u64) {
-    #[cfg(feature = "smp-selftest")]
+    // V0.20 production skeleton: EL0 sync ABI-v3 SVCs (0x40/0x41/0x50) are
+    // dispatched IN-VECTOR by the production dispatcher and return straight to
+    // EL0; all other exceptions fall through to the proven smp capture path.
+    #[cfg(feature = "v020-production")]
+    {
+        // A lower-EL AArch64 synchronous fault, including a permission abort,
+        // enters its CPU's summary. SVCs are requests; ESR and FAR come from
+        // the EL1 vector. FAR contributes only for instruction and data aborts.
+        let ec = f.esr >> 26;
+        if kind == 8 && ec != 0x15 {
+            let far = if matches!(ec, 0x20 | 0x24) && f.esr & (1 << 10) == 0 {
+                f.far
+            } else {
+                0
+            };
+            smp::production::recovery::record_fault(
+                cyxia_arch_aarch64::cpu::slot() as u32,
+                f.esr,
+                far,
+            );
+        }
+        smp::production::exception(f, kind);
+    }
+    #[cfg(all(feature = "smp-selftest", not(feature = "v020-production")))]
     {
         smp::exception(f, kind);
     }

@@ -1,6 +1,7 @@
-//! Bounded legacy transition ledger plus V0.19 fixed one-core control role.
-//! Production V0.19 uses new_fixed; old dynamic new is retained only for
-//! historical transition-replay compatibility and MUST NOT be called natively.
+//! Bounded legacy transition ledger plus the V0.20 fixed one-core control role.
+//! Production V0.20 uses new_fixed (CPU0 control, CPU1-3 business); old dynamic
+//! new is retained only for historical transition-replay compatibility and MUST
+//! NOT be called natively.
 use super::{Error, Plane};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,8 +200,9 @@ impl<const N: usize> Ownership<N> {
         }
         Ok(value)
     }
-    /// V0.19 native constructor: CPU1 alone is the dedicated AI control CPU;
-    /// CPU0's mechanism broker does not count toward the control core.
+    /// V0.20 native constructor: CPU0 alone is the dedicated control CPU and
+    /// CPU1-3 are the ordinary business cores (fixed.rs re-exports the
+    /// cpu0_v0199 constants). EL1 mechanisms stay shared on every vCPU.
     pub fn new_fixed(
         online: u64,
         capacity: [u32; N],
@@ -210,8 +212,8 @@ impl<const N: usize> Ownership<N> {
         if !super::fixed::valid_layout(online, super::fixed::CONTROL_MASK) {
             return Err(Error::Invalid);
         }
-        let mut owner=Self::new(online, super::fixed::CONTROL_MASK, capacity, groups, limits)?;
-        owner.fixed_control=true;
+        let mut owner = Self::new(online, super::fixed::CONTROL_MASK, capacity, groups, limits)?;
+        owner.fixed_control = true;
         Ok(owner)
     }
     /// Reference V0.19.9 constructor; does not silently enable old CPU1
@@ -222,24 +224,35 @@ impl<const N: usize> Ownership<N> {
         groups: [u64; N],
         limits: Limits,
     ) -> Result<Self, Error> {
-        if N!=4
+        if N != 4
             || !super::cpu0_v0199::fixed_masks(
-                online, super::cpu0_v0199::CONTROL_MASK,
+                online,
+                super::cpu0_v0199::CONTROL_MASK,
                 super::cpu0_v0199::BUSINESS_MASK,
             )
-            || limits.min_control_cores!=1
-            || limits.protected_control!=super::cpu0_v0199::CONTROL_MASK
-            || limits.protected_business!=super::cpu0_v0199::BUSINESS_MASK
-        {return Err(Error::Invalid);}
-        let mut owner=Self::new(
-            online,super::cpu0_v0199::CONTROL_MASK,capacity,groups,limits
+            || limits.min_control_cores != 1
+            || limits.protected_control != super::cpu0_v0199::CONTROL_MASK
+            || limits.protected_business != super::cpu0_v0199::BUSINESS_MASK
+        {
+            return Err(Error::Invalid);
+        }
+        let mut owner = Self::new(
+            online,
+            super::cpu0_v0199::CONTROL_MASK,
+            capacity,
+            groups,
+            limits,
         )?;
-        owner.fixed_control=true;
-        owner.native_cpu0_v0199=true;
+        owner.fixed_control = true;
+        owner.native_cpu0_v0199 = true;
         Ok(owner)
     }
-    pub const fn fixed_control(&self) -> bool { self.fixed_control }
-    pub const fn native_cpu0_v0199(&self) -> bool { self.native_cpu0_v0199 }
+    pub const fn fixed_control(&self) -> bool {
+        self.fixed_control
+    }
+    pub const fn native_cpu0_v0199(&self) -> bool {
+        self.native_cpu0_v0199
+    }
     /// Called by Manager only after authenticating a newer controller epoch.
     /// Ticket generations/serials are never reset.
     pub(super) fn restart_sequence(&mut self) -> Result<(), Error> {
@@ -342,7 +355,9 @@ impl<const N: usize> Ownership<N> {
     /// VALIDATE + RESERVE are one serialized transaction; failures change nothing.
     /// DRAIN removes all changing cores from BOTH dispatch sets immediately.
     pub fn begin(&mut self, p: ScaleProposal, now: u64, limits: Limits) -> Result<Ticket, Error> {
-        if self.fixed_control { return Err(Error::Denied); }
+        if self.fixed_control {
+            return Err(Error::Denied);
+        }
         self.time(now)?;
         if self.halted {
             return Err(Error::Exhausted);

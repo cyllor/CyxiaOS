@@ -572,34 +572,63 @@ fn scheduler_migration_carries_spending_and_keeps_source_charge() {
     );
 }
 
-
 #[test]
 fn migration_rechecks_same_cpu_and_preserves_destination_minimum_in_window_tail() {
-    let mut s=Scheduler::new();
+    let mut s = Scheduler::new();
     s.register_group(key(1)).unwrap();
-    let mut incoming=spec(10,1,0,20_000_000,20_000_000);
-    incoming.allowed_mask=3;
-    s.admit(incoming,layout(1),0).unwrap();
-    s.admit(spec(11,1,1,10_000_000,10_000_000),layout(1),0).unwrap();
-    assert_eq!(s.relocate(key(10),0,CpuLayout{generation:0,..layout(1)},0),Err(Error::Auth));
-    assert_eq!(s.relocate(key(10),0,CpuLayout{healthy_mask:2,..layout(1)},0),Err(Error::Auth));
-    assert_eq!(s.relocate(key(10),0,layout(1),0),Ok(()));
-    assert_eq!(s.relocate(key(10),1,layout(1),80_000_000),Err(Error::Budget));
-    assert_eq!(s.committed_ns(0),20_000_000);
-    assert_eq!(s.committed_ns(1),10_000_000);
-    s.relocate(key(10),1,layout(1),WINDOW_NS).unwrap();
-    assert_eq!(s.committed_ns(0),0);
-    assert_eq!(s.committed_ns(1),30_000_000);
+    let mut incoming = spec(10, 1, 0, 20_000_000, 20_000_000);
+    incoming.allowed_mask = 3;
+    s.admit(incoming, layout(1), 0).unwrap();
+    s.admit(spec(11, 1, 1, 10_000_000, 10_000_000), layout(1), 0)
+        .unwrap();
+    assert_eq!(
+        s.relocate(
+            key(10),
+            0,
+            CpuLayout {
+                generation: 0,
+                ..layout(1)
+            },
+            0
+        ),
+        Err(Error::Auth)
+    );
+    assert_eq!(
+        s.relocate(
+            key(10),
+            0,
+            CpuLayout {
+                healthy_mask: 2,
+                ..layout(1)
+            },
+            0
+        ),
+        Err(Error::Auth)
+    );
+    assert_eq!(s.relocate(key(10), 0, layout(1), 0), Ok(()));
+    assert_eq!(
+        s.relocate(key(10), 1, layout(1), 80_000_000),
+        Err(Error::Budget)
+    );
+    assert_eq!(s.committed_ns(0), 20_000_000);
+    assert_eq!(s.committed_ns(1), 10_000_000);
+    s.relocate(key(10), 1, layout(1), WINDOW_NS).unwrap();
+    assert_eq!(s.committed_ns(0), 0);
+    assert_eq!(s.committed_ns(1), 30_000_000);
 }
 
 #[test]
 fn control_reservation_cannot_create_an_unsettleable_window_at_clock_exhaustion() {
-    let mut s=Scheduler::new();
-    let control=CpuLayout{business_mask:2,healthy_mask:3,generation:1};
-    let now=u64::MAX-1;
-    assert_eq!(s.reserve_control(0,control,now,1),Err(Error::Overflow));
-    assert_eq!(s.control_active(0),None);
-    assert_eq!(s.cpu_spent_ns(0),Ok(0));
+    let mut s = Scheduler::new();
+    let control = CpuLayout {
+        business_mask: 2,
+        healthy_mask: 3,
+        generation: 1,
+    };
+    let now = u64::MAX - 1;
+    assert_eq!(s.reserve_control(0, control, now, 1), Err(Error::Overflow));
+    assert_eq!(s.control_active(0), None);
+    assert_eq!(s.cpu_spent_ns(0), Ok(0));
 }
 
 #[derive(Default)]

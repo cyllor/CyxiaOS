@@ -10,7 +10,7 @@ fn held() -> (Authority, u64, [u8; 120]) {
     a.session(7, 2, 0).unwrap();
     let key = CustodyKey {
         owner_boot: 1,
-        cluster: [4; 32],
+        legacy_remote_scope: [4; 32],
         requester: [5; 32],
         contract: [1; 16],
         request_hash: [6; 32],

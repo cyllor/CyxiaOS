@@ -500,7 +500,9 @@ impl<'a> Process<'a> {
             return Err(Errno::Inval);
         }
         let mut fds = self.fds[..self.fd_limit()]
-            .iter().enumerate().filter(|(_, v)| v.is_none());
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.is_none());
         let read_fd = fds.next().ok_or(Errno::Mfile)?.0;
         let write_fd = fds.next().ok_or(Errno::Mfile)?.0;
         let [read_slot, write_slot] = self.objects.free_slots::<2>()?;

@@ -135,7 +135,13 @@ fn finish(n: Node<'_>, info: &mut BootInfo) -> Result<(), FdtError> {
     if n.reserved {
         if !n.reg.is_empty() {
             regions(n, |a, l| {
-                push(&mut info.reserved, &mut info.reserved_count, a, l, RegionKind::Reserved)
+                push(
+                    &mut info.reserved,
+                    &mut info.reserved_count,
+                    a,
+                    l,
+                    RegionKind::Reserved,
+                )
             })?;
         }
         return Ok(());
@@ -180,13 +186,16 @@ fn finish(n: Node<'_>, info: &mut BootInfo) -> Result<(), FdtError> {
             _ => return Err(FdtError::Unsupported),
         });
     } else if n.name.starts_with(b"memory@") {
-        if !n.direct { return Err(FdtError::Unsupported); }
+        if !n.direct {
+            return Err(FdtError::Unsupported);
+        }
         regions(n, |a, l| {
             push(&mut info.ram, &mut info.ram_count, a, l, RegionKind::Ram)
         })?;
-
     } else if has(n.compat, b"arm,pl011") {
-        if !n.direct { return Err(FdtError::Unsupported); }
+        if !n.direct {
+            return Err(FdtError::Unsupported);
+        }
         if info.uart.is_some() {
             return Err(FdtError::Overlap);
         }
@@ -217,7 +226,9 @@ fn finish(n: Node<'_>, info: &mut BootInfo) -> Result<(), FdtError> {
             Ok(())
         })?;
     } else if has(n.compat, b"arm,cortex-a15-gic") {
-        if !n.direct { return Err(FdtError::Unsupported); }
+        if !n.direct {
+            return Err(FdtError::Unsupported);
+        }
         if info.gic.is_some() {
             return Err(FdtError::Overlap);
         }
@@ -242,7 +253,8 @@ fn finish(n: Node<'_>, info: &mut BootInfo) -> Result<(), FdtError> {
         });
     } else if has(n.compat, b"virtio,mmio") {
         // This board profile supports root-level resources only: no silent bus translation.
-        if !n.direct || n.seen & 512 != 0
+        if !n.direct
+            || n.seen & 512 != 0
             || n.irq.len() != 12
             || word(n.irq, 0)? != 0
             || word(n.irq, 4)? > 987
@@ -268,8 +280,12 @@ fn finish(n: Node<'_>, info: &mut BootInfo) -> Result<(), FdtError> {
         info.virtio[info.virtio_count] = resource.ok_or(FdtError::Missing)?;
         info.virtio_count += 1;
     } else if has(n.compat, b"arm,armv8-timer") {
-        if !n.direct || n.seen & 512 != 0 || info.timer_irq.is_some()
-            || n.irq.len() < 24 || !n.irq.len().is_multiple_of(12) {
+        if !n.direct
+            || n.seen & 512 != 0
+            || info.timer_irq.is_some()
+            || n.irq.len() < 24
+            || !n.irq.len().is_multiple_of(12)
+        {
             return Err(FdtError::Unsupported);
         }
         // GIC binding order: secure physical, non-secure physical, virtual, hypervisor.
@@ -503,7 +519,8 @@ pub fn parse_fdt(blob: &[u8]) -> Result<BootInfo, FdtError> {
             kind: RegionKind::Device,
         };
         if !a.is_multiple_of(4096)
-            || info.ram[..info.ram_count].iter()
+            || info.ram[..info.ram_count]
+                .iter()
                 .chain(info.reserved[..info.reserved_count].iter())
                 .any(|x| x.overlaps(r))
         {

@@ -103,7 +103,11 @@ impl BackgroundBudgets {
                 return Err(Error::Busy);
             }
             group.window = window;
-            group.status.spent_ns = if group.carry_window == Some(window) { group.carry_ns } else { 0 };
+            group.status.spent_ns = if group.carry_window == Some(window) {
+                group.carry_ns
+            } else {
+                0
+            };
             group.carry_window = None;
             group.carry_ns = 0;
             group.status.freeze_admission = group.status.overrun;
@@ -246,8 +250,10 @@ impl BackgroundBudgets {
         } else {
             match g.carry_window {
                 Some(window) if window > completion_window => (g.carry_window, g.carry_ns),
-                Some(window) if window == completion_window =>
-                    (g.carry_window, g.carry_ns.checked_add(actual_ns).ok_or(Error::Overflow)?),
+                Some(window) if window == completion_window => (
+                    g.carry_window,
+                    g.carry_ns.checked_add(actual_ns).ok_or(Error::Overflow)?,
+                ),
                 _ => (Some(completion_window), actual_ns),
             }
         };
@@ -286,7 +292,11 @@ impl BackgroundBudgets {
             if self.debits.iter().flatten().any(|debit| debit.key == key) {
                 return Err(Error::Busy);
             }
-            status.spent_ns = if group.carry_window == Some(window) { group.carry_ns } else { 0 };
+            status.spent_ns = if group.carry_window == Some(window) {
+                group.carry_ns
+            } else {
+                0
+            };
             status.freeze_admission = status.overrun;
         }
         if group.stamp.version != 0 && !group.stamp.live(now) {

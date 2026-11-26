@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Run the pinned four-vCPU native execution fixture, never certify full isolation.
 
-The CPU roles are scripted test inputs, not model output. Both framed serial
-records and a stopped-VM evidence page are required. No network or downloads.
+The default V0.20 contract is the fixed CPU0 topology (C={CPU0}, B={CPU1-3})
+from kernel/src/arch/aarch64/smp.rs::fixed_cpu0_fixture. The retired dynamic
+CoreSet transition contract (CPU1 control) stays reachable via --legacy-coreset
+for kernels built with --features smp-selftest,legacy-coreset. The CPU roles are
+scripted test inputs, not model output. Both framed serial records and a
+stopped-VM evidence page are required. No network or downloads.
 """
 from __future__ import annotations
 import argparse
@@ -116,7 +120,82 @@ def profile(elf: bytes) -> dict:
     raise ValueError('profile not backed by loaded ELF bytes')
 
 
+def _rows(lines: list[str], label: str) -> list[tuple[int, int, int]]:
+    result = []
+    for line in lines:
+        if line.startswith(label + ' '):
+            match = re.fullmatch(re.escape(label) + r' a=(\d+) b=(\d+) c=(\d+)', line)
+            require(match is not None, 'malformed ' + label)
+            result.append(tuple(int(v) for v in match.groups()))
+    return result
+
+
 def validate(serial: bytes, page: bytes, cpu_count: int) -> dict:
+    """Default V0.20 contract: fixed C={CPU0}, B={CPU1,CPU2,CPU3}.
+
+    Derived from smp.rs::fixed_cpu0_fixture and the shared business worker:
+    CPU0 never enters EL0 (its whole evidence row stays zero), CPU1-3 run only
+    business dispatches (one probe pass of exactly 5 permission faults each,
+    every completed turn ended by a private timer IRQ), and ownership.fault(0)
+    quarantines exactly CPU0 fail-closed: control mask empties, no business core
+    is promoted, and in-flight business keeps running until deterministic close.
+    """
+    require(cpu_count == 4, 'QMP must observe exactly four vCPUs')
+    require(len(page) == 4096, 'incomplete evidence page')
+    words = struct.unpack('<512Q', page)
+    # [MAGIC, version, completion, online, stopped, initial control/business,
+    #  reserved, final quarantined/control/business, reserved x5]
+    require(list(words[:16]) == [MAGIC, 1, 1, 15, 14, 1, 14, 0, 1, 0, 14, 0, 0, 0, 0, 0],
+            'incomplete fixed CPU0 topology/quarantine evidence')
+    require(all(v == 0 for v in words[48:]), 'nonzero evidence reserved fields')
+    require(b'FAIL' not in serial and b'SMP_ERROR' not in serial, 'guest reported failure')
+    lines = serial.decode('ascii').splitlines()
+    require(lines.count('SMP_SELFTEST_PASS cpus=4') == 1, 'missing/duplicate completion')
+    scope = 'SMP_SCOPE model=fixed_cpu0 production_isolation=false physical_isolation=false'
+    require(lines.count(scope) == 1 and sum(line.startswith('SMP_SCOPE') for line in lines) == 1,
+            'fixture scope must not claim production/model/hardware certification')
+    require(not any(line.startswith(('SMP_SCALE_FIXTURE ', 'SMP_SCALE_MODEL ', 'SMP_ROLE_PROGRESS '))
+                    for line in lines), 'retired dynamic CoreSet evidence in fixed CPU0 fixture')
+    def rows(label):
+        return _rows(lines, label)
+    require(rows('SMP_BOOT_OK') == [(4, 15, 0)], 'missing boot handshake')
+    require(rows('SMP_CPU_ON') == [(1, 1, 0), (2, 2, 0), (3, 3, 0)], 'CPU_ON failed')
+    require(rows('SMP_FIXED_CPU0') == [(words[5], words[6], 1)],
+            'wrong fixed CPU0 topology/generation or serial/page disagreement')
+    require(rows('SMP_CONTROL_STALL') == [(words[8], words[9], words[10])],
+            'serial and live fail-closed quarantine evidence disagree')
+    cpus = [words[16 + i * 8:24 + i * 8] for i in range(4)]
+    require(tuple(cpus[0]) == (0,) * 8, 'CPU0 ran user workload or took fixture interrupts')
+    require([r[0] for r in cpus] == [0, 1, 2, 3], 'affinity mismatch')
+    require(rows('SMP_CPU_EVIDENCE') == [(i, cpus[i][3], cpus[i][1]) for i in range(1, 4)],
+            'serial and live CPU evidence disagree')
+    for i in range(1, 4):
+        row = cpus[i]
+        require(row[1] >= 4, 'business CPU did not reach bounded progress before quarantine')
+        require(row[2] == 0 and row[7] == 0, 'business CPU ran control work')
+        require(row[3] > 0 and row[3] >= row[1] + row[2], 'timer preemption evidence missing')
+        require(row[4] == 5 and row[5] == 0, 'permission probe/failure accounting wrong')
+        require(row[6] > 0, 'EL0 never wrote its private business page')
+    def first(label):
+        return next(i for i, line in enumerate(lines) if line.startswith(label + ' '))
+    require(max(i for i, line in enumerate(lines) if line.startswith('SMP_CPU_ON '))
+            < first('SMP_BOOT_OK') < first('SMP_FIXED_CPU0') < first('SMP_CONTROL_STALL')
+            < min(i for i, line in enumerate(lines) if line.startswith('SMP_CPU_EVIDENCE '))
+            < first('SMP_SCOPE') < lines.index('SMP_SELFTEST_PASS cpus=4'),
+            'evidence published out of fixture order')
+    return {'cpus': 4, 'secondary_cpus': 3,
+            'permission_fault_probes': sum(r[4] for r in cpus),
+            'timer_preemptions': sum(r[3] for r in cpus),
+            'initial_control': words[5], 'initial_business': words[6],
+            'quarantined': words[8], 'final_control': words[9], 'final_business': words[10],
+            'business_progress': [cpus[i][1] for i in range(1, 4)],
+            'control_progress': [cpus[i][2] for i in range(1, 4)]}
+
+
+def validate_legacy(serial: bytes, page: bytes, cpu_count: int) -> dict:
+    """Retired dynamic CoreSet transition contract (CPU1 control). Only valid
+    for kernels built with the opt-in legacy-coreset feature; never the default
+    V0.20 fixed-CPU0 profile."""
     require(cpu_count == 4, 'QMP must observe exactly four vCPUs')
     require(len(page) == 4096, 'incomplete evidence page')
     words = struct.unpack('<512Q', page)
@@ -129,13 +208,7 @@ def validate(serial: bytes, page: bytes, cpu_count: int) -> dict:
     require(lines.count('SMP_SCOPE model=fixture production_isolation=false physical_isolation=false') == 1,
             'fixture scope must not claim production/model/hardware certification')
     def rows(label):
-        result = []
-        for line in lines:
-            if line.startswith(label + ' '):
-                match = re.fullmatch(re.escape(label) + r' a=(\d+) b=(\d+) c=(\d+)', line)
-                require(match is not None, 'malformed ' + label)
-                result.append(tuple(int(v) for v in match.groups()))
-        return result
+        return _rows(lines, label)
     require(rows('SMP_BOOT_OK') == [(4, 15, 0)], 'missing boot handshake')
     require(rows('SMP_CPU_ON') == [(1, 1, 0), (2, 2, 0), (3, 3, 0)], 'CPU_ON failed')
     require(rows('SMP_SCALE_FIXTURE') == [(6, 9, 3), (2, 13, 5)], 'wrong ownership transition sequence')
@@ -179,7 +252,7 @@ def boot_ram_mib(elf: bytes) -> int:
     raise ValueError('boot profile not backed by loaded ELF bytes')
 
 
-def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptance=None, ram_mib: int = 256, scratch_disk: Path | None = None) -> dict:
+def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptance=None, ram_mib: int = 256, scratch_disk: Path | None = None, legacy: bool = False) -> dict:
     require(1 <= timeout <= 60 and cpus in (1, 4) and ram_mib in (256, 1024),
             'invalid execution budget/configuration')
     elf = elf.resolve(strict=True)
@@ -193,6 +266,8 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
               'production_isolation_verified': False, 'host_physical_isolation_verified': False,
               'native_cluster_verified': False, 'full_cosmic_port': False,
               'elf_sha256': sha(elf), 'source_manifest_sha256': sha(output / 'source-manifest.json')}
+    if acceptance is None:
+        report['fixture_contract'] = 'legacy-coreset' if legacy else 'fixed-cpu0'
     decoder = FrameDecoder(); raw = bytearray(); decoded = bytearray()
     proc = None; sock = None; qmp = None
     started = time.monotonic()
@@ -282,7 +357,7 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                             continue
                     require(decoder.loss == 0 and decoder.corrupt == 0 and not decoder.buffer,
                             'incomplete/corrupt framed UART transport')
-                    validator = validate if acceptance is None else acceptance.validate
+                    validator = (validate_legacy if legacy else validate) if acceptance is None else acceptance.validate
                     report['observations'] = validator(bytes(decoded), (output / 'native-page.bin').read_bytes(), len(actual_cpus))
                     # Optional independent extra physical memory proof, while
                     # every guest CPU is still stopped. Only the explicit
@@ -340,8 +415,11 @@ def main() -> int:
     parser.add_argument('--timeout', type=float, default=20)
     parser.add_argument('--cpus', type=int, choices=(1, 4), default=4,
                         help='1 is a negative admission test; it must not pass')
+    parser.add_argument('--legacy-coreset', action='store_true',
+                        help='validate the retired dynamic CoreSet fixture; requires a kernel '
+                             'built with --features smp-selftest,legacy-coreset')
     args = parser.parse_args()
-    try: report = run(args.elf, args.output, args.timeout, args.cpus)
+    try: report = run(args.elf, args.output, args.timeout, args.cpus, legacy=args.legacy_coreset)
     except (OSError, ValueError) as error:
         print(str(error), file=__import__('sys').stderr); return 1
     print(json.dumps(report, indent=2))

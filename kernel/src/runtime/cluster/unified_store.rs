@@ -1,9 +1,6 @@
 //! CPU0 journal broker for append-only immutable protocol records. Partial SVC
 //! chunks never mutate disk. Only a complete bounded record reaches commit.
-use cyxia_prototype::cluster::{
-    MAX_EFFECT,
-    volume::{Cursor, Volume, VolumeScratch},
-};
+use cyxia_prototype::local_volume::{Cursor, MAX_EFFECT, Volume, VolumeScratch};
 #[path = "unified_store/identity.rs"]
 mod identity;
 static mut WORK: VolumeScratch = [[0; 4096]; 16];
@@ -94,10 +91,7 @@ pub fn request(
             });
             (*core::ptr::addr_of_mut!(STAGE)).fill(0);
             *stage = (0, 0, 0);
-            if matches!(
-                result,
-                Err(cyxia_prototype::cluster::volume::Error::Capacity)
-            ) {
+            if matches!(result, Err(cyxia_prototype::local_volume::Error::Capacity)) {
                 return (5, 0, 0);
             }
             if result.is_err() {

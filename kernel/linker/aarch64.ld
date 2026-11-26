@@ -15,7 +15,18 @@ SECTIONS {
  .rodata : AT(ADDR(.rodata)-HIGH) { KEEP(*(.cyxia.boot)) *(.rodata .rodata.*) } :ro
  . = ALIGN(4096); __ro_end = .;
  .data : AT(ADDR(.data)-HIGH) { *(.data .data.*) *(.got .got.*) } :data
- .bss (NOLOAD) : AT(ADDR(.bss)-HIGH) { . = ALIGN(16); __bss_start = .; *(.bss .bss.*) *(COMMON) . = ALIGN(16); __bss_end = .; }
+ .bss (NOLOAD) : AT(ADDR(.bss)-HIGH) {
+  . = ALIGN(16); __bss_start = .;
+  /* The pinned network/staging arena must not share a page with other statics. */
+  __sec_n_start = .;
+  *(.bss.sec_n .bss.sec_n.*)
+  . = (. == __sec_n_start) ? . : ALIGN(4096);
+  __sec_n_end = .;
+  *(.bss .bss.*) *(COMMON)
+  . = ALIGN(16); __bss_end = .;
+ }
+ ASSERT(__sec_n_start == __sec_n_end || (__sec_n_start % 4096) == 0,
+        "SEC-N arena must start on a page boundary")
  . = ALIGN(4096);
  .stack (NOLOAD) : AT(ADDR(.stack)-HIGH) { __stack_guard = .; . += 4096; . += 262144; __stack_top = .; } :data
  . = ALIGN(4096);

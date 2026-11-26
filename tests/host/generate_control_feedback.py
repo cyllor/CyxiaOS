@@ -254,7 +254,7 @@ cyxia-prototype={path="'''+str(ROOT/'crates/prototype')+'''"}
 cyxia-prototype-cluster={path="'''+str(ROOT/'user/prototype-cluster')+'''"}
 sha2="=0.10.9"
 [patch.crates-io]
-ring={path="'''+str(ROOT/'user/prototype-cluster/vendor/ring')+'''"}
+ring={path="'''+str(ROOT/'vendor/ring')+'''"}
 [workspace]
 ''')
 (OUT/'source-binding.json').write_text(json.dumps({'source_root':str(ROOT),'production_functions':SOURCES,'host_boundaries':['CPU slot and wall/CPU clocks','initialized D05 prerequisite owner','coordinator gate and Registry publication callback fixture','pool/capture/replay authority checks','evidence instrumentation sinks and CPU0-only read view'],'scope':'host control-flow and actual in-memory history, not native guest execution or disk persistence'},indent=2)+'\n')

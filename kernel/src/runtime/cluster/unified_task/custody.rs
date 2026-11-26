@@ -59,7 +59,7 @@ pub fn query(
 pub fn key(bytes: &[u8]) -> CustodyKey {
     CustodyKey {
         owner_boot: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-        cluster: bytes[8..40].try_into().unwrap(),
+        legacy_remote_scope: bytes[8..40].try_into().unwrap(),
         requester: bytes[40..72].try_into().unwrap(),
         contract: bytes[72..88].try_into().unwrap(),
         request_hash: bytes[88..120].try_into().unwrap(),
@@ -67,7 +67,7 @@ pub fn key(bytes: &[u8]) -> CustodyKey {
 }
 fn write_key(key: CustodyKey, out: &mut [u8]) {
     out[..8].copy_from_slice(&key.owner_boot.to_le_bytes());
-    out[8..40].copy_from_slice(&key.cluster);
+    out[8..40].copy_from_slice(&key.legacy_remote_scope);
     out[40..72].copy_from_slice(&key.requester);
     out[72..88].copy_from_slice(&key.contract);
     out[88..120].copy_from_slice(&key.request_hash);

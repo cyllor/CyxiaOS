@@ -91,10 +91,11 @@ class NativeSecurityWiring(unittest.TestCase):
         assert "pub enum Kind" not in echo and "ClusterId" not in echo
         assert "pub const READONLY_ECHO: u16 = 1" in echo
 
-    def test_v019_cpu1_fixed_and_two_brains_have_no_runtime_scale_path(self):
+    def test_v020_cpu0_fixed_and_two_brains_have_no_runtime_scale_path(self):
         native = source(ROOT / "kernel/src/runtime/control/prototype_runtime.rs")
         model = source(ROOT / "user/prototype-runtime/main.rs")
         role = source(ROOT / "crates/kernel-core/src/control_plane/fixed.rs")
+        contract = source(ROOT / "crates/kernel-core/src/control_plane/cpu0_v0199.rs")
         cores = source(ROOT / "crates/prototype/src/cores.rs")
         manager = source(ROOT / "crates/kernel-core/src/control_plane/manager.rs")
         self.assertIn("Cores::new_fixed(CoreSet::from_bits(15))", native)
@@ -102,23 +103,29 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertNotIn("self.poll_secondary(now);", native)
         self.assertNotIn("self.propose(target, accepted_at);", native)
         self.assertNotIn("core_candidates(input[15])", model)
-        self.assertIn("const CONTROL_CPU: usize = 1;", role)
+        # Single authoritative topology: the cpu0_v0199 contract fixes C={CPU0},
+        # B={CPU1,CPU2,CPU3}, and fixed.rs re-exports it (no dual truth).
+        self.assertIn("pub const CONTROL_CPU: usize = 0;", contract)
+        self.assertIn("pub const BUSINESS_MASK: u64 = 0b1110;", contract)
+        self.assertIn("pub const CONTROL_CPU: usize = super::cpu0_v0199::CONTROL_CPU;", role)
+        self.assertIn("pub const CONTROL_MASK: u64 = super::cpu0_v0199::CONTROL_MASK;", role)
         self.assertIn("pub fn review", role)
         self.assertIn("pub fn new_fixed(online: CoreSet)", cores)
-        self.assertIn("if self.fixed_control { return Err(Error::Invalid); }", cores)
+        self.assertIn("CoreSet::from_bits(0b0001)", cores)
+        self.assertIn("if self.fixed_control {\n            return Err(Error::Invalid);\n        }", cores)
         self.assertIn("fn review_brains", manager)
 
-    def test_v019_native_domain_never_publishes_moved_control_cpu(self):
+    def test_v020_native_domain_never_publishes_moved_control_cpu(self):
         native = source(ROOT / "kernel/src/runtime/control/domain_control.rs")
-        self.assertIn("context.control_mask != 0b10", native)
-        self.assertIn("Action::ControlSet(mask) if mask != 0b10", native)
+        self.assertIn("context.control_mask != 0b0001", native)
+        self.assertIn("Action::ControlSet(mask) if mask != 0b0001", native)
         self.assertIn("self.provenance.at(submission::Stage::Stamp)", native)
 
     def test_sec_n_source_bound_active_credits_and_bounded_idle_eviction(self):
         network = source(CORE / "network.rs")
         self.assertIn("pub fn close_active_from(&mut self, ip: u32)", network)
         self.assertIn("entry.active != 0", network)
-        self.assertIn("if self.active >= MAX_ACTIVE { return Err(Error::Capacity); }", network)
+        self.assertIn("if self.active >= MAX_ACTIVE {\n                return Err(Error::Capacity);\n            }", network)
         self.assertIn("source.inflight -= 1;", network)
         self.assertIn("source.active -= 1;", network)
         self.assertNotIn("pub fn close_active(&mut self)", network)
@@ -130,10 +137,10 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("pub struct ActiveTicket", gate)
         self.assertIn("self.pending_entry(ticket)?", gate)
         self.assertIn("tls.local_echo_proof()", gate)
-        self.assertIn("row.proof==proof", gate)
-        self.assertIn("tls.accept_local_echo(&bytes[..length])", gate)
+        self.assertIn("row.proof == proof", gate)
+        self.assertIn(".accept_local_echo(&bytes[..length])", gate)
         self.assertIn("pub fn begin_restart(&mut self)", gate)
-        self.assertIn("self.active_count()!=0", gate)
+        self.assertIn("self.active_count() != 0", gate)
         self.assertIn("static NEXT_SESSION: AtomicU64", tls)
         self.assertIn("pub fn local_echo_proof(&self)", tls)
 
@@ -146,31 +153,58 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("tls_egress_pending", gate)
         self.assertIn("pub fn confirm_tls_output_drained(", gate)
         self.assertIn("tls.has_pending_plaintext() || !tls.pending_tls().is_empty()", gate)
-        self.assertIn("row.state!=State::Draining || row.tls_egress_pending", gate)
+        self.assertIn("row.state != State::Draining || row.tls_egress_pending", gate)
         self.assertIn("pub(crate) fn reply(", gate)
         self.assertIn("pub fn local_echo_proof(&self)", tls)
 
-    def test_v019_other_five_tracks_fail_closed_with_fixed_control_roles(self):
+    def test_sec_n_single_authoritative_admission_ledger(self):
+        # 2026-11-25 designation (six-tracks "生产级接线门槛"): Admission is
+        # the sole authoritative production connection-credit ledger; the
+        # kernel-core RateLimiter stays a legacy host-contract model and is
+        # never referenced by the native transport or the EL0 Echo guest.
+        legacy = source(CORE / "network.rs")
+        self.assertIn("Legacy host-contract rate limiter", legacy)
+        self.assertIn("NOT the production admission ledger", legacy)
+        self.assertIn("cyxia_net_transport::admission::Admission", legacy)
+        self.assertIn("sole authoritative connection-credit ledger", legacy)
+        self.assertIn("Never wire both ledgers on one production connection", legacy)
+        self.assertIn("生产级接线门槛", legacy)
+        gate = source(ROOT / "crates/net-transport/src/admission.rs")
+        self.assertIn("Designated sole authoritative production connection-credit ledger", gate)
+        self.assertIn("single-machine native EL0 Echo service", gate)
+        self.assertIn("real TCP/VirtIO/TLS completion evidence", gate)
+        self.assertIn("生产级接线门槛", gate)
+        for directory in (ROOT / "crates/net-transport/src", ROOT / "user/local-echo/src"):
+            for path in sorted(directory.rglob("*.rs")):
+                self.assertNotIn("RateLimiter", source(path), str(path))
+
+    def test_v020_other_five_tracks_fail_closed_with_fixed_control_roles(self):
         process = source(CORE / "process.rs")
         file = source(CORE / "file.rs")
         memory = source(CORE / "memory.rs")
         device = source(CORE / "device.rs")
         syscall = source(CORE / "syscall.rs")
         manager = source(ROOT / "crates/kernel-core/src/control_plane/manager.rs")
-        self.assertIn("if cpu < 2 { return Err(Error::Unauthorized); }", process)
-        self.assertIn("request.cpu >= 2", process)
-        self.assertIn("if target_cpu == 1 || kind != IrqKind::VirtioSpi", device)
-        self.assertIn("protected_inode: u16, protected_generation: u64", file)
+        # CPU0 is the only control core; CPU1-3 are the business cores. The
+        # legacy SEC-P gate delegates to the single authoritative cpu0_v0199
+        # business boundary instead of the old CPU0+CPU1 rejection.
+        self.assertIn("if cpu == 0 {\n        return Err(Error::Unauthorized);\n    }", process)
+        self.assertIn("authorize_business_core_v0199(", process)
+        self.assertIn("cpu0_v0199::permits_business(", process)
+        self.assertNotIn("request.cpu >= 2", process)
+        self.assertIn("if target_cpu == 0\n        || kind != IrqKind::VirtioSpi", device)
+        self.assertIn("protected_inode: u16,\n        protected_generation: u64,", file)
         self.assertIn("frame.owner == 0", memory)
         self.assertIn("total.checked_add(usize::from(lease.descriptors))", device)
         self.assertIn("pub fn can_publish_fixed(", syscall)
+        self.assertIn("executing_cpu != crate::control_plane::fixed::CONTROL_CPU", syscall)
         self.assertIn("security::syscall::can_publish_fixed(", manager)
 
     def test_sec_n_native_tcp_uses_strict_echo_stream_framing(self):
         echo=source(ROOT / "crates/net-transport/src/echo.rs")
         tls=source(ROOT / "crates/net-transport/src/tls.rs")
         ingress=source(ROOT / "crates/net-transport/src/native_tcp.rs")
-        device=source(ROOT / "crates/cluster-transport/src/local_echo_tcp.rs")
+        device=source(ROOT / "crates/net-transport/src/local_echo_tcp.rs")
         admission=source(ROOT / "crates/net-transport/src/admission.rs")
         self.assertIn("pub(crate) fn next_frame_len(",echo)
         self.assertIn("next_frame_len(tls.plaintext())",admission)
@@ -193,19 +227,19 @@ class NativeSecurityWiring(unittest.TestCase):
     def test_sec_n_d_native_device_evidence_gates_connection_retirement(self):
         driver=source(ROOT / "crates/driver-virtio/src/net/batched.rs")
         single=source(ROOT / "crates/driver-virtio/src/net.rs")
-        port=source(ROOT / "crates/cluster-transport/src/device.rs")
-        tcp=source(ROOT / "crates/cluster-transport/src/tcp.rs")
-        adapter=source(ROOT / "crates/cluster-transport/src/local_echo_tcp.rs")
+        port=source(ROOT / "crates/net-transport/src/device.rs")
+        tcp=source(ROOT / "crates/net-transport/src/tcp.rs")
+        adapter=source(ROOT / "crates/net-transport/src/local_echo_tcp.rs")
         native=source(ROOT / "crates/net-transport/src/native_tcp.rs")
         ledger=source(ROOT / "crates/net-transport/src/admission.rs")
         self.assertIn("self.completed_tx.is_none() && self.tx.is_quiescent()",driver)
         self.assertIn("!self.failed && !self.tx.pending",single)
-        self.assertIn("fn tx_quiescent(&self) -> bool { false }",port)
+        self.assertIn("fn tx_quiescent(&self) -> bool {\n        false\n    }",port)
         self.assertIn("self.device.port().tx_quiescent()",tcp)
         self.assertIn("impl<P: Port> NativeSocket for Tcp<'_, P>",adapter)
         self.assertIn("fn terminal_tx_quiescent(&self) -> bool",native)
         self.assertIn("pub fn finish_session<S: NativeSocket>",native)
-        self.assertIn("admission.verify_session(key,tls)",native)
+        self.assertIn(".verify_session(key, tls)",native)
         self.assertIn("pub(crate) fn finish_drain(",ledger)
         self.assertNotIn("pub fn finish_drain(",ledger)
 
@@ -220,15 +254,17 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertNotIn("cyxia-prototype-cluster", manifest)
         self.assertIn("pub const DIRECT_TLS_CIPHERTEXT: u64 = 1", surface)
         self.assertIn("match op {", surface)
-        self.assertIn("allowed::allowed(op,len,arg0)", broker)
+        self.assertIn("allowed::allowed(op, len, arg0)", broker)
         self.assertIn("native_tcp::turn(", guest)
         self.assertIn("gate.begin_restart();", guest)
-        self.assertIn("fn terminal_tx_quiescent(&self)->bool{false}", guest)
+        self.assertIn("fn terminal_tx_quiescent(&self) -> bool {\n        self.terminal\n    }", guest)
+        retirement = guest.split("if session.normal_close_complete() {", 1)[1]
+        self.assertRegex(retirement, r"(?s)poll_normal_close\(generation, source\).*socket\.terminal = true;.*native_tcp::finish_session\(")
         self.assertIn("CYXIA_LOCAL_ECHO_IDENTITY", build)
         abi=source(ROOT / "user/local-echo/src/abi.rs")
         main=source(ROOT / "user/local-echo/src/main.rs")
         self.assertIn("pub struct DomainSourceView", abi)
-        self.assertIn("offset_of!(Shared,payload)==2696",abi)
+        self.assertIn("offset_of!(Shared, payload) == 2696",abi)
         self.assertNotIn("cyxia_prototype",abi)
         self.assertNotIn("prototype-cluster/src/abi.rs",main)
         fixture=source(ROOT / "user/local-echo/tests/native_shared_layout.rs")
@@ -238,9 +274,484 @@ class NativeSecurityWiring(unittest.TestCase):
     def test_v019_freestanding_ring_uses_existing_native_crypto_patch(self):
         manifest = source(ROOT / "Cargo.toml")
         lock = source(ROOT / "Cargo.lock")
-        self.assertIn('ring = { path = "user/prototype-cluster/vendor/ring" }', manifest)
+        self.assertIn('ring = { path = "vendor/ring" }', manifest)
         self.assertIn('name = "ring"\nversion = "0.17.14"\ndependencies', lock)
         self.assertNotIn('name = "ring"\nversion = "0.17.14"\nsource = "registry+', lock)
+
+    def test_v020_wave_structural_pins_kernel_core_cluster_isolation(self):
+        # Ledger #26 phase 0: the gated dual-node security core had zero active
+        # consumers and was deleted outright (module, tests and feature). The
+        # protective intent is unchanged: cluster code stays out of kernel-core.
+        # prototype::cluster (wire/engine) remains gated pending phase 1, while
+        # the kernel unified-runtime facade still references it.
+        lib = source(ROOT / "crates/kernel-core/src/lib.rs")
+        manifest = source(ROOT / "crates/kernel-core/Cargo.toml")
+        self.assertNotIn("pub mod cluster;", lib)
+        self.assertNotIn("legacy-cluster", manifest)
+        self.assertNotIn('name = "cluster"', manifest)
+        self.assertFalse((ROOT / "crates/kernel-core/src/cluster").exists())
+        self.assertFalse((ROOT / "crates/kernel-core/tests/cluster.rs").exists())
+
+    def test_v020_wave_structural_pins_prototype_wire_isolation(self):
+        # Wave 2: the cluster wire codec is legacy-only and the engine feature
+        # implies it, so no default build can reach the historical wire path.
+        cluster = source(ROOT / "crates/prototype/src/cluster/mod.rs")
+        manifest = source(ROOT / "crates/prototype/Cargo.toml")
+        self.assertIn('#[cfg(feature = "legacy-cluster")]\npub mod wire;', cluster)
+        self.assertIn("legacy-cluster = []", manifest)
+        self.assertIn('cluster-engine = ["legacy-cluster"]', manifest)
+        self.assertIn('[[test]]\nname = "cluster_wire"\nrequired-features = ["legacy-cluster"]', manifest)
+
+    def test_v020_wave_structural_pins_local_volume_relocation(self):
+        # Wave 3: reserved-volume storage left the cluster module; the local
+        # module keeps the exact MAX_EFFECT bound under both cfg branches.
+        lib = source(ROOT / "crates/prototype/src/lib.rs")
+        cluster = source(ROOT / "crates/prototype/src/cluster/mod.rs")
+        self.assertIn("pub mod local_volume;", lib)
+        self.assertNotIn("pub mod volume;", lib)
+        self.assertNotIn("pub mod volume;", cluster)
+        volume_path = ROOT / "crates/prototype/src/local_volume.rs"
+        self.assertTrue(volume_path.is_file())
+        volume = source(volume_path)
+        self.assertIn('#[cfg(feature = "cluster-engine")]\npub use crate::cluster::engine::MAX_EFFECT;', volume)
+        self.assertIn('#[cfg(not(feature = "cluster-engine"))]\npub const MAX_EFFECT: usize = 33_200;', volume)
+
+    def test_v020_wave_structural_pins_admit_v3_contract(self):
+        # Wave 2: FILE_AUTH ADMIT v3 / COMPLETE v1 contract layer pins the
+        # frozen baseline magics, versions and frame sizes. Contract layer
+        # only; native EL1 wiring is a later gate and is not claimed here.
+        contract_path = CORE / "file_auth_v3.rs"
+        self.assertTrue(contract_path.is_file())
+        contract = source(contract_path)
+        self.assertIn("pub const ADMIT_REQUEST_MAGIC: u32 = 0x4359_5646;", contract)
+        self.assertIn("pub const ADMIT_REPLY_MAGIC: u32 = 0x4359_5652;", contract)
+        self.assertIn("pub const COMPLETE_REQUEST_MAGIC: u32 = 0x4359_4643;", contract)
+        self.assertIn("pub const ADMIT_REQUEST_VERSION: u16 = 3;", contract)
+        self.assertIn("pub const ADMIT_REPLY_VERSION: u16 = 3;", contract)
+        self.assertIn("pub const COMPLETE_REQUEST_VERSION: u16 = 1;", contract)
+        self.assertIn("pub const ADMIT_REQUEST_BYTES: usize = 128;", contract)
+        self.assertIn("pub const ADMIT_REPLY_BYTES: usize = 48;", contract)
+        self.assertIn("pub const COMPLETE_REQUEST_BYTES: usize = 56;", contract)
+        self.assertIn("pub const COMPLETE_REPLY_BYTES: usize = 8;", contract)
+        self.assertIn("pub const FILE_AUTH_ADMIT: u16 = 1;", contract)
+        self.assertIn("pub const FILE_AUTH_COMPLETE: u16 = 2;", contract)
+        self.assertIn('pub const OPERATION_DOMAIN: &[u8] = b"CYX/FILE-ADMIT/v3";', contract)
+        self.assertIn("pub mod file_auth_v3;", source(CORE / "mod.rs"))
+
+    def test_v020_wave_structural_pins_legacy_coreset_gate(self):
+        # Wave 2: the default smp-selftest fixture is fixed CPU0; the retired
+        # dynamic C/B/T/Q transition fixture only compiles under legacy-coreset.
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        smp = source(ROOT / "kernel/src/arch/aarch64/smp.rs")
+        self.assertIn("legacy-coreset = []", manifest)
+        self.assertIn('        feature = "legacy-coreset"\n    )))]\n    fixed_cpu0_fixture()', smp)
+        self.assertIn('    feature = "legacy-coreset"\n)))]\nfn fixed_cpu0_fixture() -> ! {', smp)
+        self.assertIn('#[cfg(feature = "legacy-coreset")]\nfn fixture(mut ownership: Ownership<C>) -> ! {', smp)
+        self.assertIn("        fixture(ownership)\n    }", smp)
+
+    def test_v020_wave_structural_pins_smp_verifier_contract(self):
+        # Wave 2: the host verifier's default validate() pins the fixed-CPU0
+        # evidence; the retired contract is reachable only via --legacy-coreset,
+        # and CI keeps a dedicated build+run lane for that opt-in profile.
+        verifier = source(ROOT / "tools/verify_smp.py")
+        smp = source(ROOT / "kernel/src/arch/aarch64/smp.rs")
+        workflow = source(ROOT / ".github/workflows/smp-native.yml")
+        self.assertIn("def validate(serial: bytes, page: bytes, cpu_count: int) -> dict:", verifier)
+        self.assertIn("def validate_legacy(serial: bytes, page: bytes, cpu_count: int) -> dict:", verifier)
+        self.assertIn("parser.add_argument('--legacy-coreset', action='store_true',", verifier)
+        self.assertIn("require(rows('SMP_FIXED_CPU0') == [(words[5], words[6], 1)],", verifier)
+        self.assertIn("scope = 'SMP_SCOPE model=fixed_cpu0 production_isolation=false physical_isolation=false'", verifier)
+        self.assertIn("validator = (validate_legacy if legacy else validate) if acceptance is None else acceptance.validate", verifier)
+        self.assertIn("report['fixture_contract'] = 'legacy-coreset' if legacy else 'fixed-cpu0'", verifier)
+        self.assertIn("SMP_SCOPE model=fixed_cpu0 production_isolation=false physical_isolation=false", smp)
+        self.assertIn("--features smp-selftest,legacy-coreset", workflow)
+        self.assertIn("python3 tools/verify_smp.py --legacy-coreset --elf", workflow)
+        self.assertIn("Build and boot retired legacy CoreSet profile", workflow)
+
+    def test_v020_wave_structural_pins_irq_maintenance_reserve(self):
+        # Wave 1: each 100 ms business window hard-commits at most 90 ms; the
+        # explicit 10 ms IRQ/maintenance reserve is compile-time accounted.
+        scheduler = source(ROOT / "crates/prototype/src/domains/tasks/scheduler.rs")
+        self.assertIn("pub const IRQ_MAINTENANCE_RESERVE_NS: u64 = WINDOW_NS / 10;", scheduler)
+        self.assertIn("pub const CPU_BUDGET_NS: u64 = WINDOW_NS - IRQ_MAINTENANCE_RESERVE_NS;", scheduler)
+        self.assertIn("const _: () = assert!(CPU_BUDGET_NS + IRQ_MAINTENANCE_RESERVE_NS == WINDOW_NS);", scheduler)
+
+    def test_v020_wave6_structural_pins_policy_lock_budget_baseline(self):
+        # Wave 6: the G1 lock-chain scaffold keeps the frozen baseline budget
+        # split (45us effective work + 5us acquisition <= 50us IRQ-off total).
+        # Only the baseline constants are pinned; the metering counters are
+        # still being hardened this wave and are deliberately not pinned.
+        lock_path = ROOT / "crates/kernel-core/src/control_plane/policy_lock_v0199.rs"
+        self.assertTrue(lock_path.is_file())
+        lock = source(lock_path)
+        self.assertIn("pub mod policy_lock_v0199;", source(ROOT / "crates/kernel-core/src/control_plane/mod.rs"))
+        self.assertIn("pub const WORK_BUDGET_NS: u64 = 45_000;", lock)
+        self.assertIn("pub const IRQ_OFF_BUDGET_NS: u64 = 50_000;", lock)
+        self.assertIn("pub const ACQUISITION_BUDGET_NS: u64 = 5_000;", lock)
+
+    def test_v020_wave6_structural_pins_frame_meta_static_region_path(self):
+        # Wave 6: the bounded static FrameMeta path exists as structure only;
+        # the frames bridge wiring is still being rewritten this wave and is
+        # deliberately not pinned here.
+        meta_path = ROOT / "crates/kernel-core/src/frame_meta_v0199.rs"
+        self.assertTrue(meta_path.is_file())
+        meta = source(meta_path)
+        self.assertIn("pub fn initialize_static(", meta)
+        self.assertIn("regions: &[StaticRegion],", meta)
+        self.assertIn("pub struct StaticRegion {", meta)
+        self.assertIn("pub enum StaticClass {", meta)
+
+    def test_v020_wave6_structural_pins_advice_e2e_fixture_scope(self):
+        # Wave 6: the advice-chain E2E stays a fixture-scoped opt-in feature;
+        # production in-vector wiring is explicitly not claimed. The sec-n
+        # feature set in kernel/Cargo.toml is still being rewritten this wave
+        # and is deliberately not pinned here.
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        self.assertIn('v0199-advice-e2e-selftest = ["smp-selftest", "dep:sha2"]', manifest)
+        fixture_path = ROOT / "kernel/src/arch/aarch64/v0199_advice_e2e.rs"
+        self.assertTrue(fixture_path.is_file())
+        fixture = source(fixture_path)
+        self.assertIn("V0199_ADVICE_E2E_SCOPE production_wiring=false real_services=false fixture_executor=true", fixture)
+        self.assertTrue((ROOT / "tools/verify_v0199_advice_e2e.py").is_file())
+
+    def test_v020_wave6_structural_pins_net_transport_adapter_relocation(self):
+        # Wave 6: the SEC-N NativeSocket adapter lives in the active
+        # single-machine net-transport crate; cluster-transport is only a
+        # re-export facade and must not own a second adapter implementation.
+        adapter_path = ROOT / "crates/net-transport/src/local_echo_tcp.rs"
+        self.assertTrue(adapter_path.is_file())
+        adapter = source(adapter_path)
+        self.assertIn("Relocated from the excluded legacy cluster crate", adapter)
+        self.assertIn("impl<P: Port> NativeSocket for Tcp<'_, P>", adapter)
+        facade = source(ROOT / "crates/cluster-transport/src/lib.rs")
+        self.assertIn("pub use cyxia_net_transport", facade)
+        self.assertIn("pub use cyxia_net_transport::local_echo_tcp;", facade)
+        self.assertNotIn("impl<P: Port> NativeSocket", facade)
+
+    def test_v020_wave6_structural_pins_legacy_d16_decode_gate(self):
+        # Wave 6: the legacy D16 (OfferCpu/Placement) decode arms are opt-in
+        # only; the default decode rejects domain 16. The wire module lives at
+        # crates/prototype/src/policy_wire.rs (not under domains/).
+        manifest = source(ROOT / "crates/prototype/Cargo.toml")
+        self.assertIn("legacy-d16-decode = []", manifest)
+        wire = source(ROOT / "crates/prototype/src/policy_wire.rs")
+        self.assertIn('#[cfg(feature = "legacy-d16-decode")]\n        (16, 1) => Action::OfferCpu(u16_at(b, 2)?),', wire)
+        self.assertIn('#[cfg(feature = "legacy-d16-decode")]\n        (16, 2) => Action::Placement(u16_at(b, 2)?),', wire)
+        self.assertIn("_ => return Err(Error::Unsupported),", wire)
+
+    def test_v020_wave6_structural_pins_task_admission_legacy_scope_rename(self):
+        # Wave 6: the custody key's remote-task scope field is source-only
+        # legacy naming; the positional wire ABI is unchanged and the native
+        # single-machine profile carries no cluster runtime.
+        admission = source(ROOT / "crates/kernel-core/src/control_plane/task_admission.rs")
+        self.assertIn("pub legacy_remote_scope: [u8; 32],", admission)
+        self.assertIn("key.legacy_remote_scope == [0; 32]", admission)
+        self.assertNotIn("pub cluster:", admission)
+
+    # Wave 7 pin deferrals (2026-11-25): frames.rs (FrameRecorder trait),
+    # frame_meta_v0199.rs initialize_pool, and net-transport service.rs /
+    # discovery.rs all exist at HEAD but are being rewritten by concurrent
+    # wave tasks; they are deliberately not pinned until those rewrites
+    # land. The vendor/ring neutral path is already pinned by
+    # test_v019_freestanding_ring_uses_existing_native_crypto_patch.
+
+    def test_v020_wave7_structural_pins_ai_control_retirement_replay_lane(self):
+        # Wave 7: ai-control-selftest / model-v13-selftest are retired
+        # pre-cutover CPU1-control history; a standalone build emits
+        # compile_error by design (kernel/src/arch/aarch64/smp.rs retirement
+        # marker, not pinned here while smp.rs gains its new fixture). The
+        # native CI lane survives only as an explicit legacy-coreset replay,
+        # mirroring the retired-profile lane in smp-native.yml.
+        workflow = source(ROOT / ".github/workflows/ai-control-native.yml")
+        umbrella = "--features smp-selftest,ai-control-selftest,legacy-coreset"
+        # All three build sites (clippy, debug/release profile builds, fault
+        # builds) use the retirement umbrella; no standalone feature flag
+        # may remain (comment prose is not a feature flag).
+        self.assertEqual(workflow.count(umbrella), 3)
+        self.assertNotRegex(workflow, r"--features\s+ai-control-selftest(?![\w,-])")
+        self.assertIn("Retired pre-cutover CPU1-control history", workflow)
+
+    def test_v020_wave7_structural_pins_file_auth_context_contract_layer(self):
+        # Wave 6/7: the EL1-internal AuthContext identity + admission-ledger
+        # contract layer exists and is declared. Contract layer only; native
+        # EL1 wiring is a later gate and is not claimed here. The frozen
+        # baseline bounds (16 principals, 16 ledger records) are pinned;
+        # ledger state rules stay host-test territory.
+        context_path = CORE / "file_auth_context_v1.rs"
+        self.assertTrue(context_path.is_file())
+        self.assertIn("pub mod file_auth_context_v1;", source(CORE / "mod.rs"))
+        context = source(context_path)
+        self.assertIn("pub struct AuthContextV1 {", context)
+        self.assertIn("pub const MAX_AUTH_PRINCIPALS: usize = 16;", context)
+        self.assertIn("pub const ADMISSION_LEDGER_CAPACITY: usize = 16;", context)
+
+    # Wave 10 pin deferrals (2026-11-25, T6 sync time, HEAD defeae7): the
+    # v020-production feature declaration (kernel/Cargo.toml), the
+    # file_media_unified_v1 module, T1's production verifier (expected path
+    # tools/verify_v020_production.py), T3's FrameMeta allocator skeleton,
+    # T4's real VirtIO-net SEC-N adapter and T5's BootEpoch/Recovery native
+    # APIs are concurrent in-progress wave-10 outputs with no committed
+    # artifact in this checkout (verified by reading; T3/T5 edits appeared
+    # uncommitted during T6 execution). They are deliberately not pinned
+    # until they land; pin only the stable T6 skeleton lane below.
+
+    def test_v020_wave10_structural_pins_production_skeleton_lane(self):
+        # Wave 10 (T6, wired centrally after T1 landed): the production-wiring
+        # CI lane is an honest skeleton, NOT G4 acceptance. The v020-production
+        # profile build command and production-skeleton scope labels are pinned;
+        # the run step now invokes T1's frozen verifier CLI (pinned QEMU on PATH,
+        # provenance hash gates) and exits non-zero on FAIL. A skeleton-lane green
+        # is never production run evidence.
+        workflow_path = ROOT / ".github/workflows/v020-production.yml"
+        self.assertTrue(workflow_path.is_file())
+        workflow = source(workflow_path)
+        self.assertIn(
+            "cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production",
+            workflow,
+        )
+        self.assertIn("name: V0.20 production-wiring skeleton (NOT G4 acceptance)", workflow)
+        self.assertIn('"lane_scope": "production-skeleton"', workflow)
+        self.assertIn("branches: [CyxiaOS-V0.20]", workflow)
+        self.assertIn("- 'kernel/**'", workflow)
+        self.assertIn("RUSTUP_TOOLCHAIN: '1.95.0'", workflow)
+        self.assertIn("f8ed81651e61d9c2166df6121ce2af0f44f06b3e", workflow)
+        self.assertIn("tools/qemu/cyxia-per-vcpu-pmu.patch", workflow)
+        self.assertIn("python3 -B tools/verify_v020_production.py", workflow)
+        self.assertIn("--elf artifacts/v020-production/kernel.elf", workflow)
+
+    def test_v020_wave10_structural_pins_t1_production_skeleton(self):
+        # Wave 10 (T1): the production boot + in-vector SVC dispatch skeleton is
+        # an opt-in feature that elevates the proven advice-e2e SvcV3Bridge
+        # dispatch into the exception vector. It is a SKELETON, not full
+        # production authority: the scope marker must keep full_authority=false
+        # and real_models=false, and the default/fixture profiles stay intact.
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        self.assertIn('v020-production = ["smp-selftest", "dep:sha2", "sec-n-native"]', manifest)
+        boot = source(ROOT / "kernel/src/arch/aarch64/boot.rs")
+        self.assertIn('feature = "v020-production"))]\n    smp::production::run(&info);', boot)
+        exceptions = source(ROOT / "kernel/src/arch/aarch64/exceptions.rs")
+        self.assertIn("smp::production::exception(f, kind);", exceptions)
+        prod_path = ROOT / "kernel/src/arch/aarch64/production.rs"
+        self.assertTrue(prod_path.is_file())
+        prod = source(prod_path)
+        # Honest scope: skeleton only, never full authority or real models.
+        self.assertIn(
+            "V020_PROD_SCOPE production_skeleton=true full_authority=false real_models=false",
+            prod,
+        )
+        self.assertIn("production_skeleton=true, full_authority=false, real_models=false", prod)
+        # In-vector dispatch reuses the SAME kernel-core bridge APIs as the
+        # advice-e2e fixture (no reinvented chain).
+        self.assertIn("decode_aarch64_svc_v3(3, f.esr, &f.regs)", prod)
+        self.assertIn("bridge.register_assisted_one(", prod)
+        self.assertIn("bridge.publish_assisted_one(", prod)
+        self.assertIn(".claim_apply_work(", prod)
+        self.assertIn(".settle_verified_apply_reports_with_feedback(", prod)
+        # The production profile owns CPU0 and must not mix with other fixtures.
+        self.assertIn('compile_error!("v020-production requires the plain smp-selftest profile");', prod)
+        # The role catalog is built for the production feature too.
+        build = source(ROOT / "kernel/build/aarch64.rs")
+        self.assertIn('env::var_os("CARGO_FEATURE_V020_PRODUCTION").is_some()', build)
+        self.assertTrue((ROOT / "tools/verify_v020_production.py").is_file())
+
+    def test_v020_wave11_feature_gating(self):
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        self.assertRegex(manifest, r'(?m)^v020-production = \[[^\]]*"sec-n-native"[^\]]*\]')
+        self.assertRegex(
+            manifest,
+            r'(?m)^v020-production-media-staging = \[[^\]]*"v020-production"[^\]]*\]',
+        )
+        comp = source(ROOT / "kernel/src/composition/aarch64.rs")
+        gate = comp.split('mod virtio_platform;')[0].rsplit("#[cfg(any(", 1)[1]
+        self.assertIn('feature = "v020-production"', gate)
+        near = comp.split("mod net_device;")[0][-700:]
+        self.assertNotIn("allow(dead_code)", near)
+        self.assertNotIn("not yet wired by default", near)
+
+    def test_v020_wave11_sec_n_production_pins(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        net = source(arm / "production/net.rs")
+        self.assertIn("net_device::init(", net)
+        self.assertNotIn("LoopbackPort", net)
+        self.assertNotIn("RateLimiter", net)
+        self.assertIn("evidence::W11_TLS_ECHO_TURN_VERIFIED, 0", net)
+        fixture = source(arm / "v0199_sec_n_fixture.rs")
+        self.assertIn("sec_n_broker::", fixture)
+        self.assertNotIn("fn broker(", fixture)
+        self.assertNotIn("fn run_until_park(", fixture)
+        broker = source(arm / "sec_n_broker.rs")
+        self.assertIn("fn broker<P: Port>(port: &mut P, entropy: &mut EntropyFill<'_>, close_poll: Option<ClosePoll<P>>)", broker)
+        self.assertIn("broker(port, entropy, close_poll);", broker)
+        self.assertIn("pub(crate) fn run_until_park<P: Port>(", broker)
+        self.assertIn('link_section = ".bss.sec_n', broker)
+
+    def test_v020_wave12_modes_are_explicit(self):
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        self.assertIn('v020-production-authenticated-net = ["v020-production"]', manifest)
+        self.assertIn('v020-production-live-control = ["v020-production"]', manifest)
+        self.assertIn('v020-production-media-reopen = ["v020-production-media-staging"]', manifest)
+        self.assertIn('v020-production-media-signed = ["v020-production-media-staging"]', manifest)
+        self.assertIn('v020-production-media-envelopes = ["v020-production-media-staging"]', manifest)
+        self.assertIn('v020-production-media-unified = ["v020-production-media-envelopes"]', manifest)
+        self.assertIn('v020-production-snapshot-catalog = ["v020-production-media-unified", "v020-production-media-signed", "v020-production-live-control"]',
+                      manifest)
+        self.assertIn('v020-production-file-read = ["v020-production-media-unified", "v020-production-media-signed", "v020-production-live-control"]',
+                      manifest)
+        self.assertIn('v020-production-snapshot-read = ["v020-production-snapshot-catalog", "v020-production-file-read"]',
+                      manifest)
+        self.assertIn('v020-production-file-sessions = ["v020-production-file-read"]', manifest)
+        self.assertIn('v020-production-frame-pool = ["v020-production"]', manifest)
+        for base in ("default", "v020-production", "v020-production-media-staging"):
+            line = next(line for line in manifest.splitlines() if line.startswith(base + " = "))
+            for feature in ("authenticated-net", "live-control", "media-reopen", "media-signed",
+                            "media-envelopes", "media-unified", "snapshot-catalog", "file-read",
+                            "snapshot-read", "file-sessions", "frame-pool"):
+                self.assertNotIn(feature, line)
+
+    def test_v020_wave11_media_staging_is_opt_in(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        staging = 'feature = "v020-production-media-staging"'
+        prod = source(arm / "production.rs")
+        # The module is mounted only under the opt-in staging feature.
+        self.assertEqual(prod.count("mod media_staging;"), 1)
+        before = prod.split("mod media_staging;")[0].splitlines()[-2:]
+        self.assertEqual(before[0].strip(), f"#[cfg({staging})]")
+        self.assertEqual(before[1].strip(), '#[path = "production/media_staging.rs"]')
+        media = source(arm / "production/media_staging.rs")
+        self.assertIn("pub(super) fn stage(info: &BootInfo) -> StagingOutcome", media)
+        self.assertIn("golden_vector_pending=1", media)
+        # Outside staging the in-vector 0x40 branch still answers EAGAIN.
+        arm40 = prod.split("0x40 => {", 1)[1].split("0x50 if", 1)[0]
+        self.assertIn(f"#[cfg(not({staging}))]", arm40)
+        self.assertRegex(arm40, r"#\[cfg\(not\(" + staging.replace('"', '\\"').replace("(", r"\(")
+                         + r"\)\)\]\s*\{?\s*EAGAIN as u64")
+        self.assertIn(f"#[cfg({staging})]", arm40)
+        self.assertIn("media_staging::snapshot_0x40(", arm40)
+        # v020-production must not imply the staging feature.
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        line = [l for l in manifest.splitlines() if l.startswith("v020-production = ")][0]
+        self.assertNotIn("media-staging", line)
+        self.assertNotIn("prototype-memory", line)
+
+    def test_v020_wave11_verifier_lanes_pinned(self):
+        # Wave 11 (T7): the G-A lane boots a real modern virtio-net device, keeps
+        # the no-NIC negative control and the opt-in staging lane, and checks the
+        # W11 segment up to word 160 with honest labels.
+        verifier = source(ROOT / "tools/verify_v020_production.py")
+        qemu = source(ROOT / "tools/v020_production_qemu.py")
+        self.assertIn('"virtio-net-device,netdev=n0"', qemu)
+        self.assertIn('"virtio-mmio.force-legacy=false"', qemu)
+        self.assertIn('"virtio-rng-device,rng=rng0"', qemu)
+        self.assertIn("W11_END = 160", verifier)
+        self.assertIn('words[W21_END:]', verifier)
+        self.assertIn('"kernel/src/arch/aarch64/production/file_read/sessions.rs"', verifier)
+        self.assertIn('"kernel/src/arch/aarch64/production/file_read/volatile_write.rs"', verifier)
+        self.assertIn('"tls_echo_turn_verified": False', verifier)
+        self.assertIn('"policy_lock_budget_verified": False', verifier)
+        self.assertIn('"golden_vector_pending": True', verifier)
+        self.assertIn("if NET_ABSENT in serial", verifier)
+        workflow = source(ROOT / ".github/workflows/v020-production.yml")
+        self.assertIn("s.build_guest()", workflow)
+        self.assertIn("--no-nic; then", workflow)
+        self.assertIn('ValueError: guest reported V020_W11_NET_ABSENT:', workflow)
+        self.assertIn('--no-peer; then', workflow)
+        self.assertIn('ValueError: V020_W11_NET_NO_PEER:', workflow)
+        self.assertIn("--timeout 240 --media-staging", workflow)
+        self.assertIn("tools/test_verify_v020_production.py", workflow)
+        evidence = source(ROOT / "kernel/src/arch/aarch64/production/evidence.rs")
+        self.assertNotIn("allow(dead_code)", evidence)
+        self.assertIn("pub fn log_completion()", evidence)
+        prod = source(ROOT / "kernel/src/arch/aarch64/production.rs")
+        self.assertIn("evidence::log_completion();", prod)
+
+    def test_v020_wave11_ga_call_sites_pinned(self):
+        # Spec §5 (final-review I4): every G-A item keeps a live production call
+        # site, so none can silently regress to dead code.
+        arm = ROOT / "kernel/src/arch/aarch64"
+        prod = source(arm / "production.rs")
+        run = prod.split("pub(crate) fn run(info: &BootInfo) -> ! {", 1)[1]
+        # FrameMeta registration and recovery init run first in run(), in order.
+        self.assertIn("frames::register_or_fatal();", run)
+        self.assertLess(run.index("frames::register_or_fatal();"),
+                        run.index("recovery::init_or_fatal();"))
+        self.assertIn("recovery::publish_probe(", run)
+        self.assertLess(run.index("STOPPED.load(Ordering::Acquire) == 14"),
+                        run.index("recovery::takeover_stopped();"))
+        # SEC-N serve runs in run() and its outcome is sealed.
+        self.assertIn("let net_outcome = net::serve(info);", run)
+        self.assertIn("net::publish(&net_outcome);", run)
+        # 0x41: the recovery gate refuses BEFORE the metered bridge call.
+        arm41 = prod.split("        0x41 => {", 1)[1].split("\n        _ => 0,", 1)[0]
+        self.assertIn("if !recovery::publish_allowed() {", arm41)
+        self.assertIn("return E_AUTH as u64;", arm41)
+        self.assertLess(arm41.index("recovery::publish_allowed()"),
+                        arm41.index("meter::metered("))
+        self.assertLess(arm41.index("meter::metered("),
+                        arm41.index("bridge.publish_assisted_one("))
+        # 0x50 register: the bridge call is metered too; exactly these two.
+        arm50 = prod.split("        0x50 if args[2] == (DECISION_BYTES", 1)[1].split(
+            "        0x41 => {", 1)[0]
+        self.assertLess(arm50.index("meter::metered("),
+                        arm50.index("bridge.register_assisted_one("))
+        self.assertEqual(prod.count("meter::metered("), 2)
+        # EL0 aborts feed the faulting CPU's accumulator in the vector.
+        exc = source(arm / "exceptions.rs")
+        prod_block = exc.split('#[cfg(feature = "v020-production")]', 1)[1].split(
+            "smp::production::exception(f, kind);", 1)[0]
+        self.assertIn("smp::production::recovery::record_fault(", prod_block)
+        # The callees are the real implementations, not stubs.
+        frames = source(arm / "production/frames.rs")
+        self.assertRegex(frames, r"fn register_or_fatal\(\) \{\s*match register_production_statics\(\)")
+        recovery = source(arm / "production/recovery.rs")
+        self.assertIn("with_gate(|staged| staged.gate.raise(&staged.pair))", recovery)
+        self.assertIn("acc.takeover_stopped_writer(", recovery)
+        self.assertIn("acc.record(&ev)", recovery)
+        meter = source(arm / "production/meter.rs")
+        self.assertIn("m.begin(SectionKind::EffectiveWork, now_ns())", meter)
+        net = source(arm / "production/net.rs")
+        self.assertIn("pub(super) fn serve(info: &BootInfo) -> NetOutcome", net)
+
+    def test_v020_wave11_production_parks_halted_cpus_with_wfi(self):
+        # Final fix wave I1: under TCG a WFE park spins a host core per halted
+        # vCPU and starved the scratch virtio-blk completions (staging flake).
+        console = source(ROOT / "kernel/src/arch/aarch64/console.rs")
+        halt = console.split("pub(crate) fn halt() -> ! {", 1)[1].split("\n}\n", 1)[0]
+        prod = halt.split('#[cfg(feature = "v020-production")]', 1)[1].split(
+            '#[cfg(not(feature = "v020-production"))]', 1)[0]
+        self.assertIn('"msr daifset, #15", "wfi"', prod)
+        self.assertNotIn("wfe", prod)
+        verifier = source(ROOT / "tools/verify_v020_production.py")
+        self.assertIn('"kernel/src/arch/aarch64/console.rs",', verifier)
+
+    def test_v020_live_pie_dispatch_checks_trapped_identity(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        prod = source(arm / "production.rs")
+        dispatch = prod.split("fn pie_dispatch(", 1)[1].split("fn advice_dispatch(", 1)[0]
+        self.assertIn("trapped_pie_cap(index, member)", dispatch)
+        self.assertLess(dispatch.index("trapped_pie_cap("), dispatch.index("match x8"))
+        observations = source(arm / "production/observations.rs")
+        snap = observations.split("pub(super) fn snapshot(", 1)[1].split(
+            "pub(super) fn audit(", 1
+        )[0]
+        self.assertIn("trapped_pie_cap(index, m)", snap)
+        self.assertIn("endpoint_cap: cap", snap)
+        audit = source(arm / "production/observations/audit_rpc.rs")
+        self.assertIn("table.admit_live(", audit)
+        self.assertIn("trapped_pie_cap(index, m)", audit)
+        self.assertNotIn("table.admit(", audit)
+
+    def test_v020_combined_mount_gates_both_native_services(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        prod = source(arm / "production.rs")
+        normalized = " ".join(prod.split())
+        self.assertIn("staging_outcome.services_ready() && let Some(view) = staging_outcome.file_read",
+                      normalized)
+        self.assertIn("staging_outcome.services_ready() && let Some(view) = staging_outcome.snapshot_catalog",
+                      normalized)
+        staging = source(arm / "production/media_staging.rs")
+        self.assertIn("out.chain_complete = run_chain(&mut disk, &mut out).is_some()", staging)
+        self.assertIn("authority::verified_pair_state(disk, checkpoint, config)", staging)
+        self.assertIn("volume::confirmed_receipt_query_digest(&mounted, &committed, &verified)", staging)
 
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")

@@ -13,11 +13,11 @@ pub mod cpu {
 use cyxia_prototype::{
     boot::BootSession,
     cluster::{
-        volume::{Cursor, START, Volume, VolumeScratch},
         wire::{Config, Proof},
         *,
     },
     journal::{self, BlockDevice, Journal},
+    local_volume::{Cursor, START, Volume, VolumeScratch},
     storage::TOTAL_BLOCKS,
 };
 use sha2::{Digest, Sha256};

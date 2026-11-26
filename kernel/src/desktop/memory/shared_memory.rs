@@ -370,7 +370,10 @@ pub fn init_pc(range: cyxia_contracts::MemoryRegion, objects: usize) -> Result<(
             return Err(Errno::Busy);
         }
         store.backing.set_boot_limits(pages, objects)?;
-        store.ledger.limit_boot_capacity(PageCount(pages as u32)).map_err(|_| Errno::Inval)?;
+        store
+            .ledger
+            .limit_boot_capacity(PageCount(pages as u32))
+            .map_err(|_| Errno::Inval)?;
         store.base = range.start.0;
         Ok(())
     })

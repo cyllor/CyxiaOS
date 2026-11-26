@@ -82,7 +82,9 @@ fn status_domains(out: &mut impl Write, selected: impl Fn(usize) -> bool) {
     // A bounded copy is coherent at the CPU0 foreground service boundary.
     let snapshot = unsafe { *core::ptr::addr_of!(COUNTERS) };
     for (index, (name, c)) in NAMES.into_iter().zip(snapshot).enumerate() {
-        if !selected(index) { continue; }
+        if !selected(index) {
+            continue;
+        }
         writeln!(out, "AI_DOMAIN name={name} requests={} proposals={} approved={} denied={} capacity={} invalid={} failed={} committed={} granted={} released={} grant_units={} release_units={} ai={} guard={} cancelled={} enters={} returns={} elapsed_ms={} last_model={} last_errno={}\r", c.requests, c.proposals, c.approved, c.denied, c.capacity, c.invalid, c.failed, c.committed, c.granted, c.released, c.grant_units, c.release_units, c.ai, c.guard, c.cancelled, c.enters, c.returns, c.elapsed_ms, c.last_model, c.last_errno).unwrap();
     }
 }

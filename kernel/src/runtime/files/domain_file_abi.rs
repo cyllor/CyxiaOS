@@ -330,7 +330,8 @@ fn validate_shape(address: u64, f: &Frame) -> Result<(), Error> {
         // UTF-8 and NUL before authority or any inode/log allocation.
         cyxia_kernel_core::security::file::validate_absolute_path(
             &f.bytes[OFF_PATH..OFF_PATH + path],
-        ).map_err(|_| Error::Format)?;
+        )
+        .map_err(|_| Error::Format)?;
     } else if path != 0 {
         return Err(Error::Format);
     }

@@ -55,11 +55,21 @@ pub struct Reviewed {
     source: Source,
 }
 impl Reviewed {
-    pub const fn domain(self) -> usize { self.domain }
-    pub const fn target(self) -> Identity { self.target }
-    pub const fn epochs(self) -> Epochs { self.epochs }
-    pub const fn choice(self) -> u16 { self.choice }
-    pub const fn source(self) -> Source { self.source }
+    pub const fn domain(self) -> usize {
+        self.domain
+    }
+    pub const fn target(self) -> Identity {
+        self.target
+    }
+    pub const fn epochs(self) -> Epochs {
+        self.epochs
+    }
+    pub const fn choice(self) -> u16 {
+        self.choice
+    }
+    pub const fn source(self) -> Source {
+        self.source
+    }
 }
 
 /// Domains 1..=15 are local. The old D16 cluster/remote placement domain has
@@ -69,11 +79,14 @@ pub struct Controller<const D: usize> {
 }
 impl<const D: usize> Controller<D> {
     pub fn new(rules: [Rule; D]) -> Result<Self, Error> {
-        if D == 0 || D > 15 || rules.iter().any(|rule| {
-            rule.options.is_empty()
-                || rule.options.len() > 32
-                || !rule.options.contains(&rule.baseline)
-        }) {
+        if D == 0
+            || D > 15
+            || rules.iter().any(|rule| {
+                rule.options.is_empty()
+                    || rule.options.len() > 32
+                    || !rule.options.contains(&rule.baseline)
+            })
+        {
             return Err(Error::Invalid);
         }
         Ok(Self { rules })
@@ -83,11 +96,7 @@ impl<const D: usize> Controller<D> {
     /// Only an exact, fresh, locally allowed suggestion may replace it.
     /// Unknown, malformed, late, cross-target or cross-generation advice
     /// causes a baseline selection, not a new grant or model wait.
-    pub fn review(
-        &self,
-        trusted: TrustedScope,
-        advice: Option<Advice>,
-    ) -> Result<Reviewed, Error> {
+    pub fn review(&self, trusted: TrustedScope, advice: Option<Advice>) -> Result<Reviewed, Error> {
         if !trusted.epochs.valid()
             || !trusted.target.valid()
             || trusted.domain == 0
@@ -101,8 +110,9 @@ impl<const D: usize> Controller<D> {
         // A separate offline TrialPermit can be evaluated by a different
         // deterministic pathway; it cannot be created by this advisory API.
         let sensitive = matches!(trusted.domain, 6 | 11 | 12 | 14);
-        let adopted = !sensitive && advice.is_some_and(|value| {
-            value.domain == trusted.domain
+        let adopted = !sensitive
+            && advice.is_some_and(|value| {
+                value.domain == trusted.domain
                 && value.target == trusted.target
                 && value.epochs == trusted.epochs
                 && value.model_generation == trusted.epochs.model
@@ -114,13 +124,21 @@ impl<const D: usize> Controller<D> {
                 && value.snapshot_ns.checked_add(100_000_000)
                     .is_some_and(|end| value.expires_ns <= end)
                 && rule.options.contains(&value.candidate)
-        });
+            });
         Ok(Reviewed {
             domain: trusted.domain,
             target: trusted.target,
             epochs: trusted.epochs,
-            choice: if adopted { advice.unwrap().candidate } else { rule.baseline },
-            source: if adopted { Source::AdoptedAdvice } else { Source::DeterministicBaseline },
+            choice: if adopted {
+                advice.unwrap().candidate
+            } else {
+                rule.baseline
+            },
+            source: if adopted {
+                Source::AdoptedAdvice
+            } else {
+                Source::DeterministicBaseline
+            },
         })
     }
 }
@@ -128,12 +146,24 @@ impl<const D: usize> Controller<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const RULE: Rule = Rule { baseline: 2, options: &[1, 2, 4] };
+    const RULE: Rule = Rule {
+        baseline: 2,
+        options: &[1, 2, 4],
+    };
     fn scope() -> TrustedScope {
         TrustedScope {
-            epochs: Epochs { boot: 1, controller: 1, model: 2, resources: 1, cores: 1 },
+            epochs: Epochs {
+                boot: 1,
+                controller: 1,
+                model: 2,
+                resources: 1,
+                cores: 1,
+            },
             domain: 3,
-            target: Identity { id: 17, generation: 5 },
+            target: Identity {
+                id: 17,
+                generation: 5,
+            },
             now_ns: 100,
         }
     }
@@ -188,11 +218,17 @@ mod tests {
             let mut candidate = advice();
             candidate.domain = domain;
             assert_eq!(
-                controller.review(trusted, Some(candidate)).unwrap().source(),
+                controller
+                    .review(trusted, Some(candidate))
+                    .unwrap()
+                    .source(),
                 Source::DeterministicBaseline
             );
             assert_eq!(
-                controller.review(trusted, Some(candidate)).unwrap().choice(),
+                controller
+                    .review(trusted, Some(candidate))
+                    .unwrap()
+                    .choice(),
                 RULE.baseline
             );
         }
@@ -203,7 +239,10 @@ mod tests {
         let mut candidate = advice();
         candidate.domain = 10;
         assert_eq!(
-            controller.review(trusted, Some(candidate)).unwrap().source(),
+            controller
+                .review(trusted, Some(candidate))
+                .unwrap()
+                .source(),
             Source::AdoptedAdvice
         );
     }
@@ -225,20 +264,34 @@ mod tests {
     #[test]
     fn overflowing_timestamp_never_extends_advice_lifetime() {
         let controller = Controller::new([RULE; 15]).unwrap();
-        let mut trusted=scope();
-        trusted.now_ns=u64::MAX-2;
-        let mut candidate=advice();
-        candidate.snapshot_ns=u64::MAX-10;
-        candidate.expires_ns=u64::MAX-1;
+        let mut trusted = scope();
+        trusted.now_ns = u64::MAX - 2;
+        let mut candidate = advice();
+        candidate.snapshot_ns = u64::MAX - 10;
+        candidate.expires_ns = u64::MAX - 1;
         assert_eq!(
-            controller.review(trusted, Some(candidate)).unwrap().source(),
+            controller
+                .review(trusted, Some(candidate))
+                .unwrap()
+                .source(),
             Source::DeterministicBaseline
         );
     }
     #[test]
     fn remote_domain_and_invalid_rule_tables_cannot_be_approved() {
-        assert!(matches!(Controller::<16>::new([RULE; 16]), Err(Error::Invalid)));
-        assert!(matches!(Controller::new([Rule { baseline: 9, options: &[1] }; 15]), Err(Error::Invalid)));
+        assert!(matches!(
+            Controller::<16>::new([RULE; 16]),
+            Err(Error::Invalid)
+        ));
+        assert!(matches!(
+            Controller::new(
+                [Rule {
+                    baseline: 9,
+                    options: &[1]
+                }; 15]
+            ),
+            Err(Error::Invalid)
+        ));
         let controller = Controller::new([RULE; 15]).unwrap();
         let mut request = scope();
         request.domain = 16;

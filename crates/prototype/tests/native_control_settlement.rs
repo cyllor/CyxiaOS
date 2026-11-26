@@ -8,7 +8,7 @@ use cyxia_prototype::domains::tasks::{CpuLayout, Scheduler};
 
 fn layout() -> CpuLayout {
     CpuLayout {
-        business_mask: 9,
+        business_mask: 14,
         healthy_mask: 15,
         generation: 7,
     }
@@ -18,7 +18,8 @@ fn layout() -> CpuLayout {
 fn every_control_cpu_retains_the_exact_consumed_budget_failure() {
     let log = Evidence::new();
     let mut scheduler = Scheduler::new();
-    for (cpu, offset) in [(1, 2), (2, 26)] {
+    // V0.20: CPU0 is the only control core; CPU1-3 are business.
+    for (cpu, offset) in [(0, 2)] {
         let credit = scheduler
             .reserve_control(cpu, layout(), 10_000_000 * cpu as u64, 2_500_000)
             .unwrap()
@@ -64,7 +65,7 @@ fn every_control_cpu_retains_the_exact_consumed_budget_failure() {
         log.settled(credit, actual, finish, duplicate, false);
         assert_eq!(log.snapshot(), words);
     }
-    assert_eq!(log.snapshot()[1], 2);
+    assert_eq!(log.snapshot()[1], 1);
     assert_eq!(core::mem::size_of::<Evidence>(), 512);
 }
 
@@ -73,7 +74,7 @@ fn malformed_unconsumed_and_successful_bills_never_become_fault_evidence() {
     let log = Evidence::new();
     let mut scheduler = Scheduler::new();
     let credit = scheduler
-        .reserve_control(1, layout(), 10_000_000, 2_500_000)
+        .reserve_control(0, layout(), 10_000_000, 2_500_000)
         .unwrap()
         .unwrap();
     let mut forged = credit;
@@ -103,7 +104,7 @@ fn first_failure_is_not_overwritten_by_a_later_generation() {
             ..layout()
         };
         let credit = scheduler
-            .reserve_control(1, context, 10_000_000, 2_500_000)
+            .reserve_control(0, context, 10_000_000, 2_500_000)
             .unwrap()
             .unwrap();
         let actual = 2_500_000 + generation;

@@ -246,9 +246,16 @@ fn devices_variant(count: usize, disabled: bool, nested: bool, irq: u32, variant
         property(&mut s, &mut strings, b"#address-cells", &2u32.to_be_bytes());
         property(&mut s, &mut strings, b"#size-cells", &2u32.to_be_bytes());
         let addr = if variant == 3 { 0x40001000 } else { 0x09000000 };
-        resource(&mut s, &mut strings, b"memory@reserved", b"", &[addr,0x1000], &[]);
-        w(&mut s,2);
-        w(&mut s,2);
+        resource(
+            &mut s,
+            &mut strings,
+            b"memory@reserved",
+            b"",
+            &[addr, 0x1000],
+            &[],
+        );
+        w(&mut s, 2);
+        w(&mut s, 2);
     }
     if nested {
         begin(&mut s, b"bus");
@@ -263,11 +270,14 @@ fn devices_variant(count: usize, disabled: bool, nested: bool, irq: u32, variant
             &[0, irq, 1],
         );
         if variant == 1 {
-            let data: Vec<u8> = [0u32, irq + 1, 1].iter().flat_map(|v|v.to_be_bytes()).collect();
-            property(&mut s,&mut strings,b"interrupts",&data);
+            let data: Vec<u8> = [0u32, irq + 1, 1]
+                .iter()
+                .flat_map(|v| v.to_be_bytes())
+                .collect();
+            property(&mut s, &mut strings, b"interrupts", &data);
         }
         if variant == 2 {
-            property(&mut s,&mut strings,b"interrupts-extended",&[0;16]);
+            property(&mut s, &mut strings, b"interrupts-extended", &[0; 16]);
         }
         if disabled {
             property(&mut s, &mut strings, b"status", b"disabled\0");
@@ -449,14 +459,23 @@ fn smp_parser_every_truncation_fails_without_panic() {
 
 #[test]
 fn duplicate_or_unsupported_extended_irq_property_cannot_override_route() {
-    assert_eq!(parse_fdt(&devices_variant(1,false,false,16,1)),Err(FdtError::Structure));
-    assert_eq!(parse_fdt(&devices_variant(1,false,false,16,2)),Err(FdtError::Unsupported));
+    assert_eq!(
+        parse_fdt(&devices_variant(1, false, false, 16, 1)),
+        Err(FdtError::Structure)
+    );
+    assert_eq!(
+        parse_fdt(&devices_variant(1, false, false, 16, 2)),
+        Err(FdtError::Unsupported)
+    );
 }
 #[test]
 fn reserved_memory_name_cannot_reintroduce_reserved_pages_as_ram_or_mmio() {
-    let info=parse_fdt(&devices_variant(0,false,false,16,3)).unwrap();
-    assert_eq!(info.ram_count,1);
-    assert_eq!(info.reserved_count,1);
-    assert_eq!(info.reserved[0].start.0,0x40001000);
-    assert_eq!(parse_fdt(&devices_variant(0,false,false,16,4)),Err(FdtError::Overlap));
+    let info = parse_fdt(&devices_variant(0, false, false, 16, 3)).unwrap();
+    assert_eq!(info.ram_count, 1);
+    assert_eq!(info.reserved_count, 1);
+    assert_eq!(info.reserved[0].start.0, 0x40001000);
+    assert_eq!(
+        parse_fdt(&devices_variant(0, false, false, 16, 4)),
+        Err(FdtError::Overlap)
+    );
 }

@@ -763,85 +763,106 @@ fn audit_stale_timestamp_cannot_suppress_fault_containment() {
 #[test]
 fn v0199_cpu0_manager_authenticates_only_control_core_and_never_scales() {
     use cyxia_kernel_core::control_plane::cpu0_v0199 as topology;
-    let mut l=limits();
-    l.min_business_capacity=300;
-    l.committed_business_capacity=300;
-    l.protected_control=topology::CONTROL_MASK;
-    l.protected_business=topology::BUSINESS_MASK;
-    let owner=Ownership::<4>::new_v0199_cpu0(
-        0b1111,[100;4],[1,2,4,8],l
-    ).unwrap();
-    assert_eq!(owner.snapshot().business,0b1110);
-    assert!(Manager::new_fixed(
-        Ownership::<4>::new_fixed(0b1111,[100;4],[1,2,4,8],limits()).unwrap(),
-        id(10),epochs(),limits(),[env().limits;16]
-    ).is_ok());
-    let mut m=Manager::new_v0199_cpu0(
-        owner,id(10),epochs(),l,[env().limits;16]
-    ).unwrap();
-    let plan=Request::Policy(plan()).encode();
-    assert_eq!(m.submit(id(10),1,plan,10),Err(Error::Denied));
-    assert_eq!(m.submit(id(11),0,plan,10),Err(Error::Denied));
-    assert!(m.submit(id(10),0,plan,10).is_ok());
-    let old=m.snapshot();
-    let scale=Request::Scale {
-        epochs:m.epochs(),
-        proposal:ScaleProposal {
-            generation:m.epochs().cores,
-            resource_epoch:1,sequence:1,
-            desired_control:0b0010,deadline:100,
+    let mut l = limits();
+    l.min_business_capacity = 300;
+    l.committed_business_capacity = 300;
+    l.protected_control = topology::CONTROL_MASK;
+    l.protected_business = topology::BUSINESS_MASK;
+    let owner = Ownership::<4>::new_v0199_cpu0(0b1111, [100; 4], [1, 2, 4, 8], l).unwrap();
+    assert_eq!(owner.snapshot().business, 0b1110);
+    assert!(
+        Manager::new_fixed(
+            Ownership::<4>::new_fixed(0b1111, [100; 4], [1, 2, 4, 8], limits()).unwrap(),
+            id(10),
+            epochs(),
+            limits(),
+            [env().limits; 16]
+        )
+        .is_ok()
+    );
+    let mut m = Manager::new_v0199_cpu0(owner, id(10), epochs(), l, [env().limits; 16]).unwrap();
+    let plan = Request::Policy(plan()).encode();
+    assert_eq!(m.submit(id(10), 1, plan, 10), Err(Error::Denied));
+    assert_eq!(m.submit(id(11), 0, plan, 10), Err(Error::Denied));
+    assert!(m.submit(id(10), 0, plan, 10).is_ok());
+    let old = m.snapshot();
+    let scale = Request::Scale {
+        epochs: m.epochs(),
+        proposal: ScaleProposal {
+            generation: m.epochs().cores,
+            resource_epoch: 1,
+            sequence: 1,
+            desired_control: 0b0010,
+            deadline: 100,
         },
     };
-    assert_eq!(m.submit(id(10),0,scale.encode(),11),Err(Error::Denied));
-    assert_eq!(m.snapshot(),old);
+    assert_eq!(m.submit(id(10), 0, scale.encode(), 11), Err(Error::Denied));
+    assert_eq!(m.snapshot(), old);
 }
 #[test]
-fn v019_manager_rejects_control_scaling_and_keeps_business_ownership() {
+fn v020_manager_rejects_control_scaling_and_keeps_business_ownership() {
     use cyxia_kernel_core::control_plane::fixed::CONTROL_MASK;
-    let ownership=Ownership::<4>::new_fixed(15,[100;4],[1,2,4,8],limits()).unwrap();
-    assert_eq!(ownership.snapshot().control,CONTROL_MASK);
-    assert_eq!(ownership.snapshot().business,15 & !CONTROL_MASK);
-    let mut m=Manager::new_fixed(ownership,id(10),epochs(),limits(),[env().limits;16]).unwrap();
-    let before=m.snapshot();
-    for target in [1,3,6,15] {
-        let scale=Request::Scale {
-            epochs:m.epochs(),
+    let ownership = Ownership::<4>::new_fixed(15, [100; 4], [1, 2, 4, 8], limits()).unwrap();
+    assert_eq!(ownership.snapshot().control, CONTROL_MASK);
+    assert_eq!(ownership.snapshot().business, 15 & !CONTROL_MASK);
+    let mut m =
+        Manager::new_fixed(ownership, id(10), epochs(), limits(), [env().limits; 16]).unwrap();
+    let before = m.snapshot();
+    for target in [1, 3, 6, 15] {
+        let scale = Request::Scale {
+            epochs: m.epochs(),
             proposal: ScaleProposal {
-                generation:m.epochs().cores,
-                resource_epoch:1,
-                sequence:1,
-                desired_control:target,
-                deadline:100,
-            }
+                generation: m.epochs().cores,
+                resource_epoch: 1,
+                sequence: 1,
+                desired_control: target,
+                deadline: 100,
+            },
         };
-        assert_eq!(m.submit(id(10),1,scale.encode(),10),Err(Error::Denied));
-        assert_eq!(m.snapshot(),before);
+        // CPU0 is the fixed control core; even it cannot scale the topology.
+        assert_eq!(m.submit(id(10), 0, scale.encode(), 10), Err(Error::Denied));
+        assert_eq!(m.snapshot(), before);
     }
-    assert!(!m.snapshot().permits(2,Plane::Control));
-    assert!(m.snapshot().permits(2,Plane::Business));
+    assert!(!m.snapshot().permits(2, Plane::Control));
+    assert!(m.snapshot().permits(2, Plane::Business));
 }
 #[test]
-fn v019_two_brains_are_only_auxiliary_to_trusted_fixed_control_manager() {
+fn v020_two_brains_are_only_auxiliary_to_trusted_fixed_control_manager() {
     use cyxia_kernel_core::control_plane::{
-        advisory::{Advice,Controller,Rule},
-        fixed::{Brain,ChoiceSource,Pair},
+        advisory::{Advice, Controller, Rule},
+        fixed::{Brain, ChoiceSource, Pair},
     };
-    let ownership=Ownership::<4>::new_fixed(15,[100;4],[1,2,4,8],limits()).unwrap();
-    let m=Manager::new_fixed(ownership,id(10),epochs(),limits(),[env().limits;16]).unwrap();
-    let mut pair=Pair::new(id(100),id(200)).unwrap();
-    let advice=|candidate| Advice {
-        epochs:m.epochs(), model_generation:m.epochs().model,
-        domain:1,target:id(20),candidate,snapshot_ns:8,expires_ns:20,
+    let ownership = Ownership::<4>::new_fixed(15, [100; 4], [1, 2, 4, 8], limits()).unwrap();
+    let m = Manager::new_fixed(ownership, id(10), epochs(), limits(), [env().limits; 16]).unwrap();
+    let mut pair = Pair::new(id(100), id(200)).unwrap();
+    let advice = |candidate| Advice {
+        epochs: m.epochs(),
+        model_generation: m.epochs().model,
+        domain: 1,
+        target: id(20),
+        candidate,
+        snapshot_ns: 8,
+        expires_ns: 20,
     };
-    let rules=Controller::new([Rule{baseline:2,options:&[1,2,4]};15]).unwrap();
-    let no_ai=m.review_brains(&pair,&rules,1,id(20),10).unwrap();
-    assert_eq!(no_ai.source,ChoiceSource::Baseline);
-    pair.submit(Brain::Operations,id(100),1,advice(4)).unwrap();
+    let rules = Controller::new(
+        [Rule {
+            baseline: 2,
+            options: &[1, 2, 4],
+        }; 15],
+    )
+    .unwrap();
+    let no_ai = m.review_brains(&pair, &rules, 1, id(20), 10).unwrap();
+    assert_eq!(no_ai.source, ChoiceSource::Baseline);
+    pair.submit(Brain::Operations, id(100), 1, advice(4))
+        .unwrap();
     // Security findings do not have an Action-voting path.
-    assert_eq!(pair.submit(Brain::Security,id(200),1,advice(1)),Err(Error::Denied));
-    let reviewed=m.review_brains(&pair,&rules,1,id(20),10).unwrap();
-    assert_eq!(reviewed.source,ChoiceSource::OperationsAdvice);
-    assert_eq!(reviewed.candidate,4);
-    assert_eq!(m.snapshot().control,2);
-    assert_eq!(m.epochs(),epochs());
+    assert_eq!(
+        pair.submit(Brain::Security, id(200), 1, advice(1)),
+        Err(Error::Denied)
+    );
+    let reviewed = m.review_brains(&pair, &rules, 1, id(20), 10).unwrap();
+    assert_eq!(reviewed.source, ChoiceSource::OperationsAdvice);
+    assert_eq!(reviewed.candidate, 4);
+    assert_eq!(m.snapshot().control, 1);
+    assert_eq!(m.epochs(), epochs());
 }

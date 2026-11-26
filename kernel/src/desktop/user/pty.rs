@@ -20,18 +20,15 @@ fn observe_with<T>(f: impl FnOnce(&mut Ptys) -> Result<T, Errno>) -> Result<T, E
     // reference may escape the callback, and IRQ handlers do not touch PTYS.
     let pool = unsafe { &mut *core::ptr::addr_of_mut!(PTYS) };
     let result = f(pool);
-    super::objects::table().observe_backend(
-        cyxia_posix::epoll::Backend::Pty,
-        |source| {
-            let cyxia_posix::epoll::Source::Pty { owner, handle } = source else {
-                return None;
-            };
-            Some((
-                u32::from(pool.poll(owner, handle).ok()?),
-                pool.wake_mask(owner, handle).unwrap_or(0),
-            ))
-        },
-    );
+    super::objects::table().observe_backend(cyxia_posix::epoll::Backend::Pty, |source| {
+        let cyxia_posix::epoll::Source::Pty { owner, handle } = source else {
+            return None;
+        };
+        Some((
+            u32::from(pool.poll(owner, handle).ok()?),
+            pool.wake_mask(owner, handle).unwrap_or(0),
+        ))
+    });
     pool.clear_wakes();
     result
 }

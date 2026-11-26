@@ -39,18 +39,30 @@ pub struct OutputQueue<const N: usize> {
 impl<const N: usize> OutputQueue<N> {
     pub const fn new() -> Self {
         assert!(N > 0);
-        Self { bytes: [0; N], head: 0, len: 0 }
+        Self {
+            bytes: [0; N],
+            head: 0,
+            len: 0,
+        }
     }
-    pub fn pending(&self) -> usize { self.len }
+    pub fn pending(&self) -> usize {
+        self.len
+    }
     pub fn enqueue(&mut self, bytes: &[u8]) -> Result<(), PlatformError> {
-        if bytes.len() > N - self.len { return Err(PlatformError::Again); }
+        if bytes.len() > N - self.len {
+            return Err(PlatformError::Again);
+        }
         for &byte in bytes {
             self.bytes[(self.head + self.len) % N] = byte;
             self.len += 1;
         }
         Ok(())
     }
-    pub fn drain(&mut self, console: &mut impl ConsoleOps, budget: usize) -> Result<usize, PlatformError> {
+    pub fn drain(
+        &mut self,
+        console: &mut impl ConsoleOps,
+        budget: usize,
+    ) -> Result<usize, PlatformError> {
         let mut done = 0;
         while self.len != 0 && done < budget {
             let count = self.len.min(N - self.head).min(budget - done).min(64);
@@ -95,24 +107,35 @@ mod tests {
     }
     #[test]
     fn queued_stream_keeps_partial_tail_across_again_and_wrap_without_duplication() {
-        struct Short { calls: usize, bytes: std::vec::Vec<u8> }
+        struct Short {
+            calls: usize,
+            bytes: std::vec::Vec<u8>,
+        }
         impl ConsoleOps for Short {
             fn try_write(&mut self, data: &[u8]) -> Result<usize, PlatformError> {
                 self.calls += 1;
-                if self.calls % 3 == 0 { return Err(PlatformError::Again); }
+                if self.calls % 3 == 0 {
+                    return Err(PlatformError::Again);
+                }
                 let n = data.len().min(3);
-                self.bytes.extend_from_slice(&data[..n]); Ok(n)
+                self.bytes.extend_from_slice(&data[..n]);
+                Ok(n)
             }
         }
         let mut queue = OutputQueue::<16>::new();
-        let mut c = Short { calls: 0, bytes: std::vec::Vec::new() };
+        let mut c = Short {
+            calls: 0,
+            bytes: std::vec::Vec::new(),
+        };
         queue.enqueue(b"abcdefghij").unwrap();
         assert_eq!(queue.drain(&mut c, 5), Ok(5));
         assert_eq!(queue.pending(), 5);
         assert_eq!(queue.enqueue(b"012345678901"), Err(PlatformError::Again));
         assert_eq!(queue.pending(), 5);
         queue.enqueue(b"klmnopqrst").unwrap();
-        for _ in 0..32 { queue.drain(&mut c, 4).unwrap(); }
+        for _ in 0..32 {
+            queue.drain(&mut c, 4).unwrap();
+        }
         assert_eq!(queue.pending(), 0);
         assert_eq!(c.bytes, b"abcdefghijklmnopqrst");
     }
@@ -120,7 +143,9 @@ mod tests {
     fn queued_stream_zero_budget_and_zero_progress_do_not_consume_data() {
         struct Busy;
         impl ConsoleOps for Busy {
-            fn try_write(&mut self, _: &[u8]) -> Result<usize, PlatformError> { Ok(0) }
+            fn try_write(&mut self, _: &[u8]) -> Result<usize, PlatformError> {
+                Ok(0)
+            }
         }
         let mut queue = OutputQueue::<4>::new();
         queue.enqueue(b"full").unwrap();

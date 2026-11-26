@@ -138,8 +138,10 @@ fn schemas() -> Schemas {
     Schemas {
         feature: SchemaBinding {
             version: 13,
-            hash: Sha256::digest(include_bytes!("../../../../../crates/prototype/src/features.rs"))
-                .into(),
+            hash: Sha256::digest(include_bytes!(
+                "../../../../../crates/prototype/src/features.rs"
+            ))
+            .into(),
         },
         action: SchemaBinding {
             version: 13,

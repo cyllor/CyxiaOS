@@ -107,6 +107,8 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 
 六专项后续接线必须复用 V0.19 固定角色：CPU1 是唯一 AI 控制核（CPU0 仅为确定性 EL1 机制 broker），两个逻辑隔离的建议邮箱无执行权、不参与资源栅栏的签发。业务内核/IRQ/TLB/DMA/文件事务安全拒绝不能由运营或安全 AI 消除。模型建议不触发 CoreSet 伸缩/跨核接管。双 EL0 推理进程实际隔离、并行调度以及 AArch64 QEMU 证明仍缺失，G2/G3/G4 状态不因契约测试通过而升级。
 
+（2026-11-25 口径澄清：本节记录的是 V0.19 遗留接线基线。V0.19.9/V0.20 设计已固定 C={CPU0}、B={CPU1–3}；六专项后续原生接线在拓扑切换后必须以 control_plane/cpu0_v0199 契约为准，源码守卫 test_v19_native_security_source.py 的 CPU1 钉扎须随切换同步更新。）
+
 ### G2 SEC-N 活动连接/来源额度加固（固定控制核之后）
 
 - `cyxia-kernel-core::security::network::RateLimiter` 按受保护网络端点来源记录活动会话占用；以前泛化的 `close_active()` 改成 `close_active_from(ip)`，拒绝错误来源、重复关闭，防止攻击连接错误归还另一来源的活动 credit。
@@ -122,7 +124,7 @@ cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots
 - 断链/服务重启调用 `begin_drain` 或 `begin_restart` 时保留原 token 和 credit。只有可信本机适配器在**实际** TCP/TLS 输出、VirtIO 描述符、DMA pin 与完成对账后才能调用 `finish_drain`。该函数本身不是硬件证明，测试用例模拟这一外部前提；重启不会自动清空信用账本或重置源限流。
 - 新增票据代际、pending/来源容量、服务重启与 TLS 真握手后 Echo、来源重放及 17 号活动连接拒绝的主机负向测试。**仍缺实际 AArch64 EL0 单机网络服务使用此 ledger 的构造/消亡适配，以及 SEC-N07 密钥/遥测实测与 SEC-N08 QEMU 网络丢包/断链故障注入。** G2/G3/G4 原生证据不升级。
 
-生产级接线门槛：`security::network::RateLimiter` 是此前独立的主机契约模型，`net-transport::admission::Admission` 是本轮与真实 TLS Session 绑定的建议迁移实现。**不可在同一条生产连接上同时使用两套额度计账**；必须在原生网络服务迁移时指定唯一权威账本、对齐旧连接代际，并以真实 TX/DMA 完成证据管理 `finish_drain`。在完成该单点接线前，不得声称 SEC-N G2 原生完成。
+生产级接线门槛：`security::network::RateLimiter` 是此前独立的主机契约模型，`net-transport::admission::Admission` 是本轮与真实 TLS Session 绑定的建议迁移实现。**不可在同一条生产连接上同时使用两套额度计账**；必须在原生网络服务迁移时指定唯一权威账本、对齐旧连接代际，并以真实 TX/DMA 完成证据管理 `finish_drain`。在完成该单点接线前，不得声称 SEC-N G2 原生完成。2026-11-25 记录：权威账本已指定为 `net-transport::admission::Admission`（代码文档+源码守卫钉扎）；`RateLimiter` 保留为遗留宿主契约模型；原生部署接线仍未完成，G2/G3/G4 不升级。
 
 ### G2 五项受保护机制额外负向约束（本轮）
 

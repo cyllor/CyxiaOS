@@ -102,33 +102,36 @@ fn read_only_optional_projection_cannot_settle_debits_or_clear_overruns() {
 
 #[test]
 fn optional_completion_settles_independent_cpu_counter_and_rejects_wall_reversal() {
-    let mut b=BackgroundBudgets::new();
-    b.register(key(),100,0,100).unwrap();
-    let debit=b.reserve(key(),10,100).unwrap();
-    assert_eq!(b.complete(debit,9,99),Err(Error::Range));
-    assert_eq!(b.status(key()).unwrap().reserved_ns,10);
-    b.complete(debit,9,101).unwrap();
-    assert_eq!(b.status(key()).unwrap().spent_ns,9);
-    assert_eq!(b.status(key()).unwrap().reserved_ns,0);
-    assert_eq!(b.reserve(key(),1,100),Err(Error::Range));
-    assert_eq!(b.peek_status(key(),100),Err(Error::Range));
-    let over=b.reserve(key(),5,102).unwrap();
-    assert_eq!(b.complete(over,6,103),Err(Error::Budget));
-    assert_eq!(b.status(key()).unwrap().reserved_ns,0);
+    let mut b = BackgroundBudgets::new();
+    b.register(key(), 100, 0, 100).unwrap();
+    let debit = b.reserve(key(), 10, 100).unwrap();
+    assert_eq!(b.complete(debit, 9, 99), Err(Error::Range));
+    assert_eq!(b.status(key()).unwrap().reserved_ns, 10);
+    b.complete(debit, 9, 101).unwrap();
+    assert_eq!(b.status(key()).unwrap().spent_ns, 9);
+    assert_eq!(b.status(key()).unwrap().reserved_ns, 0);
+    assert_eq!(b.reserve(key(), 1, 100), Err(Error::Range));
+    assert_eq!(b.peek_status(key(), 100), Err(Error::Range));
+    let over = b.reserve(key(), 5, 102).unwrap();
+    assert_eq!(b.complete(over, 6, 103), Err(Error::Budget));
+    assert_eq!(b.status(key()).unwrap().reserved_ns, 0);
     assert!(b.status(key()).unwrap().overrun);
 }
 #[test]
 fn optional_late_receipt_carry_is_window_bound_and_order_independent() {
-    let mut b=BackgroundBudgets::new();
-    b.register(key(),100,0,0).unwrap();
-    let early=b.reserve(key(),1_000_000,0).unwrap();
-    let later=b.reserve(key(),2_000_000,1).unwrap();
-    b.complete(later,2_000_000,2*WINDOW_NS+1).unwrap();
-    b.complete(early,1_000_000,WINDOW_NS+1).unwrap();
-    assert_eq!(b.peek_status(key(),2*WINDOW_NS+1).unwrap().spent_ns,2_000_000);
-    assert_eq!(b.peek_status(key(),3*WINDOW_NS).unwrap().spent_ns,0);
-    assert_eq!(b.current_status(key(),3*WINDOW_NS).unwrap().spent_ns,0);
-    assert_eq!(b.reserve(key(),1,2*WINDOW_NS+1),Err(Error::Range));
+    let mut b = BackgroundBudgets::new();
+    b.register(key(), 100, 0, 0).unwrap();
+    let early = b.reserve(key(), 1_000_000, 0).unwrap();
+    let later = b.reserve(key(), 2_000_000, 1).unwrap();
+    b.complete(later, 2_000_000, 2 * WINDOW_NS + 1).unwrap();
+    b.complete(early, 1_000_000, WINDOW_NS + 1).unwrap();
+    assert_eq!(
+        b.peek_status(key(), 2 * WINDOW_NS + 1).unwrap().spent_ns,
+        2_000_000
+    );
+    assert_eq!(b.peek_status(key(), 3 * WINDOW_NS).unwrap().spent_ns, 0);
+    assert_eq!(b.current_status(key(), 3 * WINDOW_NS).unwrap().spent_ns, 0);
+    assert_eq!(b.reserve(key(), 1, 2 * WINDOW_NS + 1), Err(Error::Range));
 }
 
 #[derive(Default)]
@@ -194,19 +197,36 @@ fn recovery_unknown_start_is_queried_not_repeated() {
 
 #[test]
 fn recovery_failed_observation_keeps_issued_start_owned_and_rejects_clock_rewind() {
-    let mut supervisor=RecoverySupervisor::new();
-    supervisor.register(key(),1).unwrap();
-    let mut backend=Service{running_error:Some(Error::Auth),..Service::default()};
-    supervisor.begin(apply(1),1,0).unwrap();
-    for now in 1..=6 {supervisor.poll(apply(1),now,&mut backend).unwrap();}
-    assert_eq!(supervisor.query(apply(1)).unwrap().state,ExecutionState::Unknown);
-    assert_eq!(backend.starts,1);
-    assert_eq!(supervisor.poll(apply(1),5,&mut backend),Err(Error::Range));
-    assert_eq!(supervisor.begin(apply(2),1,1_000_000_001),Err(Error::Busy));
-    assert_eq!(supervisor.recover_stopped(key()),Err(Error::Busy));
-    backend.running_error=None;
-    assert_eq!(supervisor.poll(apply(1),7,&mut backend).unwrap().state,ExecutionState::Applied);
-    assert_eq!(backend.starts,1);
+    let mut supervisor = RecoverySupervisor::new();
+    supervisor.register(key(), 1).unwrap();
+    let mut backend = Service {
+        running_error: Some(Error::Auth),
+        ..Service::default()
+    };
+    supervisor.begin(apply(1), 1, 0).unwrap();
+    for now in 1..=6 {
+        supervisor.poll(apply(1), now, &mut backend).unwrap();
+    }
+    assert_eq!(
+        supervisor.query(apply(1)).unwrap().state,
+        ExecutionState::Unknown
+    );
+    assert_eq!(backend.starts, 1);
+    assert_eq!(
+        supervisor.poll(apply(1), 5, &mut backend),
+        Err(Error::Range)
+    );
+    assert_eq!(
+        supervisor.begin(apply(2), 1, 1_000_000_001),
+        Err(Error::Busy)
+    );
+    assert_eq!(supervisor.recover_stopped(key()), Err(Error::Busy));
+    backend.running_error = None;
+    assert_eq!(
+        supervisor.poll(apply(1), 7, &mut backend).unwrap().state,
+        ExecutionState::Applied
+    );
+    assert_eq!(backend.starts, 1);
 }
 
 #[test]
@@ -300,7 +320,6 @@ fn audit_storage_is_independent_and_uncertain_serial_is_not_retried() {
     assert_eq!(p.audit_read(&mut bytes), 0);
 }
 
-
 #[test]
 fn console_accepted_prefix_remains_accounted_when_clock_or_retry_fails() {
     struct Script {
@@ -310,30 +329,45 @@ fn console_accepted_prefix_remains_accounted_when_clock_or_retry_fails() {
         accepted: Vec<u8>,
     }
     impl ConsoleHardware for Script {
-        fn try_write(&mut self, byte:u8)->Result<bool,Error>{
-            if self.accepted.is_empty(){
-                self.accepted.push(byte);Ok(true)
-            }else{Ok(false)}
+        fn try_write(&mut self, byte: u8) -> Result<bool, Error> {
+            if self.accepted.is_empty() {
+                self.accepted.push(byte);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         }
-        fn now_ns(&mut self)->u64{
-            self.reads+=1;
-            if self.reads==1{self.start}else{self.end}
+        fn now_ns(&mut self) -> u64 {
+            self.reads += 1;
+            if self.reads == 1 {
+                self.start
+            } else {
+                self.end
+            }
         }
     }
-    for (start,end,expected) in [(10,9,Error::Range),(u64::MAX-10,u64::MAX,Error::Overflow)]{
-        let mut p=ConsolePump::new();
-        p.enqueue(b"ab",0).unwrap();
-        let mut hw=Script{start,end,reads:0,accepted:vec![]};
-        assert_eq!(p.pump(0,&mut hw),Err(expected));
-        assert_eq!(hw.accepted,b"a");
-        assert_eq!(p.written,1);
-        assert_eq!(p.queued(),1);
+    for (start, end, expected) in [
+        (10, 9, Error::Range),
+        (u64::MAX - 10, u64::MAX, Error::Overflow),
+    ] {
+        let mut p = ConsolePump::new();
+        p.enqueue(b"ab", 0).unwrap();
+        let mut hw = Script {
+            start,
+            end,
+            reads: 0,
+            accepted: vec![],
+        };
+        assert_eq!(p.pump(0, &mut hw), Err(expected));
+        assert_eq!(hw.accepted, b"a");
+        assert_eq!(p.written, 1);
+        assert_eq!(p.queued(), 1);
         assert!(p.poisoned());
-        assert_eq!(p.pump(0,&mut hw),Err(Error::Io));
-        assert_eq!(hw.accepted,b"a");
+        assert_eq!(p.pump(0, &mut hw), Err(Error::Io));
+        assert_eq!(hw.accepted, b"a");
         p.audit_enqueue(b"fault").unwrap();
-        let mut audit=[0;5];
-        assert_eq!(p.audit_read(&mut audit),5);
-        assert_eq!(&audit,b"fault");
+        let mut audit = [0; 5];
+        assert_eq!(p.audit_read(&mut audit), 5);
+        assert_eq!(&audit, b"fault");
     }
 }

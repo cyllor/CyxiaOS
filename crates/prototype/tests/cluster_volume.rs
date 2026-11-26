@@ -1,7 +1,7 @@
 use cyxia_prototype::{
     boot::BootSession,
-    cluster::volume::{Cursor, Volume, VolumeScratch},
     journal::{self, BlockDevice, Journal},
+    local_volume::{Cursor, Volume, VolumeScratch},
     storage::TOTAL_BLOCKS,
 };
 use std::collections::BTreeMap;

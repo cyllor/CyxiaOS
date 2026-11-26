@@ -186,10 +186,12 @@ impl Process<'_> {
         if slot.state != State::Inflight {
             return Err(Errno::Badf);
         }
-        let count = slot
-            .count
-            .min(limit)
-            .min(self.fds[..self.fd_limit()].iter().filter(|f| f.is_none()).count());
+        let count = slot.count.min(limit).min(
+            self.fds[..self.fd_limit()]
+                .iter()
+                .filter(|f| f.is_none())
+                .count(),
+        );
         let mut out = Received {
             fds: [-1; MAX_RIGHTS],
             count,

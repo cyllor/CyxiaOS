@@ -10,31 +10,44 @@ pub enum IrqAck {
 /// concurrently. No logical CPU index is interpreted as a hardware bit.
 pub struct CpuTargets(core::sync::atomic::AtomicU64);
 impl Default for CpuTargets {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl CpuTargets {
-    pub const fn new() -> Self { Self(core::sync::atomic::AtomicU64::new(0)) }
+    pub const fn new() -> Self {
+        Self(core::sync::atomic::AtomicU64::new(0))
+    }
     pub fn target(&self, slot: usize) -> Option<u8> {
-        if slot >= 8 { return None; }
+        if slot >= 8 {
+            return None;
+        }
         let bits = self.0.load(core::sync::atomic::Ordering::Acquire);
         let target = (bits >> (slot * 8)) as u8;
         (target.count_ones() == 1).then_some(target)
     }
     pub fn register(&self, slot: usize, target: u8) -> Result<(), PlatformError> {
         use core::sync::atomic::Ordering;
-        if slot >= 8 || target.count_ones() != 1 { return Err(PlatformError::Invalid); }
+        if slot >= 8 || target.count_ones() != 1 {
+            return Err(PlatformError::Invalid);
+        }
         let shift = slot * 8;
         let mut old = self.0.load(Ordering::Acquire);
         loop {
             let existing = (old >> shift) as u8;
-            if existing == target { return Ok(()); }
+            if existing == target {
+                return Ok(());
+            }
             if existing != 0 || (0..8).any(|other| (old >> (other * 8)) as u8 == target) {
                 return Err(PlatformError::Invalid);
             }
             let next = old | (u64::from(target) << shift);
             // Strong CAS: each failure observes a real competing registration;
             // at most eight slots can ever be assigned. No global spinlock.
-            match self.0.compare_exchange(old, next, Ordering::AcqRel, Ordering::Acquire) {
+            match self
+                .0
+                .compare_exchange(old, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return Ok(()),
                 Err(current) => old = current,
             }
@@ -107,7 +120,11 @@ impl Gic {
         if id >= self.lines {
             return Err(PlatformError::Invalid);
         }
-        let target = if id >= 32 { Some(self.local_target_mask()?) } else { None };
+        let target = if id >= 32 {
+            Some(self.local_target_mask()?)
+        } else {
+            None
+        };
         unsafe {
             core::ptr::write_volatile((self.dist + 0x400 + id as usize) as *mut u8, 0xa0);
             if let Some(mask) = target {
@@ -162,7 +179,9 @@ impl Gic {
     /// Historical explicit target-bit-index adapter. New topology-aware
     /// callers must use the hardware-registered target mask instead.
     pub fn route_masked_spi(&self, id: u32, cpu: u16) -> Result<(), PlatformError> {
-        if cpu >= 8 { return Err(PlatformError::Unsupported); }
+        if cpu >= 8 {
+            return Err(PlatformError::Unsupported);
+        }
         self.route_masked_spi_target(id, 1u8 << cpu)
     }
     pub fn route_masked_spi_target(&self, id: u32, mask: u8) -> Result<(), PlatformError> {

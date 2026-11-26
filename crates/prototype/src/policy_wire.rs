@@ -138,6 +138,9 @@ pub fn encode_payload(action: Action, index: u16, out: &mut [u8]) -> Result<usiz
     }
     Ok(n)
 }
+/// Decode one action payload. Domain 16 (legacy remote OfferCpu/Placement)
+/// is rejected by default; the compat decode arms exist only behind the
+/// `legacy-d16-decode` feature for offline evidence and old-media inspection.
 pub fn decode_payload(domain: u16, kind: u16, b: &[u8]) -> Result<(Action, u16), Error> {
     let index = u16_at(b, 0)?;
     if index >= 32 {
@@ -169,7 +172,9 @@ pub fn decode_payload(domain: u16, kind: u16, b: &[u8]) -> Result<(Action, u16),
         (13, 1) => Action::BackgroundBudget(u16_at(b, 2)?),
         (14, 1) => Action::RecoveryRecipe(u16_at(b, 2)?),
         (15, 1) => Action::ConsoleBatch(u16_at(b, 2)?),
+        #[cfg(feature = "legacy-d16-decode")]
         (16, 1) => Action::OfferCpu(u16_at(b, 2)?),
+        #[cfg(feature = "legacy-d16-decode")]
         (16, 2) => Action::Placement(u16_at(b, 2)?),
         _ => return Err(Error::Unsupported),
     };

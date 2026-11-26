@@ -1,6 +1,9 @@
 use cyxia_arch_x86_64::{
     code_permissions::{Phase, PhaseTable},
-    space::{AddressSpace, Error, KernelMappings, RUNTIME_RAM_BYTES, SpaceId, TableArena, UserPermissions},
+    space::{
+        AddressSpace, Error, KernelMappings, RUNTIME_RAM_BYTES, SpaceId, TableArena,
+        UserPermissions,
+    },
 };
 
 #[repr(C, align(4096))]
@@ -14,13 +17,21 @@ fn one_gib_window_covers_its_last_page_and_rejects_the_next() {
     let mut space = unsafe {
         AddressSpace::new(
             TableArena::from_raw(tables.0.as_mut_ptr(), 0x200000, 8).unwrap(),
-            &kernel, SpaceId { id: 1, generation: 1 },
+            &kernel,
+            SpaceId {
+                id: 1,
+                generation: 1,
+            },
         )
-    }.unwrap();
+    }
+    .unwrap();
     let last = RUNTIME_RAM_BYTES - 4096;
     space.map(0x1000000, last, UserPermissions::RW).unwrap();
     assert_eq!(space.translate(0x1000017).unwrap().physical, last + 0x17);
-    assert_eq!(space.map(0x1001000, RUNTIME_RAM_BYTES, UserPermissions::RW), Err(Error::Address));
+    assert_eq!(
+        space.map(0x1001000, RUNTIME_RAM_BYTES, UserPermissions::RW),
+        Err(Error::Address)
+    );
     let upper = space.map(0x1002000, (1 << 30) + 4096, UserPermissions::RW);
     assert_eq!(upper, Err(Error::Address));
 }

@@ -29,7 +29,7 @@ pub const OP_TASK: u64 = 10;
 /// LOOKUP: exact custody key; reply state:u64, admitted:u64; returned arg0 token.
 /// INVENTORY: owner_boot:u64, requester:[u8;32], with 136-byte request capacity;
 /// reply key followed by LOOKUP reply.
-/// Key: owner_boot:u64, cluster:[u8;32], requester:[u8;32], contract:[u8;16], hash:[u8;32].
+/// Key: owner_boot:u64, legacy_remote_scope:[u8;32], requester:[u8;32], contract:[u8;16], hash:[u8;32].
 /// These read operations require the dedicated service and grant no START authority.
 pub const TASK_RESERVE_CUSTODY: u64 = 31;
 pub const TASK_LOOKUP_CUSTODY: u64 = 32;

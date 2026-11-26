@@ -140,7 +140,13 @@ impl OpenDescriptions {
         if !profile.is_within_build() {
             return Err(Errno::Inval);
         }
-        if self.inner.borrow().entries.iter().any(|e| e.generation != 0) {
+        if self
+            .inner
+            .borrow()
+            .entries
+            .iter()
+            .any(|e| e.generation != 0)
+        {
             return Err(Errno::Busy);
         }
         self.limits.set(profile);
@@ -379,13 +385,22 @@ mod tests {
         for generation in [1, 2, MAX_GENERATION] {
             for slot in 0..CAPACITY {
                 let identity = Handle { slot, generation }.identity();
-                assert!(!seen[..count].contains(&identity),
-                        "retry identity aliased slot {slot} generation {generation}");
+                assert!(
+                    !seen[..count].contains(&identity),
+                    "retry identity aliased slot {slot} generation {generation}"
+                );
                 seen[count] = identity;
                 count += 1;
             }
         }
-        assert_eq!(Handle { slot: 0, generation: 1 }.identity(), 1 << SLOT_BITS);
+        assert_eq!(
+            Handle {
+                slot: 0,
+                generation: 1
+            }
+            .identity(),
+            1 << SLOT_BITS
+        );
     }
     impl Console for Sink {
         fn write(&mut self, bytes: &[u8]) -> Result<usize, Errno> {

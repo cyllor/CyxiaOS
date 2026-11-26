@@ -26,6 +26,7 @@ struct Disk {
     cut: Option<Cut>,
     recovery_depth: usize,
     reject_ordinary: bool,
+    reject_recovery: bool,
 }
 impl Disk {
     fn before(&mut self) -> Result<(), Fault> {
@@ -101,7 +102,9 @@ impl BlockDevice for Disk {
         self.recovery_depth = 0;
     }
     fn transaction_begin(&mut self, _bytes: u64) -> Result<(), Fault> {
-        if self.reject_ordinary && self.recovery_depth == 0 {
+        if (self.reject_ordinary && self.recovery_depth == 0)
+            || (self.reject_recovery && self.recovery_depth != 0)
+        {
             Err(Fault::Cut)
         } else {
             Ok(())
@@ -1240,7 +1243,8 @@ fn neither_automatic_nor_manual_delete_can_remove_either_tiers_last_readable_roo
         assert_eq!(h.manager.active(key).unwrap().state, State::Active);
     }
     let replacement = h.periodic(PeriodicLayer::Short);
-    let deleted = h.manager
+    let deleted = h
+        .manager
         .delete(
             &mut h.journal,
             &mut h.disk,
@@ -1253,7 +1257,10 @@ fn neither_automatic_nor_manual_delete_can_remove_either_tiers_last_readable_roo
         )
         .unwrap();
     assert_eq!(deleted.state, RequestState::Done);
-    assert_eq!(h.manager.catalog.entries[short.snapshot_key.slot as usize].state, State::Deleting);
+    assert_eq!(
+        h.manager.catalog.entries[short.snapshot_key.slot as usize].state,
+        State::Deleting
+    );
     assert!(h.manager.active(replacement.snapshot_key).is_ok());
     assert!(h.manager.active(long.snapshot_key).is_ok());
     h.disk.crash();
@@ -1593,14 +1600,131 @@ fn periodic_delete_refuses_corrupt_surviving_image_and_retains_valid_root() {
         h.checkpoint();
         let home = descriptor_block(survivor.snapshot_key.slot as usize) + 1;
         h.disk.stable.get_mut(&home).unwrap()[17] ^= 1;
-        let request = h.request(if automatic {14} else {0}, if automatic {3} else {1}, 0);
-        assert_eq!(h.manager.delete(
-            &mut h.journal, &mut h.disk, &mut h.scratch, &mut h.tx,
-            request, old.snapshot_key, false, automatic
-        ), Err(Error::Status(Status::Corrupt)));
+        let request = h.request(
+            if automatic { 14 } else { 0 },
+            if automatic { 3 } else { 1 },
+            0,
+        );
+        assert_eq!(
+            h.manager.delete(
+                &mut h.journal,
+                &mut h.disk,
+                &mut h.scratch,
+                &mut h.tx,
+                request,
+                old.snapshot_key,
+                false,
+                automatic
+            ),
+            Err(Error::Status(Status::Corrupt))
+        );
         assert!(h.manager.active(old.snapshot_key).is_ok());
         assert!(h.manager.control.cleanup_freeze);
         assert_eq!(h.manager.control.business_write_gate, Gate::Frozen);
         assert_eq!(h.query(request.key), Err(Error::Status(Status::Stale)));
     }
+}
+
+#[test]
+fn retention_clock_regression_between_samples_and_after_anchor_reset_freezes_cleanup() {
+    for reset in [false, true] {
+        let mut h = Harness::new();
+        assert_eq!(h.advance(100 * SECOND_NS), 0);
+        assert_eq!(h.advance(140 * SECOND_NS), 0);
+        if reset {
+            let request = h.request(0, 1, 1);
+            h.create(request, 3600).unwrap();
+        }
+        assert_eq!(
+            h.manager.advance_age(
+                &mut h.journal,
+                &mut h.disk,
+                &mut h.scratch,
+                &mut h.tx,
+                130 * SECOND_NS
+            ),
+            Err(Error::Status(Status::Invalid))
+        );
+        assert_eq!(h.manager.control.online_age_ns, 0);
+        assert!(h.manager.control.cleanup_freeze);
+        assert_eq!(h.manager.control.business_write_gate, Gate::Frozen);
+        // A second lower sample must not replace the high-water.
+        assert_eq!(
+            h.manager.advance_age(
+                &mut h.journal,
+                &mut h.disk,
+                &mut h.scratch,
+                &mut h.tx,
+                139 * SECOND_NS
+            ),
+            Err(Error::Status(Status::Invalid))
+        );
+        h.disk.crash();
+        let mut recovered = Harness::mount(h.disk);
+        // A new boot legitimately starts a new clock origin, not a new
+        // durable retention age or an automatically open write gate.
+        assert_eq!(recovered.advance(0), 0);
+        assert!(recovered.manager.control.cleanup_freeze);
+    }
+}
+
+#[test]
+fn internal_fault_freeze_retries_rejected_durability_before_any_relaxation() {
+    let mut h = Harness::new();
+    h.bootstrap();
+    let opening = h.request(15, 1, 1);
+    let generation = h.manager.control.protection_generation;
+    h.manager
+        .open_writes(
+            &mut h.journal,
+            &mut h.disk,
+            &mut h.scratch,
+            &mut h.tx,
+            opening,
+            generation,
+            FileReqKey::ZERO,
+        )
+        .unwrap();
+    let generation = h.manager.control.protection_generation;
+    assert!(h.manager.writes_open());
+    h.disk.reject_recovery = true;
+    for _ in 0..2 {
+        assert_eq!(
+            h.manager
+                .fault_freeze(&mut h.journal, &mut h.disk, &mut h.scratch, &mut h.tx),
+            Err(Error::Journal(journal::Error::Io(Fault::Cut)))
+        );
+        assert!(h.journal.is_writable());
+        assert!(!h.manager.writes_open());
+        assert!(h.manager.control.cleanup_freeze);
+        assert_eq!(h.manager.control.protection_generation, generation);
+        assert_eq!(h.disk.recovery_depth, 0);
+    }
+    let relaxation = h.request(15, 2, 0);
+    assert_eq!(
+        h.manager.clear_freeze(
+            &mut h.journal,
+            &mut h.disk,
+            &mut h.scratch,
+            &mut h.tx,
+            relaxation,
+            generation
+        ),
+        Err(Error::Status(Status::Busy))
+    );
+    assert_eq!(h.query(opening.key).unwrap().state, RequestState::Done);
+    h.disk.reject_recovery = false;
+    // Maintenance retries the original protection intent, not a new
+    // relaxation or a fictitious age advance.
+    assert_eq!(h.advance(0), 0);
+    assert_eq!(h.manager.control.protection_generation, generation + 1);
+    h.manager
+        .fault_freeze(&mut h.journal, &mut h.disk, &mut h.scratch, &mut h.tx)
+        .unwrap();
+    assert_eq!(h.manager.control.protection_generation, generation + 1);
+    h.disk.crash();
+    let h = Harness::mount(h.disk);
+    assert!(h.manager.control.cleanup_freeze);
+    assert_eq!(h.manager.control.business_write_gate, Gate::Frozen);
+    assert_eq!(h.manager.control.protection_generation, generation + 1);
 }

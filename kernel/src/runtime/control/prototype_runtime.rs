@@ -1,8 +1,12 @@
-//! V0.19 fixed-CPU1 advisory runtime. Historical handoff state is inert.
+//! V0.20 fixed-CPU0 advisory runtime. Historical handoff state is inert.
 //!
-//! CPU1 owns the restartable EL0 model. CPU0 owns scheduling accounting; neither
-//! business CPU waits for inference. This profile has no native DMA/reference
-//! adapters in the standalone profile; unified mode registers actual stop producers.
+//! CPU0 is the sole control core (cpu0_v0199::CONTROL_CPU = 0). In the standalone
+//! profile CPU0 owns both the scheduling accounting and the restartable EL0
+//! advisory model; no business CPU waits for inference. CPU1-3 are business-only.
+//! This profile has no native DMA/reference adapters in the standalone profile;
+//! unified mode registers actual stop producers and keeps its historical bounded
+//! advisory EL0 fixtures on business CPUs while the CPU0 mechanism broker stays
+//! authoritative.
 //! Business programs are explicitly bounded CPU workloads, not desktop services.
 use super::*;
 #[path = "../../../../user/prototype-runtime/abi.rs"]
@@ -84,7 +88,8 @@ static mut OUTPUT: Page = Page::ZERO;
 #[cfg(not(feature = "unified-runtime"))]
 static mut STACK_PAGES: [Page; 8] = [const { Page::ZERO }; 8];
 static ENTRY: AtomicU64 = AtomicU64::new(0);
-// 0 idle; 1 request published; 2 owned by CPU1; 3 reply; 4 failure.
+// 0 idle; 1 request published; 2 owned by the advisory model worker (CPU0 in
+// the standalone fixed-CPU0 profile); 3 reply; 4 failure.
 static REQUEST: AtomicU64 = AtomicU64::new(0);
 static REQUEST_START: AtomicU64 = AtomicU64::new(0);
 static REQUEST_END: AtomicU64 = AtomicU64::new(0);
@@ -458,12 +463,12 @@ pub(super) fn step(worker: &mut Worker) {
         }
         return;
     }
-    if cpu::slot() == 2 {
-        // CPU2 is a business CPU in V0.20. Never enter the retired
-        // second control-worker path, including on stale mailbox wakeups.
+    if cpu::slot() != 0 {
+        // CPU1-3 are business CPUs in V0.20. Never enter the control-worker
+        // path on a business core, including on stale mailbox wakeups.
         return;
     }
-    assert_eq!(cpu::slot(), 1);
+    assert_eq!(cpu::slot(), 0);
     if !worker.probed {
         unsafe {
             core::arch::asm!("ic iallu", "dsb ish", "isb", options(nostack));
@@ -742,7 +747,7 @@ impl Coordinator {
         assert!(frequency >= 1000);
         let origin = timer::ticks();
         CLOCK_ORIGIN.store(origin, Ordering::Release);
-        let mut owner = Cores::new_fixed(CoreSet::from_bits(15)).expect("V0.19 fixed CPU1 role");
+        let mut owner = Cores::new_fixed(CoreSet::from_bits(15)).expect("V0.20 fixed CPU0 role");
         let threads = [2, 3].map(|slot| {
             Some(
                 owner
@@ -827,8 +832,9 @@ impl Coordinator {
             secondary_input: [0; abi::INPUT_WORDS],
         }
     }
-    /// One bounded CPU0 mechanism turn. CPU1 alone hosts advisory AI work.
-    /// Device/network work belongs between turns.
+    /// One bounded CPU0 mechanism turn. The standalone advisory EL0 model also
+    /// runs on CPU0; unified-runtime keeps its historical advisory fixtures on
+    /// business CPUs. Device/network work belongs between turns.
     pub(crate) fn poll(&mut self) {
         #[cfg(feature = "unified-runtime")]
         {
@@ -846,10 +852,11 @@ impl Coordinator {
             if self.wake_pulse.due(now) {
                 wake_workers();
             }
-            // V0.19: no control-core scaling, CPU2 secondary control worker,
-            // or ownership handoff. CPU2/3 remain business-only. Control
-            // advice is bounded by CPU1; the CPU0 mechanism broker remains
-            // authoritative and independent of model completion.
+            // V0.20: no control-core scaling, secondary control worker, or
+            // ownership handoff. CPU1-3 are business cores; bounded advisory
+            // model opportunities run on the TARGET business CPU while the
+            // CPU0 mechanism broker remains authoritative and independent of
+            // model completion.
         }
         // Reap credits before advancing the ledger. A slice from the old window
         // cannot be hidden by reset or by controller restart.
@@ -1298,7 +1305,7 @@ fn resume_action_tail() {
         .unwrap();
 }
 
-#[allow(dead_code)] // Historical diagnostic routine: unreachable in fixed CPU1 runtime.
+#[allow(dead_code)] // Historical diagnostic routine: unreachable in the fixed CPU0 runtime.
 fn secondary_control_step(worker: &mut Worker) {
     assert_eq!(cpu::slot(), 2);
     if CONTROL_OVERRUNS.load(Ordering::Acquire) != 0 {
@@ -1395,7 +1402,6 @@ impl Coordinator {
     /// CPU2 is permanently business-only. Never submit an AI job to it.
     #[allow(dead_code)]
     fn poll_secondary(&mut self, _now: u64) {}
-
 }
 
 /// CPU0's unified boot adapter calls this after attaching every native device.

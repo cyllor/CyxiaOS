@@ -6,10 +6,10 @@ extern crate self as cyxia_platform_pc;
 use cyxia_posix::Errno;
 use std::cell::RefCell;
 
-#[path = "../../platform-pc/src/rtc.rs"]
-pub mod rtc;
 #[path = "../../../kernel/src/platform/pc/clock.rs"]
 mod clock;
+#[path = "../../platform-pc/src/rtc.rs"]
+pub mod rtc;
 
 struct Device {
     registers: [u8; 128],
@@ -28,14 +28,30 @@ impl Device {
         let mut registers = [0; 128];
         // 2024-02-29 12:34:56 UTC, valid battery, BCD, 24-hour mode.
         for (register, value) in [
-            (0, 0x56), (2, 0x34), (4, 0x12), (7, 0x29),
-            (8, 0x02), (9, 0x24), (0x32, 0x20),
-            (10, 0x26), (11, 2), (13, 0x80),
+            (0, 0x56),
+            (2, 0x34),
+            (4, 0x12),
+            (7, 0x29),
+            (8, 0x02),
+            (9, 0x24),
+            (0x32, 0x20),
+            (10, 0x26),
+            (11, 2),
+            (13, 0x80),
         ] {
             registers[register] = value;
         }
-        Self { registers, selected: 0, reads: 0, busy_reads: 0,
-            elapsed_ns: 0, tick_ns: 10_000, clock_calls: 0, cpu: 0, log: Vec::new() }
+        Self {
+            registers,
+            selected: 0,
+            reads: 0,
+            busy_reads: 0,
+            elapsed_ns: 0,
+            tick_ns: 10_000,
+            clock_calls: 0,
+            cpu: 0,
+            log: Vec::new(),
+        }
     }
 }
 
@@ -50,7 +66,10 @@ pub mod io {
     /// Test substitute for the kernel's CMOS register-selection port.
     pub unsafe fn outb(port: u16, register: u8) {
         assert_eq!(port, 0x70);
-        assert!(register < 128, "CMOS reads must preserve the enabled NMI policy");
+        assert!(
+            register < 128,
+            "CMOS reads must preserve the enabled NMI policy"
+        );
         DEVICE.with(|device| device.borrow_mut().selected = register);
     }
 

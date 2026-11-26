@@ -358,23 +358,26 @@ impl Service {
 
 #[cfg(target_arch = "aarch64")]
 pub fn init(info: &cyxia_contracts::BootInfo) {
-    let transports = info.virtio[..info.virtio_count].iter().filter_map(|resource| {
-        if resource.base.0 < 0x0a000000
-            || resource
-                .base
-                .0
-                .checked_add(resource.len)
-                .is_none_or(|e| e > 0x0a200000)
-        {
-            return None;
-        }
-        unsafe {
-            Transport::attach(
-                (super::HIGH + resource.base.0) as usize,
-                resource.len as usize,
-            )
-        }.ok()
-    });
+    let transports = info.virtio[..info.virtio_count]
+        .iter()
+        .filter_map(|resource| {
+            if resource.base.0 < 0x0a000000
+                || resource
+                    .base
+                    .0
+                    .checked_add(resource.len)
+                    .is_none_or(|e| e > 0x0a200000)
+            {
+                return None;
+            }
+            unsafe {
+                Transport::attach(
+                    (super::HIGH + resource.base.0) as usize,
+                    resource.len as usize,
+                )
+            }
+            .ok()
+        });
     init_transports(transports);
 }
 

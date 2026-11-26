@@ -5,6 +5,12 @@
 //! control service does not manufacture observations, models, plans or audit
 //! ACKs. Production work must arrive through a verified input/service path.
 use core::arch::asm;
+#[cfg(control_role="11")]
+mod audit;
+#[cfg(all(snapshot_catalog_probe, any(control_role = "6", control_role = "11")))]
+mod catalog;
+#[cfg(all(file_read_probe, any(control_role = "6", control_role = "11")))]
+mod file_read;
 #[cfg(any(control_role="6",control_role="7"))]
 #[path="../../crates/control-model/src/native_v0199.rs"]
 mod brain;
@@ -54,17 +60,32 @@ fn model_probe(generation:u64){
     let p=core::ptr::addr_of_mut!(PROBE_RESULT).cast::<u64>();
     for (i,v) in row.into_iter().enumerate(){unsafe{p.add(i).write_volatile(v)}}
 }
-#[cfg(any(control_role="6",control_role="7"))]
+#[cfg(any(control_role="6",control_role="7",control_role="11"))]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn memcpy(dst:*mut u8,src:*const u8,n:usize)->*mut u8{
     for i in 0..n{unsafe{dst.add(i).write_volatile(src.add(i).read_volatile())}}
     dst
 }
-#[cfg(any(control_role="6",control_role="7"))]
+#[cfg(any(control_role="6",control_role="7",control_role="11"))]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn memset(dst:*mut u8,v:i32,n:usize)->*mut u8{
     for i in 0..n{unsafe{dst.add(i).write_volatile(v as u8)}}
     dst
+}
+#[cfg(control_role="11")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn memcmp(a:*const u8,b:*const u8,n:usize)->i32{
+    for i in 0..n {
+        let x=unsafe {a.add(i).read_volatile()};
+        let y=unsafe {b.add(i).read_volatile()};
+        if x!=y {return i32::from(x)-i32::from(y);}
+    }
+    0
+}
+#[cfg(control_role="11")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn bcmp(a:*const u8,b:*const u8,n:usize)->i32{
+    unsafe {memcmp(a,b,n)}
 }
 #[cfg(control_role="6")] const ROLE:u16=6;
 #[cfg(control_role="7")] const ROLE:u16=7;
@@ -94,13 +115,13 @@ fn yield_now(){let _=call(2,[0;6]);}
 fn put16(b:&mut[u8],at:usize,v:u16){b[at..at+2].copy_from_slice(&v.to_le_bytes());}
 fn put32(b:&mut[u8],at:usize,v:u32){b[at..at+4].copy_from_slice(&v.to_le_bytes());}
 fn put64(b:&mut[u8],at:usize,v:u64){b[at..at+8].copy_from_slice(&v.to_le_bytes());}
-fn snapshot(cap:u64,target:u64,domain:u64){
+fn snapshot(cap:u64,target:u64,domain:u64)->i64{
     let mut reply=[0u8;264];
     let result=call(0x40,[cap,domain,target,reply.as_mut_ptr() as u64,264,0]);
     // No model inference is started until a production snapshot, immutable
     // model/config and a frozen candidate/evidence context are all available.
     // This bootstrap deliberately does not accept a partially filled reply.
-    core::hint::black_box((result,reply[0]));
+    core::hint::black_box((result,reply[0])).0
 }
 #[cfg(control_role="6")]
 fn role_step(cap:u64,target:u64,_generation:u64,_now:u64){snapshot(cap,target,1);}
@@ -157,6 +178,12 @@ extern "C" fn _start(arg_va:u64,args_len:u64)->!{
     if generation==0{reject_startup();}
     #[cfg(any(control_role="6",control_role="7"))]
     model_probe(generation);
+    #[cfg(all(control_role = "6", file_read_probe))]
+    file_read::probe_operations(cap, target);
+    #[cfg(all(control_role = "6", snapshot_catalog_probe))]
+    catalog::probe_operations(cap, target);
+    #[cfg(control_role="11")]
+    if target != 0 { audit::run(cap,target,generation); }
     loop{
         let now=clock();
         if now>=0 {role_step(cap,target,generation,now as u64);}

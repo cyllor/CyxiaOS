@@ -6,8 +6,8 @@
 //! package and supply its separately frozen manifest SHA-256. This parser
 //! never writes or publishes user mappings, never grants task capabilities
 //! and never treats a hash match as a complete trusted launch proof.
-use sha2::{Digest, Sha256};
 use super::Error;
+use sha2::{Digest, Sha256};
 
 pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const PAGE_BYTES: u64 = 4096;
@@ -27,192 +27,255 @@ const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
-fn le16(b:&[u8],at:usize)->Result<u16,Error>{
-    let s=b.get(at..at+2).ok_or(Error::Invalid)?;
-    Ok(u16::from_le_bytes([s[0],s[1]]))
+fn le16(b: &[u8], at: usize) -> Result<u16, Error> {
+    let s = b.get(at..at + 2).ok_or(Error::Invalid)?;
+    Ok(u16::from_le_bytes([s[0], s[1]]))
 }
-fn le32(b:&[u8],at:usize)->Result<u32,Error>{
-    let s=b.get(at..at+4).ok_or(Error::Invalid)?;
-    Ok(u32::from_le_bytes([s[0],s[1],s[2],s[3]]))
+fn le32(b: &[u8], at: usize) -> Result<u32, Error> {
+    let s = b.get(at..at + 4).ok_or(Error::Invalid)?;
+    Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
-fn le64(b:&[u8],at:usize)->Result<u64,Error>{
-    let s=b.get(at..at+8).ok_or(Error::Invalid)?;
-    Ok(u64::from_le_bytes([s[0],s[1],s[2],s[3],s[4],s[5],s[6],s[7]]))
+fn le64(b: &[u8], at: usize) -> Result<u64, Error> {
+    let s = b.get(at..at + 8).ok_or(Error::Invalid)?;
+    Ok(u64::from_le_bytes([
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+    ]))
 }
-fn range_end(start:u64,length:u64)->Result<u64,Error>{
+fn range_end(start: u64, length: u64) -> Result<u64, Error> {
     start.checked_add(length).ok_or(Error::Invalid)
 }
-fn within(start:u64,len:u64,outer_start:u64,outer_end:u64)->bool{
-    start>=outer_start
-        && range_end(start,len).is_ok_and(|end|end<=outer_end)
+fn within(start: u64, len: u64, outer_start: u64, outer_end: u64) -> bool {
+    start >= outer_start && range_end(start, len).is_ok_and(|end| end <= outer_end)
 }
 
-#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadSegment {
-    pub virtual_address:u64,
-    pub file_offset:u64,
-    pub file_bytes:u64,
-    pub memory_bytes:u64,
-    pub flags:u32,
+    pub virtual_address: u64,
+    pub file_offset: u64,
+    pub file_bytes: u64,
+    pub memory_bytes: u64,
+    pub flags: u32,
 }
 impl LoadSegment {
-    fn writable(self)->bool{self.flags&PF_W!=0}
-    fn executable(self)->bool{self.flags&PF_X!=0}
-    fn contains_memory(self,start:u64,bytes:u64)->bool{
-        within(start,bytes,self.virtual_address,
-            self.virtual_address.saturating_add(self.memory_bytes))
+    fn writable(self) -> bool {
+        self.flags & PF_W != 0
     }
-    fn contains_file(self,start:u64,bytes:u64)->bool{
-        within(start,bytes,self.virtual_address,
-            self.virtual_address.saturating_add(self.file_bytes))
+    fn executable(self) -> bool {
+        self.flags & PF_X != 0
+    }
+    fn contains_memory(self, start: u64, bytes: u64) -> bool {
+        within(
+            start,
+            bytes,
+            self.virtual_address,
+            self.virtual_address.saturating_add(self.memory_bytes),
+        )
+    }
+    fn contains_file(self, start: u64, bytes: u64) -> bool {
+        within(
+            start,
+            bytes,
+            self.virtual_address,
+            self.virtual_address.saturating_add(self.file_bytes),
+        )
     }
 }
-#[derive(Clone,Copy)]
+#[derive(Clone, Copy)]
 pub struct PieImage<'a> {
-    pub verified_bytes:&'a [u8],
-    pub entry:u64,
-    pub loads:[Option<LoadSegment>;MAX_HEADERS],
-    pub load_count:usize,
-    pub relro:Option<(u64,u64)>,
-    pub has_executable_stack:bool,
+    pub verified_bytes: &'a [u8],
+    pub entry: u64,
+    pub loads: [Option<LoadSegment>; MAX_HEADERS],
+    pub load_count: usize,
+    pub relro: Option<(u64, u64)>,
+    pub has_executable_stack: bool,
 }
 
 /// A build-controlled sidecar entry; the type and symbol index are checked,
 /// never interpreted as a dynamic-symbol or external-link lookup.
-#[derive(Clone,Copy,Debug)]
-pub struct RelativeRelocation{
-    pub offset:u64,
-    pub info:u64,
-    pub addend:i64,
+#[derive(Clone, Copy, Debug)]
+pub struct RelativeRelocation {
+    pub offset: u64,
+    pub info: u64,
+    pub addend: i64,
 }
 impl<'a> PieImage<'a> {
     pub fn parse_verified(
-        bytes:&'a[u8],
-        expected_manifest_sha256:[u8;32],
-    )->Result<Self,Error>{
-        Self::parse_verified_checkpointed(bytes,expected_manifest_sha256,||{})
+        bytes: &'a [u8],
+        expected_manifest_sha256: [u8; 32],
+    ) -> Result<Self, Error> {
+        Self::parse_verified_checkpointed(bytes, expected_manifest_sha256, || {})
     }
 
     /// The immutable exclusive package remains borrowed for the entire
     /// verification, including scheduler checkpoints. The callback can
     /// yield/replenish the loader budget, never replace bytes or digest.
     pub fn parse_verified_checkpointed(
-        bytes:&'a[u8],expected_manifest_sha256:[u8;32],
-        mut checkpoint:impl FnMut(),
-    )->Result<Self,Error>{
-        if bytes.len()<64 || bytes.len()>MAX_IMAGE_BYTES
-            || expected_manifest_sha256==[0;32]
-            || bytes.get(0..4)!=Some(&b"\x7fELF"[..])
-            || bytes[4]!=2 || bytes[5]!=1 || bytes[6]!=1
-            || le16(bytes,16)?!=TYPE_DYN
-            || le16(bytes,18)?!=MACHINE_AARCH64
-            || le32(bytes,20)?!=1
-            || le16(bytes,52)?!=64
-            || le16(bytes,54)?!=56
-        {return Err(Error::Invalid);}
-        let mut h=Sha256::new();
-        for chunk in bytes.chunks(4096){h.update(chunk);checkpoint();}
-        let actual:[u8;32]=h.finalize().into();
-        if actual!=expected_manifest_sha256{return Err(Error::Denied);}
-        let ph_off=le64(bytes,32)?;
-        let ph_num=usize::from(le16(bytes,56)?);
-        if ph_num==0 || ph_num>MAX_HEADERS{return Err(Error::Invalid);}
-        let table_start=usize::try_from(ph_off).map_err(|_|Error::Invalid)?;
-        let table_end=table_start.checked_add(ph_num*56).ok_or(Error::Invalid)?;
-        if table_end>bytes.len(){return Err(Error::Invalid);}
-        let entry=le64(bytes,24)?;
-        if entry==0 || entry%4!=0{return Err(Error::Invalid);}
+        bytes: &'a [u8],
+        expected_manifest_sha256: [u8; 32],
+        mut checkpoint: impl FnMut(),
+    ) -> Result<Self, Error> {
+        if bytes.len() < 64
+            || bytes.len() > MAX_IMAGE_BYTES
+            || expected_manifest_sha256 == [0; 32]
+            || bytes.get(0..4) != Some(&b"\x7fELF"[..])
+            || bytes[4] != 2
+            || bytes[5] != 1
+            || bytes[6] != 1
+            || le16(bytes, 16)? != TYPE_DYN
+            || le16(bytes, 18)? != MACHINE_AARCH64
+            || le32(bytes, 20)? != 1
+            || le16(bytes, 52)? != 64
+            || le16(bytes, 54)? != 56
+        {
+            return Err(Error::Invalid);
+        }
+        let mut h = Sha256::new();
+        for chunk in bytes.chunks(4096) {
+            h.update(chunk);
+            checkpoint();
+        }
+        let actual: [u8; 32] = h.finalize().into();
+        if actual != expected_manifest_sha256 {
+            return Err(Error::Denied);
+        }
+        let ph_off = le64(bytes, 32)?;
+        let ph_num = usize::from(le16(bytes, 56)?);
+        if ph_num == 0 || ph_num > MAX_HEADERS {
+            return Err(Error::Invalid);
+        }
+        let table_start = usize::try_from(ph_off).map_err(|_| Error::Invalid)?;
+        let table_end = table_start.checked_add(ph_num * 56).ok_or(Error::Invalid)?;
+        if table_end > bytes.len() {
+            return Err(Error::Invalid);
+        }
+        let entry = le64(bytes, 24)?;
+        if entry == 0 || entry % 4 != 0 {
+            return Err(Error::Invalid);
+        }
         let mut loads: [Option<LoadSegment>; MAX_HEADERS] = [None; MAX_HEADERS];
-        let mut count=0usize;
-        let mut relro=None;
-        let mut phdr=None;
-        let mut stack_seen=false;
+        let mut count = 0usize;
+        let mut relro = None;
+        let mut phdr = None;
+        let mut stack_seen = false;
         for i in 0..ph_num {
-            let at=table_start+i*56;
-            let kind=le32(bytes,at)?;
-            let flags=le32(bytes,at+4)?;
-            let off=le64(bytes,at+8)?;
-            let va=le64(bytes,at+16)?;
-            let file=le64(bytes,at+32)?;
-            let mem=le64(bytes,at+40)?;
-            let align=le64(bytes,at+48)?;
+            let at = table_start + i * 56;
+            let kind = le32(bytes, at)?;
+            let flags = le32(bytes, at + 4)?;
+            let off = le64(bytes, at + 8)?;
+            let va = le64(bytes, at + 16)?;
+            let file = le64(bytes, at + 32)?;
+            let mem = le64(bytes, at + 40)?;
+            let align = le64(bytes, at + 48)?;
             match kind {
-                PT_NULL=>(),
-                PT_LOAD=>{
-                    if count==MAX_HEADERS || mem==0 || file>mem
-                        || flags&!(PF_R|PF_W|PF_X)!=0
-                        || flags&PF_R==0
-                        || flags&(PF_W|PF_X)==(PF_W|PF_X)
-                        || align!=PAGE_BYTES
-                        || va%PAGE_BYTES!=off%PAGE_BYTES
-                        || !within(off,file,0,bytes.len() as u64)
-                        || range_end(va,mem).is_err()
-                    {return Err(Error::Invalid);}
-                    let page_start=va/PAGE_BYTES;
-                    let page_end=range_end(va,mem)?.div_ceil(PAGE_BYTES);
+                PT_NULL => (),
+                PT_LOAD => {
+                    if count == MAX_HEADERS
+                        || mem == 0
+                        || file > mem
+                        || flags & !(PF_R | PF_W | PF_X) != 0
+                        || flags & PF_R == 0
+                        || flags & (PF_W | PF_X) == (PF_W | PF_X)
+                        || align != PAGE_BYTES
+                        || va % PAGE_BYTES != off % PAGE_BYTES
+                        || !within(off, file, 0, bytes.len() as u64)
+                        || range_end(va, mem).is_err()
+                    {
+                        return Err(Error::Invalid);
+                    }
+                    let page_start = va / PAGE_BYTES;
+                    let page_end = range_end(va, mem)?.div_ceil(PAGE_BYTES);
                     for other in loads[..count].iter().flatten() {
-                        let a=other.virtual_address/PAGE_BYTES;
-                        let b=range_end(other.virtual_address,other.memory_bytes)?
+                        let a = other.virtual_address / PAGE_BYTES;
+                        let b = range_end(other.virtual_address, other.memory_bytes)?
                             .div_ceil(PAGE_BYTES);
                         // No ambiguous page permissions or writable alias.
-                        if page_start<b && a<page_end {
+                        if page_start < b && a < page_end {
                             return Err(Error::Denied);
                         }
                     }
-                    loads[count]=Some(LoadSegment{
-                        virtual_address:va,file_offset:off,file_bytes:file,
-                        memory_bytes:mem,flags,
+                    loads[count] = Some(LoadSegment {
+                        virtual_address: va,
+                        file_offset: off,
+                        file_bytes: file,
+                        memory_bytes: mem,
+                        flags,
                     });
-                    count+=1;
+                    count += 1;
                 }
-                PT_PHDR=>{
-                    if phdr.is_some() || file==0 || mem!=file
-                        || off!=ph_off || file!=ph_num as u64*56
-                        || range_end(va,mem).is_err()
-                    {return Err(Error::Invalid);}
-                    phdr=Some((va,file));
-                }
-                PT_GNU_STACK=>{
-                    if stack_seen || flags&PF_X!=0{return Err(Error::Denied);}
-                    stack_seen=true;
-                }
-                PT_GNU_RELRO=>{
-                    if relro.is_some() || mem==0 || range_end(va,mem).is_err(){
+                PT_PHDR => {
+                    if phdr.is_some()
+                        || file == 0
+                        || mem != file
+                        || off != ph_off
+                        || file != ph_num as u64 * 56
+                        || range_end(va, mem).is_err()
+                    {
                         return Err(Error::Invalid);
                     }
-                    relro=Some((va,mem));
+                    phdr = Some((va, file));
                 }
-                PT_NOTE=>{
-                    if flags&(PF_W|PF_X)!=0 || !within(off,file,0,bytes.len() as u64)
-                        || file>64*1024
-                    {return Err(Error::Invalid);}
+                PT_GNU_STACK => {
+                    if stack_seen || flags & PF_X != 0 {
+                        return Err(Error::Denied);
+                    }
+                    stack_seen = true;
+                }
+                PT_GNU_RELRO => {
+                    if relro.is_some() || mem == 0 || range_end(va, mem).is_err() {
+                        return Err(Error::Invalid);
+                    }
+                    relro = Some((va, mem));
+                }
+                PT_NOTE => {
+                    if flags & (PF_W | PF_X) != 0
+                        || !within(off, file, 0, bytes.len() as u64)
+                        || file > 64 * 1024
+                    {
+                        return Err(Error::Invalid);
+                    }
                 }
                 // PT_DYNAMIC, PT_INTERP and unknown loaders are not supported.
-                _=>return Err(Error::Denied),
+                _ => return Err(Error::Denied),
             }
         }
-        if count==0{return Err(Error::Invalid);}
-        let entry_ok=loads[..count].iter().flatten().any(|seg|
-            seg.executable() && seg.contains_file(entry,4)
-        );
-        if !entry_ok{return Err(Error::Denied);}
-        if let Some((start,len))=relro {
-            if !loads[..count].iter().flatten()
-                .any(|seg|seg.writable()&&seg.contains_memory(start,len))
-            {return Err(Error::Denied);}
+        if count == 0 {
+            return Err(Error::Invalid);
         }
-        if let Some((start,len))=phdr {
+        let entry_ok = loads[..count]
+            .iter()
+            .flatten()
+            .any(|seg| seg.executable() && seg.contains_file(entry, 4));
+        if !entry_ok {
+            return Err(Error::Denied);
+        }
+        if let Some((start, len)) = relro
+            && !loads[..count]
+                .iter()
+                .flatten()
+                .any(|seg| seg.writable() && seg.contains_memory(start, len))
+        {
+            return Err(Error::Denied);
+        }
+        if let Some((start, len)) = phdr {
             // A mapped interval alone is insufficient: it must map the
             // exact verified program-header bytes from the file.
-            if !loads[..count].iter().flatten().any(|seg|
-                seg.contains_file(start,len)
-                && start.checked_sub(seg.virtual_address)
-                    .and_then(|offset|seg.file_offset.checked_add(offset))==Some(ph_off))
-            {return Err(Error::Denied);}
+            if !loads[..count].iter().flatten().any(|seg| {
+                seg.contains_file(start, len)
+                    && start
+                        .checked_sub(seg.virtual_address)
+                        .and_then(|offset| seg.file_offset.checked_add(offset))
+                        == Some(ph_off)
+            }) {
+                return Err(Error::Denied);
+            }
         }
-        Ok(Self{
-            verified_bytes:bytes,entry,loads,load_count:count,relro,
-            has_executable_stack:false,
+        Ok(Self {
+            verified_bytes: bytes,
+            entry,
+            loads,
+            load_count: count,
+            relro,
+            has_executable_stack: false,
         })
     }
 
@@ -229,52 +292,70 @@ impl<'a> PieImage<'a> {
     /// rollback all staging on any failure before making a task RUNNABLE.
     pub fn stage_private_image(
         &self,
-        staging:&mut [u8],
-        random_base:u64,
-        el0_start:u64,
-        el0_end:u64,
-        relocations:&[RelativeRelocation],
-    )->Result<(),Error>{
-        self.stage_private_image_checkpointed(staging,random_base,el0_start,el0_end,relocations,||{})
+        staging: &mut [u8],
+        random_base: u64,
+        el0_start: u64,
+        el0_end: u64,
+        relocations: &[RelativeRelocation],
+    ) -> Result<(), Error> {
+        self.stage_private_image_checkpointed(
+            staging,
+            random_base,
+            el0_start,
+            el0_end,
+            relocations,
+            || {},
+        )
     }
     /// Same fully preflighted private staging operation, with bounded
     /// progress points after each page-sized copy or scrub. The native
     /// loader retains exclusive ownership and never maps unfinished data.
     pub fn stage_private_image_checkpointed(
-        &self,staging:&mut [u8],random_base:u64,el0_start:u64,el0_end:u64,
-        relocations:&[RelativeRelocation],mut checkpoint:impl FnMut(),
-    )->Result<(),Error>{
-        if staging.is_empty() || staging.len()>MAX_IMAGE_BYTES {
+        &self,
+        staging: &mut [u8],
+        random_base: u64,
+        el0_start: u64,
+        el0_end: u64,
+        relocations: &[RelativeRelocation],
+        mut checkpoint: impl FnMut(),
+    ) -> Result<(), Error> {
+        if staging.is_empty() || staging.len() > MAX_IMAGE_BYTES {
             return Err(Error::Invalid);
         }
-        self.validate_relative_sidecar(relocations,random_base,el0_start,el0_end)?;
+        self.validate_relative_sidecar(relocations, random_base, el0_start, el0_end)?;
         // Fail atomically on undersized private staging before zeroing it.
         for seg in self.loads[..self.load_count].iter().flatten() {
-            let at=usize::try_from(seg.virtual_address).map_err(|_|Error::Invalid)?;
-            let bytes=usize::try_from(seg.memory_bytes).map_err(|_|Error::Invalid)?;
-            if at.checked_add(bytes).is_none_or(|end|end>staging.len()) {
+            let at = usize::try_from(seg.virtual_address).map_err(|_| Error::Invalid)?;
+            let bytes = usize::try_from(seg.memory_bytes).map_err(|_| Error::Invalid)?;
+            if at.checked_add(bytes).is_none_or(|end| end > staging.len()) {
                 return Err(Error::Invalid);
             }
         }
-        for chunk in staging.chunks_mut(PAGE_BYTES as usize){
-            chunk.fill(0);checkpoint();
+        for chunk in staging.chunks_mut(PAGE_BYTES as usize) {
+            chunk.fill(0);
+            checkpoint();
         }
         for seg in self.loads[..self.load_count].iter().flatten() {
-            let off=usize::try_from(seg.file_offset).map_err(|_|Error::Invalid)?;
-            let n=usize::try_from(seg.file_bytes).map_err(|_|Error::Invalid)?;
-            let at=usize::try_from(seg.virtual_address).map_err(|_|Error::Invalid)?;
-            for (dst,src) in staging[at..at+n].chunks_mut(PAGE_BYTES as usize)
-                .zip(self.verified_bytes[off..off+n].chunks(PAGE_BYTES as usize)){
-                dst.copy_from_slice(src);checkpoint();
+            let off = usize::try_from(seg.file_offset).map_err(|_| Error::Invalid)?;
+            let n = usize::try_from(seg.file_bytes).map_err(|_| Error::Invalid)?;
+            let at = usize::try_from(seg.virtual_address).map_err(|_| Error::Invalid)?;
+            for (dst, src) in staging[at..at + n]
+                .chunks_mut(PAGE_BYTES as usize)
+                .zip(self.verified_bytes[off..off + n].chunks(PAGE_BYTES as usize))
+            {
+                dst.copy_from_slice(src);
+                checkpoint();
             }
             // The remaining p_memsz-p_filesz bytes are already zero.
         }
-        for (i,relocation) in relocations.iter().enumerate() {
-            let at=usize::try_from(relocation.offset).map_err(|_|Error::Invalid)?;
-            let value=(random_base as i128)+(relocation.addend as i128);
-            let relocated=u64::try_from(value).map_err(|_|Error::Invalid)?;
-            staging[at..at+8].copy_from_slice(&relocated.to_le_bytes());
-            if i%16==15{checkpoint();}
+        for (i, relocation) in relocations.iter().enumerate() {
+            let at = usize::try_from(relocation.offset).map_err(|_| Error::Invalid)?;
+            let value = (random_base as i128) + (relocation.addend as i128);
+            let relocated = u64::try_from(value).map_err(|_| Error::Invalid)?;
+            staging[at..at + 8].copy_from_slice(&relocated.to_le_bytes());
+            if i % 16 == 15 {
+                checkpoint();
+            }
         }
         checkpoint();
         Ok(())
@@ -282,45 +363,64 @@ impl<'a> PieImage<'a> {
 
     pub fn validate_relative_sidecar(
         &self,
-        entries:&[RelativeRelocation],
-        randomized_base:u64,
-        el0_start:u64,
-        el0_end:u64,
-    )->Result<(),Error>{
-        if randomized_base%PAGE_BYTES!=0
-            || el0_start>=el0_end || entries.len()>MAX_RELOCATIONS
-        {return Err(Error::Invalid);}
+        entries: &[RelativeRelocation],
+        randomized_base: u64,
+        el0_start: u64,
+        el0_end: u64,
+    ) -> Result<(), Error> {
+        if !randomized_base.is_multiple_of(PAGE_BYTES)
+            || el0_start >= el0_end
+            || entries.len() > MAX_RELOCATIONS
+        {
+            return Err(Error::Invalid);
+        }
         for seg in self.loads[..self.load_count].iter().flatten() {
-            let mapped=randomized_base.checked_add(seg.virtual_address)
+            let mapped = randomized_base
+                .checked_add(seg.virtual_address)
                 .ok_or(Error::Invalid)?;
-            if !within(mapped,seg.memory_bytes,el0_start,el0_end) {
+            if !within(mapped, seg.memory_bytes, el0_start, el0_end) {
                 return Err(Error::Denied);
             }
         }
-        for (i,entry) in entries.iter().enumerate(){
-            if entry.info>>32!=0 || entry.info&0xffff_ffff!=R_AARCH64_RELATIVE
-                || entry.offset%8!=0
-            {return Err(Error::Denied);}
-            for old in &entries[..i] {
-                if old.offset==entry.offset{return Err(Error::Denied);}
-            }
-            if !self.loads[..self.load_count].iter().flatten()
-                .any(|seg|seg.writable()&&seg.contains_memory(entry.offset,8))
-            {return Err(Error::Denied);}
-            let target=randomized_base.checked_add(entry.offset)
-                .ok_or(Error::Invalid)?;
-            if !within(target,8,el0_start,el0_end){return Err(Error::Denied);}
-            let value=(randomized_base as i128)+(entry.addend as i128);
-            if value<el0_start as i128 || value>=el0_end as i128 {
+        for (i, entry) in entries.iter().enumerate() {
+            if entry.info >> 32 != 0
+                || entry.info & 0xffff_ffff != R_AARCH64_RELATIVE
+                || entry.offset % 8 != 0
+            {
                 return Err(Error::Denied);
             }
-            let value=value as u64;
-            if !self.loads[..self.load_count].iter().flatten().any(|seg|
-                randomized_base.checked_add(seg.virtual_address)
-                    .is_some_and(|mapped|within(
-                        value,1,mapped,mapped.saturating_add(seg.memory_bytes)
-                    ))
-            ) {return Err(Error::Denied);}
+            for old in &entries[..i] {
+                if old.offset == entry.offset {
+                    return Err(Error::Denied);
+                }
+            }
+            if !self.loads[..self.load_count]
+                .iter()
+                .flatten()
+                .any(|seg| seg.writable() && seg.contains_memory(entry.offset, 8))
+            {
+                return Err(Error::Denied);
+            }
+            let target = randomized_base
+                .checked_add(entry.offset)
+                .ok_or(Error::Invalid)?;
+            if !within(target, 8, el0_start, el0_end) {
+                return Err(Error::Denied);
+            }
+            let value = (randomized_base as i128) + (entry.addend as i128);
+            if value < el0_start as i128 || value >= el0_end as i128 {
+                return Err(Error::Denied);
+            }
+            let value = value as u64;
+            if !self.loads[..self.load_count].iter().flatten().any(|seg| {
+                randomized_base
+                    .checked_add(seg.virtual_address)
+                    .is_some_and(|mapped| {
+                        within(value, 1, mapped, mapped.saturating_add(seg.memory_bytes))
+                    })
+            }) {
+                return Err(Error::Denied);
+            }
         }
         Ok(())
     }
@@ -329,74 +429,110 @@ impl<'a> PieImage<'a> {
 /// Protected launch inventory, not a new wire schema. These entries must
 /// originate in the read-only boot manifest. Eight role identities may share
 /// immutable code pages, but never silently reuse an unregistered package ID.
-use super::role_manifest_v0199::{Role, ROLES, ROLE_COUNT};
-pub const ROLE_STACK_BYTES: usize = 32*1024;
-#[derive(Clone,Copy,Debug,Eq,PartialEq)]
+use super::role_manifest_v0199::{ROLE_COUNT, ROLES, Role};
+pub const ROLE_STACK_BYTES: usize = 32 * 1024;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RolePackageSpec {
-    pub role:Role,
-    pub package_id:u64,
-    pub abi:u16,
-    pub image_bytes:usize,
-    pub image_sha256:[u8;32],
-    pub relative_count:usize,
-    pub relative_sha256:[u8;32],
-    pub stack_bytes:usize,
+    pub role: Role,
+    pub package_id: u64,
+    pub abi: u16,
+    pub image_bytes: usize,
+    pub image_sha256: [u8; 32],
+    pub relative_count: usize,
+    pub relative_sha256: [u8; 32],
+    pub stack_bytes: usize,
 }
-#[derive(Clone,Copy)]
-pub struct RolePackageInput<'a>{
-    pub package_id:u64,
-    pub bytes:&'a[u8],
-    pub relative:&'a[RelativeRelocation],
+#[derive(Clone, Copy)]
+pub struct RolePackageInput<'a> {
+    pub package_id: u64,
+    pub bytes: &'a [u8],
+    pub relative: &'a [RelativeRelocation],
 }
 /// The build/boot adapter hashes the canonical LE triples, including count.
 /// It must authenticate this hash with the immutable role/package manifest,
 /// separately from the ELF bytes. No relocations are read from live EL0.
-pub fn relative_sidecar_digest(entries:&[RelativeRelocation])->Result<[u8;32],Error>{
-    if entries.len()>MAX_RELOCATIONS{return Err(Error::Exhausted);}
-    let mut h=Sha256::new();
+pub fn relative_sidecar_digest(entries: &[RelativeRelocation]) -> Result<[u8; 32], Error> {
+    if entries.len() > MAX_RELOCATIONS {
+        return Err(Error::Exhausted);
+    }
+    let mut h = Sha256::new();
     h.update(b"CyxiaOS-v0199-relative-sidecar");
     h.update((entries.len() as u32).to_le_bytes());
-    for e in entries{
-        h.update(e.offset.to_le_bytes());h.update(e.info.to_le_bytes());h.update(e.addend.to_le_bytes());
+    for e in entries {
+        h.update(e.offset.to_le_bytes());
+        h.update(e.info.to_le_bytes());
+        h.update(e.addend.to_le_bytes());
     }
     Ok(h.finalize().into())
 }
 /// Bound package, immutable image copy and sidecar share one lifetime.
 /// The parsed image is private so consumers cannot replace its entry/loads.
-pub struct VerifiedRolePackage<'a>{
-    spec:RolePackageSpec,
-    image:PieImage<'a>,
-    relative:&'a[RelativeRelocation],
+pub struct VerifiedRolePackage<'a> {
+    spec: RolePackageSpec,
+    image: PieImage<'a>,
+    relative: &'a [RelativeRelocation],
 }
-impl<'a> VerifiedRolePackage<'a>{
-    pub fn verify(spec:RolePackageSpec,input:RolePackageInput<'a>)->Result<Self,Error>{
-        Self::verify_checkpointed(spec,input,||{})
+impl<'a> VerifiedRolePackage<'a> {
+    pub fn verify(spec: RolePackageSpec, input: RolePackageInput<'a>) -> Result<Self, Error> {
+        Self::verify_checkpointed(spec, input, || {})
     }
-    pub fn verify_checkpointed(spec:RolePackageSpec,input:RolePackageInput<'a>,
-        checkpoint:impl FnMut())->Result<Self,Error>{
-        if spec.package_id==0 || input.package_id!=spec.package_id
-            || spec.abi!=crate::security::syscall_v3::ABI_VERSION
-            || spec.stack_bytes!=ROLE_STACK_BYTES || spec.image_bytes!=input.bytes.len()
-            || spec.relative_count!=input.relative.len()
-            || spec.relative_sha256!=relative_sidecar_digest(input.relative)?
-        {return Err(Error::Denied);}
-        let image=PieImage::parse_verified_checkpointed(input.bytes,spec.image_sha256,checkpoint)?;
-        Ok(Self{spec,image,relative:input.relative})
+    pub fn verify_checkpointed(
+        spec: RolePackageSpec,
+        input: RolePackageInput<'a>,
+        checkpoint: impl FnMut(),
+    ) -> Result<Self, Error> {
+        if spec.package_id == 0
+            || input.package_id != spec.package_id
+            || spec.abi != crate::security::syscall_v3::ABI_VERSION
+            || spec.stack_bytes != ROLE_STACK_BYTES
+            || spec.image_bytes != input.bytes.len()
+            || spec.relative_count != input.relative.len()
+            || spec.relative_sha256 != relative_sidecar_digest(input.relative)?
+        {
+            return Err(Error::Denied);
+        }
+        let image =
+            PieImage::parse_verified_checkpointed(input.bytes, spec.image_sha256, checkpoint)?;
+        Ok(Self {
+            spec,
+            image,
+            relative: input.relative,
+        })
     }
-    pub fn role(&self)->Role{self.spec.role}
-    pub fn load_segments(&self)->impl Iterator<Item=LoadSegment>+'_ {
-        self.image.loads[..self.image.load_count].iter().flatten().copied()
+    pub fn role(&self) -> Role {
+        self.spec.role
     }
-    pub fn relro(&self)->Option<(u64,u64)>{self.image.relro}
+    pub fn load_segments(&self) -> impl Iterator<Item = LoadSegment> + '_ {
+        self.image.loads[..self.image.load_count]
+            .iter()
+            .flatten()
+            .copied()
+    }
+    pub fn relro(&self) -> Option<(u64, u64)> {
+        self.image.relro
+    }
     /// All writes remain in unpublished staging. The native owner separately
     /// accounts mapped pages, guard stack, RELRO, TLB/cache sync and publication.
-    pub fn stage(&self,staging:&mut[u8],base:u64,start:u64,end:u64)->Result<u64,Error>{
-        self.stage_checkpointed(staging,base,start,end,||{})
+    pub fn stage(&self, staging: &mut [u8], base: u64, start: u64, end: u64) -> Result<u64, Error> {
+        self.stage_checkpointed(staging, base, start, end, || {})
     }
-    pub fn stage_checkpointed(&self,staging:&mut[u8],base:u64,start:u64,end:u64,
-        checkpoint:impl FnMut())->Result<u64,Error>{
-        let entry=base.checked_add(self.image.entry).ok_or(Error::Invalid)?;
-        self.image.stage_private_image_checkpointed(staging,base,start,end,self.relative,checkpoint)?;
+    pub fn stage_checkpointed(
+        &self,
+        staging: &mut [u8],
+        base: u64,
+        start: u64,
+        end: u64,
+        checkpoint: impl FnMut(),
+    ) -> Result<u64, Error> {
+        let entry = base.checked_add(self.image.entry).ok_or(Error::Invalid)?;
+        self.image.stage_private_image_checkpointed(
+            staging,
+            base,
+            start,
+            end,
+            self.relative,
+            checkpoint,
+        )?;
         Ok(entry)
     }
 }
@@ -405,13 +541,18 @@ impl<'a> VerifiedRolePackage<'a>{
 /// state is produced. The real boot loader verifies/stages one package at a
 /// time, under its exclusive staging reservation, immediately before launch.
 pub fn verify_role_inventory(
-    specs:&[RolePackageSpec;ROLE_COUNT], inputs:&[RolePackageInput<'_>;ROLE_COUNT]
-)->Result<(),Error>{
-    for i in 0..ROLE_COUNT{
-        if specs[i].role!=ROLES[i] || specs[..i].iter().any(|s|s.package_id==specs[i].package_id){
+    specs: &[RolePackageSpec; ROLE_COUNT],
+    inputs: &[RolePackageInput<'_>; ROLE_COUNT],
+) -> Result<(), Error> {
+    for i in 0..ROLE_COUNT {
+        if specs[i].role != ROLES[i]
+            || specs[..i]
+                .iter()
+                .any(|s| s.package_id == specs[i].package_id)
+        {
             return Err(Error::Denied);
         }
-        VerifiedRolePackage::verify(specs[i],inputs[i])?;
+        VerifiedRolePackage::verify(specs[i], inputs[i])?;
     }
     Ok(())
 }
@@ -422,11 +563,13 @@ mod tests {
     use super::*;
     use std::vec;
 
-    fn elf()->std::vec::Vec<u8>{
+    fn elf() -> std::vec::Vec<u8> {
         // One 4KiB RX LOAD followed by a 4KiB RW LOAD.
-        let mut b=vec![0u8;0x3000];
+        let mut b = vec![0u8; 0x3000];
         b[0..4].copy_from_slice(b"\x7fELF");
-        b[4]=2;b[5]=1;b[6]=1;
+        b[4] = 2;
+        b[5] = 1;
+        b[6] = 1;
         b[16..18].copy_from_slice(&TYPE_DYN.to_le_bytes());
         b[18..20].copy_from_slice(&MACHINE_AARCH64.to_le_bytes());
         b[20..24].copy_from_slice(&1u32.to_le_bytes());
@@ -435,169 +578,242 @@ mod tests {
         b[52..54].copy_from_slice(&64u16.to_le_bytes());
         b[54..56].copy_from_slice(&56u16.to_le_bytes());
         b[56..58].copy_from_slice(&2u16.to_le_bytes());
-        for (i,flag) in [(0,5u32),(1,6u32)] {
-            let at=64+i*56;
-            b[at..at+4].copy_from_slice(&PT_LOAD.to_le_bytes());
-            b[at+4..at+8].copy_from_slice(&flag.to_le_bytes());
-            let offset=((i+1)*0x1000) as u64;
-            b[at+8..at+16].copy_from_slice(&offset.to_le_bytes());
-            b[at+16..at+24].copy_from_slice(&offset.to_le_bytes());
-            b[at+32..at+40].copy_from_slice(&0x1000u64.to_le_bytes());
-            b[at+40..at+48].copy_from_slice(&0x1000u64.to_le_bytes());
-            b[at+48..at+56].copy_from_slice(&PAGE_BYTES.to_le_bytes());
+        for (i, flag) in [(0, 5u32), (1, 6u32)] {
+            let at = 64 + i * 56;
+            b[at..at + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+            b[at + 4..at + 8].copy_from_slice(&flag.to_le_bytes());
+            let offset = ((i + 1) * 0x1000) as u64;
+            b[at + 8..at + 16].copy_from_slice(&offset.to_le_bytes());
+            b[at + 16..at + 24].copy_from_slice(&offset.to_le_bytes());
+            b[at + 32..at + 40].copy_from_slice(&0x1000u64.to_le_bytes());
+            b[at + 40..at + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+            b[at + 48..at + 56].copy_from_slice(&PAGE_BYTES.to_le_bytes());
         }
-        b[0x1000..0x1004].copy_from_slice(&[0x1f,0x20,0x03,0xd5]); // NOP
+        b[0x1000..0x1004].copy_from_slice(&[0x1f, 0x20, 0x03, 0xd5]); // NOP
         b
     }
-    fn parse(b:&[u8])->Result<PieImage<'_>,Error>{
-        let hash:[u8;32]=Sha256::digest(b).into();
-        PieImage::parse_verified(b,hash)
+    fn parse(b: &[u8]) -> Result<PieImage<'_>, Error> {
+        let hash: [u8; 32] = Sha256::digest(b).into();
+        PieImage::parse_verified(b, hash)
     }
     #[test]
-    fn verified_et_dyn_has_exact_rx_entry_and_private_writable_relocations(){
-        let b=elf();
-        let image=parse(&b).unwrap();
-        assert_eq!(image.entry,0x1000);
-        assert_eq!(image.load_count,2);
-        let reloc=[RelativeRelocation{
-            offset:0x2000,info:R_AARCH64_RELATIVE,addend:0x1000,
+    fn verified_et_dyn_has_exact_rx_entry_and_private_writable_relocations() {
+        let b = elf();
+        let image = parse(&b).unwrap();
+        assert_eq!(image.entry, 0x1000);
+        assert_eq!(image.load_count, 2);
+        let reloc = [RelativeRelocation {
+            offset: 0x2000,
+            info: R_AARCH64_RELATIVE,
+            addend: 0x1000,
         }];
-        assert!(image.validate_relative_sidecar(
-            &reloc,0x4000_0000,0x4000_0000,0x5000_0000
-        ).is_ok());
-        let mut bad=reloc;
-        bad[0].offset=0x1000; // RX is immutable
-        assert!(image.validate_relative_sidecar(
-            &bad,0x4000_0000,0x4000_0000,0x5000_0000
-        ).is_err());
-        bad=reloc;bad[0].info=1;
-        assert!(image.validate_relative_sidecar(
-            &bad,0x4000_0000,0x4000_0000,0x5000_0000
-        ).is_err());
-        assert!(image.validate_relative_sidecar(
-            &[reloc[0],reloc[0]],0x4000_0000,0x4000_0000,0x5000_0000
-        ).is_err());
+        assert!(
+            image
+                .validate_relative_sidecar(&reloc, 0x4000_0000, 0x4000_0000, 0x5000_0000)
+                .is_ok()
+        );
+        let mut bad = reloc;
+        bad[0].offset = 0x1000; // RX is immutable
+        assert!(
+            image
+                .validate_relative_sidecar(&bad, 0x4000_0000, 0x4000_0000, 0x5000_0000)
+                .is_err()
+        );
+        bad = reloc;
+        bad[0].info = 1;
+        assert!(
+            image
+                .validate_relative_sidecar(&bad, 0x4000_0000, 0x4000_0000, 0x5000_0000)
+                .is_err()
+        );
+        assert!(
+            image
+                .validate_relative_sidecar(
+                    &[reloc[0], reloc[0]],
+                    0x4000_0000,
+                    0x4000_0000,
+                    0x5000_0000
+                )
+                .is_err()
+        );
     }
     #[test]
-    fn private_staging_copies_rx_clears_bss_and_applies_only_verified_rw_relocations(){
-        let b=elf();
-        let image=parse(&b).unwrap();
-        let reloc=[RelativeRelocation{
-            offset:0x2008,info:R_AARCH64_RELATIVE,addend:0x1000,
+    fn private_staging_copies_rx_clears_bss_and_applies_only_verified_rw_relocations() {
+        let b = elf();
+        let image = parse(&b).unwrap();
+        let reloc = [RelativeRelocation {
+            offset: 0x2008,
+            info: R_AARCH64_RELATIVE,
+            addend: 0x1000,
         }];
-        let mut out=vec![0xaau8;0x4000];
-        image.stage_private_image(
-            &mut out,0x4000_0000,0x4000_0000,0x5000_0000,&reloc
-        ).unwrap();
+        let mut out = vec![0xaau8; 0x4000];
+        image
+            .stage_private_image(&mut out, 0x4000_0000, 0x4000_0000, 0x5000_0000, &reloc)
+            .unwrap();
         // The native checkpointed path must yield the very same fully
         // validated private image, without exposing a partial mapping.
-        let mut checkpointed=vec![0xbbu8;0x4000];let mut checkpoints=0;
-        image.stage_private_image_checkpointed(&mut checkpointed,0x4000_0000,0x4000_0000,
-            0x5000_0000,&reloc,||checkpoints+=1).unwrap();
-        assert!(checkpoints>=4);assert_eq!(checkpointed,out);
-        assert_eq!(&out[0x1000..0x1004],&[0x1f,0x20,0x03,0xd5]);
-        assert!(out[0x1004..0x2000].iter().all(|b|*b==0));
+        let mut checkpointed = vec![0xbbu8; 0x4000];
+        let mut checkpoints = 0;
+        image
+            .stage_private_image_checkpointed(
+                &mut checkpointed,
+                0x4000_0000,
+                0x4000_0000,
+                0x5000_0000,
+                &reloc,
+                || checkpoints += 1,
+            )
+            .unwrap();
+        assert!(checkpoints >= 4);
+        assert_eq!(checkpointed, out);
+        assert_eq!(&out[0x1000..0x1004], &[0x1f, 0x20, 0x03, 0xd5]);
+        assert!(out[0x1004..0x2000].iter().all(|b| *b == 0));
         assert_eq!(
             u64::from_le_bytes(out[0x2008..0x2010].try_into().unwrap()),
             0x4000_1000
         );
-        assert!(out[0..0x1000].iter().all(|b|*b==0));
-        let mut short=vec![0xaau8;0x2100];
-        assert!(image.stage_private_image(
-            &mut short,0x4000_0000,0x4000_0000,0x5000_0000,&reloc
-        ).is_err());
-        assert!(short.iter().all(|b|*b==0xaa)); // validation precedes writes
-        assert!(image.stage_private_image_checkpointed(&mut short,0x4000_0000,0x4000_0000,
-            0x5000_0000,&reloc,||panic!("invalid staging must never start")).is_err());
-        assert!(short.iter().all(|b|*b==0xaa));
-        let mut bad=reloc;bad[0].offset=0x1000;
-        let mut previous=vec![0x55u8;0x4000];
-        assert!(image.stage_private_image(
-            &mut previous,0x4000_0000,0x4000_0000,0x5000_0000,&bad
-        ).is_err());
-        assert!(previous.iter().all(|b|*b==0x55));
+        assert!(out[0..0x1000].iter().all(|b| *b == 0));
+        let mut short = vec![0xaau8; 0x2100];
+        assert!(
+            image
+                .stage_private_image(&mut short, 0x4000_0000, 0x4000_0000, 0x5000_0000, &reloc)
+                .is_err()
+        );
+        assert!(short.iter().all(|b| *b == 0xaa)); // validation precedes writes
+        assert!(
+            image
+                .stage_private_image_checkpointed(
+                    &mut short,
+                    0x4000_0000,
+                    0x4000_0000,
+                    0x5000_0000,
+                    &reloc,
+                    || panic!("invalid staging must never start")
+                )
+                .is_err()
+        );
+        assert!(short.iter().all(|b| *b == 0xaa));
+        let mut bad = reloc;
+        bad[0].offset = 0x1000;
+        let mut previous = vec![0x55u8; 0x4000];
+        assert!(
+            image
+                .stage_private_image(&mut previous, 0x4000_0000, 0x4000_0000, 0x5000_0000, &bad)
+                .is_err()
+        );
+        assert!(previous.iter().all(|b| *b == 0x55));
     }
 
     #[test]
-    fn legacy_exec_wrong_machine_dynamic_loader_and_wx_rejected(){
-        let mut b=elf();
+    fn legacy_exec_wrong_machine_dynamic_loader_and_wx_rejected() {
+        let mut b = elf();
         b[16..18].copy_from_slice(&2u16.to_le_bytes());
         assert!(parse(&b).is_err());
-        b=elf();b[18..20].copy_from_slice(&62u16.to_le_bytes());
+        b = elf();
+        b[18..20].copy_from_slice(&62u16.to_le_bytes());
         assert!(parse(&b).is_err());
-        b=elf();b[64..68].copy_from_slice(&3u32.to_le_bytes()); // INTERP
+        b = elf();
+        b[64..68].copy_from_slice(&3u32.to_le_bytes()); // INTERP
         assert!(parse(&b).is_err());
-        b=elf();b[64..68].copy_from_slice(&2u32.to_le_bytes()); // DYNAMIC
+        b = elf();
+        b[64..68].copy_from_slice(&2u32.to_le_bytes()); // DYNAMIC
         assert!(parse(&b).is_err());
-        b=elf();b[64+4..64+8].copy_from_slice(&7u32.to_le_bytes());
+        b = elf();
+        b[64 + 4..64 + 8].copy_from_slice(&7u32.to_le_bytes());
         assert!(parse(&b).is_err());
-        b=elf();b[24..32].copy_from_slice(&0x4000u64.to_le_bytes());
+        b = elf();
+        b[24..32].copy_from_slice(&0x4000u64.to_le_bytes());
         assert!(parse(&b).is_err());
     }
     #[test]
-    fn phdr_overflow_truncated_file_overlap_and_bad_manifest_rejected(){
-        let b=elf();
-        assert!(PieImage::parse_verified(&b,[1;32]).is_err());
+    fn phdr_overflow_truncated_file_overlap_and_bad_manifest_rejected() {
+        let b = elf();
+        assert!(PieImage::parse_verified(&b, [1; 32]).is_err());
         assert!(parse(&b[..0x1800]).is_err());
-        let mut bad=b.clone();
+        let mut bad = b.clone();
         bad[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(parse(&bad).is_err());
-        bad=b.clone();
-        bad[64+56+16..64+56+24].copy_from_slice(&0x1000u64.to_le_bytes());
+        bad = b.clone();
+        bad[64 + 56 + 16..64 + 56 + 24].copy_from_slice(&0x1000u64.to_le_bytes());
         assert!(parse(&bad).is_err()); // overlapping LOAD page
-        bad=b;
-        bad[64+32..64+40].copy_from_slice(&0x2000u64.to_le_bytes());
+        bad = b;
+        bad[64 + 32..64 + 40].copy_from_slice(&0x2000u64.to_le_bytes());
         assert!(parse(&bad).is_err()); // p_filesz>p_memsz
     }
     #[test]
-    fn role_inventory_requires_exact_package_sidecar_abi_and_stack(){
-        let bytes=elf();
-        let r=[RelativeRelocation{offset:0x2000,info:R_AARCH64_RELATIVE,addend:0x1000}];
-        let specs=core::array::from_fn(|i|RolePackageSpec{
-            role:ROLES[i],package_id:i as u64+1,abi:3,image_bytes:bytes.len(),
-            image_sha256:Sha256::digest(&bytes).into(),relative_count:1,
-            relative_sha256:relative_sidecar_digest(&r).unwrap(),stack_bytes:ROLE_STACK_BYTES,
+    fn role_inventory_requires_exact_package_sidecar_abi_and_stack() {
+        let bytes = elf();
+        let r = [RelativeRelocation {
+            offset: 0x2000,
+            info: R_AARCH64_RELATIVE,
+            addend: 0x1000,
+        }];
+        let specs = core::array::from_fn(|i| RolePackageSpec {
+            role: ROLES[i],
+            package_id: i as u64 + 1,
+            abi: 3,
+            image_bytes: bytes.len(),
+            image_sha256: Sha256::digest(&bytes).into(),
+            relative_count: 1,
+            relative_sha256: relative_sidecar_digest(&r).unwrap(),
+            stack_bytes: ROLE_STACK_BYTES,
         });
-        let inputs=core::array::from_fn(|i|RolePackageInput{package_id:i as u64+1,bytes:&bytes,relative:&r});
-        assert!(verify_role_inventory(&specs,&inputs).is_ok());
-        for i in 0..ROLE_COUNT{
-            let mut bad=specs;bad[i].abi=1;
-            assert!(verify_role_inventory(&bad,&inputs).is_err());
-            bad=specs;bad[i].stack_bytes=4096;
-            assert!(verify_role_inventory(&bad,&inputs).is_err());
-            bad=specs;bad[i].image_sha256[0]^=1;
-            assert!(verify_role_inventory(&bad,&inputs).is_err());
+        let inputs = core::array::from_fn(|i| RolePackageInput {
+            package_id: i as u64 + 1,
+            bytes: &bytes,
+            relative: &r,
+        });
+        assert!(verify_role_inventory(&specs, &inputs).is_ok());
+        for i in 0..ROLE_COUNT {
+            let mut bad = specs;
+            bad[i].abi = 1;
+            assert!(verify_role_inventory(&bad, &inputs).is_err());
+            bad = specs;
+            bad[i].stack_bytes = 4096;
+            assert!(verify_role_inventory(&bad, &inputs).is_err());
+            bad = specs;
+            bad[i].image_sha256[0] ^= 1;
+            assert!(verify_role_inventory(&bad, &inputs).is_err());
         }
-        let mut bad=specs;bad[1].role=bad[0].role;
-        assert!(verify_role_inventory(&bad,&inputs).is_err());
-        bad=specs;bad[1].package_id=bad[0].package_id;
-        assert!(verify_role_inventory(&bad,&inputs).is_err());
-        let mut alternate=r;alternate[0].addend=0x1004;
-        let mut substituted=inputs;substituted[0].relative=&alternate;
-        assert!(verify_role_inventory(&specs,&substituted).is_err());
-        let verified=VerifiedRolePackage::verify(specs[0],inputs[0]).unwrap();
-        let mut out=vec![0xaa;0x3000];
-        assert_eq!(verified.stage(&mut out,0x4000_0000,0x4000_0000,0x5000_0000),Ok(0x4000_1000));
-        assert_eq!(u64::from_le_bytes(out[0x2000..0x2008].try_into().unwrap()),0x4000_1000);
+        let mut bad = specs;
+        bad[1].role = bad[0].role;
+        assert!(verify_role_inventory(&bad, &inputs).is_err());
+        bad = specs;
+        bad[1].package_id = bad[0].package_id;
+        assert!(verify_role_inventory(&bad, &inputs).is_err());
+        let mut alternate = r;
+        alternate[0].addend = 0x1004;
+        let mut substituted = inputs;
+        substituted[0].relative = &alternate;
+        assert!(verify_role_inventory(&specs, &substituted).is_err());
+        let verified = VerifiedRolePackage::verify(specs[0], inputs[0]).unwrap();
+        let mut out = vec![0xaa; 0x3000];
+        assert_eq!(
+            verified.stage(&mut out, 0x4000_0000, 0x4000_0000, 0x5000_0000),
+            Ok(0x4000_1000)
+        );
+        assert_eq!(
+            u64::from_le_bytes(out[0x2000..0x2008].try_into().unwrap()),
+            0x4000_1000
+        );
     }
     #[test]
-    fn phdr_must_describe_the_actual_verified_header_bytes(){
-        let mut b=elf();
+    fn phdr_must_describe_the_actual_verified_header_bytes() {
+        let mut b = elf();
         b[56..58].copy_from_slice(&3u16.to_le_bytes());
         // Map file offset zero through a read-only LOAD at virtual 0.
         // Existing RX and RW segments stay independently page aligned.
-        let at=64+2*56;
-        b[at..at+4].copy_from_slice(&PT_PHDR.to_le_bytes());
-        b[at+4..at+8].copy_from_slice(&4u32.to_le_bytes());
-        b[at+8..at+16].copy_from_slice(&64u64.to_le_bytes());
-        b[at+16..at+24].copy_from_slice(&0x1040u64.to_le_bytes());
-        b[at+32..at+40].copy_from_slice(&168u64.to_le_bytes());
-        b[at+40..at+48].copy_from_slice(&168u64.to_le_bytes());
+        let at = 64 + 2 * 56;
+        b[at..at + 4].copy_from_slice(&PT_PHDR.to_le_bytes());
+        b[at + 4..at + 8].copy_from_slice(&4u32.to_le_bytes());
+        b[at + 8..at + 16].copy_from_slice(&64u64.to_le_bytes());
+        b[at + 16..at + 24].copy_from_slice(&0x1040u64.to_le_bytes());
+        b[at + 32..at + 40].copy_from_slice(&168u64.to_le_bytes());
+        b[at + 40..at + 48].copy_from_slice(&168u64.to_le_bytes());
         // The VA is inside RX file-backed bytes, but those bytes are
         // offset 0x1040 rather than the verified header at offset 64.
         assert!(parse(&b).is_err());
-        b[64+8..64+16].copy_from_slice(&0u64.to_le_bytes());
+        b[64 + 8..64 + 16].copy_from_slice(&0u64.to_le_bytes());
         assert!(parse(&b).is_ok());
     }
-
 }

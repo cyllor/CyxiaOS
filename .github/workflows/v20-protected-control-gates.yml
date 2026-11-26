@@ -1,5 +1,7 @@
 name: V0.20 protected control gate components
 on:
+  push:
+    branches: [work/v020-integrated-eleven-gate-custody]
   pull_request:
     branches: [CyxiaOS-V0.20]
     paths:
@@ -7,6 +9,7 @@ on:
       - 'crates/kernel-core/src/frame_meta_v0199.rs'
       - 'crates/kernel-core/src/security/**'
       - 'crates/control-model/**'
+      - 'crates/prototype/src/snapshot/**'
       - 'kernel/src/arch/aarch64/v0199_control_bringup.rs'
       - '.github/workflows/v20-protected-control-gates.yml'
       - 'tools/verify_v0199_verdicts.py'
@@ -60,6 +63,10 @@ jobs:
           cargo test --locked --offline -p cyxia-kernel-core --lib file_structure_v1 2>&1 | tee artifacts/control-gates/file-structure.log
           cargo test --locked --offline -p cyxia-kernel-core --lib recovery_v1 2>&1 | tee artifacts/control-gates/recovery-v1.log
           cargo test --locked --offline -p cyxia-kernel-core --lib boot_epoch_v1 2>&1 | tee artifacts/control-gates/boot-pair.log
+          cargo test --locked --offline -p cyxia-kernel-core --lib epoch_redo_v0199 2>&1 | tee artifacts/control-gates/epoch-redo.log
+          cargo test --locked --offline -p cyxia-kernel-core --lib file_receipt_store_v0199 2>&1 | tee artifacts/control-gates/receipt-retirement.log
+          cargo test --locked --offline -p cyxia-kernel-core --lib file_receipt_query_v4 2>&1 | tee artifacts/control-gates/receipt-query.log
+          cargo test --locked --offline -p cyxia-prototype --lib snapshot::tests 2>&1 | tee artifacts/control-gates/snapshot-retention.log
           cargo test --locked --offline -p cyxia-kernel-core --lib file_mount_v1 2>&1 | tee artifacts/control-gates/file-mount-v1.log
           cargo test --locked --offline -p cyxia-kernel-core --lib frame_meta_v0199 2>&1 | tee artifacts/control-gates/frame-meta.log
           (cd tools; python3 -B -m unittest -v test_verify_v0199_verdicts) 2>&1 | tee artifacts/control-gates/verdict-custody.log

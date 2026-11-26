@@ -5,7 +5,8 @@ use cyxia_posix::executable::{PAGE_SIZE, parse_for_profile};
 
 fn inspect() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: check_elf_layout <legacy|full-os-v1|full-os-v2|full-os-v3> <aarch64|x86_64> <elf>";
+    let usage =
+        "usage: check_elf_layout <legacy|full-os-v1|full-os-v2|full-os-v3> <aarch64|x86_64> <elf>";
     let profile = match args.next().as_deref() {
         Some("legacy") => ImageProfile::Legacy,
         Some("full-os-v1") => ImageProfile::FullOsV1,

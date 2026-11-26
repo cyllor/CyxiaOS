@@ -227,8 +227,7 @@ impl BatchedBlock {
             // A device completion is not the caller's acknowledgment.
             // Retain the original token/custody until acknowledge() actually
             // frees the pinned queue buffers, including if the caller fails.
-            self.pending[usize::from(token.slot)] =
-                Some((token, operation, COMPLETED_RETAINED));
+            self.pending[usize::from(token.slot)] = Some((token, operation, COMPLETED_RETAINED));
             self.last_completed = self.last_completed.max(c.version);
             return Ok(Some(BlockCompletion {
                 token,
@@ -237,14 +236,9 @@ impl BatchedBlock {
                 latency_ns: c.latency_ns,
             }));
         }
-        if self
-            .pending
-            .iter()
-            .flatten()
-            .any(|(_, _, start)| {
-                *start != COMPLETED_RETAINED && observed_ms.wrapping_sub(*start) >= 250
-            })
-        {
+        if self.pending.iter().flatten().any(|(_, _, start)| {
+            *start != COMPLETED_RETAINED && observed_ms.wrapping_sub(*start) >= 250
+        }) {
             self.fail(p);
             return Err(Error::Timeout);
         }
@@ -254,7 +248,8 @@ impl BatchedBlock {
         let at = usize::from(token.slot);
         // Fail closed on an early, stale or forged acknowledgment. Only the
         // exact completion observed by poll() can terminate its DMA custody.
-        if !matches!(self.pending.get(at), Some(Some((owned, _, COMPLETED_RETAINED))) if *owned == token) {
+        if !matches!(self.pending.get(at), Some(Some((owned, _, COMPLETED_RETAINED))) if *owned == token)
+        {
             return Err(Error::Response);
         }
         self.queue.release(token)?;
@@ -464,14 +459,16 @@ mod tests {
         // A delayed ACK does not convert the held completion into a timeout.
         p.clock.set(300_000_000);
         assert_eq!(b.poll(&mut [0; 512], &p), Ok(None));
-        let forged = Token { generation: token.generation + 1, ..token };
+        let forged = Token {
+            generation: token.generation + 1,
+            ..token
+        };
         assert_eq!(b.acknowledge(forged), Err(Error::Response));
         assert!(!b.is_quiescent());
         b.acknowledge(token).unwrap();
         assert!(b.is_quiescent());
         assert_eq!(b.acknowledge(token), Err(Error::Response));
     }
-
 
     #[test]
     fn native_sec_d04_partial_completion_and_timeout_keep_unknown_dma_pinned() {

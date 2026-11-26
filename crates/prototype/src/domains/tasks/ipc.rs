@@ -380,11 +380,17 @@ impl<const B: usize> Ipc<B> {
     // Reserved identities stay burned across API mode changes. Ordinary
     // sends and waits cannot evade a retired reservation's high-water gate.
     fn reject_retired_reservation(
-        &self, actor: ObjectKey, endpoint: ObjectKey, request_id: u64,
+        &self,
+        actor: ObjectKey,
+        endpoint: ObjectKey,
+        request_id: u64,
     ) -> Result<(), Error> {
-        if self.grant_high.iter().flatten().any(|h| {
-            h.actor == actor && h.endpoint == endpoint && request_id <= h.request_id
-        }) {
+        if self
+            .grant_high
+            .iter()
+            .flatten()
+            .any(|h| h.actor == actor && h.endpoint == endpoint && request_id <= h.request_id)
+        {
             return Err(Error::Stale);
         }
         Ok(())
@@ -412,7 +418,8 @@ impl<const B: usize> Ipc<B> {
         }
         self.reject_retired_reservation(sender, key, request_id)?;
         if self.waiters.iter().flatten().any(|w| {
-            w.ticket.endpoint == key && w.ticket.sender == sender
+            w.ticket.endpoint == key
+                && w.ticket.sender == sender
                 && w.message.request_id == request_id
         }) {
             return Err(Error::Conflict);

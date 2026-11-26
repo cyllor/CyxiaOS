@@ -81,13 +81,18 @@ impl Runner {
     }
 
     fn epoll_readiness(&self, epfd: i32) -> Result<[u32; OPEN_MAX], Errno> {
-        self.process.epoll_sample_at(epfd, super::now_ns, Self::source_readiness)
+        self.process
+            .epoll_sample_at(epfd, super::now_ns, Self::source_readiness)
     }
 
     pub(super) fn epoll_readable(
-        &mut self, epfd: i32, clock: impl FnOnce() -> u64,
+        &mut self,
+        epfd: i32,
+        clock: impl FnOnce() -> u64,
     ) -> Result<bool, Errno> {
-        let readiness = self.process.epoll_sample_at(epfd, clock, Self::source_readiness)?;
+        let readiness = self
+            .process
+            .epoll_sample_at(epfd, clock, Self::source_readiness)?;
         self.process.epoll_readable(epfd, &readiness)
     }
 

@@ -8,20 +8,20 @@
 //! document; the existing CPU0-only kernel must not advertise SMP isolation.
 #![forbid(unsafe_code)]
 
-pub mod advisory;
-pub mod advice_envelope_v1;
 pub mod advice_disposition_v1;
+pub mod advice_envelope_v1;
 pub mod advice_ledger_v0199;
-pub mod decision_record_v3;
-pub mod registered_gate_v3;
-pub mod desired_plan_v0199;
-pub mod svc_bridge_v3;
-pub mod plan_wire_v2;
+pub mod advisory;
 pub mod apply_report_v1;
 pub mod budget;
 pub mod cores;
+pub mod decision_record_v3;
+pub mod desired_plan_v0199;
+pub mod plan_wire_v2;
 pub mod policy;
 pub mod queue;
+pub mod registered_gate_v3;
+pub mod svc_bridge_v3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plane {
@@ -74,40 +74,41 @@ impl Epochs {
 pub mod manager;
 pub mod wire;
 
+pub mod cpu0_v0199;
 pub mod dispatch;
 pub mod exchange;
 pub mod fixed;
-pub mod cpu0_v0199;
-pub mod security_finding;
-pub mod rule_profile_v2;
 pub mod image;
-pub mod pie_image_v0199;
 pub mod image_abi;
+pub mod pie_image_v0199;
+pub mod rule_profile_v2;
+pub mod security_finding;
 pub mod service;
 
 pub mod service_image;
 pub mod service_restart;
 
-pub mod task_admission;
 pub mod role_manifest_v0199;
+pub mod task_admission;
 
+pub mod policy_lock_v0199;
 pub mod role_budget_v0199;
 
 pub mod feedback_v0199;
 
 pub mod action_schema_v2;
 
-pub mod control_rpc_v1;
 pub mod apply_work_v1;
+pub mod control_rpc_v1;
 
 pub mod snapshot_store_v3;
 
 pub mod trial_permit_v1;
 
-pub mod d15_owner_v0199;
-pub mod d07_owner_v0199;
 pub mod d02_owner_v0199;
 pub mod d05_owner_v0199;
+pub mod d07_owner_v0199;
+pub mod d15_owner_v0199;
 
 pub mod candidate_registry_v0199;
 

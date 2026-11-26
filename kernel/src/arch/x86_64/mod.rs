@@ -75,9 +75,9 @@ mod boot;
 mod checks;
 pub(crate) mod console;
 #[cfg(feature = "os-runtime")]
-pub(crate) mod runtime;
-#[cfg(feature = "os-runtime")]
 pub(crate) mod dispatch;
+#[cfg(feature = "os-runtime")]
+pub(crate) mod runtime;
 #[cfg(all(feature = "smp-selftest", not(feature = "os-runtime")))]
 mod smp;
 pub(crate) use console::{exit, log};

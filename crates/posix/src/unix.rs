@@ -357,13 +357,18 @@ impl UnixSockets {
         Capacity {
             endpoints: self.endpoint_limit,
             connections: self.connection_limit,
-            free_endpoints: self
-                .endpoints[..self.endpoint_limit]
+            free_endpoints: self.endpoints[..self.endpoint_limit]
                 .iter()
                 .filter(|s| s.endpoint.is_none() && s.generation < GENERATION_MAX)
                 .count(),
-            free_connections: self.connections[..self.connection_limit].iter().filter(|c| c.is_none()).count(),
-            free_bindings: self.bindings[..self.endpoint_limit].iter().filter(|b| b.is_none()).count(),
+            free_connections: self.connections[..self.connection_limit]
+                .iter()
+                .filter(|c| c.is_none())
+                .count(),
+            free_bindings: self.bindings[..self.endpoint_limit]
+                .iter()
+                .filter(|b| b.is_none())
+                .count(),
         }
     }
     fn free_endpoint(&self, excluded: Option<usize>) -> Result<usize, Errno> {
@@ -517,8 +522,7 @@ impl UnixSockets {
         {
             return Err(Errno::Addrinuse);
         }
-        let slot = self
-            .bindings[..self.endpoint_limit]
+        let slot = self.bindings[..self.endpoint_limit]
             .iter()
             .position(Option::is_none)
             .ok_or(Errno::Nospc)?;
@@ -1074,7 +1078,10 @@ mod tests {
     fn stream_ring_copies_and_clears_across_the_wrap() {
         let mut stream = Stream::new();
         let mut out = [0u8; BUFFER_BYTES];
-        assert_eq!(stream.write(&[3; BUFFER_BYTES - 2], None), Ok(BUFFER_BYTES - 2));
+        assert_eq!(
+            stream.write(&[3; BUFFER_BYTES - 2], None),
+            Ok(BUFFER_BYTES - 2)
+        );
         assert_eq!(
             stream.read(&mut out[..BUFFER_BYTES - 3], true),
             Ok((BUFFER_BYTES - 3, None))
@@ -1082,14 +1089,20 @@ mod tests {
         assert!(out[..BUFFER_BYTES - 3].iter().all(|v| *v == 3));
         assert_eq!(stream.head, BUFFER_BYTES - 3);
         // Straddling write: three bytes at the tail, the rest at the front.
-        assert_eq!(stream.write(&[9; BUFFER_BYTES - 1], None), Ok(BUFFER_BYTES - 1));
+        assert_eq!(
+            stream.write(&[9; BUFFER_BYTES - 1], None),
+            Ok(BUFFER_BYTES - 1)
+        );
         assert_eq!(stream.len, BUFFER_BYTES);
         // Straddling read returns the tail byte first, then the wrapped run.
         assert_eq!(stream.read(&mut out, true), Ok((BUFFER_BYTES, None)));
         assert_eq!(out[0], 3);
         assert!(out[1..].iter().all(|v| *v == 9));
         assert_eq!(stream.len, 0);
-        assert!(stream.bytes.iter().all(|v| *v == 0), "consumed bytes were not cleared");
+        assert!(
+            stream.bytes.iter().all(|v| *v == 0),
+            "consumed bytes were not cleared"
+        );
     }
 
     #[test]

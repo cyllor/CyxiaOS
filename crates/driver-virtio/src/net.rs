@@ -1,7 +1,7 @@
 //! Bounded modern VirtIO Ethernet driver (one RX and one TX credit).
 use crate::{Error, Platform, QueueMemory, Transport};
 mod batched;
-pub use batched::BatchedNet;
+pub use batched::{BatchedNet, TxReceipt};
 
 pub const MAX_FRAME: usize = 1514;
 const HEADER: usize = 12;

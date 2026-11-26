@@ -30,13 +30,13 @@ class NativeTaskCredit(unittest.TestCase):
         NetworkPieceTrace(
             "test_real_driver_reports_fixed_rx_and_queue_stages_without_new_checkpoints"
         ).debug()
-        transport = (ROOT / "crates/cluster-transport/src/device.rs").read_text()
+        transport = (ROOT / "crates/net-transport/src/device.rs").read_text()
         self.assertIn("receive_frame_with_checkpoint", transport)
         self.assertIn("receive_with_checkpoint(&mut self.rx.bytes, checkpoint)", transport)
 
     def test_native_tcp_ingress_and_handshake_have_separate_bounded_credits(self):
-        tcp = (ROOT / "crates/cluster-transport/src/tcp.rs").read_text()
-        tls = (ROOT / "crates/cluster-transport/src/tls.rs").read_text()
+        tcp = (ROOT / "crates/net-transport/src/tcp.rs").read_text()
+        tls = (ROOT / "crates/net-transport/src/tls.rs").read_text()
 
         self.assertIn("pub const IDLE_TIMEOUT_SECS: u64 = 60;", tcp)
         ingress = tcp[tcp.index("let queued = before.send_queue();"):

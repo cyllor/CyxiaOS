@@ -81,22 +81,45 @@ pub(crate) fn try_log(s: &[u8]) -> Result<(), PlatformError> {
 /// before advancing the sole writer's sequence. Emergency log() stays
 /// independent. Call only from the serialized native console owner;
 /// no direct/emergency writer may interleave an admitted partial frame.
-#[cfg(feature="v0199-epoch-disk-selftest")]
-pub(crate) fn enqueue_v0199(owner:&mut cyxia_kernel_core::control_plane::d15_owner_v0199::Owner,
-    payload:&[u8],now:u64)->Result<usize,cyxia_kernel_core::control_plane::Error>{
+#[cfg(feature = "v0199-epoch-disk-selftest")]
+pub(crate) fn enqueue_v0199(
+    owner: &mut cyxia_kernel_core::control_plane::d15_owner_v0199::Owner,
+    payload: &[u8],
+    now: u64,
+) -> Result<usize, cyxia_kernel_core::control_plane::Error> {
     use cyxia_kernel_core::control_plane::Error;
-    let seq=LOG_SEQUENCE.load(Ordering::Relaxed);
-    let next=seq.checked_add(1).ok_or(Error::Exhausted)?;
-    let mut frame=[0;128];
-    let n=cyxia_contracts::transport::encode(1,seq,payload,&mut frame).map_err(|_|Error::Invalid)?;
-    owner.enqueue(&frame[..n],now)?;
-    LOG_SEQUENCE.compare_exchange(seq,next,Ordering::Relaxed,Ordering::Relaxed)
+    let seq = LOG_SEQUENCE.load(Ordering::Relaxed);
+    let next = seq.checked_add(1).ok_or(Error::Exhausted)?;
+    let mut frame = [0; 128];
+    let n = cyxia_contracts::transport::encode(1, seq, payload, &mut frame)
+        .map_err(|_| Error::Invalid)?;
+    owner.enqueue(&frame[..n], now)?;
+    LOG_SEQUENCE
+        .compare_exchange(seq, next, Ordering::Relaxed, Ordering::Relaxed)
         .expect("serialized console writer");
     Ok(n)
 }
 pub(crate) fn halt() -> ! {
     loop {
-        unsafe { core::arch::asm!("msr daifset, #15", "wfe") }
+        // v020-production parks with WFI. QEMU TCG implements WFE as a yield
+        // hint that never sleeps the vCPU, so every CPU parked here burned one
+        // host core for the rest of the boot; with the three halted business
+        // CPUs that starved QEMU's device-completion path and pushed scratch
+        // virtio-blk completions toward the driver's 250 ms deadline (wave-11
+        // staging flake). WFI halts the vCPU until an interrupt is pending;
+        // with DAIF masked it then just loops back here. Other profiles keep WFE.
+        #[cfg(feature = "v020-production")]
+        // SAFETY: masking DAIF and waiting for an interrupt touches no memory;
+        // this CPU never leaves the loop.
+        unsafe {
+            core::arch::asm!("msr daifset, #15", "wfi")
+        }
+        #[cfg(not(feature = "v020-production"))]
+        // SAFETY: masking DAIF and waiting for an event touches no memory;
+        // this CPU never leaves the loop.
+        unsafe {
+            core::arch::asm!("msr daifset, #15", "wfe")
+        }
     }
 }
 #[panic_handler]

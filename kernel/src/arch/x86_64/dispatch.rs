@@ -158,7 +158,9 @@ pub(crate) fn try_collect(ticket: Ticket) -> Result<Option<Completion>, Error> {
 /// ownership still transfers only through try_collect after the worker returns.
 pub(crate) fn is_complete(ticket: Ticket) -> Result<bool, Error> {
     owner()?;
-    slot(ticket.cpu)?.is_done(ticket.generation).map_err(ticket_error)
+    slot(ticket.cpu)?
+        .is_done(ticket.generation)
+        .map_err(ticket_error)
 }
 
 /// Stop and recover the complete batch before foreground service work. On any
@@ -241,7 +243,9 @@ pub(crate) extern "C" fn worker(cpu_slot: usize) -> ! {
                                 && (local_syscalls == 0
                                     || !CPU0_SERVICE_PENDING.load(Ordering::Acquire))
                                 && process_arch::complete_ap_clock(
-                                    &mut job.context, root, job.deadline_ns,
+                                    &mut job.context,
+                                    root,
+                                    job.deadline_ns,
                                 )
                             {
                                 local_syscalls += 1;

@@ -1,8 +1,8 @@
 //! Shared VirtIO entropy service. Board adapters supply actual transports.
 use super::virtio_platform::Board;
-use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "unified-runtime")]
 use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_driver_virtio::{Transport, queue::BatchMemory as QueueMemory, rng::BatchedRng as Rng};
 static BUSY: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "unified-runtime")]

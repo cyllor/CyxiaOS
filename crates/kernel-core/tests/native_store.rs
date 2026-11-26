@@ -106,7 +106,7 @@ fn missing_ordinal_cannot_relabel_the_last_scanned_record() {
     // deterministic no-space result keeps both reads and closing reserve live.
     let mut exhausted = false;
     for key in 10..600 {
-        let total = cyxia_prototype::cluster::MAX_EFFECT;
+        let total = cyxia_prototype::local_volume::MAX_EFFECT;
         let mut status = 0;
         for offset in (0..total).step_by(4096) {
             let n = (total - offset).min(4096);

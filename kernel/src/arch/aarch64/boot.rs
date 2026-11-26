@@ -44,7 +44,12 @@ extern "C" fn boot_entry() -> ! {
     unsafe {
         timer::init_cpu_accounting();
     }
-    #[cfg(feature = "smp-selftest")]
+    // V0.20 production skeleton: production::run(info) performs the same proven
+    // SMP bring-up and then initializes the production control plane with
+    // in-vector SVC dispatch. Every other smp-selftest profile keeps smp::run.
+    #[cfg(all(feature = "smp-selftest", feature = "v020-production"))]
+    smp::production::run(&info);
+    #[cfg(all(feature = "smp-selftest", not(feature = "v020-production")))]
     smp::run(&info);
     #[cfg(not(feature = "smp-selftest"))]
     primary_services(info)

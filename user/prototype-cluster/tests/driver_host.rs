@@ -315,7 +315,7 @@ mod broker {
                             };
                             let key = CustodyKey {
                                 owner_boot: value(104),
-                                cluster: input[112..144].try_into().unwrap(),
+                                legacy_remote_scope: input[112..144].try_into().unwrap(),
                                 requester: input[144..176].try_into().unwrap(),
                                 contract: input[176..192].try_into().unwrap(),
                                 request_hash: input[192..224].try_into().unwrap(),

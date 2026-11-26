@@ -186,13 +186,16 @@ impl BatchedNet {
         }
         match self.tx.poll(&mut self.transport, &mut [], p) {
             Ok(Some(c)) => {
-                let receipt=TxReceipt {token:c.token,version:c.version};
-                self.completed_tx=Some(receipt);
-                self.report(p,true);
+                let receipt = TxReceipt {
+                    token: c.token,
+                    version: c.version,
+                };
+                self.completed_tx = Some(receipt);
+                self.report(p, true);
                 Ok(Some(receipt))
             }
             Ok(None) => {
-                self.report(p,true);
+                self.report(p, true);
                 Ok(None)
             }
             Err(e) => {
@@ -204,17 +207,15 @@ impl BatchedNet {
     /// Only the exact, driver-issued completed TX token may retire the DMA
     /// descriptor. A stale/reused generation or arbitrary caller notification
     /// does not release another chain or advance completed policy versions.
-    pub fn acknowledge_tx(
-        &mut self, receipt: TxReceipt, p: &impl Platform,
-    ) -> Result<(), Error> {
+    pub fn acknowledge_tx(&mut self, receipt: TxReceipt, p: &impl Platform) -> Result<(), Error> {
         if self.completed_tx != Some(receipt) {
             return Err(Error::Response);
         }
         self.healthy(p)?;
         self.tx.release(receipt.token)?;
-        self.completed_tx=None;
-        self.last_completed=self.last_completed.max(receipt.version);
-        self.report(p,true);
+        self.completed_tx = None;
+        self.last_completed = self.last_completed.max(receipt.version);
+        self.report(p, true);
         Ok(())
     }
     /// Historical port compatibility: the trusted native VirtIO owner may
@@ -223,10 +224,10 @@ impl BatchedNet {
     pub fn poll_tx(&mut self, p: &impl Platform) -> Result<bool, Error> {
         match self.poll_tx_receipt(p)? {
             Some(receipt) => {
-                self.acknowledge_tx(receipt,p)?;
+                self.acknowledge_tx(receipt, p)?;
                 Ok(true)
             }
-            None => Ok(false)
+            None => Ok(false),
         }
     }
     pub fn poll_rx(&mut self, p: &impl Platform) -> Result<bool, Error> {
@@ -493,36 +494,47 @@ mod tests {
     }
     #[test]
     fn v019_sec_d_tx_completion_retains_dma_until_exact_generation_ack() {
-        let (mut n,p,_,tx)=fixture();
-        n.send(&[0x31;64],&p).unwrap();
-        unsafe { used(tx,0,0); }
-        let receipt=n.poll_tx_receipt(&p).unwrap().unwrap();
-        assert_eq!(n.tx.free(),n.tx.capacity()-1);
-        assert_eq!(n.poll_tx_receipt(&p),Err(Error::Busy));
-        assert_eq!(n.poll_tx(&p),Err(Error::Busy));
-        assert_eq!(n.acknowledge_tx(TxReceipt {
-            token:Token{generation:receipt.token.generation+1,..receipt.token},
-            ..receipt
-        },&p),Err(Error::Response));
-        assert_eq!(n.tx.free(),n.tx.capacity()-1);
-        assert_eq!(n.notify_stats().last_completed_version,0);
-        n.acknowledge_tx(receipt,&p).unwrap();
-        assert_eq!(n.tx.free(),n.tx.capacity());
-        assert_eq!(n.acknowledge_tx(receipt,&p),Err(Error::Response));
-        n.send(&[0x32;64],&p).unwrap();
+        let (mut n, p, _, tx) = fixture();
+        n.send(&[0x31; 64], &p).unwrap();
+        unsafe {
+            used(tx, 0, 0);
+        }
+        let receipt = n.poll_tx_receipt(&p).unwrap().unwrap();
+        assert_eq!(n.tx.free(), n.tx.capacity() - 1);
+        assert_eq!(n.poll_tx_receipt(&p), Err(Error::Busy));
+        assert_eq!(n.poll_tx(&p), Err(Error::Busy));
+        assert_eq!(
+            n.acknowledge_tx(
+                TxReceipt {
+                    token: Token {
+                        generation: receipt.token.generation + 1,
+                        ..receipt.token
+                    },
+                    ..receipt
+                },
+                &p
+            ),
+            Err(Error::Response)
+        );
+        assert_eq!(n.tx.free(), n.tx.capacity() - 1);
+        assert_eq!(n.notify_stats().last_completed_version, 0);
+        n.acknowledge_tx(receipt, &p).unwrap();
+        assert_eq!(n.tx.free(), n.tx.capacity());
+        assert_eq!(n.acknowledge_tx(receipt, &p), Err(Error::Response));
+        n.send(&[0x32; 64], &p).unwrap();
         // Reusing a freed slot cannot make the old completion valid again.
-        assert_eq!(n.acknowledge_tx(receipt,&p),Err(Error::Response));
+        assert_eq!(n.acknowledge_tx(receipt, &p), Err(Error::Response));
     }
     #[test]
     fn v019_sec_d_tx_quiescent_requires_used_ring_and_matching_ack() {
-        let (mut n,p,_,tx)=fixture();
+        let (mut n, p, _, tx) = fixture();
         assert!(n.tx_quiescent());
-        n.send(&[0x2d;64],&p).unwrap();
+        n.send(&[0x2d; 64], &p).unwrap();
         assert!(!n.tx_quiescent());
-        unsafe{used(tx,0,0)};
-        let receipt=n.poll_tx_receipt(&p).unwrap().unwrap();
+        unsafe { used(tx, 0, 0) };
+        let receipt = n.poll_tx_receipt(&p).unwrap().unwrap();
         assert!(!n.tx_quiescent());
-        n.acknowledge_tx(receipt,&p).unwrap();
+        n.acknowledge_tx(receipt, &p).unwrap();
         assert!(n.tx_quiescent());
     }
     #[test]
