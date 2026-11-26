@@ -169,16 +169,25 @@ impl DurableEpochGate {
     pub fn boot_epoch(&self) -> Option<u64> {
         (self.boot_confirmed && self.pending.is_none()).then_some(self.committed.last_boot_epoch)
     }
+    pub(super) fn verify_startup_config(
+        &self,
+        config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+    ) -> Result<(), Error> {
+        if !self.startup_verified {
+            return Err(Error::Unauthorized);
+        }
+        config.check_committed(&self.committed)
+    }
     /// Revalidate the committed signed startup configuration before
     /// constructing or issuing actual static control roots.
     pub fn confirmed_config_boot(
         &self,
         config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
     ) -> Result<u64, Error> {
-        if !self.startup_verified || !self.paired_confirmed {
+        if !self.paired_confirmed {
             return Err(Error::Unauthorized);
         }
-        config.check_committed(&self.committed)?;
+        self.verify_startup_config(config)?;
         self.boot_epoch().ok_or(Error::Busy)
     }
     fn slot(&self, role: Role) -> Result<usize, Error> {

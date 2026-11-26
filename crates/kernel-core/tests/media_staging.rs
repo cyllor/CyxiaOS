@@ -340,6 +340,66 @@ fn signed_scratch_checks_envelope_and_mounted_state_before_mutation() {
 }
 
 #[test]
+fn signed_startup_requires_authority_before_io_and_binds_exact_committed_state() {
+    use cyxia_kernel_core::{
+        control_plane::role_manifest_v0199::ROLES,
+        security::{
+            boot_epoch_v1::{BootEpochAuthority, BootEpochTx, BootPairRedo},
+            durable_role_epoch_v0199::SlotBinding,
+        },
+    };
+
+    let _owner = STAGING_OWNER.lock().unwrap();
+    let mut disk = Disk::default();
+    let verified = signed::verify(signed::WIRE, &mut [0; 1024]).unwrap();
+    let sb = volume::format(&mut disk, Some(&verified), LegacyZero).unwrap();
+    let state_raw = disk.blocks[&volume::SECURITY_HOME];
+    let boot_raw = disk.blocks[&volume::BOOT_HOME];
+    let sb_raw = disk.blocks[&0];
+    let slots = core::array::from_fn(|index| SlotBinding {
+        role: ROLES[index],
+        slot: index as u8,
+    });
+    let tx = BootEpochTx {
+        superblock_raw: &sb_raw,
+        first_log_block: volume::FIRST_LOG_BLOCK,
+        state_home: volume::SECURITY_HOME,
+        boot_home: volume::BOOT_HOME,
+        txid: sb.generation,
+        commit_lsn: sb.checkpoint_lsn + 4,
+    };
+    let mut pair = BootPairRedo::new();
+    let mut recovered = BootEpochAuthority::open(&state_raw, &boot_raw, slots, |_| Ok(())).unwrap();
+    let before = (disk.reads, disk.writes, disk.flushes);
+    assert_eq!(
+        recovered.allocate_for_startup(&mut disk, &mut pair, tx, &verified),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!((disk.reads, disk.writes, disk.flushes), before);
+    assert_eq!(recovered.confirmed_epoch(), None);
+
+    let mut startup =
+        BootEpochAuthority::open_for_startup(&state_raw, &boot_raw, slots, &verified, |_| Ok(()))
+            .unwrap();
+    let binding = startup
+        .allocate_for_startup(&mut disk, &mut pair, tx, &verified)
+        .unwrap();
+    assert_eq!(binding.epoch(), 1);
+    let state = authority::verified_pair_state(&mut disk, sb, Some(&verified)).unwrap();
+    assert_eq!(binding.verify_state(&state), Ok(()));
+    let mut other = state;
+    other.service_generations[0] += 1;
+    assert_eq!(verified.check_committed(&other), Ok(()));
+    assert_eq!(binding.verify_state(&other), Err(Error::Conflict));
+    let before_retry = (disk.reads, disk.writes, disk.flushes);
+    assert_eq!(
+        startup.allocate_for_startup(&mut disk, &mut pair, tx, &verified),
+        Err(Error::Conflict)
+    );
+    assert_eq!((disk.reads, disk.writes, disk.flushes), before_retry);
+}
+
+#[test]
 fn staging_snapshot_envelopes_are_checked_before_replay() {
     use cyxia_kernel_core::security::file_media_unified_v1::{
         ENVELOPE_BYTES, ObjectEnvelope, SNAPSHOT_CATALOG_BLOCK, SNAPSHOT_PROTECTION_BLOCK,
