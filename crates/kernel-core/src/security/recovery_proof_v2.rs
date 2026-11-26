@@ -1,10 +1,9 @@
 //! V0.19.9 RecoveryProof v2 + RECOVERY_REQUIRED contract layer.
 //!
-//! Contract-only model of the baseline recovery evidence rules; native EL1
-//! wiring (audit-slot fallback, per-CPU preallocated accumulators, consumer
-//! takeover, mount integration) is a LATER deliverable and is deliberately
-//! NOT faked here. Nothing in this module mounts a volume, allocates a
-//! BootEpoch or authorizes a write by itself.
+//! This module models recovery evidence and admission. The V0.20 AArch64
+//! production adapter owns its volatile accumulators and supplies real CPU
+//! quiescence evidence for writer handoff. Media verification and persistent
+//! audit authority remain the responsibilities of their native owners.
 //!
 //! Baseline citations (docs/design/baselines/v0.19.9-implementation-spec.txt):
 //! * 安§0.9 (~L7411-7470): RecoveryProof v2 fixed 256B layout, the
@@ -470,6 +469,29 @@ impl RecoveryAccumulator {
             p.flags |= FLAG_OVERFLOW;
         }
         Ok(())
+    }
+
+    /// Advance a stopped writer's generation after EL1 has excluded all old
+    /// writers. Match the boot, CPU, previous generation and independently
+    /// published event count before consuming its retained summary on CPU0.
+    pub fn takeover_stopped_writer(
+        &mut self,
+        boot_epoch: u64,
+        cpu_id: u32,
+        previous_generation: u64,
+        published_count: u64,
+    ) -> Result<(), Error> {
+        let p = self.proof();
+        if p.boot_epoch != boot_epoch
+            || p.cpu_id != cpu_id
+            || p.cpu_generation != previous_generation
+        {
+            return Err(Error::Stale);
+        }
+        if p.total_count != published_count {
+            return Err(Error::Conflict);
+        }
+        self.takeover(previous_generation.checked_add(1).ok_or(Error::Exhausted)?)
     }
 
     /// Issue a successor writer/consumer generation after the native takeover
@@ -1193,6 +1215,46 @@ mod tests {
         });
         assert_eq!(max.takeover(u64::MAX), Err(Error::Stale));
         assert_eq!(max.takeover(1), Err(Error::Stale));
+    }
+
+    #[test]
+    fn stopped_writer_handoff_binds_owner_watermark_and_retains_entire_summary() {
+        let mut acc = RecoveryAccumulator::new(7, 3, 5).unwrap();
+        acc.record(&event(1, DegradedEventKind::OtherCritical, 1))
+            .unwrap();
+        let before = *acc.proof();
+        for (epoch, cpu, generation, count, error) in [
+            (8, 3, 5, 1, Error::Stale),
+            (7, 1, 5, 1, Error::Stale),
+            (7, 3, 4, 1, Error::Stale),
+            (7, 3, 5, 0, Error::Conflict),
+            (7, 3, 5, 2, Error::Conflict),
+        ] {
+            assert_eq!(
+                acc.takeover_stopped_writer(epoch, cpu, generation, count),
+                Err(error)
+            );
+            assert_eq!(*acc.proof(), before);
+        }
+        acc.takeover_stopped_writer(7, 3, 5, 1).unwrap();
+        assert_eq!(
+            *acc.proof(),
+            RecoveryProofV2 {
+                cpu_generation: 6,
+                ..before
+            }
+        );
+        assert_eq!(acc.takeover_stopped_writer(7, 3, 5, 1), Err(Error::Stale));
+        let exhausted = RecoveryProofV2 {
+            cpu_generation: u64::MAX,
+            ..before
+        };
+        let mut acc = RecoveryAccumulator::from_decoded(exhausted);
+        assert_eq!(
+            acc.takeover_stopped_writer(7, 3, u64::MAX, 1),
+            Err(Error::Exhausted)
+        );
+        assert_eq!(*acc.proof(), exhausted);
     }
 
     #[test]

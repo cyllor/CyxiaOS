@@ -12,6 +12,24 @@
 # -m 1024M (prototype-memory) with a fresh all-zero scratch disk; it proves the
 # boot and fail-closed paths only (golden_vector_pending=true, signed_config=false).
 #
+# Wave 13 exercises authenticated closure and abrupt EOF against the same
+# guest, plus Supervisor audit delivery and volatile ACK. The opt-in signed
+# scratch profile checks the test policy across two boots, then refuses blank
+# and unsigned media without writes or flushes.
+#
+# Wave 14 adds the bounded FramePool lifecycle and reads the four empty D1.5
+# snapshot envelopes from the scratch disk with an independent host decoder.
+# Wave 15 allocates all eight system objects on an opt-in scratch disk and
+# checks that allocation and ACL corruption stops reopen before replay.
+# Wave 16 runs the Supervisor's empty catalogue LIST and checks its reply
+# and denial evidence against the confirmed BootEpoch and on-disk catalogue.
+# Wave 18 runs the read-only v4 file endpoint against an allocated scratch file.
+# Wave 19 checks QUERY and HISTORY_OPEN against the empty slot range on the
+# same signed disk and refuses a corrupted slot tail before recovery writes.
+# Wave 20 verifies concurrent read handles and precise receipt retirement on
+# the same signed staging volume across both boots.
+# Wave 21 verifies ACL-bound volatile overwrites and exact write replay.
+#
 # Build order: the production kernel include_bytes!-embeds the fixture-identity
 # local-echo guest, so the build job builds the guest first with the exact
 # helper tools/verify_v0199_sec_n.py uses (build_guest), then the kernels.
@@ -23,9 +41,17 @@ on:
       - 'kernel/**'
       - 'crates/**'
       - 'user/local-echo/**'
+      - 'user/v0199-control/**'
+      - 'tests/fixtures/v020-signed-scratch/**'
       - '.github/workflows/v020-production.yml'
       - 'tools/verify_v020_production.py'
       - 'tools/test_verify_v020_production.py'
+      - 'tools/v020_production_*.py'
+      - 'tools/v020_tls_peer.py'
+      - 'tools/test_v020_tls_peer.py'
+      - 'tools/test_v020_signed_scratch_vector.py'
+      - 'tools/v020_snapshot_envelopes.py'
+      - 'tools/test_v020_snapshot_envelopes.py'
       - 'tools/verify_v0199_sec_n.py'
   pull_request:
     branches: [CyxiaOS-V0.20]
@@ -33,9 +59,17 @@ on:
       - 'kernel/**'
       - 'crates/**'
       - 'user/local-echo/**'
+      - 'user/v0199-control/**'
+      - 'tests/fixtures/v020-signed-scratch/**'
       - '.github/workflows/v020-production.yml'
       - 'tools/verify_v020_production.py'
       - 'tools/test_verify_v020_production.py'
+      - 'tools/v020_production_*.py'
+      - 'tools/v020_tls_peer.py'
+      - 'tools/test_v020_tls_peer.py'
+      - 'tools/test_v020_signed_scratch_vector.py'
+      - 'tools/v020_snapshot_envelopes.py'
+      - 'tools/test_v020_snapshot_envelopes.py'
       - 'tools/verify_v0199_sec_n.py'
   workflow_dispatch:
 permissions:
@@ -80,7 +114,7 @@ jobs:
               "verifier_present": os.environ["VERIFIER_PRESENT"] == "true",
               "build_status": "NOT_RUN",
               "run_status": "NOT_RUN",
-              "note": "Wave-11 production skeleton lanes; no production authority, no TLS echo turn, no G4 claim.",
+              "note": "Production skeleton, pinned fixture TLS, live observations and scratch reopen.",
           }
           if scope["feature_present"]:
               scope["build_status"] = "delegated-to-arm-build-job"
@@ -91,8 +125,11 @@ jobs:
               handle.write("\n")
           print(json.dumps(scope, indent=2, sort_keys=True))
           PY
-      - name: Verifier unit tests (synthetic pages only, not runtime evidence)
-        run: python3 -m unittest -v tools/test_verify_v020_production.py 2>&1 | tee artifacts/v020-production/unit-tests.log
+      - name: Verifier, loopback TLS, and scratch media vector tests
+        run: |
+          set -euo pipefail
+          openssl version
+          python3 -m unittest -v tools/test_verify_v020_production.py tools/test_v020_tls_peer.py tools/test_v020_signed_scratch_vector.py tools/test_v020_snapshot_envelopes.py 2>&1 | tee artifacts/v020-production/unit-tests.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -131,9 +168,56 @@ jobs:
           # Opt-in staging profile (prototype-memory, RAM_MIB 1024).
           cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production-media-staging 2>&1 | tee artifacts/v020-production/build-staging.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-staging.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v020-production-live-control,v020-production-authenticated-net 2>&1 | tee artifacts/v020-production/build-live.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-live.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v020-production-media-reopen 2>&1 | tee artifacts/v020-production/build-reopen.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-reopen.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v020-production-media-signed 2>&1 | tee artifacts/v020-production/build-signed.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-signed.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v020-production-media-signed,v020-production-media-reopen 2>&1 | tee artifacts/v020-production/build-signed-reopen.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-signed-reopen.elf
+          wave14_features=v020-production-frame-pool,v020-production-media-envelopes,v020-production-live-control,v020-production-authenticated-net
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave14_features" 2>&1 | tee artifacts/v020-production/build-envelopes-unsigned.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-envelopes-unsigned.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave14_features,v020-production-media-signed" 2>&1 | tee artifacts/v020-production/build-envelopes-signed.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-envelopes-signed.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave14_features,v020-production-media-signed,v020-production-media-reopen" 2>&1 | tee artifacts/v020-production/build-envelopes-reopen.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-envelopes-reopen.elf
+          wave15_features=v020-production-frame-pool,v020-production-media-unified,v020-production-live-control,v020-production-authenticated-net
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave15_features" 2>&1 | tee artifacts/v020-production/build-unified-unsigned.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-unified-unsigned.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave15_features,v020-production-media-signed" 2>&1 | tee artifacts/v020-production/build-unified-signed.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-unified-signed.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave15_features,v020-production-media-signed,v020-production-media-reopen" 2>&1 | tee artifacts/v020-production/build-unified-reopen.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-unified-reopen.elf
+          wave16_features=v020-production-snapshot-catalog,v020-production-frame-pool,v020-production-authenticated-net
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave16_features" 2>&1 | tee artifacts/v020-production/build-catalog.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-catalog.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave16_features,v020-production-media-reopen" 2>&1 | tee artifacts/v020-production/build-catalog-reopen.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-catalog-reopen.elf
+          wave18_features="$wave16_features,v020-production-file-read"
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave18_features" 2>&1 | tee artifacts/v020-production/build-file-read.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-file-read.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave18_features,v020-production-media-reopen" 2>&1 | tee artifacts/v020-production/build-file-read-reopen.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-file-read-reopen.elf
+          wave19_features=v020-production-snapshot-read,v020-production-frame-pool,v020-production-authenticated-net
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave19_features" 2>&1 | tee artifacts/v020-production/build-snapshot-read.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-snapshot-read.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave19_features,v020-production-media-reopen" 2>&1 | tee artifacts/v020-production/build-snapshot-read-reopen.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-snapshot-read-reopen.elf
+          wave20_features="$wave19_features,v020-production-file-sessions"
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave20_features" 2>&1 | tee artifacts/v020-production/build-file-sessions.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-file-sessions.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave20_features,v020-production-media-reopen" 2>&1 | tee artifacts/v020-production/build-file-sessions-reopen.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-file-sessions-reopen.elf
+          wave21_features="$wave20_features,v020-production-file-volatile-write"
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave21_features" 2>&1 | tee artifacts/v020-production/build-file-volatile-write.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-file-volatile-write.elf
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$wave21_features,v020-production-media-reopen" 2>&1 | tee artifacts/v020-production/build-file-volatile-write-reopen.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-file-volatile-write-reopen.elf
           readelf -h artifacts/v020-production/kernel.elf > artifacts/v020-production/elf.txt
           readelf -h artifacts/v020-production/kernel-staging.elf > artifacts/v020-production/elf-staging.txt
-          (cd artifacts/v020-production && sha256sum kernel.elf kernel-staging.elf > image.sha256)
+          (cd artifacts/v020-production && sha256sum kernel*.elf > image.sha256)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -149,15 +233,13 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      # Same pinned QEMU build as v20-native-eight-role-bringup.yml: exact
-      # upstream commit + per-vCPU accounting patch, built once per run and
-      # shared with the run job through the evidence artifact (repo convention;
-      # no actions/cache is used by any native lane).
+      # Use the eight-role lane's QEMU commit and per-vCPU accounting patch.
+      # The shared binary also enables slirp for the loopback host-forwarding lanes.
       - name: Build pinned QEMU with exact per-vCPU accounting patch
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends clang make ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev python3-venv
+          sudo apt-get install -y --no-install-recommends clang make ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev libslirp-dev python3-venv
           mkdir -p artifacts/v020-production-qemu
           sha256sum tools/qemu/cyxia-per-vcpu-pmu.patch > artifacts/v020-production-qemu/patch.sha256
           git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu-source"
@@ -168,7 +250,7 @@ jobs:
           git -C "$RUNNER_TEMP/qemu-source" diff --binary > artifacts/v020-production-qemu/applied.patch
           git -C "$RUNNER_TEMP/qemu-source" rev-parse HEAD > artifacts/v020-production-qemu/upstream.txt
           cd "$RUNNER_TEMP/qemu-source"
-          ./configure --target-list=aarch64-softmmu --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/v020-production-qemu/configure.log"
+          ./configure --target-list=aarch64-softmmu --enable-slirp --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/v020-production-qemu/configure.log"
           ninja -C build qemu-system-aarch64 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/v020-production-qemu/build.log"
           mkdir -p "$GITHUB_WORKSPACE/artifacts/v020-production-qemu/bin"
           cp build/qemu-system-aarch64 "$GITHUB_WORKSPACE/artifacts/v020-production-qemu/bin/"
@@ -202,7 +284,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
           test "$(cat artifacts/v020-production/commit.txt)" = "$(git rev-parse HEAD)"
           (cd artifacts/v020-production; sha256sum -c image.sha256)
           (cd artifacts/v020-production-qemu; sha256sum -c binary.sha256)
@@ -229,10 +311,31 @@ jobs:
             echo "no-NIC negative control unexpectedly PASSED" >&2
             exit 1
           fi
-          grep -q '"negative_control"' artifacts/v020-production/run-no-nic/summary.json
-          # It must fail for the RIGHT reason: the guest reported the missing
-          # NIC. A NIC-less hang or an unrelated failure must not stay green.
-          grep -q 'V020_W11_NET_ABSENT' artifacts/v020-production/run-no-nic/serial.txt
+          grep -q '"error": "ValueError: guest reported V020_W11_NET_ABSENT:' artifacts/v020-production/run-no-nic/summary.json
+          if python3 -B tools/verify_v020_production.py \
+            --elf artifacts/v020-production/kernel.elf \
+            --output artifacts/v020-production/run-no-peer \
+            --timeout 120 --no-peer; then
+            echo "no-peer negative control unexpectedly PASSED" >&2
+            exit 1
+          fi
+          grep -q '"error": "ValueError: V020_W11_NET_NO_PEER:' artifacts/v020-production/run-no-peer/summary.json
+          python3 -B tools/verify_v020_production.py \
+            --elf artifacts/v020-production/kernel-live.elf \
+            --authenticated-net --live-control --timeout 120 \
+            --output artifacts/v020-production/run-live
+          python3 -B tools/verify_v020_production.py \
+            --elf artifacts/v020-production/kernel-live.elf \
+            --authenticated-net --live-control --abrupt-peer --timeout 120 \
+            --output artifacts/v020-production/run-abrupt
+          if python3 -B tools/verify_v020_production.py \
+            --elf artifacts/v020-production/kernel-live.elf \
+            --authenticated-net --live-control --no-rng --timeout 120 \
+            --output artifacts/v020-production/run-no-rng; then
+            echo "authenticated relay without RNG unexpectedly PASSED" >&2
+            exit 1
+          fi
+          grep -q '"error": "ValueError: V020_W12_NET_ENTROPY_UNAVAILABLE:' artifacts/v020-production/run-no-rng/summary.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -260,7 +363,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
           test "$(cat artifacts/v020-production/commit.txt)" = "$(git rev-parse HEAD)"
           (cd artifacts/v020-production; sha256sum -c image.sha256)
           (cd artifacts/v020-production-qemu; sha256sum -c binary.sha256)
@@ -274,9 +377,75 @@ jobs:
             --elf artifacts/v020-production/kernel-staging.elf \
             --output artifacts/v020-production/run-media-staging \
             --timeout 240 --media-staging
+          python3 -B tools/verify_v020_production.py \
+            --fresh-elf artifacts/v020-production/kernel-staging.elf \
+            --elf artifacts/v020-production/kernel-reopen.elf \
+            --output artifacts/v020-production/run-media-reopen \
+            --timeout 240 --media-reopen
+          python3 -B tools/verify_v020_production.py \
+            --fresh-elf artifacts/v020-production/kernel-signed.elf \
+            --unsigned-fresh-elf artifacts/v020-production/kernel-staging.elf \
+            --elf artifacts/v020-production/kernel-signed-reopen.elf \
+            --output artifacts/v020-production/run-media-signed \
+            --timeout 240 --media-reopen --signed-media
+          python3 -B tools/verify_v020_production.py \
+            --fresh-elf artifacts/v020-production/kernel-envelopes-signed.elf \
+            --unsigned-fresh-elf artifacts/v020-production/kernel-envelopes-unsigned.elf \
+            --elf artifacts/v020-production/kernel-envelopes-reopen.elf \
+            --output artifacts/v020-production/run-media-envelopes \
+            --timeout 240 --media-reopen --signed-media --media-envelopes \
+            --frame-pool --authenticated-net --live-control
+          python3 -B tools/verify_v020_production.py \
+            --fresh-elf artifacts/v020-production/kernel-unified-signed.elf \
+            --unsigned-fresh-elf artifacts/v020-production/kernel-unified-unsigned.elf \
+            --elf artifacts/v020-production/kernel-unified-reopen.elf \
+            --output artifacts/v020-production/run-media-unified \
+            --timeout 240 --media-reopen --signed-media --media-unified \
+            --frame-pool --authenticated-net --live-control
+          python3 -B tools/verify_v020_production.py \
+            --fresh-elf artifacts/v020-production/kernel-catalog.elf \
+            --unsigned-fresh-elf artifacts/v020-production/kernel-unified-unsigned.elf \
+            --elf artifacts/v020-production/kernel-catalog-reopen.elf \
+            --output artifacts/v020-production/run-snapshot-catalog \
+            --timeout 240 --media-reopen --snapshot-catalog --frame-pool --authenticated-net
+          python3 -B tools/verify_v020_production.py \
+            --fresh-elf artifacts/v020-production/kernel-file-read.elf \
+            --unsigned-fresh-elf artifacts/v020-production/kernel-unified-unsigned.elf \
+            --elf artifacts/v020-production/kernel-file-read-reopen.elf \
+            --output artifacts/v020-production/run-file-read \
+            --timeout 240 --media-reopen --file-read --snapshot-catalog --frame-pool --authenticated-net
+          python3 -B tools/verify_v020_production.py \
+            --fresh-elf artifacts/v020-production/kernel-snapshot-read.elf \
+            --unsigned-fresh-elf artifacts/v020-production/kernel-unified-unsigned.elf \
+            --elf artifacts/v020-production/kernel-snapshot-read-reopen.elf \
+            --output artifacts/v020-production/run-snapshot-read \
+            --timeout 240 --media-reopen --snapshot-read --frame-pool --authenticated-net
+          python3 -B tools/verify_v020_production.py \
+            --fresh-elf artifacts/v020-production/kernel-file-sessions.elf \
+            --unsigned-fresh-elf artifacts/v020-production/kernel-unified-unsigned.elf \
+            --elf artifacts/v020-production/kernel-file-sessions-reopen.elf \
+            --output artifacts/v020-production/run-file-sessions \
+            --timeout 240 --media-reopen --file-sessions --snapshot-read --frame-pool --authenticated-net
+          python3 -B tools/verify_v020_production.py \
+            --fresh-elf artifacts/v020-production/kernel-file-volatile-write.elf \
+            --unsigned-fresh-elf artifacts/v020-production/kernel-unified-unsigned.elf \
+            --elf artifacts/v020-production/kernel-file-volatile-write-reopen.elf \
+            --output artifacts/v020-production/run-file-volatile-write \
+            --timeout 240 --media-reopen --file-volatile-write --file-sessions --snapshot-read \
+            --frame-pool --authenticated-net
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: v020-production-media-staging-run-${{ github.sha }}
-          path: artifacts/v020-production/run-media-staging/
+          path: |
+            artifacts/v020-production/run-media-staging/
+            artifacts/v020-production/run-media-reopen/
+            artifacts/v020-production/run-media-signed/
+            artifacts/v020-production/run-media-envelopes/
+            artifacts/v020-production/run-media-unified/
+            artifacts/v020-production/run-snapshot-catalog/
+            artifacts/v020-production/run-file-read/
+            artifacts/v020-production/run-snapshot-read/
+            artifacts/v020-production/run-file-sessions/
+            artifacts/v020-production/run-file-volatile-write/
           retention-days: 7

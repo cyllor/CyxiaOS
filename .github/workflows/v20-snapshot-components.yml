@@ -7,9 +7,13 @@ on:
       - 'crates/prototype/src/snapshot/**'
       - 'crates/prototype/src/domains/filesystem/**'
       - 'crates/prototype/tests/immutable_snapshots.rs'
+      - 'crates/prototype/tests/snapshot_read_cost.rs'
       - 'crates/kernel-core/src/security/file_*'
+      - 'crates/kernel-core/src/security/snapshot_*'
+      - 'crates/kernel-core/tests/snapshot_*'
       - 'tests/host/test_snapshot*'
       - 'tools/test_snapshot_probe.py'
+      - 'tools/run_snapshot_probe.py'
       - 'tools/host_prototype_library.py'
       - 'kernel/src/runtime/files/**'
       - 'crates/prototype/src/journal*'
@@ -53,6 +57,7 @@ jobs:
           set -euo pipefail
           cargo test --locked --offline -p cyxia-prototype snapshot::tests 2>&1 | tee artifacts/snapshot-host/manager.log
           cargo test --locked --offline -p cyxia-prototype --test immutable_snapshots 2>&1 | tee artifacts/snapshot-host/filesystem.log
+          cargo test --locked --offline -p cyxia-prototype --test snapshot_read_cost 2>&1 | tee artifacts/snapshot-host/read-cost.log
       - name: Independent legacy format and protocol negative tests
         run: |
           set -euo pipefail
@@ -92,6 +97,7 @@ jobs:
           rustc -vV > artifacts/snapshot-media/toolchain.txt
           printf '%s\n' 'HOST_COMPONENT_ONLY; no mount or device FLUSH proof' > artifacts/snapshot-media/scope.txt
           cargo test --locked --offline -p cyxia-kernel-core security::file_ 2>&1 | tee artifacts/snapshot-media/guard.log
+          cargo test --locked --offline -p cyxia-kernel-core --test snapshot_list_v4 --test snapshot_read_v4 2>&1 | tee artifacts/snapshot-media/snapshot-read.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

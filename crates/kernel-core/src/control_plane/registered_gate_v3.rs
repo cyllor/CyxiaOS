@@ -55,6 +55,8 @@ pub struct TrustedTerminal {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalSummary {
+    pub boot_epoch: u64,
+    pub controller_epoch: u64,
     pub plan_seq: u64,
     pub plan_digest: [u8; 32],
     pub action_count: u16,
@@ -85,8 +87,29 @@ pub struct FrozenAction<'a> {
     pub target: Identity,
     pub candidate_set_hash: [u8; 32],
     pub static_ordinals: &'a [u16],
+    pub candidate_payloads: &'a [&'a [u8]],
     pub raw_fields: [Option<u64>; 7],
     pub action_payload: &'a [u8],
+}
+impl FrozenAction<'_> {
+    fn verify_selected(&self, index: u16) -> Result<(), Error> {
+        if self.static_ordinals.len() != self.candidate_payloads.len()
+            || self.static_ordinals.is_empty()
+            || self.static_ordinals.len() > 32
+        {
+            return Err(Error::Denied);
+        }
+        for (i, payload) in self.candidate_payloads.iter().enumerate() {
+            super::action_schema_v2::ActionV2::decode(self.domain_id, 1, payload)?;
+            if self.candidate_payloads[..i].contains(payload) {
+                return Err(Error::Denied);
+            }
+        }
+        if self.candidate_payloads.get(usize::from(index)).copied() != Some(self.action_payload) {
+            return Err(Error::Denied);
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingStatus {
@@ -107,10 +130,18 @@ pub struct AssistedScope<'a> {
     pub offline_model_authorized: bool,
 }
 #[derive(Clone, Copy)]
+enum WorkCustody {
+    Accepted,
+    // Not an accepted execution. A protected recovery owner has sealed
+    // this exact no-effect report; subsequent fetch must never execute it.
+    NeverAccepted { report_digest: [u8; 32] },
+}
+#[derive(Clone, Copy)]
 struct ClaimedWork {
     frame: super::apply_work_v1::WorkFrame,
     origin: apply_report_v1::ReportOrigin,
-    accepted_ns: u64,
+    recorded_ns: u64,
+    custody: WorkCustody,
 }
 #[derive(Clone, Copy)]
 struct TrialProof {
@@ -125,6 +156,7 @@ struct Pending {
     count: usize,
     decision_bytes: [[u8; DECISION_BYTES]; MAX_ACTIONS],
     status: PendingStatus,
+    recovered_version: Option<u64>,
     expires_ns: u64,
     assisted: Option<AssistedProof>,
     claimed: [Option<ClaimedWork>; MAX_ACTIONS],
@@ -173,6 +205,7 @@ pub struct RegisteredDecisionGate<'pool> {
     publisher: Identity,
     boot_epoch: u64,
     controller_epoch: u64,
+    fenced: bool,
     last_plan_seq: u64,
     last_decision_seq: u64,
     pending: Option<Pending>, // legacy single-plan component profile
@@ -203,6 +236,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             publisher,
             boot_epoch: boot,
             controller_epoch: epoch,
+            fenced: false,
             last_plan_seq: 0,
             last_decision_seq: 0,
             pending: None,
@@ -278,6 +312,9 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         }
     }
     fn check_registration_slot(&self) -> Result<(), Error> {
+        if self.fenced {
+            return Err(Error::NotReady);
+        }
         if self.frozen_or_legacy_busy().is_some() {
             return Err(Error::Busy);
         }
@@ -305,6 +342,9 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         }
     }
     fn begin_publish(&mut self, seq: u64) -> Result<(), Error> {
+        if self.fenced {
+            return Err(Error::NotReady);
+        }
         if self.published_count() >= MAX_PUBLISHED_PLANS {
             return Err(Error::Busy);
         }
@@ -345,7 +385,62 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             .is_some_and(|p| p.status == PendingStatus::Frozen)
     }
 
+    /// Stop new registrations, publications and execution claims. The
+    /// exact old terminal/recovery obligations remain accessible.
+    pub fn fence(&mut self, supervisor: Identity) -> Result<(), Error> {
+        if self.terminal_owner != Some(supervisor) || !supervisor.valid() {
+            return Err(Error::Denied);
+        }
+        self.fenced = true;
+        Ok(())
+    }
+    /// Same serialized EL1 handoff as DesiredBank::replace_controller.
+    /// The callback must prove the complete old safe fallback and commit
+    /// the matching bank epoch atomically (no effect on error). Do not
+    /// construct a fresh gate to evade occupied slots or history.
+    pub fn replace_epoch(
+        &mut self,
+        supervisor: Identity,
+        next_epoch: u64,
+        controller: Identity,
+        publisher: Identity,
+        commit_native_handoff: impl FnOnce(u64, u64, Identity, Identity) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if self.terminal_owner != Some(supervisor) || !supervisor.valid() {
+            return Err(Error::Denied);
+        }
+        if !self.fenced {
+            return Err(Error::NotReady);
+        }
+        if self.published_count() != 0 || self.has_unpublished() {
+            return Err(Error::Busy);
+        }
+        if self.controller_epoch.checked_add(1) != Some(next_epoch)
+            || controller.id != self.controller.id
+            || publisher.id != self.publisher.id
+            || controller.generation < self.controller.generation
+            || publisher.generation < self.publisher.generation
+            || controller == self.controller && publisher == self.publisher
+        {
+            return Err(Error::Stale);
+        }
+        commit_native_handoff(self.controller_epoch, next_epoch, controller, publisher)?;
+        self.controller = controller;
+        self.publisher = publisher;
+        self.controller_epoch = next_epoch;
+        self.last_plan_seq = 0;
+        self.last_decision_seq = 0;
+        self.fenced = false;
+        Ok(())
+    }
+
     fn check_identity_and_context(&self, context: TrustedRegistrationScope) -> Result<(), Error> {
+        if self.fenced {
+            return Err(Error::NotReady);
+        }
+        if context.base_plan_version == u64::MAX {
+            return Err(Error::Exhausted);
+        }
         if context.boot_epoch != self.boot_epoch
             || context.controller_epoch != self.controller_epoch
             || context.boot_epoch == 0
@@ -461,6 +556,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             count: records.len(),
             decision_bytes: copied,
             status: PendingStatus::Frozen,
+            recovered_version: None,
             expires_ns: expires,
             assisted: None,
             claimed: [None; MAX_ACTIONS],
@@ -524,6 +620,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         for (index, (raw, local)) in records.iter().zip(actions).enumerate() {
             let rec = DecisionRecordV3::decode(raw)?;
             let act = plan.action(index)?;
+            local.verify_selected(rec.selected_index)?;
             if super::action_schema_v2::ActionV2::decode(
                 act.domain_id,
                 act.action_kind,
@@ -663,6 +760,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         plan.matches_untrusted_sidecars(core::slice::from_ref(record))?;
         let rec = DecisionRecordV3::decode(record)?;
         let act = plan.action(0)?;
+        local.verify_selected(rec.selected_index)?;
         let end = context
             .sampled_ns
             .checked_add(100_000_000)
@@ -783,6 +881,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             count: 1,
             decision_bytes: copied,
             status: PendingStatus::Frozen,
+            recovered_version: None,
             expires_ns: plan.action(0)?.expires_local_ns,
             assisted: None,
             claimed: [None; MAX_ACTIONS],
@@ -949,6 +1048,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         plan.matches_untrusted_sidecars(core::slice::from_ref(record))?;
         let rec = DecisionRecordV3::decode(record)?;
         let act = plan.action(0)?;
+        local.verify_selected(rec.selected_index)?;
         let end = context
             .sampled_ns
             .checked_add(100_000_000)
@@ -1096,6 +1196,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             count: 1,
             decision_bytes: copied,
             status: PendingStatus::Frozen,
+            recovered_version: None,
             expires_ns: expiry,
             assisted: Some(AssistedProof {
                 advice: advice_wire,
@@ -1253,6 +1354,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             count: 1,
             decision_bytes: copied,
             status: PendingStatus::Frozen,
+            recovered_version: None,
             expires_ns: expiry,
             assisted: Some(AssistedProof {
                 advice: advice_wire,
@@ -1412,6 +1514,8 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         // Independent authority check executes before modifying any state.
         verify_native(&terminal)?;
         let summary = TerminalSummary {
+            boot_epoch: self.boot_epoch,
+            controller_epoch: self.controller_epoch,
             plan_seq: pending.plan_seq,
             plan_digest: pending.plan_digest,
             action_count: terminal.action_count,
@@ -1421,6 +1525,53 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         self.history_next = (self.history_next + 1) % TERMINAL_HISTORY;
         self.release(summary.plan_seq);
         Ok(summary)
+    }
+
+    /// Recover a publication that may have succeeded before the adapter
+    /// reply was lost. Never invoke the writer again. The independent
+    /// terminal owner must prove the complete exact committed plan at the
+    /// native bank, all reservations, original admission and its allocated
+    /// version. Current expiry is NOT permission to invent a new publish.
+    /// Trials require separate permit/acceptance reconciliation and are
+    /// deliberately not reopened by this restricted path.
+    pub fn reconcile_published(
+        &mut self,
+        supervisor: Identity,
+        plan_wire: &[u8],
+        version: u64,
+        verify_native: impl FnOnce(&PlanV2<'_>, [u8; 32], u64) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if !supervisor.valid() || self.terminal_owner != Some(supervisor) {
+            return Err(Error::Denied);
+        }
+        let plan = PlanV2::decode(plan_wire)?;
+        if plan.header.controller_epoch != self.controller_epoch
+            || version <= plan.header.base_plan_version
+        {
+            return Err(Error::Stale);
+        }
+        let digest = sha256(plan_wire);
+        let p = self.lookup_mut(plan.header.plan_seq).ok_or(Error::Stale)?;
+        if p.plan_digest != digest {
+            return Err(Error::Denied);
+        }
+        if p.status == PendingStatus::AdapterAccepted {
+            return if p.recovered_version == Some(version) {
+                Ok(())
+            } else {
+                Err(Error::Busy)
+            };
+        }
+        if p.status != PendingStatus::AdapterUnknown
+            || p.trial.is_some()
+            || p.claimed.iter().any(Option::is_some)
+        {
+            return Err(Error::NotReady);
+        }
+        verify_native(&plan, digest, version)?;
+        p.recovered_version = Some(version);
+        p.status = PendingStatus::AdapterAccepted;
+        Ok(())
     }
 
     /// Native EXECUTOR_FETCH/EL1 acceptance linearization boundary.
@@ -1438,6 +1589,9 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         origin: apply_report_v1::ReportOrigin,
         verify_and_accept: impl FnOnce(&super::apply_work_v1::ApplyWorkV1<'_>) -> Result<(), Error>,
     ) -> Result<super::apply_work_v1::WorkFrame, Error> {
+        if self.fenced {
+            return Err(Error::NotReady);
+        }
         let plan = PlanV2::decode(plan_wire)?;
         if plan.header.controller_epoch != self.controller_epoch
             || scope.boot_epoch != self.boot_epoch
@@ -1446,6 +1600,13 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             return Err(Error::Denied);
         }
         let boot = self.boot_epoch;
+        // A native publication must allocate a version strictly newer
+        // than the exact registered base. First accepted work is bound
+        // by the real native admission callback; every later action of
+        // that same plan must carry the same installed version.
+        if scope.plan_version <= plan.header.base_plan_version {
+            return Err(Error::Stale);
+        }
         let p = self.lookup_mut(plan.header.plan_seq).ok_or(Error::Stale)?;
         if p.status != PendingStatus::AdapterAccepted {
             return Err(Error::NotReady);
@@ -1455,6 +1616,15 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         }
         if p.claimed[index].is_some() {
             return Err(Error::Busy);
+        }
+        if p.recovered_version.is_some_and(|v| v != scope.plan_version) {
+            return Err(Error::Stale);
+        }
+        for claim in p.claimed.iter().flatten() {
+            let prior = super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
+            if prior.plan_version != scope.plan_version || scope.now_ns < claim.recorded_ns {
+                return Err(Error::Stale);
+            }
         }
         if plan.header.active_until_local_ns != 0
             && scope.now_ns >= plan.header.active_until_local_ns
@@ -1477,9 +1647,100 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         p.claimed[index] = Some(ClaimedWork {
             frame,
             origin,
-            accepted_ns: scope.now_ns,
+            recorded_ns: scope.now_ns,
+            custody: WorkCustody::Accepted,
         });
         Ok(frame)
+    }
+
+    /// Terminal custody for a published action that provably never crossed
+    /// the executor admission point. Only the authenticated independent
+    /// terminal owner may seal it. The callback must atomically fence its
+    /// native desired slot, verify all reservations/queue/device obligations
+    /// and establish the exact no-effect terminal. Expiry alone is not proof.
+    /// No new ApplyWork is delivered and no executor accept callback runs.
+    /// A later ordinary claim is blocked by the same retained action slot.
+    pub fn seal_unaccepted_terminal(
+        &mut self,
+        supervisor: Identity,
+        plan_wire: &[u8],
+        copied: BoundReport<'_>,
+        scope: TrustedApplyScope,
+        binding: ExecutorBindingV1,
+        verify_no_effect: impl FnOnce(
+            &super::apply_work_v1::ApplyWorkV1<'_>,
+            &ApplyReportV1<'_>,
+        ) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if !supervisor.valid() || self.terminal_owner != Some(supervisor) {
+            return Err(Error::Denied);
+        }
+        let plan = PlanV2::decode(plan_wire)?;
+        let r = ApplyReportV1::decode(copied.bytes)?;
+        use apply_report_v1::ActionStatus;
+        if !matches!(r.state, ActionStatus::Rejected | ActionStatus::Cancelled)
+            || r.result >= 0
+            || r.completed_ns > scope.now_ns
+            || scope.now_ns == 0
+            || scope.boot_epoch != self.boot_epoch
+            || plan.header.controller_epoch != self.controller_epoch
+            || scope.plan_version <= plan.header.base_plan_version
+        {
+            return Err(Error::Denied);
+        }
+        let boot = self.boot_epoch;
+        let index = usize::from(r.action_index);
+        let p = self.lookup_mut(plan.header.plan_seq).ok_or(Error::Stale)?;
+        // Unknown publication may itself have committed. Resolve that
+        // independently before trying this narrower no-effect path.
+        if p.status != PendingStatus::AdapterAccepted {
+            return Err(Error::NotReady);
+        }
+        if sha256(plan_wire) != p.plan_digest || index >= p.count {
+            return Err(Error::Denied);
+        }
+        if p.recovered_version.is_some_and(|v| v != scope.plan_version) {
+            return Err(Error::Stale);
+        }
+        let frame = super::apply_work_v1::WorkFrame::from_plan(
+            &plan,
+            index,
+            boot,
+            scope.plan_version,
+            binding,
+            copied.origin,
+        )?;
+        let work = super::apply_work_v1::ApplyWorkV1::decode(frame.bytes())?;
+        if !work.matches_report(r) {
+            return Err(Error::Denied);
+        }
+        let report_digest = sha256(copied.bytes);
+        if let Some(prior) = p.claimed[index] {
+            return match prior.custody {
+                WorkCustody::NeverAccepted { report_digest: old }
+                    if old == report_digest
+                        && prior.frame == frame
+                        && prior.origin == copied.origin =>
+                {
+                    Ok(())
+                }
+                _ => Err(Error::Busy),
+            };
+        }
+        for claim in p.claimed.iter().flatten() {
+            let prior = super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
+            if prior.plan_version != scope.plan_version || scope.now_ns < claim.recorded_ns {
+                return Err(Error::Stale);
+            }
+        }
+        verify_no_effect(&work, &r)?;
+        p.claimed[index] = Some(ClaimedWork {
+            frame,
+            origin: copied.origin,
+            recorded_ns: scope.now_ns,
+            custody: WorkCustody::NeverAccepted { report_digest },
+        });
+        Ok(())
     }
 
     pub fn publisher_scope(&self, actor: Identity) -> Result<(u64, u64), Error> {
@@ -1542,12 +1803,31 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         if !actor.valid() {
             return Err(Error::Denied);
         }
+        Ok(self.history.iter().flatten().copied().find(|item| {
+            item.controller_epoch == self.controller_epoch && item.plan_seq == plan_seq
+        }))
+    }
+    /// Only independent supervisor may query a historical controller
+    /// epoch. The complete key prevents sequence reuse from aliasing it.
+    pub fn historical_terminal(
+        &self,
+        actor: Identity,
+        boot: u64,
+        epoch: u64,
+        seq: u64,
+    ) -> Result<Option<TerminalSummary>, Error> {
+        if self.terminal_owner != Some(actor) || !actor.valid() {
+            return Err(Error::Denied);
+        }
+        if boot != self.boot_epoch || epoch == 0 || epoch > self.controller_epoch || seq == 0 {
+            return Err(Error::Stale);
+        }
         Ok(self
             .history
             .iter()
             .flatten()
             .copied()
-            .find(|item| item.plan_seq == plan_seq))
+            .find(|r| (r.boot_epoch, r.controller_epoch, r.plan_seq) == (boot, epoch, seq)))
     }
 
     /// Terminal integration from exact copied 0x43 ApplyReport v1 bytes.
@@ -1592,8 +1872,8 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             return Err(Error::NotReady);
         }
         // A valid current executor binding alone is insufficient. Every
-        // report must refer to an already accepted exact ApplyWork key;
-        // a stale or never-accepted report cannot reach the effect verifier.
+        // report refers either to an exact accepted ApplyWork or to an
+        // independently sealed never-accepted no-effect terminal.
         for copied in report_frames {
             let r = ApplyReportV1::decode(copied.bytes)?;
             let i = usize::from(r.action_index);
@@ -1603,11 +1883,19 @@ impl<'pool> RegisteredDecisionGate<'pool> {
                 .and_then(|v| v.as_ref())
                 .ok_or(Error::NotReady)?;
             let work = super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
-            if claim.origin != copied.origin
-                || !work.matches_report(r)
-                || r.completed_ns < claim.accepted_ns
-            {
+            if claim.origin != copied.origin || !work.matches_report(r) {
                 return Err(Error::Denied);
+            }
+            match claim.custody {
+                WorkCustody::Accepted if r.completed_ns < claim.recorded_ns => {
+                    return Err(Error::Denied);
+                }
+                WorkCustody::NeverAccepted { report_digest }
+                    if sha256(copied.bytes) != report_digest =>
+                {
+                    return Err(Error::Denied);
+                }
+                _ => (),
             }
         }
         // Retain the exact causal sidecar from registration, not a new
@@ -1837,9 +2125,21 @@ mod tests {
             },
             candidate_set_hash: [1; 32],
             static_ordinals: ordinals,
+            candidate_payloads: &[&[2, 0], &[4, 0]],
             raw_fields: [None; 7],
             action_payload: payload,
         }]
+    }
+    #[test]
+    fn selected_candidate_index_must_bind_exact_payload_even_if_value_is_legal() {
+        let mut a = frozen(&[2, 4], &[2, 0]);
+        assert_eq!(a[0].verify_selected(0), Ok(()));
+        assert_eq!(a[0].verify_selected(1), Err(Error::Denied));
+        a[0].action_payload = &[4, 0];
+        assert_eq!(a[0].verify_selected(0), Err(Error::Denied));
+        assert_eq!(a[0].verify_selected(1), Ok(()));
+        a[0].candidate_payloads = &[&[4, 0], &[4, 0]];
+        assert_eq!(a[0].verify_selected(0), Err(Error::Denied));
     }
     #[test]
     fn trial_registration_publication_and_cost_custody_are_independent() {
@@ -2091,6 +2391,202 @@ mod tests {
             Err(Error::Stale)
         );
     }
+    #[test]
+    fn fenced_gate_handoff_preserves_old_epoch_history() {
+        let rules = profile_bytes();
+        let profile = Profile::parse(&rules).unwrap();
+        let plan = plan_bytes();
+        let records = [decision(&plan, &rules)];
+        let actions = frozen(&[2, 4], &[2, 0]);
+        let ctx = trusted(&rules);
+        let mut gate = RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER, PUBLISHER, SUPERVISOR, 1, 2,
+        )
+        .unwrap();
+        gate.register_rule_only(CONTROLLER, &plan, &records, &profile, &actions, ctx)
+            .unwrap();
+        gate.publish_once(PUBLISHER, &plan, &records, &profile, &actions, ctx, || {
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(gate.fence(PUBLISHER), Err(Error::Denied));
+        gate.fence(SUPERVISOR).unwrap();
+        let next = Identity {
+            generation: 2,
+            ..CONTROLLER
+        };
+        assert_eq!(
+            gate.replace_epoch(SUPERVISOR, 3, next, PUBLISHER, |_, _, _, _| panic!()),
+            Err(Error::Busy)
+        );
+        assert_eq!(
+            gate.claim_apply_work(
+                &plan,
+                0,
+                verified_scope(),
+                verified_binding(),
+                apply_report_v1::ReportOrigin::Kernel,
+                |_| panic!()
+            ),
+            Err(Error::NotReady)
+        );
+        let terminal = TrustedTerminal {
+            boot_epoch: 1,
+            controller_epoch: 2,
+            plan_seq: 1,
+            plan_digest: sha256(&plan),
+            action_count: 1,
+            terminal_mask: 1,
+            unknown_mask: 0,
+            evidence_digest: [7; 32],
+        };
+        let old = gate
+            .settle_with_native_proof(SUPERVISOR, terminal, |_| Ok(()))
+            .unwrap();
+        assert_eq!(
+            gate.replace_epoch(SUPERVISOR, 3, next, PUBLISHER, |_, _, _, _| Err(
+                Error::NotReady
+            )),
+            Err(Error::NotReady)
+        );
+        gate.replace_epoch(SUPERVISOR, 3, next, PUBLISHER, |a, b, c, p| {
+            assert_eq!((a, b, c, p), (2, 3, next, PUBLISHER));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(gate.terminal_summary(PUBLISHER, 1), Ok(None));
+        assert_eq!(gate.historical_terminal(SUPERVISOR, 1, 2, 1), Ok(Some(old)));
+        assert_eq!(
+            gate.historical_terminal(PUBLISHER, 1, 2, 1),
+            Err(Error::Denied)
+        );
+        assert_eq!(
+            gate.register_rule_only(CONTROLLER, &plan, &records, &profile, &actions, ctx),
+            Err(Error::Denied)
+        );
+    }
+    #[test]
+    fn ambiguous_publication_recovered_only_by_independent_exact_bank_proof() {
+        use super::super::desired_plan_v0199::DesiredBank;
+        let rules = profile_bytes();
+        let catalog = Profile::parse(&rules).unwrap();
+        let plan = plan_bytes();
+        let records = [decision(&plan, &rules)];
+        let actions = frozen(&[2, 4], &[2, 0]);
+        let ctx = trusted(&rules);
+        let mut bank = DesiredBank::empty();
+        bank.bind_boot(ctx.boot_epoch, ctx.controller_epoch, PUBLISHER, || Ok(()))
+            .unwrap();
+        let binding = verified_binding();
+        bank.register_target(binding, |_| Ok(())).unwrap();
+        let mut gate = RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER,
+            PUBLISHER,
+            SUPERVISOR,
+            ctx.boot_epoch,
+            ctx.controller_epoch,
+        )
+        .unwrap();
+        gate.register_rule_only(CONTROLLER, &plan, &records, &catalog, &actions, ctx)
+            .unwrap();
+        // The real bank component commits; only the diagnostic adapter
+        // response is lost. Do not rerun this writer during recovery.
+        assert_eq!(
+            gate.publish_once(PUBLISHER, &plan, &records, &catalog, &actions, ctx, || {
+                assert_eq!(
+                    bank.publish_registered(PUBLISHER, 0, &plan, ctx, |_| Ok(())),
+                    Ok(1)
+                );
+                Err(Error::NotReady)
+            }),
+            Err(Error::NotReady)
+        );
+        assert_eq!(
+            gate.reconcile_published(PUBLISHER, &plan, 1, |_, _, _| panic!()),
+            Err(Error::Denied)
+        );
+        assert_eq!(
+            gate.reconcile_published(SUPERVISOR, &plan, 2, |p, h, v| bank
+                .verify_committed_publication(p, h, v, |_| panic!())),
+            Err(Error::Stale)
+        );
+        assert_eq!(
+            gate.reconcile_published(SUPERVISOR, &plan, 1, |p, h, v| bank
+                .verify_committed_publication(p, h, v, |_| Err(Error::NotReady))),
+            Err(Error::NotReady)
+        );
+        gate.reconcile_published(SUPERVISOR, &plan, 1, |p, h, v| {
+            bank.verify_committed_publication(p, h, v, |slots| {
+                assert_eq!(slots.len(), 1);
+                assert_eq!(slots[0].unwrap().version, 1);
+                Ok(())
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            gate.reconcile_published(SUPERVISOR, &plan, 1, |_, _, _| panic!()),
+            Ok(())
+        );
+        assert_eq!(
+            gate.publish_once(
+                PUBLISHER,
+                &plan,
+                &records,
+                &catalog,
+                &actions,
+                ctx,
+                || panic!("never retry writer")
+            ),
+            Ok(Publication::ReplayNoEffect)
+        );
+        let scope = TrustedApplyScope {
+            boot_epoch: ctx.boot_epoch,
+            plan_version: 1,
+            now_ns: ctx.now_ns + 1,
+        };
+        assert_eq!(
+            gate.claim_apply_work(
+                &plan,
+                0,
+                TrustedApplyScope {
+                    plan_version: 2,
+                    ..scope
+                },
+                binding,
+                apply_report_v1::ReportOrigin::Kernel,
+                |_| panic!()
+            ),
+            Err(Error::Stale)
+        );
+        gate.claim_apply_work(
+            &plan,
+            0,
+            scope,
+            binding,
+            apply_report_v1::ReportOrigin::Kernel,
+            |w| {
+                bank.accept(
+                    w,
+                    apply_report_v1::ReportOrigin::Kernel,
+                    scope.now_ns,
+                    |a| {
+                        assert_eq!(a.plan_digest, sha256(&plan));
+                        assert_eq!(a.version, 1);
+                        Ok(())
+                    },
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            bank.pending(binding.domain, binding.target)
+                .unwrap()
+                .unwrap()
+                .accepted_ns,
+            Some(scope.now_ns)
+        );
+    }
+
     #[test]
     fn unknown_adapter_result_keeps_key_consumed_and_blocks_reexecution() {
         let bytes = profile_bytes();
@@ -2346,6 +2842,368 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap();
+    }
+    #[test]
+    fn one_published_version_binds_all_targets_and_cannot_wrap() {
+        let mut rules = profile_bytes();
+        rules[40..48].copy_from_slice(&u64::MAX.to_le_bytes()); // wildcard target
+        let catalog = Profile::parse(&rules).unwrap();
+        let original = plan_bytes();
+        let mut plan = [0u8; 360];
+        plan[..212].copy_from_slice(&original);
+        plan[212..].copy_from_slice(&original[64..]);
+        plan[8..12].copy_from_slice(&360u32.to_le_bytes());
+        plan[12..14].copy_from_slice(&2u16.to_le_bytes());
+        plan[24..32].copy_from_slice(&6u64.to_le_bytes());
+        plan[212 + 24..212 + 32].copy_from_slice(&5u64.to_le_bytes());
+        plan[212 + 40..212 + 48].copy_from_slice(&18u64.to_le_bytes());
+        let r0 = decision(&plan, &rules);
+        let mut r1 = r0;
+        r1[24..32].copy_from_slice(&5u64.to_le_bytes());
+        r1[48..56].copy_from_slice(&18u64.to_le_bytes());
+        r1[92..94].copy_from_slice(&1u16.to_le_bytes());
+        let [a] = frozen(&[2, 4], &[2, 0]);
+        let [mut b] = frozen(&[2, 4], &[2, 0]);
+        b.target.id = 18;
+        let actions = [a, b];
+        let records = [r0, r1];
+        let ctx = TrustedRegistrationScope {
+            base_plan_version: 6,
+            ..trusted(&rules)
+        };
+        let mut gate = RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER, PUBLISHER, SUPERVISOR, 1, 2,
+        )
+        .unwrap();
+        let mut overflow = plan;
+        overflow[24..32].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(
+            gate.register_rule_only(
+                CONTROLLER,
+                &overflow,
+                &records,
+                &catalog,
+                &actions,
+                TrustedRegistrationScope {
+                    base_plan_version: u64::MAX,
+                    ..ctx
+                }
+            ),
+            Err(Error::Exhausted)
+        );
+        gate.register_rule_only(CONTROLLER, &plan, &records, &catalog, &actions, ctx)
+            .unwrap();
+        gate.publish_once(PUBLISHER, &plan, &records, &catalog, &actions, ctx, || {
+            Ok(())
+        })
+        .unwrap();
+        let scope = TrustedApplyScope {
+            now_ns: 150,
+            ..verified_scope()
+        };
+        let origin = apply_report_v1::ReportOrigin::Kernel;
+        let b0 = verified_binding();
+        let b1 = ExecutorBindingV1 {
+            target: Identity {
+                id: 18,
+                generation: 1,
+            },
+            ..b0
+        };
+        assert_eq!(
+            gate.claim_apply_work(
+                &plan,
+                0,
+                TrustedApplyScope {
+                    plan_version: 6,
+                    ..scope
+                },
+                b0,
+                origin,
+                |_| panic!()
+            ),
+            Err(Error::Stale)
+        );
+        // A failed first native admission cannot freeze the installed version.
+        assert_eq!(
+            gate.claim_apply_work(
+                &plan,
+                0,
+                TrustedApplyScope {
+                    plan_version: 8,
+                    ..scope
+                },
+                b0,
+                origin,
+                |_| Err(Error::NotReady)
+            ),
+            Err(Error::NotReady)
+        );
+        gate.claim_apply_work(&plan, 0, scope, b0, origin, |w| {
+            assert_eq!(w.plan_version, 7);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            gate.claim_apply_work(
+                &plan,
+                1,
+                TrustedApplyScope {
+                    plan_version: 8,
+                    ..scope
+                },
+                b1,
+                origin,
+                |_| panic!()
+            ),
+            Err(Error::Stale)
+        );
+        assert_eq!(
+            gate.claim_apply_work(
+                &plan,
+                1,
+                TrustedApplyScope {
+                    now_ns: 149,
+                    ..scope
+                },
+                b1,
+                origin,
+                |_| panic!()
+            ),
+            Err(Error::Stale)
+        );
+        gate.claim_apply_work(
+            &plan,
+            1,
+            TrustedApplyScope {
+                now_ns: 151,
+                ..scope
+            },
+            b1,
+            origin,
+            |w| {
+                assert_eq!(w.plan_version, 7);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let first = executor_report(1);
+        let mut second = first;
+        second[24..26].copy_from_slice(&1u16.to_le_bytes());
+        second[32..40].copy_from_slice(&18u64.to_le_bytes());
+        let reports = [
+            BoundReport {
+                bytes: &first,
+                origin,
+            },
+            BoundReport {
+                bytes: &second,
+                origin,
+            },
+        ];
+        assert_eq!(
+            gate.settle_verified_apply_reports(
+                SUPERVISOR,
+                &plan,
+                &reports,
+                &[b0, b1],
+                verified_scope(),
+                |_, _| Ok(())
+            )
+            .unwrap()
+            .action_count,
+            2
+        );
+    }
+    #[test]
+    fn unaccepted_terminal_is_sealed_without_claiming_execution_and_retained_with_feedback() {
+        let mut rules = profile_bytes();
+        rules[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        let catalog = Profile::parse(&rules).unwrap();
+        let original = plan_bytes();
+        let mut plan = [0u8; 360];
+        plan[..212].copy_from_slice(&original);
+        plan[212..].copy_from_slice(&original[64..]);
+        plan[8..12].copy_from_slice(&360u32.to_le_bytes());
+        plan[12..14].copy_from_slice(&2u16.to_le_bytes());
+        plan[212 + 24..212 + 32].copy_from_slice(&5u64.to_le_bytes());
+        plan[212 + 40..212 + 48].copy_from_slice(&18u64.to_le_bytes());
+        let r0 = decision(&plan, &rules);
+        let mut r1 = r0;
+        r1[24..32].copy_from_slice(&5u64.to_le_bytes());
+        r1[48..56].copy_from_slice(&18u64.to_le_bytes());
+        r1[92..94].copy_from_slice(&1u16.to_le_bytes());
+        let [a] = frozen(&[2, 4], &[2, 0]);
+        let [mut b] = frozen(&[2, 4], &[2, 0]);
+        b.target.id = 18;
+        let ctx = trusted(&rules);
+        let mut gate = RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER, PUBLISHER, SUPERVISOR, 1, 2,
+        )
+        .unwrap();
+        let actions = [a, b];
+        gate.register_rule_only(CONTROLLER, &plan, &[r0, r1], &catalog, &actions, ctx)
+            .unwrap();
+        gate.publish_once(PUBLISHER, &plan, &[r0, r1], &catalog, &actions, ctx, || {
+            Ok(())
+        })
+        .unwrap();
+        claim_test_work(&mut gate, &plan);
+        let origin = apply_report_v1::ReportOrigin::Kernel;
+        let binding = ExecutorBindingV1 {
+            target: Identity {
+                id: 18,
+                generation: 1,
+            },
+            ..verified_binding()
+        };
+        let first = executor_report(1);
+        let mut second = first;
+        second[24..26].copy_from_slice(&1u16.to_le_bytes());
+        second[28..30].copy_from_slice(&4u16.to_le_bytes());
+        second[32..40].copy_from_slice(&18u64.to_le_bytes());
+        second[64..68].copy_from_slice(&(-7i32).to_le_bytes());
+        let cancelled = BoundReport {
+            bytes: &second,
+            origin,
+        };
+        let scope = verified_scope();
+        assert_eq!(
+            gate.seal_unaccepted_terminal(
+                PUBLISHER,
+                &plan,
+                cancelled,
+                scope,
+                binding,
+                |_, _| panic!()
+            ),
+            Err(Error::Denied)
+        );
+        let mut fabricated = second;
+        fabricated[28..30].copy_from_slice(&1u16.to_le_bytes());
+        fabricated[64..68].fill(0);
+        assert_eq!(
+            gate.seal_unaccepted_terminal(
+                SUPERVISOR,
+                &plan,
+                BoundReport {
+                    bytes: &fabricated,
+                    origin
+                },
+                scope,
+                binding,
+                |_, _| panic!()
+            ),
+            Err(Error::Denied)
+        );
+        assert_eq!(
+            gate.seal_unaccepted_terminal(
+                SUPERVISOR,
+                &plan,
+                cancelled,
+                scope,
+                binding,
+                |_, _| Err(Error::NotReady)
+            ),
+            Err(Error::NotReady)
+        );
+        gate.seal_unaccepted_terminal(SUPERVISOR, &plan, cancelled, scope, binding, |w, r| {
+            assert_eq!(w.action_index, 1);
+            assert_eq!(r.state, apply_report_v1::ActionStatus::Cancelled);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            gate.seal_unaccepted_terminal(
+                SUPERVISOR,
+                &plan,
+                cancelled,
+                scope,
+                binding,
+                |_, _| panic!()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            gate.claim_apply_work(&plan, 1, scope, binding, origin, |_| panic!()),
+            Err(Error::Busy)
+        );
+        let frames = [
+            BoundReport {
+                bytes: &first,
+                origin,
+            },
+            BoundReport {
+                bytes: &fabricated,
+                origin,
+            },
+        ];
+        assert_eq!(
+            gate.settle_verified_apply_reports(
+                SUPERVISOR,
+                &plan,
+                &frames,
+                &[verified_binding(), binding],
+                scope,
+                |_, _| panic!()
+            ),
+            Err(Error::Denied)
+        );
+        let frames = [
+            BoundReport {
+                bytes: &first,
+                origin,
+            },
+            cancelled,
+        ];
+        let mut inbox = super::super::feedback_v0199::FeedbackInbox::new(
+            SUPERVISOR,
+            Identity {
+                id: 10,
+                generation: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gate.settle_verified_apply_reports_with_feedback(
+                SUPERVISOR,
+                &plan,
+                &frames,
+                &[verified_binding(), binding],
+                scope,
+                None,
+                |_, _| Ok(()),
+                |_| Err(Error::Exhausted)
+            ),
+            Err(Error::Exhausted)
+        );
+        gate.settle_verified_apply_reports_with_feedback(
+            SUPERVISOR,
+            &plan,
+            &frames,
+            &[verified_binding(), binding],
+            scope,
+            None,
+            |_, _| Ok(()),
+            |batch| inbox.retain(SUPERVISOR, batch),
+        )
+        .unwrap();
+        assert_eq!(inbox.len(), 2);
+        let row = inbox
+            .read(
+                Identity {
+                    id: 10,
+                    generation: 1,
+                },
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.report_bytes(), &second);
+        assert_eq!(
+            row.causal_label,
+            super::super::feedback_v0199::CausalLabel::NoAdoption
+        );
     }
     #[test]
     fn native_apply_reports_require_supervisor_and_real_completion_proof() {

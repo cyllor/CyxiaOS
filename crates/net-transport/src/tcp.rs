@@ -74,6 +74,7 @@ pub struct Tcp<'a, P> {
     config: Config,
     last_ms: u64,
     failed: bool,
+    passive_fin_acked: bool,
 }
 
 impl<'a, P: Port> Tcp<'a, P> {
@@ -173,11 +174,13 @@ impl<'a, P: Port> Tcp<'a, P> {
             config,
             last_ms: now_ms,
             failed: false,
+            passive_fin_acked: false,
         })
     }
 
     pub fn listen(&mut self) -> Result<(), Error> {
         self.healthy()?;
+        self.passive_fin_acked = false;
         self.sockets
             .get_mut::<Socket>(self.socket)
             .listen((Ipv4Address::from(self.config.local), self.config.local_port))
@@ -186,6 +189,7 @@ impl<'a, P: Port> Tcp<'a, P> {
 
     pub fn connect(&mut self) -> Result<(), Error> {
         self.healthy()?;
+        self.passive_fin_acked = false;
         self.sockets
             .get_mut::<Socket>(self.socket)
             .connect(
@@ -341,6 +345,9 @@ impl<'a, P: Port> Tcp<'a, P> {
             .diagnostic_stage(Stage::TcpIngressResult as u64);
         let after = self.sockets.get::<Socket>(self.socket);
         if ingress != smoltcp::iface::PollIngressSingleResult::None {
+            if state == State::LastAck && after.state() == State::Closed {
+                self.passive_fin_acked = self.device.port().final_ack_matches();
+            }
             self.device.port_mut().ingress_processed(
                 after.send_queue() < queued
                     || (matches!(state, State::SynSent | State::SynReceived)
@@ -450,6 +457,28 @@ impl<'a, P: Port> Tcp<'a, P> {
             && self.device.port().tx_quiescent()
     }
 
+    /// Drive a passive TCP close after both authenticated TLS alerts. A peer FIN
+    /// moves the socket into CloseWait. Only an accepted ACK of our *transmitted*
+    /// FIN can establish the LastAck -> Closed witness. A timer or RST cannot.
+    pub fn poll_passive_close(&mut self, now_ms: u64) -> Result<bool, Error> {
+        let state = self.poll(now_ms)?;
+        let socket = self.sockets.get_mut::<Socket>(self.socket);
+        if socket.recv_queue() != 0 {
+            return Err(Error::Socket);
+        }
+        match state {
+            State::Established | State::LastAck => Ok(false),
+            State::CloseWait => {
+                socket.close();
+                Ok(false)
+            }
+            State::Closed if self.passive_fin_acked => {
+                Ok(self.device.tx_staging_empty() && self.terminal_tx_quiescent())
+            }
+            _ => Err(Error::Closed),
+        }
+    }
+
     pub fn observation(&self) -> Observation {
         let socket = self.sockets.get::<Socket>(self.socket);
         let active =
@@ -493,3 +522,6 @@ impl<'a, P: Port> Tcp<'a, P> {
         self.failed = true;
     }
 }
+
+#[cfg(test)]
+mod close_tests;

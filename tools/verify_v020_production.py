@@ -11,43 +11,57 @@ turn loop. It also checks the fail-closed negatives and that CPU1-3 keep
 business-only progress.
 
 HONEST SCOPE: this is a production SKELETON, not full production authority. The
-boot epoch is staged (volatile), the executor is a bounded fixture target, no
-real model is active, and the snapshot/audit backend stays fail-closed (EAGAIN).
+boot epoch is staged (volatile), the executor is a bounded fixture target and no
+real model is active. Snapshot/audit require a ready, authorized data source.
 The verifier requires the guest to advertise exactly that scope and refuses any
 claim of full_authority / real_models.
 
 WAVE 11 (words 128..160): the G-A lane boots with a REAL VirtIO-net device
 (QEMU user-net, hostfwd 127.0.0.1:<free port> -> guest :7) and a host peer that
 sends one fixed 512-byte sample. It requires FrameMeta production statics,
-four RecoveryProof v2 accumulators, policy_lock metering whose accounting is
-consistent, and real TCP bytes relayed to the EL0 local-echo guest via 0x43.
-HONEST SCOPE: no TLS echo turn is verified (word 142 must be 0); admission
-leases are inferred from guest POLL->ENTROPY; entropy is the fixture PRNG; under
-QEMU TCG every metered section overruns 45 us, so policy_lock timing is
-emulated and the budget is NOT verified. `--media-staging` boots the opt-in
-staging feature with a fresh all-zero scratch disk at -m 1024M; it proves the
-boot and fail-closed paths only (golden_vector_pending, no signed config).
-`--no-nic` is a negative control: the G-A lane must FAIL without a NIC.
+four RecoveryProof v2 accumulators, a stopped-writer handoff, policy_lock
+measurement counts, and a direct Admission receipt and TCP bytes on SVC 0x43.
+Opt-in modes exercise pinned fixture TLS with VirtIO RNG, live CPU0
+observations, and reopen of the same temporary v1 disk across two VM boots.
+Authentication also verifies normal close and native Admission retirement.
+Signed media uses a scratch-only test trust root.
+Wave 14 adds a bounded native frame lifecycle and independent readback of
+four empty D1.5 envelope blocks on the scratch disk.
+Wave 15 independently verifies the allocated eight-object scratch layout.
+Wave 16 verifies the read-only Supervisor LIST endpoint on that layout.
+Wave 19 verifies missing QUERY and HISTORY_OPEN results and reads back the
+entire SlotStore independently from the scratch disk.
+Wave 20 verifies bounded Supervisor file handles and read-only file sessions.
+Wave 21 verifies bounded volatile writes, replay, readback and unchanged staged file bytes on disk.
+`--no-nic` and `--no-peer` are negative controls for G-A.
 """
 from __future__ import annotations
 
 import argparse
 import base64
-import hashlib
+from dataclasses import replace
 import json
 from pathlib import Path
-import re
 import shutil
-import socket
 import struct
 import subprocess
 import tempfile
-import threading
 import time
 
 import verify_smp
 from run_qemu import Qmp
 from transport import FrameDecoder
+from v020_production_media import run_media_reopen, verify_signed_disk
+from v020_production_modes import (
+    Modes, QEMU_GATEWAY_IPV4, W21_END, authenticated_echo, file_read_evidence, file_sessions_evidence,
+    file_volatile_write_evidence, rows as w11_rows, signed_media_authority, snapshot_catalog_evidence,
+    snapshot_envelope_evidence, snapshot_read_evidence, unified_mount_evidence, validate_extensions,
+)
+from v020_production_qemu import (
+    GA_RAM, PEER_SAMPLE, PEER_WAIT_SECONDS, SCRATCH_BYTES, STAGING_RAM, HostPeer,
+    connect_qmp, create_scratch, free_port, qemu_args, scratch_summary, sha, shutdown,
+)
+from v020_snapshot_envelopes import verify_envelopes
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,54 +76,111 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/exceptions.rs",
     "kernel/src/arch/aarch64/console.rs",
     "kernel/Cargo.toml",
+    "kernel/linker/aarch64.ld",
     "kernel/build/aarch64.rs",
     "kernel/build/v0199_roles.rs",
     "kernel/src/arch/aarch64/sec_n_broker.rs",
+    "kernel/src/arch/aarch64/sec_n_broker/receipt.rs",
     "kernel/src/arch/aarch64/scratch_blk.rs",
     "kernel/src/arch/aarch64/production/evidence.rs",
     "kernel/src/arch/aarch64/production/frames.rs",
+    "kernel/src/arch/aarch64/production/frames/pool.rs",
+    "kernel/src/arch/aarch64/production/file_read.rs",
+    "kernel/src/arch/aarch64/production/file_read/sessions.rs",
+    "kernel/src/arch/aarch64/production/file_read/volatile_write.rs",
     "kernel/src/arch/aarch64/production/recovery.rs",
     "kernel/src/arch/aarch64/production/meter.rs",
     "kernel/src/arch/aarch64/production/net.rs",
+    "kernel/src/arch/aarch64/production/net_entropy.rs",
     "kernel/src/arch/aarch64/production/media_staging.rs",
     "kernel/src/arch/aarch64/production/media_staging/authority.rs",
+    "kernel/src/arch/aarch64/production/media_staging/reopen.rs",
+    "kernel/src/arch/aarch64/production/media_staging/signed.rs",
     "kernel/src/arch/aarch64/production/media_staging/volume.rs",
+    "kernel/src/arch/aarch64/production/observations.rs",
+    "kernel/src/arch/aarch64/production/observations/audit_record.rs",
+    "kernel/src/arch/aarch64/production/observations/audit_rpc.rs",
+    "kernel/src/arch/aarch64/production/snapshot_catalog.rs",
+    "kernel/src/platform/virt/net_device.rs",
+    "crates/arch-aarch64/src/entry.S",
+    "crates/arch-aarch64/src/timer.rs",
+    "crates/platform-virt/src/lib.rs",
+    "crates/kernel-core/src/security/recovery_proof_v2.rs",
+    "crates/kernel-core/src/security/boot_epoch_v1.rs",
+    "crates/kernel-core/src/security/durable_role_epoch_v0199.rs",
+    "crates/kernel-core/src/security/epoch_redo_v0199.rs",
+    "crates/kernel-core/src/security/offline_config_v1.rs",
+    "crates/kernel-core/src/security/file_format_v1.rs",
+    "crates/kernel-core/src/security/file_media_unified_v1.rs",
+    "crates/kernel-core/src/security/file_mount_v1.rs",
+    "crates/kernel-core/src/security/file_structure_v1.rs",
+    "crates/kernel-core/src/security/file_service_v4.rs",
+    "crates/kernel-core/src/security/file_read_v4.rs",
+    "crates/kernel-core/src/security/snapshot_list_v4.rs",
+    "crates/kernel-core/src/security/snapshot_read_v4.rs",
+    "crates/kernel-core/src/security/syscall_v3.rs",
+    "crates/kernel-core/src/frame_meta_v0199.rs",
+    "crates/kernel-core/src/frames.rs",
+    "crates/kernel-core/src/control_plane/policy_lock_v0199.rs",
+    "crates/kernel-core/src/control_plane/control_rpc_v1.rs",
+    "crates/kernel-core/src/control_plane/action_schema_v2.rs",
+    "crates/kernel-core/src/control_plane/registered_gate_v3.rs",
+    "crates/kernel-core/src/control_plane/svc_bridge_v3.rs",
+    "crates/kernel-core/src/control_plane/snapshot_store_v3.rs",
+    "crates/net-transport/src/admission.rs",
+    "crates/net-transport/src/device.rs",
+    "crates/net-transport/src/native_tcp.rs",
+    "crates/net-transport/src/tcp.rs",
+    "crates/net-transport/src/tcp/observe.rs",
+    "crates/net-transport/src/tls.rs",
+    "user/v0199-control/main.rs",
+    "user/v0199-control/audit.rs",
+    "user/v0199-control/audit_hash.rs",
+    "user/v0199-control/catalog.rs",
+    "user/v0199-control/file_read.rs",
+    "user/local-echo/src/broker.rs",
+    "user/local-echo/src/lib.rs",
     "user/local-echo/src/runtime.rs",
     "tools/verify_v020_production.py",
+    "tools/v020_production_media.py",
+    "tools/v020_production_modes.py",
+    "tools/v020_production_qemu.py",
+    "tools/v020_snapshot_envelopes.py",
+    "tools/v020_tls_peer.py",
+    "tests/fixtures/v020-signed-scratch/config.bin",
 ]
 GUEST_ELF = "target/aarch64-unknown-none/release/cyxia-local-echo"
 MAGIC = 0x4359_5052_4431_3030
 COMPLETION = b"V020_PRODUCTION_SKELETON_PASS cpus=4 roles=8 chain=advice-disposition-plan-receipt\n"
 SCOPE = "V020_PROD_SCOPE production_skeleton=true full_authority=false real_models=false"
 SVC64 = 0x5600_0000
+E_AUTH_RESULT = (1 << 64) - 1
+EAGAIN_RESULT = (1 << 64) - 13
+PIE_ROLE_IDS = (6, 7, 2, 8, 9, 3, 10, 11)
+SNAPSHOT_ROLE_COUNT = 3
 
 # Wave-11 evidence segment (kernel/src/arch/aarch64/production/evidence.rs).
 W11_MAGIC = 0x4359_5052_4431_3131
 W11_END = 160
-# Metered production calls per boot (task-4 ruling): settled + overrun == 4.
+# Two registrations and two publish attempts enter the meter.
 POLICY_LOCK_METERED_CALLS = 4
+POLICY_LOCK_WORK_BUDGET_NS = 45_000
 RECOVERY_ACCUMULATORS = 4
+RECOVERY_REQUIRED_STATE = 2
+SECONDARY_CPU_MASK = 0b1110
 W11_MARKER = "V020_W11_PRODUCTION"
 STAGING_MARKER = "V020_W11_MEDIA_STAGING golden_vector_pending=1"
 STAGING_INCOMPLETE = b"V020_W11_MEDIA_STAGING_INCOMPLETE"
-# Words 145..150 must all be nonzero for the marker's `staging_ok=1`.
-STAGING_STEP_WORDS = range(145, 151)
 NET_ABSENT = b"V020_W11_NET_ABSENT"
-# Fixed 512-byte host-peer sample (same bytes Task 5 measured). It is NOT a TLS
-# ClientHello: the guest's rustls rejects it and parks, so no echo is expected.
-PEER_SAMPLE = bytes((i * 7 + 3) & 0xFF for i in range(512))
-PEER_WAIT_SECONDS = 5.0
-GA_RAM = "256M"
-# The staging feature enables prototype-memory (RAM_MIB = 1024; task-6 ruling).
-STAGING_RAM = "1024M"
-SCRATCH_BYTES = 512 * 1024 * 1024
+NET_ACCEPT_TURNS = 20_000
 
 
 class Production:
     completion = COMPLETION
 
-    def __init__(self, staging: bool = False) -> None:
+    def __init__(self, staging: bool = False, modes: Modes = Modes()) -> None:
         self.staging = staging
+        self.modes = modes
 
     def profile(self, elf: bytes) -> dict:
         return verify_smp.profile(elf)
@@ -128,23 +199,24 @@ class Production:
             "real_executor_device": False,
             # Wave-11 scope labels (true regardless of the run's outcome).
             "tls_echo_turn_verified": False,
+            "tls_credit_retirement_verified": False,
             "recovery_pair_facts_staged": True,
             "policy_lock_timing_emulated": True,
             "policy_lock_budget_verified": False,
-            "policy_lock_note": ("QEMU TCG: every metered section overruns the 45 us budget; "
-                                 "after the sticky latch trips only the first section is "
-                                 "actually measured. Overruns are NOT budget compliance."),
-            "admission_leases_inferred": True,
+            "policy_lock_note": ("TCG diagnostic timing separates measured overruns from "
+                                 "attempts the meter could not measure."),
+            "admission_leases_inferred": False,
             "entropy_production": False,
-            "sec_n_pools_frame_meta_registered": False,
             "host_peer_sample": "fixed 512-byte non-TLS pattern (not a ClientHello)",
             "media_staging_enabled": self.staging,
-            # Word 133 (task-3 / final-review I3): the 0x41 refusal follows a
-            # SYNTHETIC mark_unknown(); accumulators do not drive the gate and
-            # no consumer takeover exists. The count itself is measured.
             "recovery_trigger_synthetic": True,
+            "recovery_trigger": "staged single checkpoint witness withdrawn",
             "degraded_events_drive_gate": False,
-            "accumulator_takeover_instantiated": False,
+            "durable_audit_consumer_takeover": False,
+            "authenticated_net_mode": self.modes.authenticated_net,
+            "live_control_mode": self.modes.live_control,
+            "frame_pool_mode": self.modes.frame_pool,
+            "fixture_identity": self.modes.authenticated_net,
         }
         if self.staging:
             meta.update({
@@ -152,8 +224,20 @@ class Production:
                 "signed_config": False,
                 "boot_epoch_verify_staged": True,
                 "admission_flow_fixed_inputs": True,
+                "persistent_audit_slot": False,
+                "media_reopen_mode": self.modes.media_reopen,
+                "signed_media_mode": self.modes.signed_media,
+                "media_envelopes_mode": self.modes.snapshot_envelopes,
+                "media_unified_mode": self.modes.media_unified,
+                "snapshot_catalog_mode": self.modes.snapshot_catalog,
+                "file_read_mode": self.modes.file_read,
+                "snapshot_read_mode": self.modes.snapshot_read,
+                "file_sessions_mode": self.modes.file_sessions,
+                "file_volatile_write_mode": self.modes.file_volatile_write,
                 "prototype_memory_ram": STAGING_RAM,
             })
+        if self.modes.authenticated_net:
+            meta["host_peer_sample"] = "pinned TLS 1.3 and a fresh read-only Echo challenge"
         return meta
 
     def success(self) -> dict:
@@ -165,10 +249,13 @@ class Production:
             "real_models": False,
             "in_vector_dispatch": True,
             "frame_meta_production_statics": True,
+            "sec_n_pools_frame_meta_registered": True,
             "recovery_accumulators": RECOVERY_ACCUMULATORS,
+            "recovery_writer_takeovers": SECONDARY_CPU_MASK.bit_count(),
             "policy_lock_metered": True,
             "real_net_device": True,
             "tcp_to_local_echo": True,
+            "admission_receipt_verified": True,
             "native_v020_media_staging_boot_verified": self.staging,
         }
 
@@ -185,7 +272,7 @@ class Production:
         ], "incomplete production advice-chain completion evidence")
         require(all(v == 0 for v in words[56:64]), "nonzero reserved evidence")
         require(all(v == 0 for v in words[76:80]), "nonzero reserved evidence")
-        require(all(v == 0 for v in words[W11_END:]), "nonzero reserved evidence tail")
+        require(all(v == 0 for v in words[W21_END:]), "nonzero reserved evidence tail")
         require(b"SMP_ERROR" not in serial and b"FAIL" not in serial, "guest reported fault")
         lines = serial.decode("ascii").splitlines()
         require(lines.count(
@@ -199,14 +286,7 @@ class Production:
         require(b"real_models=true" not in serial, "must not claim real models")
 
         def rows(name: str):
-            pattern = re.compile(re.escape(name) + r" a=(\d+) b=(\d+) c=(\d+)")
-            matched = []
-            for line in lines:
-                if line.startswith(name + " "):
-                    found = pattern.fullmatch(line)
-                    require(found is not None, "malformed " + name)
-                    matched.append(tuple(map(int, found.groups())))
-            return matched
+            return w11_rows(lines, name)
 
         require(rows("SMP_BOOT_OK") == [(4, 15, 0)], "invalid four-core boot marker")
         require(rows("SMP_CPU_ON") == [(1, 1, 0), (2, 2, 0), (3, 3, 0)], "CPU_ON proof missing")
@@ -230,6 +310,8 @@ class Production:
         require(rows("V020_PROD_NEG") == [(0, 0, 0)], "identity/domain/cap negatives not rejected")
         require(rows("V020_PROD_WRONG_CPU") == [(1, 0, 0)], "wrong-CPU negative missing")
         require(rows("V020_PROD_BAD_PUBLISH") == [(6, 0, 0)], "non-publisher not rejected")
+        require(rows("V020_PROD_RECOVERY_REJECT") == [(8, E_AUTH_RESULT, words[13])],
+                "in-vector recovery refusal must return E_AUTH without another acceptance")
         # Independent memory rows.
         submit = words[16:24]
         register = words[24:32]
@@ -246,13 +328,20 @@ class Production:
         # PIE evidence: eight distinct TTBR roots, each clocked; snapshot/audit
         # roles serviced an in-vector role call (EAGAIN), sleep roles yielded.
         roots = []
-        for i in range(8):
+        snapshot_calls = 0
+        for i, role_id in enumerate(PIE_ROLE_IDS):
             at = 80 + i * 6
             root, clocks, role_calls, yields, hash_lo, svc_out = words[at:at + 6]
             require(root != 0 and root % 4096 == 0, "PIE TTBR root must be a real page")
             require(clocks >= 1, "PIE role did not clock")
             require(role_calls >= 1 or yields >= 1, "PIE role made no progress")
             require(hash_lo != 0, "PIE image hash must be nonzero")
+            require(pie_roles[i] == (role_id, clocks, role_calls), "PIE serial/memory mismatch")
+            if i < SNAPSHOT_ROLE_COUNT or role_id == PIE_ROLE_IDS[-1]:
+                require(role_calls > 0 and svc_out == EAGAIN_RESULT,
+                        "PIE snapshot/audit call must return in-vector EAGAIN")
+            if i < SNAPSHOT_ROLE_COUNT:
+                snapshot_calls += role_calls
             roots.append(root)
         require(len(set(roots)) == 8, "eight PIE TTBR roots must be distinct")
         # Business CPUs kept running, control never promoted.
@@ -265,9 +354,21 @@ class Production:
                     "CPU1-3 did not keep business-only native progress")
             require(business[slot - 1] == (slot, progress, irqs), "business serial/memory mismatch")
             progress_total += progress
-        wave11 = validate_w11(words, lines, serial, self.staging)
+        extensions = validate_extensions(words, lines, self.modes)
+        wave11 = validate_w11(words, lines, serial, self.staging, snapshot_calls, self.modes)
+        signed = signed_media_authority(words, lines, self.modes)
         return {
             **wave11,
+            **extensions,
+            **signed,
+            **snapshot_envelope_evidence(words, lines, self.modes.snapshot_envelopes),
+            **unified_mount_evidence(words, lines, self.modes.media_unified, file_read=self.modes.file_read),
+            **snapshot_catalog_evidence(words, lines, self.modes.snapshot_catalog),
+            **file_read_evidence(words, lines, self.modes.file_read),
+            **snapshot_read_evidence(words, lines, self.modes.snapshot_read),
+            **file_sessions_evidence(words, lines, self.modes.file_sessions,
+                                     file_volatile_write=self.modes.file_volatile_write),
+            **file_volatile_write_evidence(words, lines, self.modes.file_volatile_write),
             "guest_cpus": 4,
             "fixed_control_cpu": 0,
             "business_cpu_mask": 14,
@@ -291,17 +392,6 @@ class Production:
         }
 
 
-def w11_rows(lines: list, name: str) -> list:
-    pattern = re.compile(re.escape(name) + r" a=(\d+) b=(\d+) c=(\d+)")
-    matched = []
-    for line in lines:
-        if line.startswith(name + " "):
-            found = pattern.fullmatch(line)
-            verify_smp.require(found is not None, "malformed " + name)
-            matched.append(tuple(map(int, found.groups())))
-    return matched
-
-
 def completion_marker(flags: dict) -> str:
     return W11_MARKER + " " + " ".join(f"{k}={int(v)}" for k, v in flags.items())
 
@@ -314,8 +404,7 @@ def check_w11_baseline(words: tuple) -> None:
     require(words[131] == RECOVERY_ACCUMULATORS, "recovery_accumulators must be 4 (word 131)")
     require(words[132] >= 1, "no DegradedEvent recorded (word 132)")
     require(words[133] == 1,
-            "recovery gate must refuse exactly one 0x41 publish after the synthetic "
-            f"mark_unknown() probe (word 133), got {words[133]}")
+            f"recovery gate must refuse exactly one 0x41 in RECOVERY_REQUIRED (word 133), got {words[133]}")
     require(words[134] == 1, "recovery_pair_facts_staged label missing (word 134)")
     require(words[135] == 1, "policy_lock_metered not set (word 135)")
     require(words[136] + words[137] == POLICY_LOCK_METERED_CALLS,
@@ -323,6 +412,14 @@ def check_w11_baseline(words: tuple) -> None:
             f"{POLICY_LOCK_METERED_CALLS} metered calls, got {words[136]}+{words[137]}")
     require(words[142] == 0, "must not claim tls_echo_turn_verified (word 142)")
     require(words[143] == 1, "staged_boot_epoch not set (word 143)")
+    require(words[152] == SECONDARY_CPU_MASK.bit_count(),
+            "RecoveryProof writer takeover must cover the three stopped CPUs (word 152)")
+    require(0 < words[153] < words[130], "FrameMeta Arena pages missing or inconsistent (word 153)")
+    require(words[154] <= min(1, words[137])
+            and (words[155] > POLICY_LOCK_WORK_BUDGET_NS) == (words[154] == 1),
+            "policy_lock measured overrun disagrees with the maximum elapsed time")
+    require(words[136] + words[154] > 0, "policy_lock requires a settled measurement")
+    require(all(v == 0 for v in words[156:W11_END]), "nonzero wave-11 reserved words")
 
 
 def check_w11_rows(words: tuple, lines: list) -> dict:
@@ -334,64 +431,119 @@ def check_w11_rows(words: tuple, lines: list) -> dict:
     require(registered == words[130] and permanent >= registered
             and gaps == permanent - registered,
             "FrameMeta rows serial row disagrees with word 130 (registered static pages)")
+    require(w11_rows(lines, "V020_W11_FRAME_META_ARENA")
+            == [(words[153], registered - words[153], 0)],
+            "FrameMeta Arena serial counts disagree with words 130/153")
     gate = w11_rows(lines, "V020_W11_RECOVERY_GATE_REJECTS")
-    require(gate == [(0, words[133], 1)],
-            "recovery gate refusal counter must go 0 -> 1 with the gate Unknown "
+    require(gate == [(0, words[133], RECOVERY_REQUIRED_STATE)],
+            "recovery gate refusal counter must go 0 -> 1 in RECOVERY_REQUIRED "
             "(V020_W11_RECOVERY_GATE_REJECTS) and match word 133")
-    return {"frame_meta_permanent_rows": permanent, "frame_meta_permanent_gap_rows": gaps}
+    handoff = w11_rows(lines, "V020_W11_RECOVERY_HANDOFF")
+    require(len(handoff) == 1, "expected one RecoveryProof writer handoff row")
+    mask, retained, fixture_faults = handoff[0]
+    require(mask == SECONDARY_CPU_MASK and 0 < fixture_faults <= retained <= words[132],
+            "RecoveryProof writer handoff counts or CPU mask disagree with the sealed page")
+    unmeasured = words[137] - words[154]
+    require(w11_rows(lines, "V020_W11_POLICY_LOCK_METER") == [(words[136], words[154], unmeasured)],
+            "policy_lock serial accounting disagrees with the sealed page")
+    return {
+        "frame_meta_permanent_rows": permanent,
+        "frame_meta_permanent_gap_rows": gaps,
+        "frame_meta_service_arena_pages": words[153],
+        "recovery_handoff_events_retained": retained,
+        "recovery_validated_fixture_faults": fixture_faults,
+        "policy_lock_unmeasured": unmeasured,
+    }
 
 
 def check_w11_net(words: tuple, lines: list, serial: bytes) -> None:
     require = verify_smp.require
-    require(NET_ABSENT not in serial,
-            "guest reported V020_W11_NET_ABSENT: no real VirtIO-net device (NIC missing); "
-            "the G-A lane fails closed")
+    if NET_ABSENT in serial:
+        require(lines.count("V020_W11_NET_ABSENT device=0 tcp_echo=0") == 1
+                and not any(words[138:143])
+                and not w11_rows(lines, "V020_W11_NET_ADMISSION")
+                and not w11_rows(lines, "V020_W11_NET_RELAY"),
+                "network absence evidence disagrees with the sealed network fields")
+        raise ValueError("guest reported V020_W11_NET_ABSENT: no real VirtIO-net device "
+                         "(NIC missing); the G-A lane fails closed")
     require(words[138] == 1, "real_net_device not set (word 138): no NIC was brought up")
+    no_peer = w11_rows(lines, "V020_W11_NET_NO_PEER")
+    if no_peer:
+        require(no_peer == [(1, NET_ACCEPT_TURNS, 0)] and not any(words[139:143])
+                and not w11_rows(lines, "V020_W11_NET_ADMISSION"),
+                "network accept failed without a valid bounded no-peer outcome")
+        raise ValueError("V020_W11_NET_NO_PEER: bounded TCP accept ended without a connection")
     require(words[139] == 1, "tcp_to_local_echo not set (word 139): no TCP bytes reached the guest")
-    require(words[140] >= 1, "no Admission lease issued (word 140)")
+    require(words[140] == 1, "expected one Admission lease (word 140)")
     require(words[141] > 0,
             "peer silent: tcp_to_local_echo claimed but 0 bytes relayed via 0x43 (word 141); "
             "the handshake budget was exhausted without peer data")
     relay = w11_rows(lines, "V020_W11_NET_RELAY")
     require(len(relay) == 1 and relay[0][1:] == (words[140], words[141]),
             "net relay serial row (V020_W11_NET_RELAY) disagrees with memory words 140/141")
+    admission = w11_rows(lines, "V020_W11_NET_ADMISSION")
+    require(admission == [(1, QEMU_GATEWAY_IPV4, words[140])],
+            "direct Admission receipt missing or disagrees with the pinned connection")
 
 
-def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool) -> None:
+def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
+                      snapshot_calls: int, modes: Modes) -> None:
     require = verify_smp.require
     if not staging:
-        require(words[144] == 0 and all(v == 0 for v in words[145:W11_END]),
-                "media staging words 144..159 must be zero in the G-A lane")
+        require(all(v == 0 for v in words[144:152]),
+                "media staging words 144..151 must be zero in the G-A lane")
         require(b"V020_W11_MEDIA_" not in serial, "media staging markers in the G-A lane")
         return
     require(b"V020_W11_MEDIA_ABSENT" not in serial, "V020_W11_MEDIA_ABSENT: no scratch disk")
     require(STAGING_INCOMPLETE not in serial,
             "guest reported V020_W11_MEDIA_STAGING_INCOMPLETE: a staging step failed")
+    reopen = modes.media_reopen
     require(words[144] == 1, "media_staging_enabled not set (word 144)")
-    require(all(words[w] == 1 for w in range(145, 151)),
-            "media staging steps incomplete (words 145..150 must all be 1)")
+    epoch = 2 if reopen else 1
+    require(words[145:151] == (int(not reopen), 1, 1, epoch, 1, 1),
+            "media staging steps or confirmed epoch disagree with the selected mode")
+    require(words[162:164] == (int(reopen), epoch - 1)
+            and w11_rows(lines, "V020_W12_MEDIA_EPOCH") == [(epoch - 1, epoch, int(reopen))],
+            "media staging prior epoch and reopen flags must match serial")
     require(words[151] == 1, "golden_vector_pending not set (word 151)")
     require(lines.count(STAGING_MARKER) == 1,
             "staging marker with golden_vector_pending=1 must appear exactly once")
-    require(all(v == 0 for v in words[152:W11_END]), "nonzero media staging reserved words")
+    steps = w11_rows(lines, "V020_W11_MEDIA_STEP")
+    live_inodes = (9 if modes.media_unified else 5) + int(modes.file_read)
+    require([step[:2] for step in steps] == [(index, 1) for index in range(1, 6)]
+            and steps[0][2] == 1 and steps[1][2] == live_inodes and steps[2][2] == 151 and steps[4][2] == 1,
+            "media staging serial steps must show format, mount, map, epoch and admission success")
+    require(steps[3][2] == words[148], "media staging BootEpoch disagrees with word 148")
+    io = w11_rows(lines, "V020_W11_MEDIA_IO")
+    fresh_writes = 4138 + (4 if modes.media_envelopes else 0)
+    if modes.media_unified:
+        fresh_writes = 4276 + int(modes.file_read)
+    expected_io = (15, 5) if reopen else (fresh_writes, 6)
+    require(len(io) == 1 and io[0][0] > 0 and io[0][1:] == expected_io,
+            "media staging device writes and flushes disagree with the selected protocol")
+    snapshot = w11_rows(lines, "V020_W11_MEDIA_SNAPSHOT_0X40")
+    require(snapshot == [(snapshot_calls, EAGAIN_RESULT, 0)],
+            "media staging snapshot refusal must match in-vector EAGAIN role calls")
 
 
-def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool) -> dict:
+def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
+                 snapshot_calls: int, modes: Modes) -> dict:
     """Words 128..160 and the wave-11 serial contract (words 0..127 are checked by the caller)."""
     require = verify_smp.require
     check_w11_baseline(words)
     measured_rows = check_w11_rows(words, lines)
     check_w11_net(words, lines, serial)
-    check_w11_staging(words, lines, serial, staging)
+    check_w11_staging(words, lines, serial, staging, snapshot_calls, modes)
     flags = {
         "frame_meta": words[129] == 1,
-        "recovery": words[131] == RECOVERY_ACCUMULATORS and words[133] == 1,
+        "recovery": (words[131] == RECOVERY_ACCUMULATORS and words[133] == 1
+                     and words[152] == SECONDARY_CPU_MASK.bit_count()),
         "metered": words[135] == 1,
         "net": words[138] == 1,
         "tcp_echo": words[139] == 1,
         "tls_echo": words[142] == 1,
         "media_staging_enabled": words[144] == 1,
-        "staging_ok": all(words[w] != 0 for w in STAGING_STEP_WORDS),
+        "staging_ok": staging,
     }
     expected = completion_marker(flags)
     require(sum(line.startswith(W11_MARKER + " ") for line in lines) == 1
@@ -404,26 +556,24 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool) -> dic
         **measured_rows,
         "recovery_accumulators": words[131],
         "degraded_events": words[132],
-        "recovery_publish_rejected_after_synthetic_unknown": words[133],
+        "recovery_required_publish_rejected": words[133],
+        "recovery_writer_takeovers": words[152],
         "policy_lock_metered": True,
         "policy_lock_settled_in_budget": words[136],
         "policy_lock_overrun_or_unmeasured": words[137],
+        "policy_lock_measured_overruns": words[154],
+        "policy_lock_max_elapsed_ns": words[155],
         "real_net_device": True,
         "tcp_to_local_echo": True,
-        "admission_leases_inferred_count": words[140],
+        "admission_leases": words[140],
         "echo_bytes_relayed": words[141],
         "tls_echo_turn_verified": False,
         "media_staging_enabled": staging,
+        "staging_confirmed_epoch": words[148] if staging else None,
+        "staging_previous_epoch": words[163] if staging else None,
+        "staging_reopened": modes.media_reopen,
         "w11_completion_marker": expected,
     }
-
-
-def sha(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
 
 
 def source_manifest() -> dict:
@@ -435,138 +585,34 @@ def source_manifest() -> dict:
     return names
 
 
-def free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
-def qemu_args(binary: str, qmp_path: str, elf: Path, port: int,
-              scratch: Path | None = None, nic: bool = True) -> list:
-    """Pinned G-A argv; `scratch` selects the media-staging lane (-m 1024M + blk)."""
-    ram = STAGING_RAM if scratch is not None else GA_RAM
-    args = [binary, "-machine", "virt-10.2,gic-version=2,secure=off,virtualization=off",
-            "-cpu", "cortex-a53", "-smp", "4", "-m", ram, "-accel", "tcg,thread=multi",
-            "-display", "none", "-monitor", "none"]
-    if nic:
-        # `-nic user,model=virtio-net-device` is not created on virt, and the
-        # driver accepts modern (version 2) virtio-mmio only (task-5 ruling).
-        args += ["-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:7",
-                 "-device", "virtio-net-device,netdev=n0"]
-    else:
-        args += ["-nic", "none"]
-    if nic or scratch is not None:
-        args += ["-global", "virtio-mmio.force-legacy=false"]
-    if scratch is not None:
-        args += ["-drive", f"file={scratch},if=none,id=scratch,format=raw,cache=none",
-                 "-device", "virtio-blk-device,drive=scratch"]
-    return args + ["-chardev", "ringbuf,id=cyxlog,size=1048576", "-serial", "chardev:cyxlog",
-                   "-qmp", f"unix:{qmp_path},server=on,wait=off", "-kernel", str(elf),
-                   "-no-reboot"]
-
-
-class HostPeer(threading.Thread):
-    """Connect through hostfwd once the guest listens, send PEER_SAMPLE, read <= 5 s.
-
-    QEMU slirp connects to the guest from its own ephemeral port; no fixed
-    source port is bound here.
-    """
-
-    def __init__(self, port: int) -> None:
-        super().__init__(daemon=True)
-        self.port = port
-        self.listening = threading.Event()
-        self.stopping = threading.Event()
-        self.result: dict = {"sent": 0, "received": 0}
-
-    def run(self) -> None:
-        while not self.listening.wait(0.05):
-            if self.stopping.is_set():
-                self.result["error"] = "guest never listened"
-                return
-        try:
-            with socket.create_connection(("127.0.0.1", self.port),
-                                          timeout=PEER_WAIT_SECONDS) as conn:
-                conn.sendall(PEER_SAMPLE)
-                self.result["sent"] = len(PEER_SAMPLE)
-                self.result["closed_by_guest"] = self.drain(conn)
-        except OSError as error:
-            self.result["error"] = type(error).__name__ + ": " + str(error)
-
-    def drain(self, conn: socket.socket) -> bool:
-        deadline = time.monotonic() + PEER_WAIT_SECONDS
-        while not self.stopping.is_set():
-            left = deadline - time.monotonic()
-            if left <= 0:
-                return False
-            conn.settimeout(min(left, 0.25))
-            try:
-                chunk = conn.recv(4096)
-            except socket.timeout:
-                continue
-            if not chunk:
-                return True
-            self.result["received"] += len(chunk)
-        return False
-
-
-def create_scratch(path: Path) -> None:
-    with path.open("xb") as handle:
-        handle.truncate(SCRATCH_BYTES)
-
-
-def scratch_summary(path: Path) -> dict:
-    nonzero = 0
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(4096), b""):
-            nonzero += any(block)
-    return {"scratch_bytes": SCRATCH_BYTES, "scratch_after_sha256": sha(path),
-            "scratch_after_nonzero_blocks": nonzero}
-
-
-def shutdown(proc, qmp) -> None:
-    if proc.poll() is None:
-        try:
-            if qmp:
-                qmp.execute("quit")
-        except (OSError, ValueError, RuntimeError):
-            pass
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill(); proc.wait(timeout=2)
-
-
-def connect_qmp(proc, path: str, end: float):
-    require = verify_smp.require
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    while True:
-        require(proc.poll() is None, "QEMU exited before handshake")
-        if time.monotonic() >= end:
-            raise TimeoutError("QMP handshake deadline")
-        try:
-            sock.connect(path)
-            return sock
-        except (FileNotFoundError, ConnectionRefusedError):
-            time.sleep(0.01)
-
-
 def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
-        nic: bool = True) -> dict:
+        nic: bool = True, connect_peer: bool = True, *, modes: Modes = Modes(),
+        rng_present: bool = True, boot_disk: Path | None = None) -> dict:
     require = verify_smp.require
     require(1 <= timeout <= 300, "invalid execution budget")
-    require(nic or not staging, "--no-nic is a G-A negative control only")
+    require(not staging or (nic and connect_peer), "network negative controls are G-A only")
+    require(staging or not modes.media_reopen, "media reopen requires the staging lane")
+    require(staging or not modes.file_volatile_write, "file volatile write requires the staging lane")
+    require(staging or not modes.signed_media, "signed media requires the staging lane")
+    require(staging or not modes.snapshot_envelopes, "snapshot envelopes require the staging lane")
+    require(not modes.snapshot_read or (staging and modes.snapshot_catalog and modes.file_read),
+            "snapshot read requires the staging lane, snapshot catalog and file read")
+    require(not modes.file_sessions or (staging and modes.file_read),
+            "file sessions require the staging lane and file read")
+    require(not modes.snapshot_catalog or (staging and modes.signed_media
+                                            and modes.media_unified and modes.live_control),
+            "snapshot catalog requires signed unified media and the live Supervisor role")
+    require(not modes.file_read or (staging and modes.signed_media
+                                    and modes.media_unified and modes.live_control),
+            "file read requires signed unified media and the live Supervisor role")
+    require(rng_present or modes.authenticated_net, "missing RNG control requires authenticated mode")
     elf = elf.resolve(strict=True)
     output = output.resolve()
     require(not output.exists(), "refuse to reuse evidence output")
     output.mkdir(parents=True)
     before = source_manifest()
     (output / "source-manifest.json").write_text(json.dumps(before, indent=2) + "\n")
-    acceptance = Production(staging=staging)
+    acceptance = Production(staging=staging, modes=modes)
     report = {
         "status": "FAIL", "scope": "native-v020-production-skeleton",
         "model_driven": False, "production_skeleton": True, "full_authority": False,
@@ -577,11 +623,17 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
     report.update(acceptance.metadata())
     if not nic:
         report["negative_control"] = "no-nic: the G-A lane must FAIL closed"
+    elif not connect_peer:
+        report["negative_control"] = "no-peer: bounded accept with the NIC present"
+    elif not rng_present:
+        report["negative_control"] = "no-rng: authenticated relay must refuse to listen"
+    elif modes.authenticated_net and not modes.orderly_close:
+        report["negative_control"] = "abrupt-peer: authenticated Echo with no normal credit retirement"
     decoder = FrameDecoder(); raw = bytearray(); decoded = bytearray()
     proc = None; sock = None; qmp = None; peer = None
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="cyx-prod-") as td, (output / "qemu-stderr.log").open("wb") as err:
-        scratch = Path(td) / "scratch.raw" if staging else None
+        scratch = (boot_disk or Path(td) / "scratch.raw") if staging else None
         try:
             location = acceptance.profile(elf.read_bytes())
             binary = shutil.which("qemu-system-aarch64")
@@ -594,14 +646,19 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
             report["qemu_version"] = version
             report["qemu_sha256"] = sha(Path(binary))
             if scratch is not None:
-                create_scratch(scratch)
+                if boot_disk is None:
+                    create_scratch(scratch)
+                require(scratch.is_file() and not scratch.is_symlink()
+                        and scratch.stat().st_size == SCRATCH_BYTES, "invalid staging scratch disk")
+                report["scratch_before_sha256"] = sha(scratch)
             port = free_port()
             path = str(Path(td) / "q.sock")
-            args = qemu_args(binary, path, elf, port, scratch=scratch, nic=nic)
+            args = qemu_args(binary, path, elf, port, scratch=scratch, nic=nic,
+                            rng=modes.authenticated_net and rng_present)
             report["argv"] = args
             proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=err)
-            if nic:
-                peer = HostPeer(port)
+            if nic and connect_peer:
+                peer = HostPeer(port, modes.authenticated_net, modes.orderly_close)
                 peer.start()
             end = started + timeout
             sock = connect_qmp(proc, path, end)
@@ -630,11 +687,52 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                             "incomplete/corrupt framed UART transport")
                     page = (output / "native-page.bin").read_bytes()
                     report["observations"] = acceptance.validate(bytes(decoded), page, len(actual_cpus))
-                    require(peer is None or report["observations"]["echo_bytes_relayed"]
-                            == peer.result["sent"],
-                            "relayed bytes (word 141) differ from the bytes the host peer sent")
+                    relay_bytes = report["observations"]["echo_bytes_relayed"]
+                    if modes.authenticated_net:
+                        require(peer is not None, "missing authenticated host peer")
+                        peer.join(timeout=min(max(end - time.monotonic(), 0), PEER_WAIT_SECONDS))
+                        authenticated_echo(peer.result, relay_bytes, modes.orderly_close)
+                    else:
+                        require(peer is None or relay_bytes == peer.result["sent"],
+                                "relayed bytes (word 141) differ from the bytes the host peer sent")
                     require(sha(elf) == report["elf_sha256"], "ELF changed during guest run")
                     require(before == source_manifest(), "production source changed during guest run")
+                    if modes.signed_media:
+                        epoch = report["observations"]["signed_config_bound_boot_epoch"]
+                        report["signed_scratch_policy_sha256"] = verify_signed_disk(scratch, epoch)
+                        report["signed_config"] = True
+                    if modes.snapshot_envelopes:
+                        disk_evidence = verify_envelopes(
+                            scratch, unified=modes.media_unified, file_read=modes.file_read,
+                            snapshot_read=modes.snapshot_read, file_volatile_write=modes.file_volatile_write,
+                        )
+                        require(disk_evidence["superblock_generation"] ==
+                                report["observations"]["staging_confirmed_epoch"],
+                                "scratch checkpoint generation disagrees with the confirmed BootEpoch")
+                        if modes.media_unified:
+                            require(all(disk_evidence[key] == report["observations"]["unified_mount_" + key]
+                                        for key in ("system_inodes", "system_blocks", "data_blocks")),
+                                    "host and guest unified mount evidence disagree")
+                        if modes.snapshot_catalog:
+                            require(disk_evidence["objects"]["catalog"]["envelope_sha256"] ==
+                                    report["observations"]["snapshot_catalog_sha256"],
+                                    "Supervisor catalog witness differs from the scratch disk bytes")
+                        if modes.file_read:
+                            require(disk_evidence["file_read_sha256"] == report["observations"]["file_read_sha256"],
+                                    "Supervisor staged file witness differs from the scratch disk bytes")
+                        if modes.file_volatile_write:
+                            require(disk_evidence["file_owner_rights"] ==
+                                    report["observations"]["file_volatile_write_owner_rights"],
+                                    "Supervisor volatile write owner rights differ from the scratch disk ACL")
+                        if modes.snapshot_read:
+                            require(disk_evidence["objects"]["slot"]["extent_sha256"] ==
+                                    report["observations"]["snapshot_read_slot_sha256"],
+                                    "Supervisor SlotStore witness differs from the scratch disk bytes")
+                        report["snapshot_envelope_disk"] = disk_evidence
+                    if modes.authenticated_net:
+                        report["tls_echo_turn_verified"] = True
+                        report["observations"]["tls_echo_turn_verified"] = True
+                        report["tls_credit_retirement_verified"] = modes.orderly_close
                     report["status"] = "PASS"
                     report.update(acceptance.success())
                     break
@@ -666,14 +764,14 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
     return report
 
 
-def build(staging: bool) -> Path:
+def build(staging: bool, modes: Modes = Modes()) -> Path:
     """Build the fixture-identity local-echo guest first (the kernel embeds it),
     then the production kernel feature, exactly as verify_v0199_sec_n.build()."""
     import os
     import verify_v0199_sec_n
     verify_v0199_sec_n.build_guest()
     verify_smp.require((ROOT / GUEST_ELF).is_file(), "local-echo guest ELF missing after build")
-    feature = "v020-production-media-staging" if staging else "v020-production"
+    feature = modes.features(staging)
     kernel_env = dict(os.environ)
     kernel_env.pop("RUSTFLAGS", None)
     subprocess.run(
@@ -690,15 +788,95 @@ def main() -> int:
     parser.add_argument("--elf", type=Path, help="kernel ELF; omitted -> build guest + kernel first")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=120)
-    parser.add_argument("--media-staging", action="store_true",
-                        help="opt-in staging lane: -m 1024M + fresh all-zero scratch disk")
-    parser.add_argument("--no-nic", action="store_true",
-                        help="negative control: boot with -nic none; the G-A lane must FAIL")
+    media = parser.add_mutually_exclusive_group()
+    media.add_argument("--media-staging", action="store_true",
+                       help="staging boot with an all-zero scratch disk")
+    media.add_argument("--media-reopen", action="store_true",
+                       help="format and reopen the same temporary staging disk across QEMU boots")
+    parser.add_argument("--fresh-elf", type=Path, help="first boot ELF for --media-reopen")
+    parser.add_argument("--unsigned-fresh-elf", type=Path,
+                        help="prebuilt unsigned comparison ELF for signed reopen")
+    parser.add_argument("--signed-media", action="store_true",
+                        help="authenticate the temporary disk with the pinned test policy")
+    parser.add_argument("--media-envelopes", action="store_true",
+                        help="verify empty D1.5 snapshot envelopes on the temporary disk")
+    parser.add_argument("--media-unified", action="store_true",
+                        help="format or reopen the allocated eight-object scratch layout")
+    parser.add_argument("--snapshot-catalog", action="store_true",
+                        help="verify the empty LIST endpoint with signed unified media and the Supervisor")
+    parser.add_argument("--file-read", action="store_true",
+                        help="verify the Supervisor's read-only file service on signed unified media")
+    parser.add_argument("--snapshot-read", action="store_true",
+                        help="verify Supervisor QUERY and HISTORY_OPEN refusals and the SlotStore digest")
+    parser.add_argument("--file-sessions", action="store_true",
+                        help="verify bounded Supervisor file handles, replay and revocation on signed media")
+    parser.add_argument("--file-volatile-write", action="store_true",
+                        help="verify bounded Supervisor RAM writes, replay and disk readback on signed media")
+    parser.add_argument("--frame-pool", action="store_true",
+                        help="verify the bounded native allocator and FrameMeta lifecycle")
+    parser.add_argument("--authenticated-net", action="store_true", help="pinned fixture TLS and VirtIO RNG")
+    parser.add_argument("--live-control", action="store_true", help="live D01 and volatile audit readbacks")
+    network = parser.add_mutually_exclusive_group()
+    network.add_argument("--no-nic", action="store_true",
+                         help="negative control: boot with -nic none")
+    network.add_argument("--no-peer", action="store_true",
+                         help="negative control: attach VirtIO-net and omit the TCP peer")
+    network.add_argument("--no-rng", action="store_true",
+                         help="negative control: authenticated boot without VirtIO RNG")
+    network.add_argument("--abrupt-peer", action="store_true",
+                         help="authenticated Echo with abrupt EOF and retained credit")
     args = parser.parse_args()
+    snapshot_catalog = args.snapshot_catalog or args.snapshot_read
+    file_read = args.file_read or args.snapshot_read or args.file_sessions
+    modes = Modes(authenticated_net=args.authenticated_net,
+                  live_control=args.live_control or snapshot_catalog or file_read,
+                  media_reopen=args.media_reopen, signed_media=args.signed_media or snapshot_catalog or file_read,
+                  orderly_close=not args.abrupt_peer, frame_pool=args.frame_pool,
+                  media_envelopes=args.media_envelopes, media_unified=args.media_unified or snapshot_catalog or file_read,
+                  snapshot_catalog=snapshot_catalog, file_read=file_read, snapshot_read=args.snapshot_read,
+                  file_sessions=args.file_sessions, file_volatile_write=args.file_volatile_write)
+    if args.fresh_elf is not None and not args.media_reopen:
+        parser.error("--fresh-elf requires --media-reopen")
+    if args.media_reopen and ((args.elf is None) != (args.fresh_elf is None)):
+        parser.error("--media-reopen requires both ELFs or neither")
+    if args.media_reopen and (args.no_nic or args.no_peer or args.no_rng):
+        parser.error("--media-reopen uses an independent blank disk negative control")
+    if args.snapshot_read and not (args.media_staging or args.media_reopen):
+        parser.error("--snapshot-read requires a staging or reopen run")
+    if args.file_sessions and not (args.media_staging or args.media_reopen):
+        parser.error("--file-sessions requires a staging or reopen run")
+    if args.file_volatile_write and not (args.media_staging or args.media_reopen):
+        parser.error("--file-volatile-write requires a staging or reopen run")
+    if args.snapshot_catalog and not (args.media_staging or args.media_reopen):
+        parser.error("--snapshot-catalog requires a staging or reopen run")
+    if modes.signed_media and not (args.media_staging or args.media_reopen):
+        parser.error("--signed-media requires a staging or reopen run")
+    if modes.snapshot_envelopes and not (args.media_staging or args.media_reopen):
+        parser.error("--media-envelopes and --media-unified require a staging or reopen run")
+    if args.unsigned_fresh_elf and not (modes.signed_media and args.media_reopen and args.elf):
+        parser.error("--unsigned-fresh-elf requires a prebuilt signed reopen run")
+    if modes.signed_media and args.media_reopen and args.elf and args.unsigned_fresh_elf is None:
+        parser.error("prebuilt signed reopen also requires --unsigned-fresh-elf")
+    if (args.abrupt_peer or args.no_rng) and not args.authenticated_net:
+        parser.error("--abrupt-peer and --no-rng require --authenticated-net")
     try:
-        elf = args.elf if args.elf is not None else build(args.media_staging)
-        result = run(elf, args.output, args.timeout, staging=args.media_staging,
-                     nic=not args.no_nic)
+        if args.media_reopen:
+            with tempfile.TemporaryDirectory(prefix="cyx-v020-images-") as temp:
+                fresh = args.fresh_elf
+                unsigned = args.unsigned_fresh_elf
+                if fresh is None:
+                    fresh = Path(temp) / "fresh.elf"
+                    shutil.copyfile(build(True, replace(modes, media_reopen=False)), fresh)
+                    if modes.signed_media:
+                        unsigned = Path(temp) / "unsigned.elf"
+                        shutil.copyfile(build(True, modes.unsigned_fixture()), unsigned)
+                elf = args.elf if args.elf is not None else build(True, modes)
+                result = run_media_reopen(run, fresh, elf, args.output, args.timeout, modes, unsigned)
+        else:
+            elf = args.elf if args.elf is not None else build(args.media_staging, modes)
+            result = run(elf, args.output, args.timeout, staging=args.media_staging,
+                         nic=not args.no_nic, connect_peer=not args.no_peer, modes=modes,
+                         rng_present=not args.no_rng)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         print(str(error), file=__import__("sys").stderr)
         return 1

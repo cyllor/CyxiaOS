@@ -14,20 +14,16 @@
 //!   unless `cpu == 0`, and never re-entrantly (the bridge call does not
 //!   dispatch). The `&mut` lives only inside one synchronous closure; no safe
 //!   fn returns a reference to it.
-//! * SETTLED / OVER_BUDGET (atomics): written by CPU0 in `metered`, read by
-//!   CPU0 at the evidence seal (`publish`).
+//! * ATTEMPTS / MAX_ELAPSED_NS (atomics): written by CPU0 in `metered`,
+//!   read by CPU0 at the evidence seal (`publish`).
 
-use super::{evidence, now_ns};
+use super::{evidence, now_ns, report};
 use core::sync::atomic::{AtomicU64, Ordering};
-use cyxia_kernel_core::control_plane::policy_lock_v0199::{
-    CriticalSectionMeter, OverrunClass, SectionKind,
-};
+use cyxia_kernel_core::control_plane::policy_lock_v0199::{CriticalSectionMeter, SectionKind};
 
 static mut METER: CriticalSectionMeter = CriticalSectionMeter::new();
-/// Scopes that settled within budget.
-static SETTLED: AtomicU64 = AtomicU64::new(0);
-/// Scopes that overran, failed to begin/settle (clock, denied, busy).
-static OVER_BUDGET: AtomicU64 = AtomicU64::new(0);
+static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static MAX_ELAPSED_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Run `f` with the scoped meter. The reference never escapes the closure.
 fn with_meter<R>(f: impl FnOnce(&mut CriticalSectionMeter) -> R) -> R {
@@ -42,29 +38,33 @@ fn with_meter<R>(f: impl FnOnce(&mut CriticalSectionMeter) -> R) -> R {
 pub(super) fn metered<T>(f: impl FnOnce() -> T) -> T {
     let begun = with_meter(|m| m.begin(SectionKind::EffectiveWork, now_ns())).is_ok();
     let out = f();
-    let within_budget = begun
-        && matches!(
-            with_meter(|m| m.end(now_ns())),
-            Ok(s) if s.overrun_class == OverrunClass::None
-        );
-    let counter = if within_budget {
-        &SETTLED
-    } else {
-        &OVER_BUDGET
-    };
-    counter.fetch_add(1, Ordering::Relaxed);
+    if begun && let Ok(settlement) = with_meter(|m| m.end(now_ns())) {
+        MAX_ELAPSED_NS.fetch_max(settlement.elapsed_ns, Ordering::Relaxed);
+    }
+    ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     out
 }
 
-/// Evidence seal: words 135..137 (CPU0, after the business CPUs stopped).
+/// Publish measured overruns separately from attempts denied by the latch.
 pub(super) fn publish() {
+    let (settled, overruns) = with_meter(|m| (m.settled_count(), m.overrun_count()));
+    let in_budget = settled - overruns;
+    let unmeasured = ATTEMPTS.load(Ordering::Relaxed) - settled;
     evidence::put(evidence::W11_POLICY_LOCK_METERED, 1);
-    evidence::put(
-        evidence::W11_POLICY_LOCK_SETTLED_IN_BUDGET,
-        SETTLED.load(Ordering::Relaxed),
-    );
+    evidence::put(evidence::W11_POLICY_LOCK_SETTLED_IN_BUDGET, in_budget);
     evidence::put(
         evidence::W11_POLICY_LOCK_OVERRUN_OR_UNMEASURED,
-        OVER_BUDGET.load(Ordering::Relaxed),
+        overruns + unmeasured,
+    );
+    evidence::put(evidence::W11_POLICY_LOCK_MEASURED_OVERRUNS, overruns);
+    evidence::put(
+        evidence::W11_POLICY_LOCK_MAX_ELAPSED_NS,
+        MAX_ELAPSED_NS.load(Ordering::Relaxed),
+    );
+    report(
+        "V020_W11_POLICY_LOCK_METER",
+        in_budget,
+        overruns,
+        unmeasured,
     );
 }

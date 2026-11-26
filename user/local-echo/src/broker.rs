@@ -98,14 +98,43 @@ pub fn boot_identity() -> Option<([u8; 32], [u8; 32])> {
         ))
     }
 }
-pub fn poll() -> Result<(bool, u64, u32), Error> {
+pub fn poll() -> Result<(bool, u64, u32, bool), Error> {
     let (_, connected) = request(allowed::POLL, &[], &mut [], 0)?;
     unsafe {
         let p = page();
         let generation = core::ptr::addr_of!((*p).connection_epoch).read_volatile();
         let ip = core::ptr::addr_of!((*p).domains.peer_ipv4).read_volatile();
         let ip = u32::try_from(ip).map_err(|_| Error::Invalid)?;
-        Ok((connected == 1, generation, ip))
+        match connected {
+            0 | 1 | 3 => Ok((connected != 0, generation, ip, connected == 3)),
+            _ => Err(Error::Invalid),
+        }
+    }
+}
+/// The caller must hold a pending ticket from this guest's admission ledger.
+pub fn admission_granted(
+    _ticket: cyxia_net_transport::admission::PendingTicket,
+    generation: u64,
+    source: u32,
+) -> Result<(), Error> {
+    connection_receipt(allowed::ADMISSION_GRANTED, generation, source)
+}
+
+pub fn poll_normal_close(generation: u64, source: u32) -> Result<(), Error> {
+    connection_receipt(allowed::POLL_NORMAL_CLOSE, generation, source)
+}
+
+pub fn admission_retired(generation: u64, source: u32) -> Result<(), Error> {
+    connection_receipt(allowed::ADMISSION_RETIRED, generation, source)
+}
+
+fn connection_receipt(op: u64, generation: u64, source: u32) -> Result<(), Error> {
+    let mut receipt = [0u8; allowed::ADMISSION_RECEIPT_BYTES];
+    receipt[..8].copy_from_slice(&generation.to_le_bytes());
+    receipt[8..].copy_from_slice(&source.to_le_bytes());
+    match request(op, &receipt, &mut [], 0)? {
+        (0, 0) => Ok(()),
+        _ => Err(Error::Invalid),
     }
 }
 pub fn read(out: &mut [u8]) -> Result<usize, Error> {

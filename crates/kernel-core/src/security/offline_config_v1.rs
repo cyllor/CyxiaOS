@@ -366,6 +366,230 @@ mod tests {
         ));
     }
     #[test]
+    fn offline_install_requires_signed_clear_quiescence_and_exact_redo_before_remount() {
+        use super::super::{
+            boot_epoch_v1::BootEpochStoreV1,
+            durable_role_epoch_v0199::{Change, DurableEpochGate, Outcome, SlotBinding},
+            epoch_redo_v0199::{EpochBlockIo, OneStateRedo},
+            file_media_v0199::SuperblockV1,
+        };
+        use crate::control_plane::role_manifest_v0199::ROLES;
+        use ed25519_dalek::{Signer, SigningKey};
+        const B: usize = 4096;
+        struct Disk {
+            blocks: [[u8; B]; 4],
+            writes: u32,
+            flushes: u32,
+        }
+        impl EpochBlockIo for Disk {
+            fn read(&mut self, b: u32, out: &mut [u8; B]) -> Result<(), Error> {
+                *out = self.blocks[(b - 2) as usize];
+                Ok(())
+            }
+            fn write(&mut self, b: u32, data: &[u8; B]) -> Result<(), Error> {
+                self.blocks[(b - 2) as usize] = *data;
+                self.writes += 1;
+                Ok(())
+            }
+            fn flush(&mut self) -> Result<(), Error> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let (mut wire, c) = fixture();
+        wire[192..200].copy_from_slice(&2u64.to_le_bytes());
+        let signer = SigningKey::from_bytes(&[0x38; 32]);
+        let mut message = [0u8; SIGNATURE_LABEL.len() + 513];
+        message[..SIGNATURE_LABEL.len()].copy_from_slice(SIGNATURE_LABEL);
+        message[SIGNATURE_LABEL.len()..].copy_from_slice(&wire[..513]);
+        wire[513..].copy_from_slice(&signer.sign(&message).to_bytes());
+        let mut scratch = [0u8; SIGNATURE_LABEL.len() + 513];
+        let cfg = VerifiedOfflineConfig::verify(
+            &wire,
+            &signer.verifying_key().to_bytes(),
+            c,
+            &mut scratch,
+            |_, _, p| {
+                if p == [42] {
+                    Ok(())
+                } else {
+                    Err(Error::Invalid)
+                }
+            },
+        )
+        .unwrap();
+        let old = SecurityStateStoreV2 {
+            fs_uuid: [1; 16],
+            state_generation: 10,
+            rule_min_generation: 2,
+            security_min_generation: 3,
+            key_generation: 4,
+            isolated_service_bitmap: 6,
+            last_boot_epoch: 9,
+            offline_config_generation: 6,
+            offline_config_hash: [9; 32],
+            service_generations: [4; 16],
+        };
+        let raw = old.encode().unwrap();
+        let boot = BootEpochStoreV1 {
+            fs_uuid: old.fs_uuid,
+            boot_epoch: old.last_boot_epoch,
+        }
+        .encode()
+        .unwrap();
+        let slots = core::array::from_fn(|i| SlotBinding {
+            role: ROLES[i],
+            slot: i as u8,
+        });
+        let mut gate = DurableEpochGate::recovered_pair(&raw, &boot, slots, |s| {
+            assert_eq!(*s, old);
+            Ok(())
+        })
+        .unwrap();
+        let mut gens = old.service_generations;
+        gens[1] += 1;
+        let change = Change::InstallConfig {
+            generation: 7,
+            digest: cfg.digest(),
+        };
+        assert_eq!(gate.prepare(change, |_| panic!()), Err(Error::Unauthorized));
+        assert_eq!(
+            gate.prepare_offline_install(&cfg, 4, gens, |_, _, _| panic!()),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            gate.prepare_offline_install(&cfg, 2, old.service_generations, |_, _, _| panic!()),
+            Err(Error::Conflict)
+        );
+        assert_eq!(
+            gate.prepare_offline_install(&cfg, 2, gens, |_, _, _| Err(Error::Unknown)),
+            Err(Error::Unknown)
+        );
+        let ticket = gate
+            .prepare_offline_install(&cfg, 2, gens, |_, before, after| {
+                assert_eq!(*before, old);
+                assert_eq!(after.isolated_service_bitmap, 4);
+                assert_eq!(after.last_boot_epoch, 9);
+                assert_eq!(after.service_generations, gens);
+                Ok(())
+            })
+            .unwrap();
+        let after = gate.after_image(ticket).unwrap();
+        let state = SecurityStateStoreV2::decode(&after).unwrap();
+        assert_eq!(cfg.check_committed(&state), Ok(()));
+        assert_eq!(
+            gate.prepare_offline_install(&cfg, 2, gens, |_, _, _| panic!()),
+            Ok(ticket)
+        );
+        assert_eq!(
+            gate.prepare_offline_install(&cfg, 0, gens, |_, _, _| panic!()),
+            Err(Error::Conflict)
+        );
+        assert_eq!(
+            gate.prepare(Change::AllocateBoot, |_| panic!()),
+            Err(Error::Busy)
+        );
+        assert_eq!(gate.boot_epoch(), None);
+        let mut disk = Disk {
+            blocks: [[0; B]; 4],
+            writes: 0,
+            flushes: 0,
+        };
+        let sb = SuperblockV1 {
+            fs_uuid: old.fs_uuid,
+            generation: 1,
+            checkpoint_lsn: 0,
+            log_epoch: 1,
+        };
+        let mut redo = OneStateRedo::zeroed();
+        let proof = redo
+            .append_once(&mut disk, &mut gate, sb, 2, 7000, 1, 3, ticket, |place| {
+                assert_eq!(place.state_home, 7000);
+                assert_eq!(place.txid, 1);
+                Ok(())
+            })
+            .unwrap();
+        let receipt = proof.receipt();
+        assert_eq!((disk.writes, disk.flushes), (4, 2));
+        assert_eq!(
+            gate.confirm(ticket, receipt, &after, |_, _| panic!()),
+            Err(Error::Unauthorized)
+        );
+        let mut sb_raw = [0u8; B];
+        for (at, v) in [
+            (0, 0x43594653u32),
+            (8, 4096),
+            (12, 131072),
+            (56, 4098),
+            (60, 4102),
+            (64, 4118),
+            (68, 256),
+        ] {
+            sb_raw[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        sb_raw[4..6].copy_from_slice(&1u16.to_le_bytes());
+        sb_raw[6..8].copy_from_slice(&80u16.to_le_bytes());
+        sb_raw[16..32].copy_from_slice(&old.fs_uuid);
+        sb_raw[32..40].copy_from_slice(&1u64.to_le_bytes());
+        sb_raw[48..56].copy_from_slice(&1u64.to_le_bytes());
+        let crc = super::super::file_media_v0199::crc32c_zeroed(&sb_raw, 76).unwrap();
+        sb_raw[76..80].copy_from_slice(&crc.to_le_bytes());
+        assert_eq!(SuperblockV1::decode(&sb_raw), Ok(sb));
+        assert_eq!(
+            gate.confirm_from_redo(
+                ticket,
+                receipt,
+                redo.image(),
+                &sb_raw,
+                2,
+                7000,
+                &redo.begin,
+                &[&redo.redo],
+                &redo.commit,
+                |_, _| Err(Error::Unknown)
+            ),
+            Err(Error::Unknown)
+        );
+        assert_eq!(gate.boot_epoch(), None);
+        assert_eq!(
+            gate.confirm_from_redo(
+                ticket,
+                receipt,
+                redo.image(),
+                &sb_raw,
+                2,
+                7000,
+                &redo.begin,
+                &[&redo.redo],
+                &redo.commit,
+                |t, r| proof.verifies(t, r)
+            ),
+            Ok(Outcome::ConfigInstalled { generation: 7 })
+        );
+        // No role/cap can be published on the old mount. Signed config
+        // and full volume evidence must be revalidated after actual replay.
+        assert_eq!(gate.confirmed_config_boot(&cfg), Err(Error::Unauthorized));
+        assert_eq!(
+            gate.prepare(Change::AllocateBoot, |_| panic!()),
+            Err(Error::Busy)
+        );
+        let mut recovered =
+            DurableEpochGate::recovered_for_startup(&after, &boot, slots, &cfg, |s| {
+                assert_eq!(*s, state);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(recovered.boot_epoch(), None);
+        assert_eq!(
+            recovered
+                .prepare(Change::AllocateBoot, |_| panic!())
+                .unwrap()
+                .target_boot_epoch,
+            10
+        );
+    }
+
+    #[test]
     fn invalid_signature_catalog_reserved_and_payload_deny_admission() {
         let (b, c) = fixture();
         let mut bad = b;

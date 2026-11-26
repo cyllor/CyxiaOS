@@ -9,3 +9,5 @@ pub mod model;
 pub mod native_v0199;
 
 pub mod reward_v2;
+
+pub mod sgd_v2;

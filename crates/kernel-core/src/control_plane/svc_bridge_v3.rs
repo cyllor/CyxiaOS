@@ -175,7 +175,7 @@ pub fn executor_fetch_rpc(
         holder: native.identity,
         cap_id: native.endpoint_cap,
     };
-    if native.cpu >= 4
+    if !(1..=3).contains(&native.cpu)
         || caller.role != 12
         || caller.boot_epoch != scope.boot_epoch
         || caller.holder != native.identity
@@ -721,6 +721,7 @@ mod tests {
             },
             candidate_set_hash: [1; 32],
             static_ordinals: &static_ordinals,
+            candidate_payloads: &[&[2, 0], &[4, 0]],
             raw_fields: [None; 7],
             action_payload: &action_bytes,
         }];
@@ -932,6 +933,7 @@ mod tests {
             },
             candidate_set_hash: [1; 32],
             static_ordinals: &ordinals,
+            candidate_payloads: &[&[2, 0, 8, 0], &[8, 0, 16, 0]],
             raw_fields: [None; 7],
             action_payload: &payload,
         }];
@@ -1012,6 +1014,26 @@ mod tests {
         }
         request[48..50].copy_from_slice(&4u16.to_le_bytes());
         let args = [99, 4096, 72, 0, 8192, 384];
+        for cpu in [0, 4] {
+            let wrong = VerifiedNativeCaller { cpu, ..native };
+            assert_eq!(
+                executor_fetch_rpc(
+                    &mut gate,
+                    &mut table,
+                    caller,
+                    wrong,
+                    args,
+                    &request,
+                    &plan,
+                    0,
+                    binding,
+                    scope,
+                    200,
+                    |_| panic!()
+                ),
+                Err(RpcError::Auth)
+            );
+        }
         let wrong = VerifiedNativeCaller {
             endpoint_cap: 100,
             ..native

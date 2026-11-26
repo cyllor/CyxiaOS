@@ -419,10 +419,20 @@ enum Connection {
     Client(UnbufferedClientConnection),
     Server(UnbufferedServerConnection),
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloseState {
+    Disabled,
+    Waiting,
+    PeerNotified,
+    ReplyEncoded,
+    Closed,
+}
+
 pub struct Session<'a> {
     connection: Connection,
     buffers: &'a mut Buffers,
     application: ApplicationProtocol,
+    close: CloseState,
     session_serial: u64,
     input: usize,
     output: usize,
@@ -437,6 +447,7 @@ pub struct Session<'a> {
     handshake_deadline: u64,
 }
 struct Step {
+    close: CloseState,
     discard: usize,
     output: usize,
     received: usize,
@@ -469,6 +480,7 @@ impl<'a> Session<'a> {
             connection,
             buffers,
             application,
+            close: CloseState::Disabled,
             session_serial,
             input: 0,
             output: 0,
@@ -522,8 +534,37 @@ impl<'a> Session<'a> {
         }
         crate::echo::parse_request(message).map_err(|_| Error::Buffer)
     }
+    /// Enable reciprocal close_notify handling on this authenticated Echo session.
+    pub fn enable_normal_close(&mut self) -> Result<(), Error> {
+        if self.local_echo_proof().is_none() || self.close != CloseState::Disabled {
+            return Err(Error::Handshake);
+        }
+        self.close = CloseState::Waiting;
+        Ok(())
+    }
+
+    /// Both rustls close notifications and every buffered byte were accounted for.
+    pub fn normal_close_complete(&self) -> bool {
+        !self.failed
+            && self.close == CloseState::Closed
+            && self.input == 0
+            && self.received == 0
+            && self.sending == 0
+            && self.output == 0
+    }
+
+    pub(crate) fn retirement_tls_ready(&self) -> bool {
+        self.close == CloseState::Disabled || self.normal_close_complete()
+    }
+
+    fn peer_notified(&self) -> bool {
+        matches!(
+            self.close,
+            CloseState::PeerNotified | CloseState::ReplyEncoded | CloseState::Closed
+        )
+    }
     pub fn receive_tls(&mut self, bytes: &[u8]) -> Result<usize, Error> {
-        if self.failed {
+        if self.failed || (self.peer_notified() && !bytes.is_empty()) {
             return Err(Error::Closed);
         }
         let count = bytes.len().min(RECORD_BUFFER - self.input);
@@ -542,7 +583,7 @@ impl<'a> Session<'a> {
     /// permits another bounded read, including handshake messages fragmented
     /// across records. Callers retain any unread suffix in their transport.
     pub fn receive_capacity(&self) -> usize {
-        if self.failed || (self.sending != 0 && !self.needs_input) {
+        if self.failed || self.peer_notified() || (self.sending != 0 && !self.needs_input) {
             0
         } else {
             RECORD_BUFFER - self.input
@@ -566,7 +607,7 @@ impl<'a> Session<'a> {
         Ok(())
     }
     pub fn send_plaintext(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if self.failed {
+        if self.failed || self.peer_notified() {
             return Err(Error::Closed);
         }
         if !self.authenticated {
@@ -637,6 +678,7 @@ impl<'a> Session<'a> {
                 &mut self.buffers.received[accepted..],
                 &self.buffers.sending[..self.sending],
                 self.input,
+                self.close,
             ),
             Connection::Server(c) => step(
                 c.process_tls_records(incoming),
@@ -644,6 +686,7 @@ impl<'a> Session<'a> {
                 &mut self.buffers.received[accepted..],
                 &self.buffers.sending[..self.sending],
                 self.input,
+                self.close,
             ),
         };
         let progress = match result {
@@ -685,6 +728,11 @@ impl<'a> Session<'a> {
             self.buffers.sending[..self.sending].fill(0);
             self.sending = 0;
         }
+        if progress.close == CloseState::PeerNotified && (self.input != 0 || self.received != 0) {
+            self.fail();
+            return Err(Error::Buffer);
+        }
+        self.close = progress.close;
         self.authenticated |= progress.authenticated;
         Ok(())
     }
@@ -719,8 +767,10 @@ fn step<T>(
     received: &mut [u8],
     sending: &[u8],
     input_len: usize,
+    close: CloseState,
 ) -> Result<Step, Error> {
     let mut result = Step {
+        close,
         discard: status.discard,
         output: 0,
         received: 0,
@@ -741,6 +791,14 @@ fn step<T>(
             if !sending.is_empty() && result.discard == input_len {
                 result.output = state.encrypt(sending, output).map_err(|_| Error::Buffer)?;
                 result.sent = true;
+            } else if sending.is_empty() && close == CloseState::PeerNotified {
+                result.output = state
+                    .queue_close_notify(output)
+                    .map_err(|_| Error::Buffer)?;
+                if result.output == 0 {
+                    return Err(Error::Closed);
+                }
+                result.close = CloseState::ReplyEncoded;
             }
         }
         ConnectionState::ReadTraffic(mut state) => {
@@ -754,6 +812,14 @@ fn step<T>(
                 result.received = record.payload.len();
                 result.discard += record.discard;
             }
+        }
+        ConnectionState::PeerClosed if close == CloseState::Waiting => {
+            result.close = CloseState::PeerNotified;
+        }
+        ConnectionState::Closed
+            if matches!(close, CloseState::ReplyEncoded | CloseState::Closed) =>
+        {
+            result.close = CloseState::Closed;
         }
         ConnectionState::Closed | ConnectionState::PeerClosed => return Err(Error::Closed),
         ConnectionState::ReadEarlyData(_) => return Err(Error::Handshake),

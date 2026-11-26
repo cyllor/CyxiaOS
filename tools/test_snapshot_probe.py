@@ -2,11 +2,48 @@
 import copy
 import struct
 import unittest
+from unittest import mock
 
 import run_snapshot_probe as probe
 
 
 class SnapshotProbeOracle(unittest.TestCase):
+    def qmp_socket(self, connect_error=None):
+        sock = mock.MagicMock()
+        sock.__enter__.return_value = sock
+        sock.close.return_value = None
+        sock.__exit__.side_effect = lambda *_: sock.close()
+        sock.connect.side_effect = connect_error
+        return sock
+
+    def test_qmp_retries_with_a_fresh_socket_and_closes_both(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        refused = self.qmp_socket(ConnectionRefusedError)
+        connected = self.qmp_socket()
+        with (mock.patch.object(probe.socket, 'socket', side_effect=[refused, connected]),
+              mock.patch.object(probe.time, 'sleep') as sleep,
+              probe.ExitStack() as cleanup):
+            deadline = probe.time.monotonic() + 15
+            self.assertIs(probe.connect_qmp(process, 'a', 12345, deadline, cleanup), connected)
+            refused.connect.assert_called_once_with(('127.0.0.1', 12345))
+            refused.close.assert_called_once_with()
+            connected.connect.assert_called_once_with(('127.0.0.1', 12345))
+            connected.close.assert_not_called()
+            sleep.assert_called_once_with(.02)
+        connected.close.assert_called_once_with()
+
+    def test_qmp_failed_connect_closes_its_socket(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        failed = self.qmp_socket(ConnectionResetError)
+        with (mock.patch.object(probe.socket, 'socket', return_value=failed),
+              probe.ExitStack() as cleanup):
+            deadline = probe.time.monotonic() + 15
+            with self.assertRaises(ConnectionResetError):
+                probe.connect_qmp(process, 'b', 12345, deadline, cleanup)
+            failed.close.assert_called_once_with()
+
     def test_scope_is_explicit_and_never_claims_full_unified_acceptance(self):
         required = ['--build', 'build', '--output', 'output', '--qemu', 'qemu',
                     '--qemu-source', 'source']

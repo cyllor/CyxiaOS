@@ -28,6 +28,8 @@ struct Packet {
     seq: u32,
     end: u32,
     ack: Option<u32>,
+    fin: bool,
+    final_ack_candidate: bool,
 }
 pub(super) struct ObservedPort<P> {
     inner: P,
@@ -35,6 +37,8 @@ pub(super) struct ObservedPort<P> {
     now: u64,
     outstanding: [Option<Segment>; 64],
     received_ack: Option<u32>,
+    sent_fin_end: Option<u32>,
+    final_ack_candidate: bool,
     rtt: Option<(u64, u64)>,
     window_started: u64,
     sent: u64,
@@ -103,6 +107,12 @@ fn packet(frame: &[u8], config: Config, outgoing: bool) -> Option<Packet> {
         seq,
         end: seq.wrapping_add(length),
         ack: tcp.ack().then_some(tcp.ack_number().0 as u32),
+        fin: tcp.fin() && !tcp.rst(),
+        final_ack_candidate: tcp.ack()
+            && !tcp.rst()
+            && !tcp.fin()
+            && !tcp.syn()
+            && tcp.payload().is_empty(),
     })
 }
 impl<P: Port> ObservedPort<P> {
@@ -113,6 +123,8 @@ impl<P: Port> ObservedPort<P> {
             now,
             outstanding: [None; 64],
             received_ack: None,
+            sent_fin_end: None,
+            final_ack_candidate: false,
             rtt: None,
             window_started: now,
             sent: 0,
@@ -127,6 +139,11 @@ impl<P: Port> ObservedPort<P> {
             self.sent = 0;
             self.retransmitted = 0;
         }
+    }
+    pub(super) fn final_ack_matches(&self) -> bool {
+        self.final_ack_candidate
+            && self.sent_fin_end.is_some()
+            && self.received_ack == self.sent_fin_end
     }
     pub(super) fn ingress_processed(&mut self, accepted_ack: bool) {
         let Some(ack) = self.received_ack.take().filter(|_| accepted_ack) else {
@@ -233,6 +250,9 @@ impl<P: Port> Port for ObservedPort<P> {
         // Count only packets actually accepted by the device, not socket
         // preparation/queueing. PCAP remains the independent wire evidence.
         if let Some(packet) = packet(frame, self.config, true) {
+            if packet.fin {
+                self.sent_fin_end = Some(packet.end);
+            }
             self.sent_packet(packet);
         }
         Ok(())
@@ -250,10 +270,11 @@ impl<P: Port> Port for ObservedPort<P> {
         // into one CPU reservation even though the NIC exposes safe points.
         let received = self.inner.receive_with_checkpoint(frame, checkpoint)?;
         if let Some(length) = received {
-            self.received_ack = frame
+            let received = frame
                 .get(..length)
-                .and_then(|frame| packet(frame, self.config, false))
-                .and_then(|p| p.ack);
+                .and_then(|frame| packet(frame, self.config, false));
+            self.received_ack = received.and_then(|p| p.ack);
+            self.final_ack_candidate = received.is_some_and(|p| p.final_ack_candidate);
         }
         Ok(received)
     }

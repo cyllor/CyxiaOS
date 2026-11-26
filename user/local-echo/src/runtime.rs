@@ -27,17 +27,15 @@ impl TimeProvider for Clock {
 struct BrokerSocket {
     generation: u64,
     source: u32,
+    terminal: bool,
 }
 impl NativeSocket for BrokerSocket {
-    // Not an independently verified TCP+VirtIO completion witness. The
-    // existing broker does not yet expose protected generation-bound TX
-    // quiescence; until then it must fail closed, not fake successful drain.
     fn terminal_tx_quiescent(&self) -> bool {
-        false
+        self.terminal
     }
     fn poll_native(&mut self, _now_ms: u64) -> Result<(), SocketError> {
         match broker::poll() {
-            Ok((true, generation, ip)) if generation == self.generation && ip == self.source => {
+            Ok((true, generation, ip, _)) if generation == self.generation && ip == self.source => {
                 Ok(())
             }
             Ok(_) => Err(SocketError::Closed),
@@ -123,7 +121,8 @@ pub fn run() -> ! {
     let mut scratch = [0u8; cyxia_local_echo::broker_surface::PAYLOAD];
     loop {
         let now = broker::now().unwrap_or_else(|_| broker::park());
-        let (connected, generation, source) = broker::poll().unwrap_or_else(|_| broker::park());
+        let (connected, generation, source, normal_close) =
+            broker::poll().unwrap_or_else(|_| broker::park());
         if !connected {
             broker::yield_cpu();
             continue;
@@ -138,6 +137,7 @@ pub fn run() -> ! {
         let ticket = gate
             .begin_ns(source, admission_ns, 16)
             .unwrap_or_else(|_| broker::park());
+        broker::admission_granted(ticket, generation, source).unwrap_or_else(|_| broker::park());
         // Reconstruct the key object from static provisioned DER only. No
         // private key or peer identity is ever taken from wire requests.
         let key =
@@ -150,7 +150,11 @@ pub fn run() -> ! {
         let mut session = pairing
             .server(&mut buffers, now)
             .unwrap_or_else(|_| broker::park());
-        let mut socket = BrokerSocket { generation, source };
+        let mut socket = BrokerSocket {
+            generation,
+            source,
+            terminal: false,
+        };
         if handshake(&mut socket, &mut session, &mut scratch).is_err() {
             let _ = gate.reject(ticket);
             gate.begin_restart();
@@ -159,6 +163,11 @@ pub fn run() -> ! {
         let active = gate
             .authenticate(ticket, &session)
             .unwrap_or_else(|_| broker::park());
+        if normal_close {
+            session
+                .enable_normal_close()
+                .unwrap_or_else(|_| broker::park());
+        }
         loop {
             let now = broker::now().unwrap_or_else(|_| broker::park());
             if native_tcp::turn(
@@ -176,6 +185,30 @@ pub fn run() -> ! {
                 // can prove all outstanding descriptors have stopped.
                 gate.begin_restart();
                 session.abort();
+                broker::park();
+            }
+            if session.normal_close_complete() {
+                // Timers only stop the attempt. Retirement requires a positive
+                // kernel witness for the current generation and a finished ledger entry.
+                let deadline = now.checked_add(5_000).unwrap_or_else(|| broker::park());
+                loop {
+                    if !matches!(broker::now(), Ok(t) if t < deadline) {
+                        gate.begin_restart();
+                        broker::park();
+                    }
+                    match broker::poll_normal_close(generation, source) {
+                        Ok(()) => break,
+                        Err(broker::Error::Again) => broker::yield_cpu(),
+                        Err(_) => {
+                            gate.begin_restart();
+                            broker::park();
+                        }
+                    }
+                }
+                socket.terminal = true;
+                native_tcp::finish_session(&socket, &mut gate, active, &session)
+                    .unwrap_or_else(|_| broker::park());
+                broker::admission_retired(generation, source).unwrap_or_else(|_| broker::park());
                 broker::park();
             }
             broker::yield_cpu();

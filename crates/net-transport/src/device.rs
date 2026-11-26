@@ -202,6 +202,9 @@ pub struct Ethernet<P> {
 }
 
 impl<P: Port> Ethernet<P> {
+    pub(crate) fn tx_staging_empty(&self) -> bool {
+        !self.failed && self.tx.len == 0
+    }
     pub(crate) fn port(&self) -> &P {
         &self.port
     }

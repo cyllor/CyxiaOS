@@ -257,7 +257,9 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("allowed::allowed(op, len, arg0)", broker)
         self.assertIn("native_tcp::turn(", guest)
         self.assertIn("gate.begin_restart();", guest)
-        self.assertIn("fn terminal_tx_quiescent(&self) -> bool {\n        false\n    }", guest)
+        self.assertIn("fn terminal_tx_quiescent(&self) -> bool {\n        self.terminal\n    }", guest)
+        retirement = guest.split("if session.normal_close_complete() {", 1)[1]
+        self.assertRegex(retirement, r"(?s)poll_normal_close\(generation, source\).*socket\.terminal = true;.*native_tcp::finish_session\(")
         self.assertIn("CYXIA_LOCAL_ECHO_IDENTITY", build)
         abi=source(ROOT / "user/local-echo/src/abi.rs")
         main=source(ROOT / "user/local-echo/src/main.rs")
@@ -572,15 +574,39 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("net_device::init(", net)
         self.assertNotIn("LoopbackPort", net)
         self.assertNotIn("RateLimiter", net)
-        self.assertIn("tls_echo_turn_verified", net)
+        self.assertIn("evidence::W11_TLS_ECHO_TURN_VERIFIED, 0", net)
         fixture = source(arm / "v0199_sec_n_fixture.rs")
         self.assertIn("sec_n_broker::", fixture)
         self.assertNotIn("fn broker(", fixture)
         self.assertNotIn("fn run_until_park(", fixture)
         broker = source(arm / "sec_n_broker.rs")
-        self.assertIn("pub(crate) fn broker<P: Port>(", broker)
+        self.assertIn("fn broker<P: Port>(port: &mut P, entropy: &mut EntropyFill<'_>, close_poll: Option<ClosePoll<P>>)", broker)
+        self.assertIn("broker(port, entropy, close_poll);", broker)
         self.assertIn("pub(crate) fn run_until_park<P: Port>(", broker)
         self.assertIn('link_section = ".bss.sec_n', broker)
+
+    def test_v020_wave12_modes_are_explicit(self):
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        self.assertIn('v020-production-authenticated-net = ["v020-production"]', manifest)
+        self.assertIn('v020-production-live-control = ["v020-production"]', manifest)
+        self.assertIn('v020-production-media-reopen = ["v020-production-media-staging"]', manifest)
+        self.assertIn('v020-production-media-signed = ["v020-production-media-staging"]', manifest)
+        self.assertIn('v020-production-media-envelopes = ["v020-production-media-staging"]', manifest)
+        self.assertIn('v020-production-media-unified = ["v020-production-media-envelopes"]', manifest)
+        self.assertIn('v020-production-snapshot-catalog = ["v020-production-media-unified", "v020-production-media-signed", "v020-production-live-control"]',
+                      manifest)
+        self.assertIn('v020-production-file-read = ["v020-production-media-unified", "v020-production-media-signed", "v020-production-live-control"]',
+                      manifest)
+        self.assertIn('v020-production-snapshot-read = ["v020-production-snapshot-catalog", "v020-production-file-read"]',
+                      manifest)
+        self.assertIn('v020-production-file-sessions = ["v020-production-file-read"]', manifest)
+        self.assertIn('v020-production-frame-pool = ["v020-production"]', manifest)
+        for base in ("default", "v020-production", "v020-production-media-staging"):
+            line = next(line for line in manifest.splitlines() if line.startswith(base + " = "))
+            for feature in ("authenticated-net", "live-control", "media-reopen", "media-signed",
+                            "media-envelopes", "media-unified", "snapshot-catalog", "file-read",
+                            "snapshot-read", "file-sessions", "frame-pool"):
+                self.assertNotIn(feature, line)
 
     def test_v020_wave11_media_staging_is_opt_in(self):
         arm = ROOT / "kernel/src/arch/aarch64"
@@ -612,19 +638,24 @@ class NativeSecurityWiring(unittest.TestCase):
         # the no-NIC negative control and the opt-in staging lane, and checks the
         # W11 segment up to word 160 with honest labels.
         verifier = source(ROOT / "tools/verify_v020_production.py")
-        self.assertIn('"virtio-net-device,netdev=n0"', verifier)
-        self.assertIn('"virtio-mmio.force-legacy=false"', verifier)
+        qemu = source(ROOT / "tools/v020_production_qemu.py")
+        self.assertIn('"virtio-net-device,netdev=n0"', qemu)
+        self.assertIn('"virtio-mmio.force-legacy=false"', qemu)
+        self.assertIn('"virtio-rng-device,rng=rng0"', qemu)
         self.assertIn("W11_END = 160", verifier)
-        self.assertIn('words[W11_END:]', verifier)
+        self.assertIn('words[W21_END:]', verifier)
+        self.assertIn('"kernel/src/arch/aarch64/production/file_read/sessions.rs"', verifier)
+        self.assertIn('"kernel/src/arch/aarch64/production/file_read/volatile_write.rs"', verifier)
         self.assertIn('"tls_echo_turn_verified": False', verifier)
         self.assertIn('"policy_lock_budget_verified": False', verifier)
         self.assertIn('"golden_vector_pending": True', verifier)
-        self.assertIn("NET_ABSENT not in serial", verifier)
+        self.assertIn("if NET_ABSENT in serial", verifier)
         workflow = source(ROOT / ".github/workflows/v020-production.yml")
         self.assertIn("s.build_guest()", workflow)
         self.assertIn("--no-nic; then", workflow)
-        self.assertIn("grep -q 'V020_W11_NET_ABSENT' artifacts/v020-production/run-no-nic/serial.txt",
-                      workflow)
+        self.assertIn('ValueError: guest reported V020_W11_NET_ABSENT:', workflow)
+        self.assertIn('--no-peer; then', workflow)
+        self.assertIn('ValueError: V020_W11_NET_NO_PEER:', workflow)
         self.assertIn("--timeout 240 --media-staging", workflow)
         self.assertIn("tools/test_verify_v020_production.py", workflow)
         evidence = source(ROOT / "kernel/src/arch/aarch64/production/evidence.rs")
@@ -644,6 +675,8 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertLess(run.index("frames::register_or_fatal();"),
                         run.index("recovery::init_or_fatal();"))
         self.assertIn("recovery::publish_probe(", run)
+        self.assertLess(run.index("STOPPED.load(Ordering::Acquire) == 14"),
+                        run.index("recovery::takeover_stopped();"))
         # SEC-N serve runs in run() and its outcome is sealed.
         self.assertIn("let net_outcome = net::serve(info);", run)
         self.assertIn("net::publish(&net_outcome);", run)
@@ -670,7 +703,8 @@ class NativeSecurityWiring(unittest.TestCase):
         frames = source(arm / "production/frames.rs")
         self.assertRegex(frames, r"fn register_or_fatal\(\) \{\s*match register_production_statics\(\)")
         recovery = source(arm / "production/recovery.rs")
-        self.assertIn("with_gate(|g| g.state() == RecoveryState::Verified)", recovery)
+        self.assertIn("with_gate(|staged| staged.gate.raise(&staged.pair))", recovery)
+        self.assertIn("acc.takeover_stopped_writer(", recovery)
         self.assertIn("acc.record(&ev)", recovery)
         meter = source(arm / "production/meter.rs")
         self.assertIn("m.begin(SectionKind::EffectiveWork, now_ns())", meter)

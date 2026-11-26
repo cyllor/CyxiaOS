@@ -14,6 +14,10 @@ smp_user_start:
  b.eq smp_registers
  cmp x2, #6
  b.eq smp_v3_probe
+.if {d02_enabled}
+ cmp x2, #7
+ b.eq smp_d02_business
+.endif
  b smp_probe
 smp_busy:
  ldr x10, [x1]
@@ -197,6 +201,31 @@ smp_v3_copy:
 smp_v3_call:
  svc #0
  b .
+.if {d02_enabled}
+// Dedicated D02 business task with fresh private data and stack.
+// Exit via ABI3 SVC #0.
+smp_d02_business:
+ ldr x10, [x1]
+ cmp x10, x0
+ b.ne smp_cookie_bad
+ ldr x11, [x1, #8]
+ cbnz x11, smp_cookie_bad
+ mov x12, #16
+1:
+ add x11, x11, #1
+ str x11, [x1, #8]
+ subs x12, x12, #1
+ b.ne 1b
+ mov x0, #0
+ mov x1, #0
+ mov x2, #0
+ mov x3, #0
+ mov x4, #0
+ mov x5, #0
+ mov x8, #1
+ svc #0
+ b .
+.endif
 .global smp_user_end
 smp_user_end:
 .balign 4096

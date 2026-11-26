@@ -70,6 +70,7 @@ pub struct Cpu0BudgetLedger {
     last_ns: u64,
     serial: u64,
     active: Option<Turn>,
+    active_start_ns: u64,
     spent: [u64; 6],
     role_spent: [u64; ROLE_COUNT],
     kernel_coordination_spent: u64,
@@ -79,6 +80,7 @@ pub struct Cpu0BudgetLedger {
     security_count: u8,
     decision_spent: [u64; 15],
     ordinary_closed: bool,
+    continuous: bool,
 }
 impl Default for Cpu0BudgetLedger {
     fn default() -> Self {
@@ -92,6 +94,7 @@ impl Cpu0BudgetLedger {
             last_ns: 0,
             serial: 0,
             active: None,
+            active_start_ns: 0,
             spent: [0; 6],
             role_spent: [0; ROLE_COUNT],
             kernel_coordination_spent: 0,
@@ -101,7 +104,34 @@ impl Cpu0BudgetLedger {
             security_count: 0,
             decision_spent: [0; 15],
             ordinary_closed: false,
+            continuous: false,
         }
+    }
+    /// Native interval accounting starts at an authenticated observation
+    /// before any admitted turn. Subsequent debit and reservation boundaries
+    /// must be contiguous. A missing interval cannot be silently skipped by
+    /// waiting for a new window. No exact split is inferred from wall time.
+    pub fn start_continuous(
+        &mut self,
+        cpu: usize,
+        initial_ns: u64,
+        verify_origin: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if cpu != CONTROL_CPU {
+            return Err(Error::Denied);
+        }
+        if self.continuous
+            || self.window.is_some()
+            || self.active.is_some()
+            || self.serial != 0
+            || self.last_ns != 0
+        {
+            return Err(Error::Busy);
+        }
+        verify_origin()?;
+        self.last_ns = initial_ns;
+        self.continuous = true;
+        Ok(())
     }
     pub fn spent(&self, class: Class) -> u64 {
         self.spent[class.index()]
@@ -156,6 +186,10 @@ impl Cpu0BudgetLedger {
             return Err(Error::Busy);
         }
         if start_ns < self.last_ns || now_ns < start_ns {
+            return Err(Error::Clock);
+        }
+        if self.continuous && start_ns != self.last_ns {
+            self.ordinary_closed = true;
             return Err(Error::Clock);
         }
         self.time(start_ns)?;
@@ -227,6 +261,10 @@ impl Cpu0BudgetLedger {
             return Err(Error::Invalid);
         }
         let start = segments[0].start_ns;
+        if self.continuous && start != self.last_ns {
+            self.ordinary_closed = true;
+            return Err(Error::Clock);
+        }
         if start < self.last_ns || self.window.is_some() && start != self.last_ns {
             return Err(Error::Clock);
         }
@@ -380,13 +418,48 @@ impl Cpu0BudgetLedger {
         if cpu != CONTROL_CPU {
             return Err(Error::Denied);
         }
-        let (index, member) = manifest
+        let index = manifest
             .manifest()
             .members
             .iter()
-            .enumerate()
-            .find(|(_, m)| m.actor == actor)
+            .position(|m| m.actor == actor)
             .ok_or(Error::Denied)?;
+        self.reserve_indexed_role_with_wall(
+            manifest, index, actor, cpu, class, domain, requested, wall_ns, now,
+        )
+    }
+    /// A trusted scheduler already has the selected live manifest index.
+    /// Recheck the exact actor (including generation) and CPU at that index,
+    /// then use the identical admission/settlement ledger. No second
+    /// eight-entry scan and no authority derived from the index alone.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_indexed_role_with_wall(
+        &mut self,
+        manifest: &ValidatedRoleManifest<'_>,
+        index: usize,
+        actor: Identity,
+        cpu: usize,
+        class: Class,
+        domain: u16,
+        requested: u64,
+        wall_ns: u64,
+        now: u64,
+    ) -> Result<Turn, Error> {
+        if wall_ns == 0 || wall_ns > 50_000_000 {
+            return Err(Error::Invalid);
+        }
+        if cpu != CONTROL_CPU {
+            return Err(Error::Denied);
+        }
+        let member = manifest
+            .manifest()
+            .members
+            .get(index)
+            .ok_or(Error::Denied)?;
+        if member.actor != actor {
+            return Err(Error::Denied);
+        }
         let allowed = matches!(
             (member.role, class),
             (Role::Operations, Class::Operations | Class::Optional)
@@ -438,7 +511,7 @@ impl Cpu0BudgetLedger {
         }
         self.reserve(None, None, class, 0, requested, wall_ns, now)
     }
-    // Stable wide budget API; regrouping arguments would change the public contract.
+    #[inline]
     #[allow(clippy::too_many_arguments)]
     fn reserve(
         &mut self,
@@ -450,10 +523,14 @@ impl Cpu0BudgetLedger {
         wall_ns: u64,
         now: u64,
     ) -> Result<Turn, Error> {
-        self.time(now)?;
         if self.active.is_some() {
             return Err(Error::Busy);
         }
+        if self.continuous && now != self.last_ns {
+            self.ordinary_closed = true;
+            return Err(Error::Clock);
+        }
+        self.time(now)?;
         if self.ordinary_closed && class != Class::Recovery {
             return Err(Error::Denied);
         }
@@ -530,12 +607,120 @@ impl Cpu0BudgetLedger {
         };
         self.serial = serial;
         self.active = Some(turn);
+        self.active_start_ns = now;
         self.operations_seen |= bit;
         if class == Class::Security {
             self.security_count += 1;
         }
         Ok(turn)
     }
+    /// Settle a stopped role or kernel turn using independently measured
+    /// CPU-counter intervals at every aligned boundary. Unlike the
+    /// conservative scalar settlement, an interval ending exactly at a
+    /// boundary belongs to the old window. Crossing beyond the prepaid
+    /// wall deadline still closes ordinary admission; exact measurement
+    /// cannot excuse an overrun or create more reservation credit.
+    /// All segment metadata is staged before committing the ledger.
+    pub fn settle_measured(
+        &mut self,
+        cpu: usize,
+        turn: Turn,
+        segments: &[MeasuredSegment],
+        observed_total: u64,
+        verify_native: impl FnOnce(&[MeasuredSegment], u64) -> Result<(), Error>,
+    ) -> Result<Settlement, Error> {
+        if cpu != CONTROL_CPU {
+            return Err(Error::Denied);
+        }
+        if self.active != Some(turn) {
+            return Err(Error::Stale);
+        }
+        if segments.is_empty() || segments.len() > 64 {
+            return Err(Error::Invalid);
+        }
+        let start = self.active_start_ns;
+        if start / WINDOW_NS != turn.window || segments[0].start_ns != start {
+            return Err(Error::Clock);
+        }
+        let mut cursor = start;
+        let mut total = 0u64;
+        for s in segments {
+            if s.start_ns != cursor
+                || s.end_ns <= s.start_ns
+                || s.start_ns / WINDOW_NS != (s.end_ns - 1) / WINDOW_NS
+            {
+                return Err(Error::Clock);
+            }
+            total = total.checked_add(s.cpu_ns).ok_or(Error::Exhausted)?;
+            cursor = s.end_ns;
+        }
+        if cursor < self.last_ns {
+            return Err(Error::Clock);
+        }
+        if total != observed_total {
+            return Err(Error::Denied);
+        }
+        verify_native(segments, total)?;
+        let mut next = self.clone();
+        next.active = None;
+        next.active_start_ns = 0;
+        let idx = turn.class.index();
+        let kernel_coord = turn.actor.is_none() && turn.class == Class::Coordination;
+        let crossed = (cursor - 1) / WINDOW_NS != turn.window;
+        let mut overrun = total > turn.reserved_ns || cursor > turn.deadline_ns;
+        for s in segments {
+            let old = next.window;
+            next.time(s.start_ns)?;
+            next.enter_window(s.start_ns)?;
+            if old != next.window {
+                // An overrun tail is real activity in the subsequent
+                // window, not a fresh discretionary evaluation.
+                if turn.class == Class::Operations {
+                    next.operations_seen |= 1u16 << (turn.domain - 1);
+                }
+                if turn.class == Class::Security {
+                    next.security_count = 1;
+                }
+            }
+            next.spent[idx] = next.spent[idx]
+                .checked_add(s.cpu_ns)
+                .ok_or(Error::Exhausted)?;
+            next.lifetime_spent[idx] = next.lifetime_spent[idx]
+                .checked_add(s.cpu_ns)
+                .ok_or(Error::Exhausted)?;
+            if let Some(i) = turn.role_index {
+                next.role_spent[i] = next.role_spent[i]
+                    .checked_add(s.cpu_ns)
+                    .ok_or(Error::Exhausted)?;
+            }
+            if turn.class == Class::Decision {
+                let d = &mut next.decision_spent[usize::from(turn.domain - 1)];
+                *d = d.checked_add(s.cpu_ns).ok_or(Error::Exhausted)?;
+                overrun |= *d > 500_000;
+            }
+            if kernel_coord {
+                next.kernel_coordination_spent = next
+                    .kernel_coordination_spent
+                    .checked_add(s.cpu_ns)
+                    .ok_or(Error::Exhausted)?;
+                overrun |= next.kernel_coordination_spent > KERNEL_COORDINATION_LIMIT_NS;
+            }
+            let sum = next.total_spent()?;
+            next.max_window_upper_ns = next.max_window_upper_ns.max(sum);
+            overrun |= sum > LIMIT_NS || next.spent[idx] > CLASS_LIMITS[idx];
+            next.time(s.end_ns)?;
+        }
+        if overrun || crossed {
+            next.ordinary_closed = true;
+        }
+        *self = next;
+        Ok(Settlement {
+            actual_ns: total,
+            overrun,
+            crossed_window: crossed,
+        })
+    }
+
     /// Only after the exact native context has returned/stopped and its
     /// actual CPU counter interval is known. A bad clock retains ownership.
     /// Actual overrun is charged, never clamped to the prepaid reservation.
@@ -622,6 +807,7 @@ impl Cpu0BudgetLedger {
         self.lifetime_spent[idx] = lifetime;
         self.max_window_upper_ns = self.max_window_upper_ns.max(upper).max(self.total_spent()?);
         self.active = None;
+        self.active_start_ns = 0;
         if crossed || overrun {
             self.ordinary_closed = true;
         }
@@ -665,6 +851,146 @@ mod tests {
             other_protected_pool_bytes: 5 * 1024 * 1024,
             other_control_ns_per_100ms: 10_000_000,
         }
+    }
+    #[test]
+    fn continuous_accounting_cannot_skip_unsampled_interval_for_a_new_grant() {
+        let m = manifest();
+        let mut q = Cpu0BudgetLedger::new();
+        q.start_continuous(0, 100, || Ok(())).unwrap();
+        q.account_coordination_gap(0, 100, 110, 5).unwrap();
+        assert_eq!(
+            q.reserve_role_with_wall(
+                &m,
+                m.members[2].actor,
+                0,
+                Class::Decision,
+                1,
+                250_000,
+                50_000_000,
+                120
+            ),
+            Err(Error::Clock)
+        );
+        assert!(q.ordinary_closed());
+        assert_eq!(q.lifetime_total(), Ok(5));
+        assert_eq!(
+            q.account_coordination_gap(0, 120, 130, 5),
+            Err(Error::Clock)
+        );
+        q.account_coordination_gap(0, 110, 130, 10).unwrap();
+        assert_eq!(
+            q.reserve_role_with_wall(
+                &m,
+                m.members[2].actor,
+                0,
+                Class::Decision,
+                1,
+                250_000,
+                50_000_000,
+                130
+            ),
+            Err(Error::Denied)
+        );
+        let t = q
+            .reserve_kernel_with_wall(0, Class::Recovery, 100, 1000, 130)
+            .unwrap();
+        q.settle(0, t, 10, 140).unwrap();
+        assert_eq!(q.lifetime_total(), Ok(25));
+    }
+    #[test]
+    fn measured_role_turn_retains_exact_boundary_charge_and_closes_real_overrun() {
+        let m = manifest();
+        let mut q = Cpu0BudgetLedger::new();
+        let start = WINDOW_NS - 250_000;
+        let t = q
+            .reserve_role_with_wall(
+                &m,
+                m.members[2].actor,
+                0,
+                Class::Decision,
+                1,
+                250_000,
+                250_000,
+                start,
+            )
+            .unwrap();
+        let a = [MeasuredSegment {
+            start_ns: start,
+            end_ns: WINDOW_NS,
+            cpu_ns: 250_000,
+        }];
+        assert_eq!(
+            q.reserve_kernel(0, Class::Recovery, 1, WINDOW_NS),
+            Err(Error::Busy)
+        );
+        assert_eq!(
+            q.settle_measured(0, t, &a, 249_999, |_, _| panic!()),
+            Err(Error::Denied)
+        );
+        assert_eq!(
+            q.settle_measured(0, t, &a, 250_000, |_, _| Err(Error::NotReady)),
+            Err(Error::NotReady)
+        );
+        assert_eq!(q.lifetime_total(), Ok(0));
+        let r = q.settle_measured(0, t, &a, 250_000, |_, _| Ok(())).unwrap();
+        assert!(!r.crossed_window && !r.overrun && !q.ordinary_closed());
+        assert_eq!(q.spent(Class::Decision), 250_000);
+        assert_eq!(q.lifetime_total(), Ok(250_000));
+        let next = q
+            .reserve_role_with_wall(
+                &m,
+                m.members[3].actor,
+                0,
+                Class::Decision,
+                1,
+                250_000,
+                50_000_000,
+                WINDOW_NS,
+            )
+            .unwrap();
+        q.settle(0, next, 100_000, WINDOW_NS + 100_000).unwrap();
+        let start = 2 * WINDOW_NS - 250_000;
+        let t = q
+            .reserve_role_with_wall(
+                &m,
+                m.members[2].actor,
+                0,
+                Class::Decision,
+                1,
+                250_000,
+                250_000,
+                start,
+            )
+            .unwrap();
+        let b = [
+            MeasuredSegment {
+                start_ns: start,
+                end_ns: 2 * WINDOW_NS,
+                cpu_ns: 240_000,
+            },
+            MeasuredSegment {
+                start_ns: 2 * WINDOW_NS,
+                end_ns: 2 * WINDOW_NS + 20_000,
+                cpu_ns: 20_000,
+            },
+        ];
+        let r = q.settle_measured(0, t, &b, 260_000, |_, _| Ok(())).unwrap();
+        assert!(r.overrun && r.crossed_window && q.ordinary_closed());
+        assert_eq!(q.spent(Class::Decision), 20_000);
+        assert_eq!(q.lifetime_total(), Ok(610_000));
+        assert_eq!(q.max_window_upper_ns(), 340_000);
+        assert_eq!(
+            q.reserve_role(
+                &m,
+                m.members[2].actor,
+                0,
+                Class::Decision,
+                1,
+                1,
+                3 * WINDOW_NS
+            ),
+            Err(Error::Denied)
+        );
     }
     #[test]
     fn measured_boundary_split_conserves_debit_and_never_invents_credit() {
@@ -886,6 +1212,82 @@ mod tests {
             q.reserve_kernel(0, Class::Coordination, 1, 2 * WINDOW_NS + 10),
             Err(Error::Denied)
         );
+    }
+    #[test]
+    fn indexed_dispatch_preserves_identity_generation_and_all_shared_limits() {
+        let m = manifest();
+        let checked = m.validated().unwrap();
+        let actor = m.members[2].actor;
+        let mut indexed = Cpu0BudgetLedger::new();
+        let mut generic = Cpu0BudgetLedger::new();
+        for (i, a, cpu, class) in [
+            (3, actor, 0, Class::Decision),
+            (8, actor, 0, Class::Decision),
+            (
+                2,
+                Identity {
+                    generation: 2,
+                    ..actor
+                },
+                0,
+                Class::Decision,
+            ),
+            (2, actor, 1, Class::Decision),
+            (2, actor, 0, Class::Recovery),
+        ] {
+            assert_eq!(
+                indexed.reserve_indexed_role_with_wall(
+                    &checked, i, a, cpu, class, 1, 250_000, 50_000_000, 0
+                ),
+                Err(Error::Denied)
+            );
+        }
+        assert_eq!(indexed.lifetime_total(), Ok(0));
+        let a = indexed
+            .reserve_indexed_role_with_wall(
+                &checked,
+                2,
+                actor,
+                0,
+                Class::Decision,
+                1,
+                250_000,
+                50_000_000,
+                0,
+            )
+            .unwrap();
+        let b = generic
+            .reserve_validated_role_with_wall(
+                &checked,
+                actor,
+                0,
+                Class::Decision,
+                1,
+                250_000,
+                50_000_000,
+                0,
+            )
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(
+            indexed.settle(0, a, 240_000, 300_000),
+            generic.settle(0, b, 240_000, 300_000)
+        );
+        assert_eq!(
+            indexed.reserve_indexed_role_with_wall(
+                &checked,
+                3,
+                m.members[3].actor,
+                0,
+                Class::Decision,
+                1,
+                260_001,
+                50_000_000,
+                300_000
+            ),
+            Err(Error::Exhausted)
+        );
+        assert_eq!(indexed.lifetime_total(), Ok(240_000));
     }
     #[test]
     fn cpu_quota_and_wall_deadline_are_independently_enforced() {

@@ -1,4 +1,4 @@
-//! V0.19.9 single-device FS media **read-only validation** contracts.
+//! V0.19.9 single-device FS media validation and receipt encoding.
 //!
 //! New v1 superblock and v4 192-byte persistent receipt formats are not the
 //! legacy v2 snapshotted volume and must NEVER be silently reinterpreted as
@@ -16,6 +16,7 @@ pub const RECEIPT_BYTES: usize = 192;
 pub const RECEIPT_MAGIC: u32 = 0x4359_5243;
 pub const RECEIPT_VERSION: u16 = 4;
 pub const MAX_REQUEST_SEQ: u64 = (1u64 << 53) - 1;
+const RECEIPT_CRC_OFFSET: usize = 188;
 
 fn le16(b: &[u8], off: usize) -> Result<u16, Error> {
     let s = b.get(off..off + 2).ok_or(Error::Invalid)?;
@@ -440,13 +441,50 @@ pub const fn local_request_id(group_id: u32, stream_slot: u64, request_seq: u64)
     Some(((group_id as u64 + 1) << 56) | (stream_slot << 53) | request_seq)
 }
 impl FileReceiptV4 {
+    /// Encode the canonical receipt bytes after checking the receipt identity
+    /// and state. The transaction owner must verify the actual home closure.
+    pub fn encode(&self) -> Result<[u8; RECEIPT_BYTES], Error> {
+        let mut out = [0; RECEIPT_BYTES];
+        out[0..4].copy_from_slice(&RECEIPT_MAGIC.to_le_bytes());
+        out[4..6].copy_from_slice(&RECEIPT_VERSION.to_le_bytes());
+        out[6..8].copy_from_slice(&(RECEIPT_BYTES as u16).to_le_bytes());
+        out[8..24].copy_from_slice(&self.fs_uuid);
+        out[32..36].copy_from_slice(&self.group_id.to_le_bytes());
+        out[36..40].copy_from_slice(&self.group_generation.to_le_bytes());
+        for (offset, value) in [
+            (24, self.issued_boot_epoch),
+            (40, self.stream_slot),
+            (48, self.stream_generation),
+            (56, self.request_seq),
+            (64, self.log_epoch),
+            (72, self.txid),
+            (80, self.commit_lsn),
+            (88, self.write_seq),
+            (172, self.request_id),
+            (180, self.owner_principal_id),
+        ] {
+            out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        out[96..98].copy_from_slice(&self.status.to_le_bytes());
+        out[100..104].copy_from_slice(&self.result.to_le_bytes());
+        out[104..108].copy_from_slice(&self.completed_prefix.to_le_bytes());
+        out[108..140].copy_from_slice(&self.operation_digest);
+        out[140..172].copy_from_slice(&self.output_digest);
+        let crc = crc32c_zeroed(&out, RECEIPT_CRC_OFFSET)?;
+        out[RECEIPT_CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+        if Self::decode(&out)? != *self {
+            return Err(Error::Invalid);
+        }
+        Ok(out)
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() != RECEIPT_BYTES
             || le32(bytes, 0)? != RECEIPT_MAGIC
             || le16(bytes, 4)? != RECEIPT_VERSION
             || le16(bytes, 6)? != RECEIPT_BYTES as u16
             || le16(bytes, 98)? != 0
-            || le32(bytes, 188)? != crc32c_zeroed(bytes, 188)?
+            || le32(bytes, RECEIPT_CRC_OFFSET)? != crc32c_zeroed(bytes, RECEIPT_CRC_OFFSET)?
         {
             return Err(Error::Invalid);
         }
@@ -860,6 +898,87 @@ mod tests {
         assert!(SuperblockV1::decode(&b).is_err());
         assert_eq!(crc32c_zeroed(&[0u8; 2], 0), Err(Error::Invalid));
     }
+    #[test]
+    fn receipt_v4_encode_matches_bound_vector_and_unbound_round_trip() {
+        const BOUND: &[u8; RECEIPT_BYTES] = b"\
+            \x43\x52\x59\x43\x04\x00\xc0\x00\x72\x65\x63\x65\x69\x70\x74\x2d\
+            \x76\x65\x63\x74\x6f\x72\x2d\x34\x08\x07\x06\x05\x04\x03\x02\x01\
+            \x06\x00\x00\x00\x44\x33\x22\x11\x05\x00\x00\x00\x00\x00\x00\x00\
+            \x88\x77\x66\x55\x00\x00\x00\x00\x07\x06\x05\x04\x03\x02\x01\x00\
+            \x18\x17\x16\x15\x14\x13\x12\x11\x28\x27\x26\x25\x24\x23\x22\x21\
+            \x38\x37\x36\x35\x34\x33\x32\x31\x48\x47\x46\x45\x44\x43\x42\x41\
+            \x04\x00\x00\x00\xfa\xff\xff\xff\x34\x12\x00\x00\xa5\xa5\xa5\xa5\
+            \xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\
+            \xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xa5\xc3\xc3\xc3\xc3\
+            \xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\
+            \xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\xc3\x07\x06\x05\x04\
+            \x03\x02\xa1\x07\x68\x67\x66\x65\x64\x63\x62\x61\xf7\x07\xb5\xab";
+        let record = FileReceiptV4 {
+            fs_uuid: *b"receipt-vector-4",
+            issued_boot_epoch: 0x0102_0304_0506_0708,
+            group_id: 6,
+            group_generation: 0x1122_3344,
+            stream_slot: 5,
+            stream_generation: 0x5566_7788,
+            request_seq: 0x0001_0203_0405_0607,
+            log_epoch: 0x1112_1314_1516_1718,
+            txid: 0x2122_2324_2526_2728,
+            commit_lsn: 0x3132_3334_3536_3738,
+            write_seq: 0x4142_4344_4546_4748,
+            status: 4,
+            result: -6,
+            completed_prefix: 0x1234,
+            operation_digest: [0xa5; 32],
+            output_digest: [0xc3; 32],
+            request_id: 0x07a1_0203_0405_0607,
+            owner_principal_id: 0x6162_6364_6566_6768,
+        };
+        assert_eq!(record.encode(), Ok(*BOUND));
+        assert_eq!(FileReceiptV4::decode(BOUND), Ok(record));
+
+        let issued = receipt();
+        assert_eq!(FileReceiptV4::decode(&issued).unwrap().encode(), Ok(issued));
+    }
+
+    #[test]
+    fn receipt_v4_encode_rejects_invalid_identity_and_partial_transaction_binding() {
+        let issued = FileReceiptV4::decode(&receipt()).unwrap();
+        let bound = FileReceiptV4 {
+            status: 2,
+            operation_digest: [7; 32],
+            log_epoch: 1,
+            txid: 2,
+            commit_lsn: 3,
+            ..issued
+        };
+        assert!(bound.encode().is_ok());
+        for invalid in [
+            FileReceiptV4 {
+                request_id: 2,
+                ..bound
+            },
+            FileReceiptV4 {
+                owner_principal_id: 0,
+                ..bound
+            },
+            FileReceiptV4 {
+                stream_generation: 1 << 32,
+                ..bound
+            },
+            FileReceiptV4 {
+                log_epoch: 0,
+                ..bound
+            },
+            FileReceiptV4 { txid: 0, ..bound },
+            FileReceiptV4 {
+                commit_lsn: 0,
+                ..bound
+            },
+        ] {
+            assert_eq!(invalid.encode(), Err(Error::Invalid));
+        }
+    }
+
     #[test]
     fn receipt_canonical_local_identity_and_unbound_cancel_shape() {
         let mut b = receipt();

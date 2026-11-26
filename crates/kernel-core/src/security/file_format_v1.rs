@@ -1,17 +1,19 @@
-//! Baseline-v1 new-image formatter contract (V0.19.9 §9.2/§9.2.1/§9.6).
+//! V1 new-image formatters (V0.19.9 §9.2/§9.2.1/§9.6 and V0.20 G1 D1/D4).
 //!
-//! Contract layer only: accepts an exactly 512 MiB (131072 x 4096) all-zero
+//! Each entry point accepts an exactly 512 MiB (131072 x 4096) all-zero
 //! new image, rejects any existing content before the first write, and
 //! publishes initial metadata in the fixed §9.2.1 order:
-//! bitmap/inode table/root directory/four system objects -> FLUSH ->
+//! bitmap/inode table/root directory/system objects -> FLUSH ->
 //! zero the log region 2..4098 -> FLUSH -> two byte-identical initial
 //! superblocks (generation=1, log_epoch=1, checkpoint_lsn=0), each
-//! FLUSH-confirmed and read back. This is not a damage-recovery path and
-//! never erases existing content. Native boot wiring is a later release
-//! gate; nothing here is wired into kernel/.
+//! FLUSH-confirmed and read back. `format` publishes the four baseline
+//! objects. `format_unified` publishes all eight objects, including the
+//! generation-1 D1.5 snapshot envelopes and zero tails pending D7 vectors.
+//! The scratch file profiles also allocate one root file and write its data
+//! before that first metadata FLUSH. The writable profile adds FILE_WRITE to
+//! that file's owner ACL for the boot-local overwrite service.
 //!
-//! Byte-source derivation (every written byte comes from the baseline or a
-//! frozen module):
+//! Byte-source derivation:
 //! - Superblock/inode/directory/bitmap/ACL encodings: §9.2/§9.2.1 layouts,
 //!   cross-checked against the frozen decoders in file_media_v0199,
 //!   file_structure_v1 and file_mount_v1 before publication.
@@ -23,13 +25,13 @@
 //! - FileStreamIndex v4 / receipt store: file_index_v0199 decoder rules and
 //!   file_receipt_store_v0199 (six all-zero receipt blocks + one index).
 //! - System object inode slots/extents and the root directory block location
-//!   come from the caller's trusted build manifest (§9.2.1); this module
-//!   fixes no production locations.
+//!   come from the caller's trusted build manifest (§9.2.1). The unified
+//!   path checks the eight-object map against the D1.2 layout.
 //!
 //! Documented gaps (the baseline does not fix these initial wire values):
 //! - Empty root directory size: the frozen v1 fixtures use a one-block root
 //!   with size=128 per declared slot. This formatter writes one 4 KiB root
-//!   block whose 256 physical slots are all sealed empty (inode_id=0xFFFFFFFF
+//!   block whose 32 physical slots are all sealed empty (inode_id=0xFFFFFFFF
 //!   plus CRC per §9.2.1) and declares size=128. A zero-size extent-less root
 //!   also passes the v1 scan; the one-block convention follows the existing
 //!   fixtures and keeps a ready root directory block.
@@ -37,7 +39,7 @@
 //!   volume manifest. Following the only existing concrete reference
 //!   (tools/verify_v0199_epoch_disk.py and the file_mount_v1 fixture),
 //!   principals[0] owns the root (owner_rights=FILE_TRAVERSE bit14) and all
-//!   four system objects (owner_rights=0, system_rights=READ|WRITE|FSYNC
+//!   system objects (owner_rights=0, system_rights=READ|WRITE|FSYNC
 //!   bits 8/9/13), acl_generation=1. Production boot wiring must supply the
 //!   signed manifest's actual ownership; this is format, not authority.
 //! - Fresh free inode slots start at generation 0 (§9.2.1 retained-generation
@@ -53,6 +55,7 @@ use super::{
         CRC_OFFSET as INDEX_CRC, FileStreamIndexV4, INDEX_HEADER, INDEX_MAGIC, INDEX_VERSION,
         SecurityStateStoreV2,
     },
+    file_media_unified_v1::{self as unified, UnifiedSystemKind, UnifiedSystemObject},
     file_media_v0199::{
         BITMAP_START, BLOCK_COUNT, DATA_START, INODE_START, SUPER_MAGIC, SUPER_VERSION,
         SuperblockV1, crc32c_zeroed,
@@ -64,18 +67,26 @@ const LOG_START: u32 = 2;
 const BITMAP_BLOCKS: u32 = 4;
 const INODE_BLOCKS: u32 = 16;
 const DIR_SLOT_BYTES: usize = 128;
-const DIR_SLOTS: usize = BLOCK / DIR_SLOT_BYTES;
 const ACL_BYTES: usize = 64;
 const ACL_ENTRIES_PER_BLOCK: usize = BLOCK / ACL_BYTES;
 const RECEIPT_HOME_BLOCKS: u32 = 6;
-const SYSTEM_BLOCKS: u32 = 13;
 const ROOT_SIZE: u64 = 128;
 const INODE_MAGIC: u32 = 0x4359_494e;
 // CapabilityRightsSchema v3 bit8..14 = READ/WRITE/CREATE/REMOVE/ENUM/FSYNC/
 // TRAVERSE; masks identical to the frozen file_mount_v1 validator.
 const FILE_RIGHTS: u32 = (1 << 8) | (1 << 9) | (1 << 13);
 const ROOT_OWNER_RIGHTS: u32 = 1 << 14;
-const MAX_STEPS: usize = 16;
+pub const SCRATCH_ROOT_OWNER_RIGHTS: u32 = ROOT_OWNER_RIGHTS | (1 << 12);
+pub const SCRATCH_FILE_OWNER_RIGHTS: u32 = 1 << 8;
+pub const SCRATCH_FILE_WRITE_RIGHTS: u32 = 1 << 9;
+pub const SCRATCH_WRITABLE_FILE_OWNER_RIGHTS: u32 =
+    SCRATCH_FILE_OWNER_RIGHTS | SCRATCH_FILE_WRITE_RIGHTS;
+pub const SCRATCH_FILE_INODE: u32 = 1;
+pub const SCRATCH_FILE_GENERATION: u64 = 1;
+pub const SCRATCH_FILE_BLOCK: u32 = unified::CANONICAL_BUSINESS_START + 1;
+pub const SCRATCH_FILE_NAME: &[u8; 10] = b"readme.txt";
+pub const SCRATCH_FILE_DATA: &[u8; 29] = b"CyxiaOS V0.20 signed scratch\n";
+const MAX_STEPS: usize = 20;
 fn p16(b: &mut [u8], i: usize, v: u16) {
     b[i..i + 2].copy_from_slice(&v.to_le_bytes());
 }
@@ -86,11 +97,7 @@ fn p64(b: &mut [u8], i: usize, v: u64) {
     b[i..i + 8].copy_from_slice(&v.to_le_bytes());
 }
 const fn kind_blocks(kind: SystemKind) -> u32 {
-    match kind {
-        SystemKind::BootEpoch | SystemKind::Security => 1,
-        SystemKind::Receipts => 7,
-        SystemKind::Acl => 4,
-    }
+    UnifiedSystemKind::from_baseline(kind).blocks()
 }
 /// One completed operation in the exact §9.2.1 publication sequence.
 /// `Flush` steps carry first=0/blocks=0; every other step names the exact
@@ -105,6 +112,7 @@ pub enum FormatOp {
     Flush,
     ZeroLog,
     Superblock,
+    FileData,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FormatStep {
@@ -122,7 +130,7 @@ pub struct FormatManifest {
     pub security: SecurityStateStoreV2,
 }
 /// Bounded no-heap workspace: one write buffer, one readback buffer and the
-/// fixed-capacity operation trace (the complete sequence needs 15 steps).
+/// fixed-capacity operation trace (15 baseline, 19 unified, or 20 with the file).
 pub struct FormatWorkspace {
     block: [u8; BLOCK],
     readback: [u8; BLOCK],
@@ -160,7 +168,7 @@ pub struct FormatEvidence {
     pub data_blocks: u32,
 }
 fn record(w: &mut FormatWorkspace, op: FormatOp, first: u32, blocks: u32) {
-    // The fixed §9.2.1 sequence is statically shorter than MAX_STEPS.
+    // All fixed publication sequences fit in MAX_STEPS.
     debug_assert!(w.len < MAX_STEPS);
     if w.len < MAX_STEPS {
         w.steps[w.len] = FormatStep { op, first, blocks };
@@ -219,17 +227,24 @@ fn validate_manifest(m: &FormatManifest) -> Result<(), Error> {
     m.security.encode()?;
     Ok(())
 }
-fn allocated(block: u32, m: &FormatManifest) -> bool {
-    if block < DATA_START || block == m.root_block {
-        return true;
-    }
-    m.system
-        .iter()
-        .any(|s| block >= s.first_block && block < s.first_block + kind_blocks(s.kind))
+fn allocated(
+    block: u32,
+    root_block: u32,
+    system: &[UnifiedSystemObject],
+    scratch_file: bool,
+) -> bool {
+    block < DATA_START
+        || block == root_block
+        || scratch_file && block == SCRATCH_FILE_BLOCK
+        || system
+            .iter()
+            .any(|s| (s.first_block..s.first_block + s.kind.blocks()).contains(&block))
 }
 fn write_bitmap(
     io: &mut impl EpochBlockIo,
-    m: &FormatManifest,
+    root_block: u32,
+    system: &[UnifiedSystemObject],
+    scratch_file: bool,
     w: &mut FormatWorkspace,
 ) -> Result<(), Error> {
     for page in 0..BITMAP_BLOCKS {
@@ -238,7 +253,12 @@ fn write_bitmap(
         for (byte, slot) in w.block.iter_mut().enumerate() {
             let mut bits = 0u8;
             for bit in 0..8u32 {
-                if allocated(base + byte as u32 * 8 + bit, m) {
+                if allocated(
+                    base + byte as u32 * 8 + bit,
+                    root_block,
+                    system,
+                    scratch_file,
+                ) {
                     bits |= 1 << bit;
                 }
             }
@@ -278,7 +298,9 @@ fn seal_inode(
 }
 fn write_inodes(
     io: &mut impl EpochBlockIo,
-    m: &FormatManifest,
+    root_block: u32,
+    system: &[UnifiedSystemObject],
+    scratch_file: bool,
     w: &mut FormatWorkspace,
 ) -> Result<(), Error> {
     for page in 0..INODE_BLOCKS {
@@ -287,9 +309,18 @@ fn write_inodes(
             let id = page as usize * (BLOCK / INODE_BYTES) + slot;
             let b = &mut w.block[slot * INODE_BYTES..(slot + 1) * INODE_BYTES];
             if id == 0 {
-                seal_inode(b, 2, 1, ROOT_SIZE, m.root_block, 1)?;
-            } else if let Some(s) = m.system.iter().find(|s| usize::from(s.inode) == id) {
-                let count = kind_blocks(s.kind);
+                seal_inode(b, 2, 1, ROOT_SIZE, root_block, 1)?;
+            } else if scratch_file && id == SCRATCH_FILE_INODE as usize {
+                seal_inode(
+                    b,
+                    1,
+                    SCRATCH_FILE_GENERATION,
+                    SCRATCH_FILE_DATA.len() as u64,
+                    SCRATCH_FILE_BLOCK,
+                    1,
+                )?;
+            } else if let Some(s) = system.iter().find(|s| usize::from(s.inode) == id) {
+                let count = s.kind.blocks();
                 seal_inode(
                     b,
                     1,
@@ -309,17 +340,33 @@ fn write_inodes(
     record(w, FormatOp::InodeTable, INODE_START, INODE_BLOCKS);
     Ok(())
 }
+
+/// The canonical populated v1 root slot for the signed scratch file.
+pub fn scratch_file_dirent() -> Result<[u8; DIR_SLOT_BYTES], Error> {
+    let mut slot = [0; DIR_SLOT_BYTES];
+    p32(&mut slot, 0, SCRATCH_FILE_INODE);
+    p16(&mut slot, 4, SCRATCH_FILE_NAME.len() as u16);
+    p64(&mut slot, 8, SCRATCH_FILE_GENERATION);
+    slot[16..16 + SCRATCH_FILE_NAME.len()].copy_from_slice(SCRATCH_FILE_NAME);
+    let crc = crc32c_zeroed(&slot, 124)?;
+    p32(&mut slot, 124, crc);
+    Ok(slot)
+}
+
 fn write_root(
     io: &mut impl EpochBlockIo,
     m: &FormatManifest,
+    scratch_file: bool,
     w: &mut FormatWorkspace,
 ) -> Result<(), Error> {
     w.block.fill(0);
-    for slot in 0..DIR_SLOTS {
-        let b = &mut w.block[slot * DIR_SLOT_BYTES..(slot + 1) * DIR_SLOT_BYTES];
+    for b in w.block.chunks_exact_mut(DIR_SLOT_BYTES) {
         p32(b, 0, u32::MAX);
         let crc = crc32c_zeroed(b, 124)?;
         p32(b, 124, crc);
+    }
+    if scratch_file {
+        w.block[..DIR_SLOT_BYTES].copy_from_slice(&scratch_file_dirent()?);
     }
     io.write(m.root_block, &w.block)
         .map_err(|_| Error::Unknown)?;
@@ -344,27 +391,40 @@ fn encode_index(m: &FormatManifest, b: &mut [u8; BLOCK]) -> Result<(), Error> {
     FileStreamIndexV4::decode(b)?;
     Ok(())
 }
-fn seal_acl_entry(m: &FormatManifest, id: usize, b: &mut [u8]) -> Result<(), Error> {
-    let system = m.system.iter().find(|s| usize::from(s.inode) == id);
-    let live = id == 0 || system.is_some();
-    p32(b, 0, id as u32);
-    if live {
-        let generation = if id == 0 {
-            1
+fn seal_acl_entry(
+    owner: Principal,
+    system: &[UnifiedSystemObject],
+    scratch_owner_rights: Option<u32>,
+    id: usize,
+    b: &mut [u8],
+) -> Result<(), Error> {
+    let (generation, owner_rights, system_rights) = if id == 0 {
+        let rights = if scratch_owner_rights.is_some() {
+            SCRATCH_ROOT_OWNER_RIGHTS
         } else {
-            system.map_or(0, |s| s.generation)
+            ROOT_OWNER_RIGHTS
         };
+        (1, rights, 0)
+    } else if id == SCRATCH_FILE_INODE as usize
+        && let Some(rights) = scratch_owner_rights
+    {
+        (SCRATCH_FILE_GENERATION, rights, 0)
+    } else {
+        system
+            .iter()
+            .find(|s| usize::from(s.inode) == id)
+            .map_or((0, 0, 0), |s| (s.generation, 0, FILE_RIGHTS))
+    };
+    p32(b, 0, id as u32);
+    if generation != 0 {
         p32(b, 4, 1);
         p64(b, 8, generation);
-        p64(b, 16, m.principals[0].id);
-        p64(b, 24, m.principals[0].generation);
-        if id == 0 {
-            p32(b, 32, ROOT_OWNER_RIGHTS);
-        } else {
-            p32(b, 36, FILE_RIGHTS);
-        }
+        p64(b, 16, owner.id);
+        p64(b, 24, owner.generation);
+        p32(b, 32, owner_rights);
+        p32(b, 36, system_rights);
         p64(b, 40, 1);
-        // parent_inode at 48 stays 0, matching root/system inode parents.
+        // parent_inode at 48 stays 0, matching the live inode parents.
     }
     let crc = crc32c_zeroed(b, 60)?;
     p32(b, 60, crc);
@@ -373,12 +433,15 @@ fn seal_acl_entry(m: &FormatManifest, id: usize, b: &mut [u8]) -> Result<(), Err
 fn write_system(
     io: &mut impl EpochBlockIo,
     m: &FormatManifest,
+    system: &[UnifiedSystemObject],
+    scratch_owner_rights: Option<u32>,
     w: &mut FormatWorkspace,
 ) -> Result<(), Error> {
-    for s in &m.system {
+    for s in system {
         let first = s.first_block;
+        let count = s.kind.blocks();
         match s.kind {
-            SystemKind::BootEpoch => {
+            UnifiedSystemKind::BootEpoch => {
                 w.block = BootEpochStoreV1 {
                     fs_uuid: m.fs_uuid,
                     boot_epoch: 0,
@@ -386,11 +449,11 @@ fn write_system(
                 .encode()?;
                 io.write(first, &w.block).map_err(|_| Error::Unknown)?;
             }
-            SystemKind::Security => {
+            UnifiedSystemKind::Security => {
                 w.block = m.security.encode()?;
                 io.write(first, &w.block).map_err(|_| Error::Unknown)?;
             }
-            SystemKind::Receipts => {
+            UnifiedSystemKind::Receipts => {
                 w.block.fill(0);
                 for i in 0..RECEIPT_HOME_BLOCKS {
                     io.write(first + i, &w.block).map_err(|_| Error::Unknown)?;
@@ -399,19 +462,36 @@ fn write_system(
                 io.write(first + RECEIPT_HOME_BLOCKS, &w.block)
                     .map_err(|_| Error::Unknown)?;
             }
-            SystemKind::Acl => {
+            UnifiedSystemKind::Acl => {
                 for page in 0..(INODES * ACL_BYTES / BLOCK) as u32 {
                     w.block.fill(0);
                     for j in 0..ACL_ENTRIES_PER_BLOCK {
                         let id = page as usize * ACL_ENTRIES_PER_BLOCK + j;
-                        seal_acl_entry(m, id, &mut w.block[j * ACL_BYTES..(j + 1) * ACL_BYTES])?;
+                        seal_acl_entry(
+                            m.principals[0],
+                            system,
+                            scratch_owner_rights,
+                            id,
+                            &mut w.block[j * ACL_BYTES..(j + 1) * ACL_BYTES],
+                        )?;
                     }
                     io.write(first + page, &w.block)
                         .map_err(|_| Error::Unknown)?;
                 }
             }
+            UnifiedSystemKind::SnapshotCatalog
+            | UnifiedSystemKind::SnapshotSlot
+            | UnifiedSystemKind::SnapshotRequest
+            | UnifiedSystemKind::SnapshotProtection => {
+                unified::encode_object_envelope(s.kind, m.fs_uuid, s.generation, &mut w.block)?;
+                io.write(first, &w.block).map_err(|_| Error::Unknown)?;
+                w.block.fill(0);
+                for block in first + 1..first + count {
+                    io.write(block, &w.block).map_err(|_| Error::Unknown)?;
+                }
+            }
         }
-        record(w, FormatOp::SystemObject, first, kind_blocks(s.kind));
+        record(w, FormatOp::SystemObject, first, count);
     }
     Ok(())
 }
@@ -451,11 +531,110 @@ pub fn format(
     m: &FormatManifest,
     w: &mut FormatWorkspace,
 ) -> Result<FormatEvidence, Error> {
+    format_layout(io, total_blocks, m, None, None, w)
+}
+
+/// Format an all-zero v1 image with the eight-object D1 scratch layout.
+/// The full map, root block, and initial snapshot generations are checked
+/// before I/O. The four D1.5 heads and their zero tails join the first
+/// metadata FLUSH and use the envelope fields pending D7 vectors.
+pub fn format_unified(
+    io: &mut impl EpochBlockIo,
+    total_blocks: u32,
+    m: &FormatManifest,
+    snapshots: &[UnifiedSystemObject; 4],
+    w: &mut FormatWorkspace,
+) -> Result<FormatEvidence, Error> {
+    format_layout(io, total_blocks, m, Some(snapshots), None, w)
+}
+
+/// Format the canonical unified scratch layout with one immutable root file.
+/// The caller supplies the verified offline policy through the manifest.
+pub fn format_unified_with_scratch_file(
+    io: &mut impl EpochBlockIo,
+    total_blocks: u32,
+    m: &FormatManifest,
+    snapshots: &[UnifiedSystemObject; 4],
+    w: &mut FormatWorkspace,
+) -> Result<FormatEvidence, Error> {
+    format_layout(
+        io,
+        total_blocks,
+        m,
+        Some(snapshots),
+        Some(SCRATCH_FILE_OWNER_RIGHTS),
+        w,
+    )
+}
+
+/// Format the canonical unified scratch layout with a READ|WRITE owner ACL
+/// for the fixture's boot-local overwrite service.
+pub fn format_unified_with_writable_scratch_file(
+    io: &mut impl EpochBlockIo,
+    total_blocks: u32,
+    m: &FormatManifest,
+    snapshots: &[UnifiedSystemObject; 4],
+    w: &mut FormatWorkspace,
+) -> Result<FormatEvidence, Error> {
+    format_layout(
+        io,
+        total_blocks,
+        m,
+        Some(snapshots),
+        Some(SCRATCH_WRITABLE_FILE_OWNER_RIGHTS),
+        w,
+    )
+}
+
+fn format_layout(
+    io: &mut impl EpochBlockIo,
+    total_blocks: u32,
+    m: &FormatManifest,
+    snapshots: Option<&[UnifiedSystemObject; 4]>,
+    scratch_owner_rights: Option<u32>,
+    w: &mut FormatWorkspace,
+) -> Result<FormatEvidence, Error> {
     w.len = 0;
     if total_blocks != BLOCK_COUNT {
         return Err(Error::Capacity);
     }
     validate_manifest(m)?;
+    let baseline_system;
+    let unified_system;
+    let system: &[UnifiedSystemObject] = match snapshots {
+        Some(snapshots) => {
+            unified_system = unified::unified_map_from_baseline(&m.system, snapshots)?;
+            if snapshots.iter().any(|s| s.generation != 1) {
+                return Err(Error::Invalid);
+            }
+            if unified_system
+                .iter()
+                .any(|s| (s.first_block..s.first_block + s.kind.blocks()).contains(&m.root_block))
+            {
+                return Err(Error::Conflict);
+            }
+            &unified_system
+        }
+        None => {
+            baseline_system = m.system.map(|s| UnifiedSystemObject {
+                kind: UnifiedSystemKind::from_baseline(s.kind),
+                inode: s.inode,
+                generation: s.generation,
+                first_block: s.first_block,
+            });
+            &baseline_system
+        }
+    };
+    let scratch_file = scratch_owner_rights.is_some();
+    if scratch_file
+        && (m.root_block != unified::CANONICAL_BUSINESS_START
+            || allocated(SCRATCH_FILE_BLOCK, m.root_block, system, false)
+            || system
+                .iter()
+                .any(|s| u32::from(s.inode) == SCRATCH_FILE_INODE))
+    {
+        return Err(Error::Conflict);
+    }
     // Whole-image zero verification with bounded one-block reads, before any
     // write. First non-zero block rejects the entire image untouched.
     for block in 0..BLOCK_COUNT {
@@ -465,10 +644,17 @@ pub fn format(
         }
     }
     record(w, FormatOp::ScanZero, 0, BLOCK_COUNT);
-    write_bitmap(io, m, w)?;
-    write_inodes(io, m, w)?;
-    write_root(io, m, w)?;
-    write_system(io, m, w)?;
+    write_bitmap(io, m.root_block, system, scratch_file, w)?;
+    write_inodes(io, m.root_block, system, scratch_file, w)?;
+    write_root(io, m, scratch_file, w)?;
+    write_system(io, m, system, scratch_owner_rights, w)?;
+    if scratch_file {
+        w.block.fill(0);
+        w.block[..SCRATCH_FILE_DATA.len()].copy_from_slice(SCRATCH_FILE_DATA);
+        io.write(SCRATCH_FILE_BLOCK, &w.block)
+            .map_err(|_| Error::Unknown)?;
+        record(w, FormatOp::FileData, SCRATCH_FILE_BLOCK, 1);
+    }
     flush(io, w)?;
     // Explicit log zeroing is contractual even though the scan proved the
     // region zero; it carries its own FLUSH boundary.
@@ -496,11 +682,12 @@ pub fn format(
             return Err(Error::Unknown);
         }
     }
+    let system_blocks: u32 = system.iter().map(|s| s.kind.blocks()).sum();
     Ok(FormatEvidence {
         superblock: sb,
         root_block: m.root_block,
-        system_blocks: SYSTEM_BLOCKS,
-        data_blocks: SYSTEM_BLOCKS + 1,
+        system_blocks,
+        data_blocks: system_blocks + 1 + u32::from(scratch_file),
     })
 }
 
@@ -1126,21 +1313,7 @@ mod tests {
         assert!(d.ops.is_empty());
         assert!(w.steps().is_empty());
     }
-    // Mirrors the V0.20 wave-11 opt-in media-staging lane (kernel
-    // production/media_staging): baseline objects on the ratified unified
-    // inode slots at the unified host canonical-map positions, root at the
-    // first canonical business block, so the image both mounts through the
-    // frozen v1 validator and bridges to the N=8 unified map. Then the boot
-    // epoch authority allocates epoch 1 on the formatted image exactly once.
-    // Fixture-derived host vector, NOT a golden vector.
-    #[test]
-    fn unified_slot_staging_manifest_formats_mounts_and_allocates_boot_epoch() {
-        use super::super::boot_epoch_v1::{BootEpochAuthority, BootEpochTx, BootPairRedo};
-        use super::super::durable_role_epoch_v0199::SlotBinding;
-        use super::super::file_media_unified_v1::{
-            self as unified, CANONICAL_BUSINESS_START, UnifiedSystemKind, UnifiedSystemObject,
-        };
-        use crate::control_plane::role_manifest_v0199::ROLES;
+    fn staging_manifest() -> FormatManifest {
         let obj = |kind, inode, first_block| SystemObject {
             kind,
             inode,
@@ -1148,7 +1321,7 @@ mod tests {
             first_block,
         };
         let mut m = manifest();
-        m.root_block = CANONICAL_BUSINESS_START;
+        m.root_block = unified::CANONICAL_BUSINESS_START;
         m.system = [
             obj(SystemKind::BootEpoch, unified::BOOT_INODE, DATA_START),
             obj(
@@ -1163,6 +1336,218 @@ mod tests {
                 DATA_START + 12,
             ),
         ];
+        m
+    }
+    fn staging_snapshots() -> [UnifiedSystemObject; 4] {
+        [
+            UnifiedSystemKind::SnapshotCatalog,
+            UnifiedSystemKind::SnapshotSlot,
+            UnifiedSystemKind::SnapshotRequest,
+            UnifiedSystemKind::SnapshotProtection,
+        ]
+        .map(|kind| UnifiedSystemObject {
+            kind,
+            inode: kind.inode_slot(),
+            generation: 1,
+            first_block: kind.fixed_first_block().unwrap(),
+        })
+    }
+    #[test]
+    fn unified_format_materializes_eight_system_objects_before_publication() {
+        let m = staging_manifest();
+        let snapshots = staging_snapshots();
+        let map = unified::unified_map_from_baseline(&m.system, &snapshots).unwrap();
+        let mut d = Disk::blank();
+        let mut w = FormatWorkspace::new();
+        let e = format_unified(&mut d, BLOCK_COUNT, &m, &snapshots, &mut w).unwrap();
+        assert_eq!(
+            (e.root_block, e.system_blocks, e.data_blocks),
+            (4269, 151, 152)
+        );
+        assert_eq!(d.reads, BLOCK_COUNT + 2);
+        let (sb0, sb1) = (*d.blocks[&0], *d.blocks[&1]);
+        assert_eq!(sb0, sb1);
+        assert_eq!(
+            unified::unified_superblock_pair(&sb0, &sb1),
+            Ok(SuperblockV1 {
+                fs_uuid: m.fs_uuid,
+                generation: 1,
+                checkpoint_lsn: 0,
+                log_epoch: 1,
+            })
+        );
+
+        let mut metadata: Vec<_> = (BITMAP_START..DATA_START).map(Op::Write).collect();
+        metadata.push(Op::Write(m.root_block));
+        for object in &map {
+            let range = object.first_block..object.first_block + object.kind.blocks();
+            metadata.extend(range.map(Op::Write));
+        }
+        assert_eq!(metadata.len(), 172);
+        let mut ops = metadata;
+        ops.push(Op::Flush);
+        ops.extend((LOG_START..BITMAP_START).map(Op::Write));
+        ops.extend([Op::Flush, Op::Write(0), Op::Flush, Op::Write(1), Op::Flush]);
+        assert_eq!(d.ops, ops);
+        assert_eq!(w.steps().len(), 19);
+        for (step, object) in w.steps()[4..12].iter().zip(map) {
+            assert_eq!(
+                *step,
+                FormatStep {
+                    op: FormatOp::SystemObject,
+                    first: object.first_block,
+                    blocks: object.kind.blocks(),
+                }
+            );
+        }
+        assert_eq!(w.steps()[12].op, FormatOp::Flush);
+
+        for block in 0..BLOCK_COUNT {
+            assert_eq!(
+                bitmap_bit(&d, block),
+                block <= m.root_block,
+                "block {block}"
+            );
+        }
+        let acl_home = m.system[2].first_block;
+        for object in map {
+            let id = u32::from(object.inode);
+            let blocks = object.kind.blocks();
+            let inode = Inode::decode(&*inode_slot(&d, id)).unwrap();
+            assert_eq!((inode.kind, inode.generation, inode.extents), (1, 1, 1));
+            assert_eq!((inode.parent, inode.parent_generation), (0, 1));
+            assert_eq!(inode.size, u64::from(blocks) * BLOCK as u64);
+            assert_eq!(
+                inode.runs[0],
+                Extent {
+                    logical: 0,
+                    physical: object.first_block,
+                    count: blocks
+                }
+            );
+            let acl = &d.blocks[&(acl_home + id / ACL_ENTRIES_PER_BLOCK as u32)];
+            let offset = id as usize % ACL_ENTRIES_PER_BLOCK * ACL_BYTES;
+            assert_eq!(
+                Acl::decode(&acl[offset..offset + ACL_BYTES]),
+                Ok(Acl {
+                    inode_id: id,
+                    state: 1,
+                    inode_generation: 1,
+                    principal: m.principals[0],
+                    owner_rights: 0,
+                    system_rights: FILE_RIGHTS,
+                    acl_generation: 1,
+                    parent: 0,
+                })
+            );
+        }
+        for id in u32::from(unified::RESERVED_INODE_START)..INODES as u32 {
+            let inode = Inode::decode(&*inode_slot(&d, id)).unwrap();
+            assert_eq!((inode.kind, inode.generation), (0, 0));
+        }
+        for object in snapshots {
+            assert_eq!(
+                unified::decode_object_envelope(object.kind, &*d.blocks[&object.first_block]),
+                Ok(unified::ObjectEnvelope {
+                    kind: object.kind,
+                    fs_uuid: m.fs_uuid,
+                    generation: 1
+                })
+            );
+            for block in object.first_block + 1..object.first_block + object.kind.blocks() {
+                assert_eq!(*d.blocks[&block], [0; BLOCK]);
+            }
+        }
+    }
+    #[test]
+    fn unified_format_rejects_inconsistent_map_before_io() {
+        let snapshots = staging_snapshots();
+        let mut root_overlaps = staging_manifest();
+        root_overlaps.root_block = snapshots[1].first_block + 1;
+        let mut baseline_overlaps = staging_manifest();
+        baseline_overlaps.system[1].first_block = snapshots[0].first_block - 1;
+        let mut wrong_slot = staging_manifest();
+        wrong_slot.system[0].inode = 20;
+        let mut moved = snapshots;
+        moved[2].first_block += 1;
+        let mut non_initial = snapshots;
+        non_initial[0].generation = 2;
+        for (m, snapshots, error) in [
+            (root_overlaps, snapshots, Error::Conflict),
+            (baseline_overlaps, snapshots, Error::Conflict),
+            (wrong_slot, snapshots, Error::Invalid),
+            (staging_manifest(), moved, Error::Invalid),
+            (staging_manifest(), non_initial, Error::Invalid),
+        ] {
+            let mut d = Disk::blank();
+            let mut w = FormatWorkspace::new();
+            assert_eq!(
+                format_unified(&mut d, BLOCK_COUNT, &m, &snapshots, &mut w),
+                Err(error)
+            );
+            assert_eq!(d.reads, 0);
+            assert!(d.ops.is_empty());
+            assert!(w.steps().is_empty());
+        }
+    }
+    #[test]
+    fn unified_format_failed_metadata_flush_leaves_superblocks_unpublished() {
+        let m = staging_manifest();
+        let snapshots = staging_snapshots();
+        let mut d = Disk::blank();
+        d.fail_flush = 1;
+        let mut w = FormatWorkspace::new();
+        assert_eq!(
+            format_unified(&mut d, BLOCK_COUNT, &m, &snapshots, &mut w),
+            Err(Error::Unknown)
+        );
+        assert_eq!(d.reads, BLOCK_COUNT);
+        assert_eq!(d.ops.len(), 173);
+        assert_eq!(d.ops.last(), Some(&Op::Flush));
+        assert_eq!(w.steps().len(), 12);
+        assert!(!d.blocks.contains_key(&0));
+        assert!(!d.blocks.contains_key(&1));
+        assert!(!d.blocks.contains_key(&LOG_START));
+    }
+    #[test]
+    fn scratch_file_data_is_included_in_the_first_flush() {
+        let m = staging_manifest();
+        let mut d = Disk::blank();
+        d.fail_flush = 1;
+        let mut w = FormatWorkspace::new();
+        assert_eq!(
+            format_unified_with_scratch_file(&mut d, BLOCK_COUNT, &m, &staging_snapshots(), &mut w),
+            Err(Error::Unknown)
+        );
+        assert_eq!(d.reads, BLOCK_COUNT);
+        assert!(bitmap_bit(&d, SCRATCH_FILE_BLOCK));
+        let block = &d.blocks[&SCRATCH_FILE_BLOCK];
+        let (data, padding) = block.split_at(SCRATCH_FILE_DATA.len());
+        assert_eq!(data, b"CyxiaOS V0.20 signed scratch\n");
+        assert!(padding.iter().all(|&byte| byte == 0));
+        assert_eq!(
+            w.steps().last(),
+            Some(&FormatStep {
+                op: FormatOp::FileData,
+                first: SCRATCH_FILE_BLOCK,
+                blocks: 1,
+            })
+        );
+        assert_eq!(
+            d.ops[d.ops.len() - 2..],
+            [Op::Write(SCRATCH_FILE_BLOCK), Op::Flush]
+        );
+        assert!(!d.blocks.contains_key(&0));
+        assert!(!d.blocks.contains_key(&1));
+        assert!(!d.blocks.contains_key(&LOG_START));
+    }
+    // Mirrors the V0.20 wave-11 media-staging baseline map and boot epoch.
+    #[test]
+    fn unified_slot_staging_manifest_formats_mounts_and_allocates_boot_epoch() {
+        use super::super::boot_epoch_v1::{BootEpochAuthority, BootEpochTx, BootPairRedo};
+        use super::super::durable_role_epoch_v0199::SlotBinding;
+        use crate::control_plane::role_manifest_v0199::ROLES;
+        let m = staging_manifest();
         let mut d = Disk::blank();
         let mut w = FormatWorkspace::new();
         let e = format(&mut d, BLOCK_COUNT, &m, &mut w).unwrap();
@@ -1177,22 +1562,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!((v.system_blocks, v.structure.live_inodes), (13, 5));
-        let snap = |kind: UnifiedSystemKind| UnifiedSystemObject {
-            kind,
-            inode: kind.inode_slot(),
-            generation: 1,
-            first_block: kind.fixed_first_block().unwrap(),
-        };
-        let map = unified::unified_map_from_baseline(
-            &m.system,
-            &[
-                snap(UnifiedSystemKind::SnapshotCatalog),
-                snap(UnifiedSystemKind::SnapshotSlot),
-                snap(UnifiedSystemKind::SnapshotRequest),
-                snap(UnifiedSystemKind::SnapshotProtection),
-            ],
-        )
-        .unwrap();
+        let map = unified::unified_map_from_baseline(&m.system, &staging_snapshots()).unwrap();
         assert_eq!(
             unified::validate_unified_system_map(&map)
                 .unwrap()

@@ -1,4 +1,4 @@
-//! Baseline-v1 mount: join inode/bitmap/directory structure with all four
+//! Baseline-v1 and unified-v1 mount checks join filesystem structure with
 //! protected system objects, persistent principal identities and ACLs.
 //! These checks consume the exclusive native post-replay disk view.
 //! They do not issue file capabilities, clear UNKNOWN receipts or certify
@@ -8,6 +8,11 @@ use super::{
     boot_epoch_v1::BootEpochStoreV1,
     epoch_redo_v0199::EpochBlockIo,
     file_index_v0199::{FileStreamIndexV4, SecurityStateStoreV2},
+    file_media_unified_v1::{
+        BASELINE_SYSTEM_BLOCKS, BASELINE_SYSTEM_OBJECTS, UNIFIED_SYSTEM_BLOCKS,
+        UNIFIED_SYSTEM_OBJECTS, UnifiedSystemKind, UnifiedSystemObject, decode_object_envelope,
+        unified_map_from_baseline,
+    },
     file_media_v0199::{SuperblockV1, crc32c_zeroed},
     file_receipt_store_v0199::{self, RECEIPT_STORE_BYTES, ReceiptStoreSummary},
     file_structure_v1::{self, BLOCK, INODES, Inode, StructureEvidence, SystemKind, SystemObject},
@@ -107,29 +112,6 @@ impl Default for Workspace {
     }
 }
 const _: () = assert!(core::mem::size_of::<Workspace>() <= 192 * 1024);
-fn system_layout(system: &[SystemObject; 4]) -> Result<(), Error> {
-    for (i, s) in system.iter().enumerate() {
-        let count = match s.kind {
-            SystemKind::BootEpoch | SystemKind::Security => 1,
-            SystemKind::Receipts => 7,
-            SystemKind::Acl => 4,
-        };
-        if s.inode == 0
-            || usize::from(s.inode) >= INODES
-            || s.generation == 0
-            || s.first_block < super::file_media_v0199::DATA_START
-            || s.first_block
-                .checked_add(count)
-                .is_none_or(|end| end > super::file_media_v0199::BLOCK_COUNT)
-            || system[..i]
-                .iter()
-                .any(|old| old.inode == s.inode || old.kind == s.kind)
-        {
-            return Err(Error::Invalid);
-        }
-    }
-    Ok(())
-}
 fn blocks(io: &mut impl EpochBlockIo, first: u32, out: &mut [u8]) -> Result<(), Error> {
     if !out.len().is_multiple_of(BLOCK) {
         return Err(Error::Invalid);
@@ -142,12 +124,12 @@ fn blocks(io: &mut impl EpochBlockIo, first: u32, out: &mut [u8]) -> Result<(), 
     }
     Ok(())
 }
-fn inspect_acls(
+fn inspect_acls<K>(
     acl: &[u8; ACL_STORE],
     inodes: &[Inode; INODES],
-    system: &[SystemObject; 4],
     principals: &[Principal; 16],
-    mut policy: impl FnMut(Acl, Inode, Option<SystemKind>) -> Result<(), Error>,
+    system_kind: impl Fn(usize) -> Option<K>,
+    mut policy: impl FnMut(Acl, Inode, Option<K>) -> Result<(), Error>,
 ) -> Result<([Usage; 16], u32), Error> {
     let mut usage = [Usage::default(); 16];
     let mut system_blocks = 0u32;
@@ -158,10 +140,7 @@ fn inspect_acls(
             return Err(Error::Conflict);
         }
         let owner = principals.iter().position(|p| *p == a.principal);
-        let hidden = system
-            .iter()
-            .find(|s| usize::from(s.inode) == i)
-            .map(|s| s.kind);
+        let hidden = system_kind(i);
         if inode.kind == 0 {
             // Initial empty and retained tombstone have no access authority.
             // The signed volume policy decides any retained identity fields.
@@ -211,19 +190,18 @@ fn inspect_acls(
     }
     Ok((usage, system_blocks))
 }
-/// All four object payloads are copied from the actual stable disk view,
-/// then cross-validated with the full inode scan. The supplied policy is
-/// the independent trusted ACL/quota authority, not an EL0 callback.
-/// Its acceptance is required even for the root and hidden system files.
-pub fn validate(
+struct BaselinePayloads {
+    boot: BootEpochStoreV1,
+    security: SecurityStateStoreV2,
+    receipts: ReceiptStoreSummary,
+}
+fn read_baseline_payloads(
     io: &mut impl EpochBlockIo,
     sb: SuperblockV1,
     system: &[SystemObject; 4],
     principals: &[Principal; 16],
     w: &mut Workspace,
-    policy: impl FnMut(Acl, Inode, Option<SystemKind>) -> Result<(), Error>,
-) -> Result<MountEvidence, Error> {
-    system_layout(system)?;
+) -> Result<BaselinePayloads, Error> {
     for (i, p) in principals.iter().enumerate() {
         if p.id == 0 || p.generation == 0 || principals[..i].iter().any(|old| old.id == p.id) {
             return Err(Error::Invalid);
@@ -256,33 +234,130 @@ pub fn validate(
     }
     let receipts =
         file_receipt_store_v0199::scan_receipts_with_index(&w.receipts, &w.index, sb.fs_uuid)?;
-    let mut counters = None;
-    let acl = &w.acl;
-    let structure = file_structure_v1::scan(
-        sb,
-        system,
-        &mut w.structure,
-        |b, out| io.read(b, out),
-        |_, sys, inodes| {
-            counters = Some(inspect_acls(acl, inodes, sys, principals, policy)?);
-            Ok(())
-        },
-    )?;
-    let (usage, system_blocks) = counters.ok_or(Error::Conflict)?;
-    if system_blocks != 13
-        || usage.iter().map(|u| u.blocks).sum::<u32>() + system_blocks != structure.data_blocks
-        || usage.iter().map(|u| u.inodes).sum::<u32>() + 4 != u32::from(structure.live_inodes)
-    {
-        return Err(Error::Conflict);
-    }
-    Ok(MountEvidence {
-        structure,
+    Ok(BaselinePayloads {
         boot,
         security,
         receipts,
-        usage,
-        system_blocks,
     })
+}
+impl BaselinePayloads {
+    fn mount_evidence(
+        self,
+        structure: StructureEvidence,
+        (usage, system_blocks): ([Usage; 16], u32),
+        expected_objects: usize,
+        expected_blocks: u32,
+    ) -> Result<MountEvidence, Error> {
+        if system_blocks != expected_blocks
+            || usage.iter().map(|u| u.blocks).sum::<u32>() + system_blocks != structure.data_blocks
+            || usage.iter().map(|u| u.inodes).sum::<u32>() + expected_objects as u32
+                != u32::from(structure.live_inodes)
+        {
+            return Err(Error::Conflict);
+        }
+        Ok(MountEvidence {
+            structure,
+            boot: self.boot,
+            security: self.security,
+            receipts: self.receipts,
+            usage,
+            system_blocks,
+        })
+    }
+}
+/// All four object payloads are copied from the actual stable disk view,
+/// then cross-validated with the full inode scan. The trusted ACL policy
+/// must accept every inode, including the root and hidden system files.
+pub fn validate(
+    io: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    system: &[SystemObject; 4],
+    principals: &[Principal; 16],
+    w: &mut Workspace,
+    policy: impl FnMut(Acl, Inode, Option<SystemKind>) -> Result<(), Error>,
+) -> Result<MountEvidence, Error> {
+    file_structure_v1::validate_system_layout(system)?;
+    let payloads = read_baseline_payloads(io, sb, system, principals, w)?;
+    let structure =
+        file_structure_v1::scan_baseline(sb, system, &mut w.structure, |b, out| io.read(b, out))?;
+    let counters = inspect_acls(
+        &w.acl,
+        w.structure.inodes(),
+        principals,
+        |i| {
+            system
+                .iter()
+                .find(|s| usize::from(s.inode) == i)
+                .map(|s| s.kind)
+        },
+        policy,
+    )?;
+    payloads.mount_evidence(
+        structure,
+        counters,
+        BASELINE_SYSTEM_OBJECTS,
+        BASELINE_SYSTEM_BLOCKS,
+    )
+}
+fn verify_snapshot_objects(
+    io: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    snapshot: &[UnifiedSystemObject; 4],
+    block: &mut [u8; BLOCK],
+) -> Result<(), Error> {
+    for s in snapshot {
+        io.read(s.first_block, block)?;
+        let envelope = decode_object_envelope(s.kind, block)?;
+        if envelope.fs_uuid != sb.fs_uuid || envelope.generation != s.generation {
+            return Err(Error::Conflict);
+        }
+        for tail in s.first_block + 1..s.first_block + s.kind.blocks() {
+            io.read(tail, block)?;
+            if block.iter().any(|&byte| byte != 0) {
+                return Err(Error::Conflict);
+            }
+        }
+    }
+    Ok(())
+}
+/// Read-only validation of the unified v1 homes under the caller's mount
+/// exclusion. The manifest fixes the identity and extents of all eight
+/// hidden objects. Snapshot payloads and continuation blocks must be zero
+/// while their formats await golden vectors. Every ACL requires the
+/// independent trusted policy's acceptance.
+pub fn validate_unified(
+    io: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    baseline: &[SystemObject; 4],
+    snapshot: &[UnifiedSystemObject; 4],
+    principals: &[Principal; 16],
+    w: &mut Workspace,
+    policy: impl FnMut(Acl, Inode, Option<UnifiedSystemKind>) -> Result<(), Error>,
+) -> Result<MountEvidence, Error> {
+    let system = unified_map_from_baseline(baseline, snapshot)?;
+    let payloads = read_baseline_payloads(io, sb, baseline, principals, w)?;
+    // Baseline payload validation has consumed the index; reuse its buffer.
+    verify_snapshot_objects(io, sb, snapshot, &mut w.index)?;
+    let structure =
+        file_structure_v1::scan_unified(sb, &system, &mut w.structure, |b, out| io.read(b, out))?;
+    let counters = inspect_acls(
+        &w.acl,
+        w.structure.inodes(),
+        principals,
+        |i| {
+            system
+                .iter()
+                .find(|s| usize::from(s.inode) == i)
+                .map(|s| s.kind)
+        },
+        policy,
+    )?;
+    payloads.mount_evidence(
+        structure,
+        counters,
+        UNIFIED_SYSTEM_OBJECTS,
+        UNIFIED_SYSTEM_BLOCKS,
+    )
 }
 /// Production callers must obtain the system object locations from an
 /// authenticated boot catalog. The exact signed principal table, security
@@ -304,6 +379,14 @@ pub fn validate_signed(
 mod tests {
     extern crate std;
     use super::*;
+    use crate::security::{
+        file_media_unified_v1::{
+            CATALOG_INODE, ENVELOPE_BYTES, RESERVED_INODE_START, SNAPSHOT_CATALOG_BLOCK,
+            SNAPSHOT_PROTECTION_BLOCK, SNAPSHOT_SLOT_START, encode_object_envelope,
+        },
+        file_media_v0199::{BITMAP_START, DATA_START, INODE_START},
+        file_structure_v1::INODE_BYTES,
+    };
     use std::{boxed::Box, collections::BTreeMap};
     const STATE_HOME: u32 = 7000;
     const BOOT_HOME: u32 = 7002;
@@ -477,6 +560,290 @@ mod tests {
         d.0.insert(STATE_HOME, Box::new(security));
         d
     }
+
+    impl Disk {
+        fn inode_slot(&mut self, id: u16) -> &mut [u8] {
+            let page = INODE_START + u32::from(id) / 16;
+            let offset = (usize::from(id) % 16) * INODE_BYTES;
+            &mut self.0.get_mut(&page).unwrap()[offset..offset + INODE_BYTES]
+        }
+
+        fn acl_slot(&mut self, id: u16) -> &mut [u8] {
+            let page = ACL + u32::from(id) / 64;
+            let offset = (usize::from(id) % 64) * ACL_BYTES;
+            &mut self.0.get_mut(&page).unwrap()[offset..offset + ACL_BYTES]
+        }
+
+        fn set_allocated(&mut self, block: u32, allocated: bool) {
+            let byte = (block / 8) as usize;
+            let page = BITMAP_START + (byte / BLOCK) as u32;
+            let slot = &mut self.0.get_mut(&page).unwrap()[byte % BLOCK];
+            let mask = 1 << (block % 8);
+            if allocated {
+                *slot |= mask;
+            } else {
+                *slot &= !mask;
+            }
+        }
+    }
+
+    fn unified_fixture() -> (Disk, [SystemObject; 4], [UnifiedSystemObject; 4]) {
+        let mut disk = fixture();
+        let mut baseline = systems();
+        for s in &mut baseline {
+            let old = s.inode;
+            inode(disk.inode_slot(old), 0, 0, 0, 0);
+            let acl = disk.acl_slot(old);
+            acl.fill(0);
+            p32(acl, 0, u32::from(old));
+            seal(acl, 60);
+            s.inode = UnifiedSystemKind::from_baseline(s.kind).inode_slot();
+        }
+        let snapshot = [
+            UnifiedSystemKind::SnapshotCatalog,
+            UnifiedSystemKind::SnapshotSlot,
+            UnifiedSystemKind::SnapshotRequest,
+            UnifiedSystemKind::SnapshotProtection,
+        ]
+        .map(|kind| UnifiedSystemObject {
+            kind,
+            inode: kind.inode_slot(),
+            generation: 1,
+            first_block: kind.fixed_first_block().unwrap(),
+        });
+        for s in unified_map_from_baseline(&baseline, &snapshot).unwrap() {
+            let count = s.kind.blocks();
+            inode(
+                disk.inode_slot(s.inode),
+                1,
+                u64::from(count) * BLOCK as u64,
+                s.first_block,
+                count,
+            );
+            let acl = disk.acl_slot(s.inode);
+            p32(acl, 4, 1);
+            p64(acl, 8, 1);
+            p64(acl, 16, 1);
+            p64(acl, 24, 1);
+            p32(acl, 36, FILE_RIGHTS);
+            p64(acl, 40, 1);
+            seal(acl, 60);
+            for block in s.first_block..s.first_block + count {
+                disk.set_allocated(block, true);
+            }
+            if s.kind.is_new_snapshot_object() {
+                let mut head = Box::new([0; BLOCK]);
+                encode_object_envelope(s.kind, [1; 16], s.generation, &mut *head).unwrap();
+                disk.0.insert(s.first_block, head);
+            }
+        }
+        // Baseline homes are relocatable, so an ordinary file may use DATA_START.
+        disk.set_allocated(STATE_HOME + 1, false);
+        disk.set_allocated(DATA_START, true);
+        inode(disk.inode_slot(1), 1, 8, DATA_START, 1);
+        (disk, baseline, snapshot)
+    }
+
+    const CHECKPOINT: SuperblockV1 = SuperblockV1 {
+        fs_uuid: [1; 16],
+        generation: 2,
+        checkpoint_lsn: 4,
+        log_epoch: 2,
+    };
+
+    fn principals() -> [Principal; 16] {
+        core::array::from_fn(|i| Principal {
+            id: i as u64 + 1,
+            generation: 1,
+        })
+    }
+
+    #[test]
+    fn unified_mount_accounts_for_all_eight_hidden_objects() {
+        let (mut disk, baseline, snapshot) = unified_fixture();
+        let map = unified_map_from_baseline(&baseline, &snapshot).unwrap();
+        let mut seen = 0;
+        let e = validate_unified(
+            &mut disk,
+            CHECKPOINT,
+            &baseline,
+            &snapshot,
+            &principals(),
+            &mut Workspace::new(),
+            |acl, _, hidden| {
+                seen += 1;
+                assert_eq!(
+                    hidden,
+                    map.iter()
+                        .find(|s| u32::from(s.inode) == acl.inode_id)
+                        .map(|s| s.kind)
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, INODES);
+        assert_eq!(e.system_blocks, 151);
+        assert_eq!(
+            e.structure,
+            StructureEvidence {
+                live_inodes: 10,
+                data_blocks: 153,
+                directory_entries: 1,
+            }
+        );
+        assert_eq!(
+            e.usage[0],
+            Usage {
+                inodes: 2,
+                blocks: 2,
+                directory_slots: 1,
+            }
+        );
+        assert!(e.usage[1..].iter().all(|u| *u == Usage::default()));
+    }
+
+    #[test]
+    fn unified_mount_denies_corrupt_homes() {
+        #[derive(Debug)]
+        enum Fault {
+            ReservedTombstone,
+            HiddenGeneration,
+            SharedExtent,
+            MissingAllocation,
+            OrphanAllocation,
+            HiddenDirectoryEntry,
+            EnvelopeUuid,
+            EnvelopeGeneration,
+            EnvelopePayload,
+            ContinuationBlock,
+        }
+        let mut w = Workspace::new();
+        let p = principals();
+        for fault in [
+            Fault::ReservedTombstone,
+            Fault::HiddenGeneration,
+            Fault::SharedExtent,
+            Fault::MissingAllocation,
+            Fault::OrphanAllocation,
+            Fault::HiddenDirectoryEntry,
+            Fault::EnvelopeUuid,
+            Fault::EnvelopeGeneration,
+            Fault::EnvelopePayload,
+            Fault::ContinuationBlock,
+        ] {
+            let (mut disk, baseline, snapshot) = unified_fixture();
+            let expected = match fault {
+                Fault::ReservedTombstone => {
+                    let tombstone = disk.inode_slot(RESERVED_INODE_START);
+                    p64(tombstone, 8, 1);
+                    seal(tombstone, 252);
+                    let acl = disk.acl_slot(RESERVED_INODE_START);
+                    p32(acl, 4, 2);
+                    p64(acl, 8, 1);
+                    seal(acl, 60);
+                    Error::Conflict
+                }
+                Fault::HiddenGeneration => {
+                    let hidden = disk.inode_slot(CATALOG_INODE);
+                    p64(hidden, 8, 2);
+                    seal(hidden, 252);
+                    Error::Conflict
+                }
+                Fault::SharedExtent => {
+                    inode(disk.inode_slot(1), 1, 8, SNAPSHOT_SLOT_START, 1);
+                    Error::Conflict
+                }
+                Fault::MissingAllocation => {
+                    disk.set_allocated(SNAPSHOT_PROTECTION_BLOCK, false);
+                    Error::Conflict
+                }
+                Fault::OrphanAllocation => {
+                    disk.set_allocated(DATA_START + 1, true);
+                    Error::Conflict
+                }
+                Fault::HiddenDirectoryEntry => {
+                    let root = disk.inode_slot(0);
+                    p64(root, 16, 256);
+                    seal(root, 252);
+                    let entry = &mut disk.0.get_mut(&ROOT).unwrap()[128..256];
+                    p32(entry, 0, u32::from(CATALOG_INODE));
+                    p16(entry, 4, 1);
+                    p64(entry, 8, 1);
+                    entry[16] = b'y';
+                    seal(entry, 124);
+                    Error::Invalid
+                }
+                Fault::EnvelopeUuid => {
+                    let head = disk.0.get_mut(&SNAPSHOT_CATALOG_BLOCK).unwrap();
+                    head[8..24].fill(2);
+                    seal(&mut **head, 32);
+                    Error::Conflict
+                }
+                Fault::EnvelopeGeneration => {
+                    let head = disk.0.get_mut(&SNAPSHOT_CATALOG_BLOCK).unwrap();
+                    p64(&mut **head, 24, 2);
+                    seal(&mut **head, 32);
+                    Error::Conflict
+                }
+                Fault::EnvelopePayload => {
+                    let head = disk.0.get_mut(&SNAPSHOT_CATALOG_BLOCK).unwrap();
+                    head[ENVELOPE_BYTES] = 1;
+                    seal(&mut **head, 32);
+                    Error::Invalid
+                }
+                Fault::ContinuationBlock => {
+                    let mut tail = Box::new([0; BLOCK]);
+                    tail[BLOCK - 1] = 1;
+                    disk.0.insert(SNAPSHOT_PROTECTION_BLOCK - 1, tail);
+                    Error::Conflict
+                }
+            };
+            assert_eq!(
+                validate_unified(
+                    &mut disk,
+                    CHECKPOINT,
+                    &baseline,
+                    &snapshot,
+                    &p,
+                    &mut w,
+                    |_, _, _| panic!("invalid home reached ACL policy")
+                ),
+                Err(expected),
+                "{fault:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unified_mount_requires_hidden_owner_denial_and_independent_acl_policy() {
+        let (mut disk, baseline, snapshot) = unified_fixture();
+        let mut w = Workspace::new();
+        let p = principals();
+        for (owner_rights, deny_policy) in [(0, true), (1 << 8, false)] {
+            let hidden = disk.acl_slot(CATALOG_INODE);
+            p32(hidden, 32, owner_rights);
+            seal(hidden, 60);
+            assert_eq!(
+                validate_unified(
+                    &mut disk,
+                    CHECKPOINT,
+                    &baseline,
+                    &snapshot,
+                    &p,
+                    &mut w,
+                    |_, _, hidden| {
+                        if deny_policy && hidden == Some(UnifiedSystemKind::SnapshotCatalog) {
+                            return Err(Error::Unauthorized);
+                        }
+                        Ok(())
+                    }
+                ),
+                Err(Error::Unauthorized)
+            );
+        }
+    }
+
     #[test]
     fn joined_mount_denies_wrong_acl_principal_hidden_right_and_split_boot() {
         let mut d = fixture();

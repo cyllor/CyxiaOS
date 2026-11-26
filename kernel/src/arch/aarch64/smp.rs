@@ -84,6 +84,15 @@ compile_error!("v0199-advice-e2e-selftest requires the plain smp-selftest profil
 #[path = "v0199_control_bringup.rs"]
 mod v0199_control_bringup;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_d02_fixture.rs"]
+mod v0199_d02_fixture;
+#[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_d07_fixture.rs"]
+mod v0199_d07_fixture;
+#[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_d15_fixture.rs"]
+mod v0199_d15_fixture;
+#[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_epoch_disk.rs"]
 mod v0199_epoch_disk;
 #[cfg(feature = "v0199-format-selftest")]
@@ -176,7 +185,10 @@ static CYXIA_SMP_PROFILE: [u64; 6] = [1, 4, 8, 1, 0, 0];
 const REQUIRED: usize = 4; // Test configuration only; never an AI core-count rule.
 
 core::arch::global_asm!(include_str!("../../../../crates/arch-aarch64/src/secondary.S"), max_cpus=const C);
-core::arch::global_asm!(include_str!("smp_user.S"));
+core::arch::global_asm!(
+    include_str!("smp_user.S"),
+    d02_enabled = const cfg!(feature = "v0199-epoch-disk-selftest") as u8,
+);
 #[cfg(feature = "v0199-advice-e2e-selftest")]
 core::arch::global_asm!(include_str!("v0199_advice_user.S"));
 #[repr(C, align(4096))]
@@ -740,7 +752,7 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
     if cpu::affinity() != AFFINITIES[slot].load(Ordering::Acquire) {
         fatal(2);
     }
-    #[cfg(feature = "unified-runtime")]
+    #[cfg(any(feature = "unified-runtime", feature = "v0199-epoch-disk-selftest"))]
     unsafe {
         timer::init_cpu_accounting();
     }
@@ -798,6 +810,14 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
         let Ok(permit) = GATES[slot].try_enter(token) else {
             continue;
         };
+        // The native D02 diagnostic worker is admitted only under the
+        // ordinary fixed business gate. It exclusively reuses the dormant
+        // private slot 3 after actual architectural stop/TLBI/scrub.
+        #[cfg(feature = "v0199-epoch-disk-selftest")]
+        if slot == 1 && token.plane == Plane::Business && v0199_d02_fixture::worker_step() {
+            drop(permit);
+            continue;
+        }
         let role = usize::from(token.plane == Plane::Control);
         let i = index(slot, token.plane);
         // Retired pre-cutover replay: a control token here is the old CPU1

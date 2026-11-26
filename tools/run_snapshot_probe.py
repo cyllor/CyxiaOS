@@ -200,6 +200,25 @@ def reserve_ports(count):
         return [listener.getsockname()[1] for listener in listeners]
 
 
+def connect_qmp(process, node, port, deadline, stack):
+    while True:
+        require(process.poll() is None, f'node {node}: QEMU exited before QMP')
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, 'QMP startup deadline')
+        # BSD/macOS can leave a socket unusable after a refused connect.
+        with ExitStack() as attempt:
+            sock = attempt.enter_context(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
+            sock.settimeout(remaining)
+            try:
+                sock.connect(('127.0.0.1', port))
+            except ConnectionRefusedError:
+                pass
+            else:
+                stack.enter_context(attempt.pop_all())
+                return sock
+        time.sleep(.02)
+
+
 def read_serial(guest):
     data = base64.b64decode(guest['qmp'].execute('ringbuf-read',
         {'device': 'cyxlog', 'size': 1048576, 'format': 'base64'}), validate=True)
@@ -300,21 +319,12 @@ def run(build_folder, output, qemu, qemu_source, formatter, timeout=120,
                 guest = dict(folder=folder, argv=args, disk=disk, uuid=uuid, locations=locations,
                              network_backend=link,
                              raw=bytearray(), serial=bytearray(), decoder=FrameDecoder(),
-                             proc=None, sock=None, qmp=None)
+                             proc=None, qmp=None)
                 guests.append(guest)
                 err = stack.enter_context((folder / 'qemu-stderr.log').open('wb'))
                 guest['proc'] = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=err)
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                guest['sock'] = sock
                 handshake = time.monotonic() + 15
-                while True:
-                    require(guest['proc'].poll() is None, f'node {node}: QEMU exited before QMP')
-                    require(time.monotonic() < handshake, 'QMP startup deadline')
-                    try:
-                        sock.connect(('127.0.0.1', qmp_ports[number - 1]))
-                        break
-                    except ConnectionRefusedError:
-                        time.sleep(.02)
+                sock = connect_qmp(guest['proc'], node, qmp_ports[number - 1], handshake, stack)
                 guest['qmp'] = Qmp(sock)
                 require('QMP' in guest['qmp'].receive(handshake), 'invalid QMP greeting')
                 guest['qmp'].execute('qmp_capabilities')
@@ -385,8 +395,6 @@ def run(build_folder, output, qemu, qemu_source, formatter, timeout=120,
                 if process is not None and process.returncode != 0:
                     report.setdefault('error', f'{guest["folder"].name}: QEMU shutdown exit '
                                       f'{process.returncode}')
-                if guest['sock'] is not None:
-                    guest['sock'].close()
                 folder = guest['folder']
                 (folder / 'serial.bin').write_bytes(guest['raw'])
                 (folder / 'serial.txt').write_bytes(guest['serial'])

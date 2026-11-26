@@ -13,6 +13,10 @@ pub mod broker_surface {
     pub const WRITE: u64 = 5;
     pub const CLOSE: u64 = 6;
     pub const YIELD: u64 = 12;
+    pub const ADMISSION_GRANTED: u64 = 0x100;
+    pub const POLL_NORMAL_CLOSE: u64 = 0x101;
+    pub const ADMISSION_RETIRED: u64 = 0x102;
+    pub const ADMISSION_RECEIPT_BYTES: usize = 12;
     pub const PAYLOAD: usize = 4096;
     /// Reserved ciphertext writes bypass the old cluster task/output queue
     /// and use only the native broker's existing bounded TCP send operation.
@@ -25,6 +29,9 @@ pub mod broker_surface {
         }
         match op {
             ENTROPY | READ => arg0 == 0,
+            ADMISSION_GRANTED | POLL_NORMAL_CLOSE | ADMISSION_RETIRED => {
+                len == ADMISSION_RECEIPT_BYTES && arg0 == 0
+            }
             WRITE => arg0 == DIRECT_TLS_CIPHERTEXT && len != 0,
             TIME | POLL | CLOSE | YIELD => len == 0 && arg0 == 0,
             _ => false,
@@ -45,6 +52,10 @@ mod tests {
         assert!(!allowed(WRITE, 20, 0));
         assert!(!allowed(WRITE, 0, DIRECT_TLS_CIPHERTEXT));
         assert!(!allowed(READ, 4097, 0));
+        assert!(allowed(ADMISSION_GRANTED, ADMISSION_RECEIPT_BYTES, 0));
+        assert!(!allowed(ADMISSION_GRANTED, 0, 0));
+        assert!(!allowed(ADMISSION_GRANTED, ADMISSION_RECEIPT_BYTES + 1, 0));
+        assert!(!allowed(ADMISSION_GRANTED, ADMISSION_RECEIPT_BYTES, 1));
         assert!(allowed(POLL, 0, 0));
         assert!(allowed(CLOSE, 0, 0));
         assert!(!allowed(CLOSE, 1, 0));

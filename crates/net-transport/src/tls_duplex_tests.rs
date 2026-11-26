@@ -888,3 +888,53 @@ fn v019_sec_n_d_tls_pending_reply_prevents_even_quiescent_socket_retirement() {
     native_tcp::finish_session(&Terminal, &mut gate, key, &server).unwrap();
     assert_eq!(gate.active_count(), 0);
 }
+
+#[test]
+fn authenticated_normal_close_requires_both_alerts_an_empty_output_and_live_proof() {
+    let pair = v019_local_pairings();
+    let mut client_buf = Buffers::new();
+    let mut server_buf = Buffers::new();
+    let mut client = pair[0].client(&mut client_buf, 0).unwrap();
+    let mut server = pair[1].server(&mut server_buf, 0).unwrap();
+    assert!(server.enable_normal_close().is_err());
+    handshake(&mut client, &mut server);
+    server.enable_normal_close().unwrap();
+    let proof = server.local_echo_proof().unwrap();
+    assert!(!server.retirement_tls_ready());
+
+    let Connection::Client(connection) = &mut client.connection else {
+        unreachable!()
+    };
+    let ConnectionState::WriteTraffic(mut writer) =
+        connection.process_tls_records(&mut []).state.unwrap()
+    else {
+        panic!("client has authenticated write keys");
+    };
+    let mut alert = [0; 128];
+    let n = writer.queue_close_notify(&mut alert).unwrap();
+    server.receive_tls(&alert[..n - 1]).unwrap();
+    server.pump(1).unwrap();
+    assert!(!server.normal_close_complete());
+    server.receive_tls(&alert[n - 1..n]).unwrap();
+    server.pump(2).unwrap();
+    assert_eq!(server.receive_capacity(), 0);
+    server.pump(2).unwrap();
+    assert!(!server.pending_tls().is_empty());
+    let mut response = server.pending_tls().to_vec();
+    let last = response.len() - 1;
+    server.consume_tls(last).unwrap();
+    server.pump(3).unwrap();
+    assert!(!server.retirement_tls_ready());
+    server.consume_tls(1).unwrap();
+    server.pump(4).unwrap();
+    assert!(server.normal_close_complete());
+    assert!(server.send_plaintext(b"late").is_err());
+    assert_eq!(server.local_echo_proof(), Some(proof));
+    assert!(matches!(
+        connection.process_tls_records(&mut response).state,
+        Ok(ConnectionState::PeerClosed)
+    ));
+    server.abort();
+    assert!(!server.retirement_tls_ready());
+    assert!(server.local_echo_proof().is_none());
+}

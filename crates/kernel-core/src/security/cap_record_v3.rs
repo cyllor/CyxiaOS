@@ -244,6 +244,8 @@ struct Entry {
 pub struct StaticControlCaps<const N: usize> {
     boot: u64,
     rows: [Option<Entry>; N],
+    // Fixed role identities, independent of whether a root was ever issued.
+    fenced: [Option<Identity>; rm::ROLE_COUNT],
 }
 impl<const N: usize> StaticControlCaps<N> {
     pub fn new(
@@ -254,6 +256,7 @@ impl<const N: usize> StaticControlCaps<N> {
         Ok(Self {
             boot,
             rows: [None; N],
+            fenced: [None; rm::ROLE_COUNT],
         })
     }
     fn issue_checked(
@@ -274,10 +277,20 @@ impl<const N: usize> StaticControlCaps<N> {
             || r.owner_group != u32::MAX
             || r.record_generation != 1
             || self
-                .rows
+                .fenced
                 .iter()
                 .flatten()
-                .any(|e| e.record.cap_id == r.cap_id)
+                .any(|a| a.id == r.holder.id && a.generation >= r.holder.generation)
+            || self.rows.iter().flatten().any(|e| {
+                e.record.cap_id==r.cap_id
+                // A fenced or retired holder generation may never gain
+                // a new root, even under a previously unused cap_id.
+                ||e.record.holder==r.holder&&e.record.state!=1
+                // Also prevent an old generation being reintroduced
+                // after a replacement has obtained any root.
+                ||e.record.holder.id==r.holder.id&&(e.record.holder.generation>r.holder.generation
+                    ||e.record.holder.generation<r.holder.generation&&e.record.state!=3)
+            })
         {
             return Err(Error::Unauthorized);
         }
@@ -352,6 +365,65 @@ impl<const N: usize> StaticControlCaps<N> {
         }
         verify_live(&r)?;
         Ok(r)
+    }
+    /// Production lookup also checks the current confirmed durable epoch,
+    /// signed configuration, and actual manifest. A stale in-memory root
+    /// or a transaction whose outcome is UNKNOWN cannot reopen authority.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lookup_current(
+        &self,
+        epochs: &DurableEpochGate,
+        config: &VerifiedOfflineConfig<'_>,
+        manifest: &NativeRoleManifest,
+        holder: Identity,
+        cpu: usize,
+        handle: u64,
+        label: Label,
+        target: Identity,
+        verify_live: impl FnOnce(&CapRecordV3) -> Result<(), Error>,
+    ) -> Result<CapRecordV3, Error> {
+        let boot = epochs.confirmed_config_boot(config)?;
+        self.lookup(boot, holder, cpu, handle, label, target, |r| {
+            let (role, authority, _, _) = label.requirement(r.source_role)?;
+            if epochs.service_generation(role)? != holder.generation {
+                return Err(Error::Stale);
+            }
+            manifest
+                .can_act(role, holder, authority, cpu)
+                .map_err(|_| Error::Unauthorized)?;
+            verify_live(r)
+        })
+    }
+    /// Fence the authenticated manifest holder even before its first root
+    /// issuance. No authority derives from an untrusted numeric role ID.
+    pub fn fence_registered(
+        &mut self,
+        manifest: &NativeRoleManifest,
+        holder: Identity,
+        verify_close: impl FnOnce(Identity) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        manifest.validate().map_err(|_| Error::Unauthorized)?;
+        let i = manifest
+            .members
+            .iter()
+            .position(|m| m.actor == holder)
+            .ok_or(Error::Stale)?;
+        if self.fenced[i]
+            .is_some_and(|old| old.id != holder.id || old.generation > holder.generation)
+        {
+            return Err(Error::Stale);
+        }
+        if self.fenced[i] == Some(holder) {
+            return Ok(());
+        }
+        verify_close(holder)?;
+        self.fenced[i] = Some(holder);
+        for e in self.rows.iter_mut().flatten() {
+            if e.record.holder == holder && e.record.state == 1 {
+                e.record.state = 2;
+            }
+        }
+        Ok(())
     }
     /// Seal new use before stopping/draining the role. Retirement requires
     /// independent native reference/DMA/IPC/accepted-work evidence.
@@ -451,6 +523,49 @@ mod tests {
         }
     }
     #[test]
+    fn preissuance_fence_survives_empty_cap_table() {
+        let m = manifest();
+        let r = publisher();
+        let mut table = StaticControlCaps::<2> {
+            boot: 1,
+            rows: [None; 2],
+            fenced: [None; rm::ROLE_COUNT],
+        };
+        assert_eq!(
+            table.fence_registered(&m, r.holder, |_| Err(Error::Unknown)),
+            Err(Error::Unknown)
+        );
+        table
+            .fence_registered(&m, r.holder, |a| {
+                assert_eq!(a, r.holder);
+                Ok(())
+            })
+            .unwrap();
+        table.fence_registered(&m, r.holder, |_| panic!()).unwrap();
+        assert_eq!(
+            table.issue_checked(&m, Label::Publish, r, |_, _| panic!()),
+            Err(Error::Unauthorized)
+        );
+        let mut next = m;
+        next.members[3].actor.generation = 2;
+        let replacement = CapRecordV3 {
+            holder: next.members[3].actor,
+            ..r
+        };
+        table
+            .issue_checked(&next, Label::Publish, replacement, |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(
+            table.issue_checked(
+                &m,
+                Label::Publish,
+                CapRecordV3 { cap_id: 18, ..r },
+                |_, _| panic!()
+            ),
+            Err(Error::Unauthorized)
+        );
+    }
+    #[test]
     fn record_type_rights_and_exact_holder_cap_lookup() {
         let m = manifest();
         let r = publisher();
@@ -472,6 +587,7 @@ mod tests {
         let mut table = StaticControlCaps::<2> {
             boot: 1,
             rows: [None; 2],
+            fenced: [None; rm::ROLE_COUNT],
         };
         let wrong = CapRecordV3 {
             holder: m.members[0].actor,
@@ -517,7 +633,37 @@ mod tests {
             ),
             Err(Error::Unauthorized)
         );
+        let mut replacement_manifest = m;
+        replacement_manifest.members[3].actor.generation = 2;
+        let early = CapRecordV3 {
+            cap_id: 18,
+            holder: replacement_manifest.members[3].actor,
+            ..r
+        };
+        assert_eq!(
+            table.issue_checked(
+                &replacement_manifest,
+                Label::Publish,
+                early,
+                |_, _| panic!()
+            ),
+            Err(Error::Unauthorized)
+        );
         table.fence_holder(r.holder).unwrap();
+        assert_eq!(
+            table.issue_checked(
+                &replacement_manifest,
+                Label::Publish,
+                early,
+                |_, _| panic!()
+            ),
+            Err(Error::Unauthorized)
+        );
+        let fresh = CapRecordV3 { cap_id: 18, ..r };
+        assert_eq!(
+            table.issue_checked(&m, Label::Publish, fresh, |_, _| panic!()),
+            Err(Error::Unauthorized)
+        );
         assert_eq!(
             table.lookup(1, r.holder, 0, h, Label::Publish, r.target, |_| panic!()),
             Err(Error::Stale)
@@ -530,6 +676,36 @@ mod tests {
         assert_eq!(
             table.issue_checked(&m, Label::Publish, r, |_, _| panic!()),
             Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            table.issue_checked(&m, Label::Publish, fresh, |_, _| panic!()),
+            Err(Error::Unauthorized)
+        );
+        let mut next = m;
+        next.members[3].actor.generation = 2;
+        let replacement = CapRecordV3 {
+            holder: next.members[3].actor,
+            ..fresh
+        };
+        let new_handle = table
+            .issue_checked(&next, Label::Publish, replacement, |_, _| Ok(()))
+            .unwrap();
+        assert_ne!(h, new_handle);
+        assert_eq!(
+            table.lookup(1, r.holder, 0, h, Label::Publish, r.target, |_| panic!()),
+            Err(Error::Stale)
+        );
+        assert_eq!(
+            table.lookup(
+                1,
+                replacement.holder,
+                0,
+                new_handle,
+                Label::Publish,
+                r.target,
+                |_| Ok(())
+            ),
+            Ok(replacement)
         );
     }
 }

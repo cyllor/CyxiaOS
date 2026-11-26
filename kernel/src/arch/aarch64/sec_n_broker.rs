@@ -2,11 +2,13 @@
 //! deployment fixture (`v0199_sec_n_fixture.rs`, mock `LoopbackPort`) and the
 //! V0.20 production boot (`production/net.rs`, real VirtIO-net TCP stream).
 //!
-//! Extracted verbatim from the fixture (wave 11 Task 5); the only change is that
-//! `broker` / `run_until_park` are generic over `cyxia_net_transport::device::Port`.
+//! The broker serves both fixture and production transports through
+//! `cyxia_net_transport::device::Port`.
 //! It loads the cross-compiled `user/local-echo` EL0 image into its own private
 //! TTBR0 address space and services the guest's restricted SVC 0x43 broker
-//! (ENTROPY/TIME/POLL/READ/WRITE/CLOSE/YIELD) from a caller-supplied port.
+//! (ENTROPY/TIME/POLL/READ/WRITE/CLOSE/YIELD/ADMISSION_GRANTED) from a caller-supplied port.
+//! The authenticated production stream also supplies POLL_NORMAL_CLOSE and
+//! ADMISSION_RETIRED, both bound to the grant and polled generation.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline 安 0.6 SEC-BUF). Global invariant: the
 //! callers assert cpu::slot()==0 and every function here executes synchronously
@@ -19,12 +21,12 @@
 //!   bss/stack/shared pages are writable only by CPU0 between phases. Every &mut
 //!   is created and consumed within one synchronous CPU0 call; no aliasing.
 //!   Under v020-production they live in the dedicated `.bss.sec_n` link section
-//!   (aarch64.ld places it before every other .bss input, outside the wave-11
-//!   FrameMeta window); they are NOT FrameMeta-registered this wave (open item).
+//!   covered by the production FrameMeta Arena registration for that pinned
+//!   section. Device descriptor custody is tracked separately by its driver.
 //! * Broker state (CONN_EPOCH, CONNECTED, STALL_AFTER_POLL, POLL_COUNT, OP_COUNTS,
 //!   CLOSE_SEEN, YIELD_RUN, ENTROPY_STATE, QUIESCENCE_REFUSED, HANDSHAKE_POLLS,
-//!   POLLED_CONNECTED, LEASE_COUNTED, INFERRED_LEASES, RELAYED_BYTES,
-//!   STREAM_CLOSED)
+//!   CONN_SOURCE, POLLED_EPOCH, ADMISSION_RECEIPT, RELAYED_BYTES,
+//!   STREAM_CLOSED, RETIREMENT)
 //!   (static mut): CPU0-only, read/written only by the functions below and the
 //!   by-value accessors; no reference escapes.
 //! * load_guest()/map_page()/seal_page()/sync_code(): raw addr_of! arithmetic over
@@ -35,6 +37,9 @@
 //!   0x02000000 broker page) through its checked high-half alias; it never walks the
 //!   guest code/data pages and never trusts guest bytes as kernel pointers.
 //! * asm!("dsb/tlbi/ic"): bounded TLB/cache maintenance; options(nostack).
+#[path = "sec_n_broker/receipt.rs"]
+mod receipt;
+
 use super::*;
 use cyxia_net_transport::device::{self, Port};
 
@@ -71,6 +76,12 @@ const OP_READ: u64 = 4;
 pub(crate) const OP_WRITE: u64 = 5;
 pub(crate) const OP_CLOSE: u64 = 6;
 pub(crate) const OP_YIELD: u64 = 12;
+const OP_ADMISSION_GRANTED: u64 = 0x100;
+#[cfg(feature = "v020-production-authenticated-net")]
+const OP_POLL_NORMAL_CLOSE: u64 = 0x101;
+#[cfg(feature = "v020-production-authenticated-net")]
+const OP_ADMISSION_RETIRED: u64 = 0x102;
+
 const DIRECT_TLS_CIPHERTEXT: u64 = 1;
 // Shared-page field offsets (exact protected layout, see abi.rs const asserts).
 const OFF_MAGIC: u64 = 0;
@@ -103,6 +114,7 @@ const PEER_NODE: [u8; 32] = [
     0xc0, 0x4a, 0xfa, 0x5e, 0xe9, 0x08, 0xe7, 0x7e, 0x04, 0x9a, 0x4b, 0xbf, 0xde, 0x03, 0x2f, 0xf0,
     0x97, 0xeb, 0x54, 0xca, 0xf3, 0xbc, 0x14, 0x77, 0x6a, 0xcd, 0xee, 0x22, 0x07, 0x4b, 0x06, 0xc7,
 ];
+#[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) const SOURCE_IP: u32 = 0x0A00_0202; // 10.0.2.2, trusted native owner observation.
 const BOOT_EPOCH: u64 = 1;
 const SERVICE_GEN: u64 = 1;
@@ -143,15 +155,31 @@ static mut POLL_COUNT: u64 = 0;
 static mut OP_COUNTS: [u64; 16] = [0; 16];
 static mut CLOSE_SEEN: bool = false;
 static mut YIELD_RUN: u64 = 0;
+#[cfg(any(
+    feature = "v0199-sec-n-selftest",
+    not(feature = "v020-production-authenticated-net")
+))]
 static mut ENTROPY_STATE: u64 = 0;
 static mut QUIESCENCE_REFUSED: u64 = 0;
 static mut HANDSHAKE_POLLS: u64 = 0;
 // Production accounting (inert for the mock-port fixture, which never reads it).
-static mut POLLED_CONNECTED: bool = false;
-static mut LEASE_COUNTED: bool = false;
-static mut INFERRED_LEASES: u64 = 0;
+static mut CONN_SOURCE: u32 = 0;
+static mut POLLED_EPOCH: u64 = 0;
+static mut ADMISSION_RECEIPT: Option<(u64, u32)> = None;
 static mut RELAYED_BYTES: u64 = 0;
 static mut STREAM_CLOSED: u64 = 0;
+// CPU0 only, reset when a stream is staged. The staged grant binds these
+// states to the same socket generation and source throughout the relay.
+#[cfg(feature = "v020-production-authenticated-net")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Retirement {
+    Open,
+    Closing,
+    Quiescent,
+    Retired,
+}
+#[cfg(feature = "v020-production-authenticated-net")]
+static mut RETIREMENT: Retirement = Retirement::Open;
 
 fn le16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
@@ -375,7 +403,12 @@ fn shared_put(off: u64, bytes: &[u8]) {
 
 /// Stage the protected shared page before a fresh guest run. `local` is the
 /// kernel-local node pin presented to the guest (wrong value => identity negative).
+#[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn stage_shared(local: [u8; 32], connected: bool, conn_epoch: u64) {
+    stage_connection(local, connected, conn_epoch, SOURCE_IP);
+}
+
+pub(crate) fn stage_connection(local: [u8; 32], connected: bool, conn_epoch: u64, source: u32) {
     let p = shared_ptr();
     unsafe { core::ptr::write_bytes(p, 0, SHARED_PAGES * PAGE) };
     shared_write(OFF_MAGIC, SVC_MAGIC);
@@ -388,7 +421,7 @@ pub(crate) fn stage_shared(local: [u8; 32], connected: bool, conn_epoch: u64) {
     shared_put(OFF_LOCAL_NODE, &local);
     shared_put(OFF_PEER_NODE, &PEER_NODE);
     shared_write(OFF_CONN_EPOCH, conn_epoch);
-    shared_write(OFF_PEER_IPV4, u64::from(SOURCE_IP));
+    shared_write(OFF_PEER_IPV4, u64::from(source));
     unsafe {
         CONN_EPOCH = conn_epoch;
         CONNECTED = connected;
@@ -397,11 +430,15 @@ pub(crate) fn stage_shared(local: [u8; 32], connected: bool, conn_epoch: u64) {
         YIELD_RUN = 0;
         OP_COUNTS = [0; 16];
         HANDSHAKE_POLLS = 0;
-        POLLED_CONNECTED = false;
-        LEASE_COUNTED = false;
-        INFERRED_LEASES = 0;
+        CONN_SOURCE = source;
+        POLLED_EPOCH = 0;
+        ADMISSION_RECEIPT = None;
         RELAYED_BYTES = 0;
         STREAM_CLOSED = 0;
+        #[cfg(feature = "v020-production-authenticated-net")]
+        {
+            RETIREMENT = Retirement::Open;
+        }
     }
 }
 
@@ -434,15 +471,27 @@ fn allowed(op: u64, len: u64, arg0: u64) -> bool {
     }
     match op {
         OP_ENTROPY | OP_READ => arg0 == 0,
+        #[cfg(feature = "v020-production-authenticated-net")]
+        OP_POLL_NORMAL_CLOSE | OP_ADMISSION_RETIRED => {
+            len == receipt::WIRE_BYTES as u64 && arg0 == 0
+        }
+        OP_ADMISSION_GRANTED => len == receipt::WIRE_BYTES as u64 && arg0 == 0,
         OP_WRITE => arg0 == DIRECT_TLS_CIPHERTEXT && len != 0,
         OP_TIME | OP_POLL | OP_CLOSE | OP_YIELD => len == 0 && arg0 == 0,
         _ => false,
     }
 }
 
-/// Deterministic fixture PRNG (NOT a production CSPRNG). Sufficient only because
-/// no real cryptographic session completes on top of it.
-pub(crate) fn fixture_entropy(out: &mut [u8]) {
+type ClosePoll<P> = fn(&mut P) -> Result<bool, device::Error>;
+
+pub(crate) type EntropyFill<'a> = dyn FnMut(&mut [u8]) -> bool + 'a;
+
+/// Non-authenticated fixture entropy. The authenticated mode has no fallback.
+#[cfg(any(
+    feature = "v0199-sec-n-selftest",
+    not(feature = "v020-production-authenticated-net")
+))]
+pub(crate) fn fixture_entropy(out: &mut [u8]) -> bool {
     let mut state = unsafe { ENTROPY_STATE };
     if state == 0 {
         state = timer::ticks() | 1;
@@ -458,14 +507,18 @@ pub(crate) fn fixture_entropy(out: &mut [u8]) {
         }
     }
     unsafe { ENTROPY_STATE = state };
+    true
 }
 
 /// Service one SVC 0x43 broker request from the shared page. The kernel never
 /// touches sequence/magic/version/epoch/generation (the guest re-validates them).
-pub(crate) fn broker<P: Port>(port: &mut P) {
+fn broker<P: Port>(port: &mut P, entropy: &mut EntropyFill<'_>, close_poll: Option<ClosePoll<P>>) {
     let op = shared_read(OFF_OP);
     let len = shared_read(OFF_LEN);
     let arg0 = shared_read(OFF_ARG0);
+    if !allowed(op, len, arg0) {
+        return reply(0, ST_FAILED);
+    }
     if op < 16 {
         unsafe { OP_COUNTS[op as usize] += 1 };
     }
@@ -476,26 +529,27 @@ pub(crate) fn broker<P: Port>(port: &mut P) {
     }
     if op == OP_CLOSE {
         unsafe { CLOSE_SEEN = true };
-        // The device boundary cannot certify TX quiescence: finish/retirement is
-        // refused (fail-closed). Record the refusal; no credit is released.
+        // CLOSE parks the guest. The normal-retirement operations independently
+        // verify the TCP/driver witness and record the guest ledger receipt.
         if !port.tx_quiescent() {
             unsafe { QUIESCENCE_REFUSED += 1 };
         }
     }
-    if !allowed(op, len, arg0) {
-        shared_write(OFF_STATUS, ST_FAILED);
-        shared_write(OFF_LEN, 0);
-        return;
-    }
     match op {
-        OP_ENTROPY => broker_entropy(len),
+        OP_ENTROPY => broker_entropy(len, entropy),
         OP_TIME => {
             shared_write(OFF_MONOTONIC_MS, now_ms());
             shared_write(OFF_MONOTONIC_NS, now_ns());
             shared_write(OFF_UNIX_SECONDS, UNIX_SECONDS);
             reply(0, ST_OK);
         }
-        OP_POLL => broker_poll(),
+        OP_POLL => broker_poll(close_poll.is_some()),
+        #[cfg(feature = "v020-production-authenticated-net")]
+        OP_POLL_NORMAL_CLOSE | OP_ADMISSION_RETIRED => broker_normal_close(port, close_poll, op),
+        #[cfg(feature = "v020-production-authenticated-net")]
+        OP_READ | OP_WRITE if unsafe { RETIREMENT } != Retirement::Open => reply(0, ST_FAILED),
+        OP_ADMISSION_GRANTED => broker_admission_granted(),
+        OP_READ | OP_WRITE if !unsafe { CONNECTED } => reply(0, ST_EOF),
         OP_READ => broker_read(port, len),
         OP_WRITE => broker_write(port, len),
         OP_CLOSE => {
@@ -515,26 +569,87 @@ fn reply(len: u64, status: u64) {
     shared_write(OFF_STATUS, status);
 }
 
-fn broker_entropy(len: u64) {
-    // INFERRED lease: the guest calls Admission::begin_ns right after a connected
-    // POLL and parks (CLOSE, no ENTROPY) if it fails; only a granted lease reaches
-    // Pairing::server, whose rustls session is the first ENTROPY requester. So the
-    // first ENTROPY after a connected POLL is counted as one issued lease. The
-    // guest does not report its Admission count; this is a broker-trace inference.
-    unsafe {
-        if POLLED_CONNECTED && !LEASE_COUNTED {
-            LEASE_COUNTED = true;
-            INFERRED_LEASES += 1;
-        }
+/// Witness one successful guest grant for the staged connection. Only the
+/// sealed guest runs in this address space; network bytes cannot dispatch an SVC.
+fn broker_admission_granted() {
+    let mut receipt = [0u8; receipt::WIRE_BYTES];
+    shared_bytes(OFF_PAYLOAD, &mut receipt);
+    // Snapshot protected state by value. The shared page is guest-writable.
+    let (connected, epoch, polled_epoch, source, prior) = unsafe {
+        (
+            CONNECTED,
+            CONN_EPOCH,
+            POLLED_EPOCH,
+            CONN_SOURCE,
+            ADMISSION_RECEIPT,
+        )
+    };
+    let Some(grant) = receipt::validate(
+        &receipt,
+        connected,
+        epoch,
+        polled_epoch,
+        source,
+        prior.is_some(),
+    ) else {
+        return reply(0, ST_FAILED);
+    };
+    unsafe { ADMISSION_RECEIPT = Some(grant) };
+    reply(0, ST_OK);
+}
+
+#[cfg(feature = "v020-production-authenticated-net")]
+fn broker_normal_close<P: Port>(port: &mut P, close_poll: Option<ClosePoll<P>>, op: u64) {
+    let Some(poll) = close_poll else {
+        return reply(0, ST_FAILED);
+    };
+    let mut wire = [0; receipt::WIRE_BYTES];
+    shared_bytes(OFF_PAYLOAD, &mut wire);
+    let (connected, epoch, polled, source, grant, state) = unsafe {
+        (
+            CONNECTED,
+            CONN_EPOCH,
+            POLLED_EPOCH,
+            CONN_SOURCE,
+            ADMISSION_RECEIPT,
+            RETIREMENT,
+        )
+    };
+    let identity = receipt::validate(&wire, connected, epoch, polled, source, false);
+    if identity.is_none() || identity != grant {
+        return reply(0, ST_FAILED);
     }
+    match (op, state) {
+        (OP_POLL_NORMAL_CLOSE, Retirement::Open | Retirement::Closing) => {
+            unsafe { RETIREMENT = Retirement::Closing };
+            match poll(port) {
+                Ok(true) => {
+                    unsafe { RETIREMENT = Retirement::Quiescent };
+                    reply(0, ST_OK)
+                }
+                Ok(false) => reply(0, ST_AGAIN),
+                Err(_) => disconnect(),
+            }
+        }
+        (OP_ADMISSION_RETIRED, Retirement::Quiescent) => {
+            unsafe { RETIREMENT = Retirement::Retired };
+            reply(0, ST_OK)
+        }
+        _ => reply(0, ST_FAILED),
+    }
+}
+
+fn broker_entropy(len: u64, fill: &mut EntropyFill<'_>) {
     let n = len as usize;
     let mut buf = [0u8; PAYLOAD];
-    fixture_entropy(&mut buf[..n]);
+    if !fill(&mut buf[..n]) {
+        return reply(0, ST_FAILED);
+    }
     shared_put(OFF_PAYLOAD, &buf[..n]);
     reply(n as u64, ST_OK);
 }
 
-fn broker_poll() {
+fn broker_poll(normal_close: bool) {
     unsafe {
         POLL_COUNT += 1;
         if CONNECTED {
@@ -546,11 +661,14 @@ fn broker_poll() {
             CONN_EPOCH += 1;
         }
     }
-    let (connected, epoch) = unsafe { (CONNECTED, CONN_EPOCH) };
-    unsafe { POLLED_CONNECTED |= connected };
+    let (connected, epoch, source) = unsafe { (CONNECTED, CONN_EPOCH, CONN_SOURCE) };
+    unsafe { POLLED_EPOCH = if connected { epoch } else { 0 } };
     shared_write(OFF_CONN_EPOCH, epoch);
-    shared_write(OFF_PEER_IPV4, u64::from(SOURCE_IP));
-    shared_write(OFF_ARG0, u64::from(connected));
+    shared_write(OFF_PEER_IPV4, u64::from(source));
+    shared_write(
+        OFF_ARG0,
+        u64::from(connected) | (u64::from(normal_close && connected) << 1),
+    );
     reply(0, ST_OK);
 }
 
@@ -566,12 +684,12 @@ fn broker_read<P: Port>(port: &mut P, len: u64) {
     }
     let mut frame = [0u8; device::MTU];
     match port.receive_up_to(&mut frame, limit) {
-        Ok(Some(n)) if n <= limit => {
+        Ok(Some(n)) if n != 0 && n <= limit && n <= frame.len() => {
             shared_put(OFF_PAYLOAD, &frame[..n]);
             unsafe { RELAYED_BYTES += n as u64 };
             reply(n as u64, ST_OK);
         }
-        Ok(None) | Err(device::Error::WouldBlock) => reply(0, ST_AGAIN),
+        Ok(None | Some(0)) | Err(device::Error::WouldBlock) => reply(0, ST_AGAIN),
         Ok(Some(_)) | Err(device::Error::Device | device::Error::Frame) => disconnect(),
     }
 }
@@ -626,7 +744,7 @@ pub(crate) struct GuestStop {
 /// `try_run_until_park` and never halts on a guest stop).
 #[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn run_until_park<P: Port>(layout: &Layout, port: &mut P, budget: u64) -> u64 {
-    match try_run_until_park(layout, port, budget) {
+    match try_run_until_park(layout, port, &mut fixture_entropy, budget) {
         Ok(dispatched) => dispatched,
         Err(stop) => fatal(stop.code),
     }
@@ -634,10 +752,25 @@ pub(crate) fn run_until_park<P: Port>(layout: &Layout, port: &mut P, budget: u64
 
 /// Run the guest until it parks or a bounded SVC budget is spent, returning the
 /// stop instead of halting the boot. Returns the number of SVC dispatches.
+#[cfg(any(
+    feature = "v0199-sec-n-selftest",
+    not(feature = "v020-production-authenticated-net")
+))]
 pub(crate) fn try_run_until_park<P: Port>(
     layout: &Layout,
     port: &mut P,
+    entropy: &mut EntropyFill<'_>,
     budget: u64,
+) -> Result<u64, GuestStop> {
+    run_guest(layout, port, entropy, budget, None)
+}
+
+pub(crate) fn run_guest<P: Port>(
+    layout: &Layout,
+    port: &mut P,
+    entropy: &mut EntropyFill<'_>,
+    budget: u64,
+    close_poll: Option<ClosePoll<P>>,
 ) -> Result<u64, GuestStop> {
     let root = phys(core::ptr::addr_of!(GUEST_ROOT) as u64);
     let mut ctx = fresh_context(layout);
@@ -655,7 +788,7 @@ pub(crate) fn try_run_until_park<P: Port>(
         if iss != 0x43 {
             return stop(901, dispatched); // only SVC 0x43 is admitted for this guest.
         }
-        broker(port);
+        broker(port, entropy, close_poll);
         dispatched += 1;
         // ELR already points past the trapped SVC; resume with no register return
         // (the broker ABI carries results in the shared page, not x0).
@@ -668,11 +801,14 @@ pub(crate) fn try_run_until_park<P: Port>(
 }
 
 // ---- by-value broker state accessors (no reference to a static escapes) ----
-/// Leases inferred from the broker trace (see `broker_entropy`), not reported
-/// by the guest.
+/// The accepted receipt for this one-shot guest connection.
 #[cfg(feature = "v020-production")]
-pub(crate) fn inferred_leases() -> u64 {
-    unsafe { INFERRED_LEASES }
+pub(crate) fn admission_receipt() -> Option<(u64, u32)> {
+    unsafe { ADMISSION_RECEIPT }
+}
+#[cfg(feature = "v020-production-authenticated-net")]
+pub(crate) fn retired() -> bool {
+    unsafe { RETIREMENT == Retirement::Retired }
 }
 /// Ingress bytes delivered to the guest through SVC 0x43 READ.
 #[cfg(feature = "v020-production")]

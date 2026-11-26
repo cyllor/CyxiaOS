@@ -827,14 +827,15 @@ pub(super) fn run() -> ! {
     let rules = rule_bytes();
     let profile = Profile::parse(&rules).expect("RuleProfile v2");
     let candidates = [2u16, 4];
-    let payload = [4u8, 0];
+    let payloads: [&[u8]; 2] = [&[2, 0], &[4, 0]];
     let local = FrozenAction {
         domain_id: 1,
         target: TARGET,
         candidate_set_hash: [1; 32],
         static_ordinals: &candidates,
+        candidate_payloads: &payloads,
         raw_fields: [None; 7],
-        action_payload: &payload,
+        action_payload: payloads[1],
     };
     let trusted = trusted_scope();
     let scope = AssistedScope {

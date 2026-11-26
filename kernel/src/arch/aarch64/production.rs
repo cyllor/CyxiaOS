@@ -18,19 +18,22 @@
 //!   claim_apply_work -> ApplyReport -> supervisor terminal) runs through the
 //!   SAME kernel-core bridge APIs the advice-e2e fixture uses, but every EL0
 //!   0x50/0x41 trap is serviced in the exception vector, not a turn loop.
+//! * Wave 11 adds permanent FrameMeta registration, the in-memory recovery
+//!   gate and stopped-writer handoff, diagnostic critical-section metering,
+//!   and real VirtIO TCP delivery plus the guest Admission receipt at 0x43.
 //!
 //! HONEST SCOPE / REMAINING GAPS (do NOT read this as full production authority):
 //! * production_skeleton=true, full_authority=false, real_models=false.
-//! * The boot epoch is STAGED (volatile BOOT=1). There is no durable BootEpoch
-//!   journal mount here; T5's durable BootEpoch contract is not yet landed, so
-//!   this skeleton deliberately does not claim a persistent epoch.
-//! * The executor is a bounded fixture target word (one EL1-owned page), NOT a
-//!   real driver/peripheral. The snapshot backend stays fail-closed (EAGAIN):
-//!   read_snapshot_rpc + SnapshotStore + live ViewGrant wiring is a later gate.
+//! * The live boot epoch is volatile (BOOT=1). The opt-in media path allocates
+//!   a separate staged epoch on its scratch disk. Checkpoint facts for the
+//!   live publish gate are staged in memory; durable audit has no media binding.
+//! * The executor is a bounded fixture target word on one EL1-owned page.
+//!   The live-control feature serves its D01 observation and a volatile audit
+//!   record once ready. Immutable disk snapshots and durable audit are open.
 //! * No real model is active; the decision artifacts are trusted EL1 fixtures.
-//! * Role budget metering (role_budget_v0199 PMU ledger) and service restart are
-//!   NOT reproduced here; turns are bounded by a fixed iteration cap + private
-//!   timer backstop, as in the smp mechanism.
+//! * Policy-lock timing is diagnostic. Role budget metering
+//!   (role_budget_v0199 PMU ledger) and service restart remain open; turns use
+//!   a fixed iteration cap and private timer backstop.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
 //! Global invariant: run() asserts cpu::slot()==0 for the control plane; the
@@ -104,6 +107,9 @@ use sha2::{Digest, Sha256};
 
 #[path = "production/evidence.rs"]
 mod evidence;
+#[cfg(feature = "v020-production-file-read")]
+#[path = "production/file_read.rs"]
+mod file_read;
 #[path = "production/frames.rs"]
 mod frames;
 #[cfg(feature = "v020-production-media-staging")]
@@ -113,8 +119,14 @@ mod media_staging;
 mod meter;
 #[path = "production/net.rs"]
 mod net;
+#[cfg(feature = "v020-production-live-control")]
+#[path = "production/observations.rs"]
+mod observations;
 #[path = "production/recovery.rs"]
 pub(crate) mod recovery;
+#[cfg(feature = "v020-production-snapshot-catalog")]
+#[path = "production/snapshot_catalog.rs"]
+mod snapshot_catalog;
 
 // The production skeleton owns the CPU0 EL0 turn loop and the in-vector dispatch
 // path; it must not be combined with another profile that also hijacks CPU0 or
@@ -742,9 +754,13 @@ fn load_role(index: usize) -> NativeRole {
         .expect("private PIE stage");
     let stack = unsafe { &mut *core::ptr::addr_of_mut!((*b).stack) };
     let cap_selector = pie_cap_selector(index);
+    #[cfg(feature = "v020-production-live-control")]
+    let target_selector = observations::selector(role);
+    #[cfg(not(feature = "v020-production-live-control"))]
+    let target_selector = 0u64;
     let mut args = [0u8; 24];
     args[..8].copy_from_slice(&cap_selector.to_le_bytes());
-    args[8..16].copy_from_slice(&0u64.to_le_bytes());
+    args[8..16].copy_from_slice(&target_selector.to_le_bytes());
     args[16..24].copy_from_slice(&actor.generation.to_le_bytes());
     let startup =
         cyxia_kernel_core::security::syscall_v3::stage_spawn_args(stack, STACK_BASE, &args)
@@ -881,9 +897,26 @@ fn svc_dispatch(f: &mut ExceptionFrame) -> Option<u64> {
     if caller == CALLER_NONE {
         return None;
     }
-    let call = decode_aarch64_svc_v3(3, f.esr, &f.regs).ok()?;
-    let args = call.args;
     let x8 = f.regs[8];
+    let args = match decode_aarch64_svc_v3(3, f.esr, &f.regs) {
+        Ok(call) => call.args,
+        Err(_) => {
+            // A failed ABI check can report a refusal for the recognized endpoint.
+            #[cfg(any(
+                feature = "v020-production-snapshot-catalog",
+                feature = "v020-production-file-read"
+            ))]
+            if f.esr == 0x5600_0000 && caller < ROLE_COUNT as u64 && x8 == 0x50 {
+                let index = caller as usize;
+                if let Some(outcome) =
+                    reject_service_preflight(index, f.regs[..6].try_into().unwrap())
+                {
+                    return Some(outcome);
+                }
+            }
+            return None;
+        }
+    };
     if !matches!(x8, 0x40 | 0x41 | 0x50) {
         return None;
     }
@@ -898,18 +931,100 @@ fn svc_dispatch(f: &mut ExceptionFrame) -> Option<u64> {
     SVC_OUT[idx].store(outcome, Ordering::Relaxed);
     Some(outcome)
 }
-/// PIE role bootstrap subset: snapshot (0x40) and supervisor audit (0x50 op1)
-/// are authenticated and fail closed (EAGAIN) — no durable snapshot/audit source
-/// exists at boot. Clock/yield/sleep are NOT in the production set and fall
-/// through to the turn loop.
-fn pie_dispatch(index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u64 {
-    let member = unsafe {
+fn pie_member(index: usize) -> NativeRole {
+    unsafe {
         core::ptr::read_volatile(
             core::ptr::addr_of!(PIE_MEMBERS)
                 .cast::<NativeRole>()
                 .add(index),
         )
-    };
+    }
+}
+
+#[cfg(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read"
+))]
+fn reject_service_preflight(index: usize, args: [u64; 6]) -> Option<u64> {
+    match args[0] {
+        #[cfg(feature = "v020-production-snapshot-catalog")]
+        cyxia_kernel_core::security::snapshot_list_v4::LIST_ENDPOINT => Some(
+            snapshot_catalog::reject_preflight(index, pie_member(index), args),
+        ),
+        #[cfg(feature = "v020-production-file-read")]
+        cyxia_kernel_core::security::file_read_v4::ENDPOINT => {
+            Some(file_read::reject_preflight(index, pie_member(index), args))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read"
+))]
+fn registered_pie_cap(index: usize, member: NativeRole) -> Option<u64> {
+    if ROLES.get(index) != Some(&member.role)
+        || member != pie_member(index)
+        || member.ttbr0_root != root_pa(index)
+    {
+        return None;
+    }
+    let cap = PIE_CAP[index].load(Ordering::Acquire);
+    (cap != 0 && cap == pie_cap_selector(index)).then_some(cap)
+}
+
+#[cfg(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read"
+))]
+fn trapped_pie_cap(index: usize, member: NativeRole) -> Result<u64, i64> {
+    if cpu::slot() != 0 || VECTOR_CALLER[0].load(Ordering::Acquire) != index as u64 {
+        return Err(E_AUTH);
+    }
+    let cap = registered_pie_cap(index, member).ok_or(E_AUTH)?;
+    let ttbr0: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags));
+    }
+    if ttbr0 != (member.ttbr0_root | (u64::from(role_asid(index)) << 48)) {
+        return Err(E_AUTH);
+    }
+    Ok(cap)
+}
+
+#[cfg(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read"
+))]
+fn wait_for_role_yield(
+    index: usize,
+    ctx: &mut user::Context,
+    until: u64,
+    failure: u64,
+    done: impl Fn() -> bool,
+) {
+    use cyxia_kernel_core::security::syscall::Syscall;
+
+    loop {
+        if ctx.kind == 8
+            && decode_aarch64_svc_v3(3, ctx.esr, &ctx.regs)
+                .is_ok_and(|call| call.operation == Syscall::Yield)
+            && done()
+        {
+            return;
+        }
+        if timer::ticks() >= until {
+            fatal(failure);
+        }
+        pie_turn(index, ctx);
+    }
+}
+
+/// In-vector snapshot/audit and optional catalogue requests share the
+/// protected PIE membership. Clock, yield and sleep use the turn loop.
+fn pie_dispatch(index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u64 {
+    let member = pie_member(index);
     let cap = PIE_CAP[index].load(Ordering::Acquire);
     match x8 {
         0x40 => {
@@ -930,6 +1045,10 @@ fn pie_dispatch(index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u
                 return EFAULT as u64;
             }
             PIE_ROLE_CALLS[index].fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "v020-production-live-control")]
+            if let Some(outcome) = observations::snapshot(index, member, args) {
+                return outcome;
+            }
             #[cfg(feature = "v020-production-media-staging")]
             {
                 media_staging::snapshot_0x40()
@@ -939,12 +1058,22 @@ fn pie_dispatch(index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u
                 EAGAIN as u64
             }
         }
-        0x50 if args[2] == 64 => {
-            // Supervisor AUDIT_READ op1: only the supervisor role, cap + span.
+        #[cfg(feature = "v020-production-snapshot-catalog")]
+        0x50 if args[0] == cyxia_kernel_core::security::snapshot_list_v4::LIST_ENDPOINT => {
+            snapshot_catalog::dispatch(index, member, args)
+        }
+        #[cfg(feature = "v020-production-file-read")]
+        0x50 if args[0] == cyxia_kernel_core::security::file_read_v4::ENDPOINT => {
+            file_read::dispatch(index, member, args)
+        }
+        0x50 if args[2] == 64
+            || (cfg!(feature = "v020-production-live-control") && args[2] == 96) =>
+        {
+            // Live Supervisor audit accepts the frozen READ and ACK wire sizes.
             if member.role != Role::Supervisor || cap == 0 || args[0] != cap || args[3] != 0 {
                 return E_AUTH as u64;
             }
-            if stack_span(index, args[1], 64, false).is_none()
+            if stack_span(index, args[1], args[2] as usize, false).is_none()
                 || usize::try_from(args[5])
                     .ok()
                     .and_then(|len| stack_span(index, args[4], len, true))
@@ -953,7 +1082,14 @@ fn pie_dispatch(index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u
                 return EFAULT as u64;
             }
             PIE_ROLE_CALLS[index].fetch_add(1, Ordering::Relaxed);
-            EAGAIN as u64
+            #[cfg(feature = "v020-production-live-control")]
+            {
+                observations::audit(index, member, args)
+            }
+            #[cfg(not(feature = "v020-production-live-control"))]
+            {
+                EAGAIN as u64
+            }
         }
         _ => E_FORMAT as u64,
     }
@@ -1106,6 +1242,7 @@ fn with_bundle(f: impl FnOnce(&FrozenNativePlan<'_>, &AssistedScope<'_>) -> u64)
         target: TARGET,
         candidate_set_hash: [1; 32],
         static_ordinals: candidates,
+        candidate_payloads: &[&[2, 0], payload],
         raw_fields: [None; 7],
         action_payload: payload,
     };
@@ -1140,12 +1277,14 @@ fn with_bundle(f: impl FnOnce(&FrozenNativePlan<'_>, &AssistedScope<'_>) -> u64)
 /// Production exception entry: dispatch the ABI-v3 production subset in-vector,
 /// fall through to the proven smp path for everything else.
 pub(crate) fn exception(f: &mut ExceptionFrame, kind: u64) {
-    if kind == 8 && f.esr >> 26 == 0x15
-        && let Some(outcome) = svc_dispatch(f) {
-            f.regs[0] = outcome;
-            // ELR_EL1 already points past the trapped SVC; SPSR stays EL0t.
-            return;
-        }
+    if kind == 8
+        && f.esr >> 26 == 0x15
+        && let Some(outcome) = svc_dispatch(f)
+    {
+        f.regs[0] = outcome;
+        // ELR_EL1 already points past the trapped SVC; SPSR stays EL0t.
+        return;
+    }
     super::exception(f, kind);
 }
 
@@ -1234,6 +1373,14 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         "only boot CPU0 owns the production control plane"
     );
     frames::register_or_fatal();
+    #[cfg(feature = "v020-production-frame-pool")]
+    let reserved_info = {
+        let mut reserved = *info;
+        frames::prove_pool_or_fatal(&mut reserved);
+        reserved
+    };
+    #[cfg(feature = "v020-production-frame-pool")]
+    let info = &reserved_info;
     recovery::init_or_fatal();
     // ---- SMP bring-up: mirrors smp::run's proven secondary-start path ----
     if info.cpu_count != REQUIRED {
@@ -1300,12 +1447,19 @@ pub(crate) fn run(info: &BootInfo) -> ! {
 
     // ---- Phase 1: load + run the eight ABI3 PIE role packages ----
     let pie_members: [NativeRole; ROLE_COUNT] = core::array::from_fn(load_role);
+    let other_protected_pool_bytes =
+        core::mem::size_of::<[Tables; ROLE_COUNT]>() + COPY + 1024 * 1024;
+    #[cfg(feature = "v020-production-live-control")]
+    let other_protected_pool_bytes = other_protected_pool_bytes + observations::protected_bytes();
+    #[cfg(feature = "v020-production-snapshot-catalog")]
+    let other_protected_pool_bytes =
+        other_protected_pool_bytes + snapshot_catalog::protected_bytes();
+    #[cfg(feature = "v020-production-file-read")]
+    let other_protected_pool_bytes = other_protected_pool_bytes + file_read::protected_bytes();
     let pie_manifest = NativeRoleManifest {
         online_mask: profile::ONLINE,
         members: pie_members,
-        other_protected_pool_bytes: core::mem::size_of::<[Tables; ROLE_COUNT]>()
-            + COPY
-            + 1024 * 1024,
+        other_protected_pool_bytes,
         other_control_ns_per_100ms: 10_000_000,
     };
     pie_manifest
@@ -1746,6 +1900,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     wait(|| (1..REQUIRED).all(|slot| GATES[slot].quiescent()));
     QUIT.store(true, Ordering::Release);
     wait(|| STOPPED.load(Ordering::Acquire) == 14);
+    recovery::takeover_stopped();
     check_failures();
     for slot in 1..REQUIRED {
         report(
@@ -1882,6 +2037,16 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     net::publish(&net_outcome);
     #[cfg(feature = "v020-production-media-staging")]
     media_staging::publish(&staging_outcome);
+    #[cfg(feature = "v020-production-live-control")]
+    observations::drive(&mut pie_ctx, &pie_manifest);
+    #[cfg(feature = "v020-production-file-read")]
+    if let Some(view) = staging_outcome.file_read {
+        file_read::drive(&mut pie_ctx, &pie_manifest, view);
+    }
+    #[cfg(feature = "v020-production-snapshot-catalog")]
+    if let Some(view) = staging_outcome.snapshot_catalog {
+        snapshot_catalog::drive(&mut pie_ctx, &pie_manifest, view);
+    }
     words.words[2].store(1, Ordering::Release);
     // Framed UART payloads are capped at 96 bytes; keep the scope marker short.
     // in_vector_dispatch / staged_boot_epoch / fixture_executor are proven by the

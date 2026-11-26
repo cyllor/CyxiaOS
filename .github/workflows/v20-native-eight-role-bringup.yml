@@ -17,6 +17,11 @@ on:
       - 'crates/control-model/src/native_v0199.rs'
       - 'crates/kernel-core/src/security/epoch_redo_v0199.rs'
       - 'kernel/src/arch/aarch64/v0199_epoch_disk.rs'
+      - 'kernel/src/arch/aarch64/v0199_d*_fixture.rs'
+      - 'crates/kernel-core/src/control_plane/d*_owner_v0199.rs'
+      - 'crates/kernel-core/src/control_plane/desired_plan_v0199.rs'
+      - 'crates/kernel-core/src/control_plane/pie_image_v0199.rs'
+      - 'crates/arch-aarch64/src/timer.rs'
       - 'tools/verify_v0199_epoch_disk.py'
   workflow_dispatch:
 permissions:

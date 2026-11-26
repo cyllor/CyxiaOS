@@ -41,7 +41,11 @@ const TURN_EXIT_GUARD_NS: u64 = 100_000;
 // before the initial eight-role milestone. A validated manifest borrow
 // alone did not eliminate the overrun. Shorten only the diagnostic
 // execution slice and retain all measured trap/dispatch overhead.
-const DECISION_SLICE_NS: u64 = 50_000;
+// PR90 capture-2: role2 443074ns / 250000ns. Keep the same
+// reservation, reduce the diagnostic EL0 wall slice and reserve more
+// exit/dispatch headroom. This is not a physical WCET claim.
+const DECISION_SLICE_NS: u64 = 20_000;
+const DECISION_EXIT_GUARD_NS: u64 = 150_000;
 const E_AUTH: i64 = -1;
 const E_FORMAT: i64 = -2;
 const E_UNSUPPORTED: i64 = -11;
@@ -112,6 +116,19 @@ fn disk_pool() -> u64 {
     assert_ne!(va, 0);
     va
 }
+/// Exclusive diagnostic metadata tail, after all role backing, page
+/// tables and copy scratch. No additional physical pool is allocated.
+#[cfg(feature = "v0199-epoch-disk-selftest")]
+pub(super) fn disk_fixture_metadata(bytes: usize) -> (u64, usize) {
+    assert_eq!(cpu::slot(), 0);
+    let offset = (DISK_COPY_OFFSET + COPY).next_multiple_of(PAGE);
+    assert!(
+        bytes != 0
+            && bytes.is_multiple_of(PAGE)
+            && offset.checked_add(bytes).unwrap() <= 8 * 1024 * 1024
+    );
+    (disk_pool().checked_add(offset as u64).unwrap(), offset)
+}
 const _: () = assert!(core::mem::size_of::<Backing>() == IMAGE + ROLE_STACK_BYTES);
 const _: () = assert!(core::mem::size_of::<Tables>() == 3 * PAGE);
 
@@ -145,13 +162,52 @@ struct Running {
     fault_esr: u64,
     fault_far: u64,
 }
-fn now_ns() -> u64 {
+// Read CNTFRQ once on the serialized CPU0 diagnostic owner. The
+// architectural frequency is fixed for this boot; a second profile entry
+// rechecks it rather than silently reusing a different scale.
+static TIMER_FREQUENCY: AtomicU64 = AtomicU64::new(0);
+static TIMER_INTEGRAL_NS_PER_TICK: AtomicU64 = AtomicU64::new(0);
+fn init_timer_frequency() {
     let f = timer::frequency();
     assert!(f != 0);
-    u64::try_from(u128::from(timer::ticks()) * 1_000_000_000 / u128::from(f)).expect("monotonic ns")
+    let old = TIMER_FREQUENCY.swap(f, Ordering::Relaxed);
+    assert!(old == 0 || old == f);
+    // The same serialized CPU0 owner initializes and uses this exact
+    // cached integer scale. Non-integral frequencies retain wide conversion.
+    let scale = if 1_000_000_000u64.is_multiple_of(f) {
+        1_000_000_000 / f
+    } else {
+        0
+    };
+    TIMER_INTEGRAL_NS_PER_TICK.store(scale, Ordering::Relaxed);
 }
+#[inline]
+fn timer_frequency() -> u64 {
+    let f = TIMER_FREQUENCY.load(Ordering::Relaxed);
+    assert!(f != 0);
+    f
+}
+#[inline]
+fn ns_from_ticks(t: u64) -> u64 {
+    let scale = TIMER_INTEGRAL_NS_PER_TICK.load(Ordering::Relaxed);
+    if scale != 0 {
+        return t.checked_mul(scale).expect("monotonic ns");
+    }
+    let f = timer_frequency();
+    u64::try_from(u128::from(t) * 1_000_000_000 / u128::from(f)).expect("monotonic ns")
+}
+#[inline]
+fn now_ns() -> u64 {
+    ns_from_ticks(timer::ticks())
+}
+#[inline]
 fn ticks_for(ns: u64) -> u64 {
-    u64::try_from((u128::from(ns) * u128::from(timer::frequency())).div_ceil(1_000_000_000))
+    let scale = TIMER_INTEGRAL_NS_PER_TICK.load(Ordering::Relaxed);
+    if scale != 0 {
+        return ns.div_ceil(scale).max(1);
+    }
+    let f = timer_frequency();
+    u64::try_from((u128::from(ns) * u128::from(f)).div_ceil(1_000_000_000))
         .expect("timer ticks")
         .max(1)
 }
@@ -172,8 +228,12 @@ impl BudgetMeter {
     fn new() -> Self {
         let wall = now_ns();
         let tick = timer::cpu_ticks();
+        let mut ledger = Cpu0BudgetLedger::new();
+        ledger
+            .start_continuous(cpu::slot(), wall, || Ok(()))
+            .expect("native accounting origin");
         Self {
-            ledger: Cpu0BudgetLedger::new(),
+            ledger,
             initial_tick: tick,
             initial_ns: wall,
             cursor: tick,
@@ -302,7 +362,7 @@ impl BudgetMeter {
         let mut total = 0u64;
         let mut largest = 0u64;
         let mut slices = 0u64;
-        let pair = load_checkpointed(index, 1, 0, || {
+        let pair = load_checkpointed(index, 1, 0, |_| {
             // The verified copy and unpublished backing stay exclusively
             // owned by the loader across these cooperative boundaries.
             if timer::cpu_elapsed_ns(began) >= 450_000
@@ -328,6 +388,59 @@ impl BudgetMeter {
             largest,
         );
         pair
+    }
+    // Recovery of a stopped role is resumable between independently
+    // verified copy/relocation/seal/scrub checkpoints. Reserve from the
+    // same 8ms recovery class, never from another role or the business CPUs.
+    fn reserve_recovery_slice(&mut self, until: u64) -> (Turn, u64) {
+        loop {
+            let (now, began) = self.sample_gap();
+            if now >= until {
+                fatal(682);
+            }
+            let remaining = 8_000_000u64.saturating_sub(self.ledger.spent(Class::Recovery));
+            if remaining < 2_000_000 || now % WINDOW_NS > WINDOW_NS - 5_000_000 {
+                self.idle_retry();
+                continue;
+            }
+            match self.ledger.reserve_kernel_with_wall(
+                0,
+                Class::Recovery,
+                2_000_000,
+                50_000_000,
+                now,
+            ) {
+                Ok(t) => return (t, began),
+                Err(Error::Exhausted | Error::Busy) => self.idle_retry(),
+                Err(e) => panic!("recovery slice: {e:?}"),
+            }
+        }
+    }
+    fn settle_recovery_slice(
+        &mut self,
+        role: Role,
+        t: Turn,
+        began: u64,
+        phase: u64,
+        part: u64,
+    ) -> u64 {
+        let receipt = self.settle(t, began);
+        if receipt.overrun || receipt.crossed_window {
+            report(
+                "V0199_RECOVERY_OVERRUN_PHASE",
+                phase,
+                part,
+                receipt.actual_ns,
+            );
+            report(
+                "V0199_BOOTSTRAP_OVERRUN",
+                role.id() as u64,
+                receipt.actual_ns,
+                t.reserved_ns(),
+            );
+            fatal(683);
+        }
+        receipt.actual_ns
     }
     /// Reserve before an individual bounded coordination operation. For
     /// final evidence, do not burn an entire window in a long UART burst.
@@ -412,7 +525,7 @@ fn high_leaf(pa: u64) -> *mut u64 {
         ((core::ptr::addr_of!(ram_l3) as u64 + super::super::HIGH) as *mut u64).add(offset as usize)
     }
 }
-fn sync_code(addr: u64, bytes: usize) {
+fn clean_code(addr: u64, bytes: usize) {
     let ctr: u64;
     unsafe {
         core::arch::asm!("mrs {}, ctr_el0",out(reg)ctr,options(nomem,nostack));
@@ -425,43 +538,75 @@ fn sync_code(addr: u64, bytes: usize) {
         }
     }
     unsafe {
+        core::arch::asm!("dsb ish", options(nostack));
+    }
+}
+fn invalidate_code() {
+    unsafe {
         core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack));
     }
 }
-fn tlbi() {
+/// The high RAM direct map is a global 4KiB leaf mapping. Invalidate
+/// the changed VA for ALL ASIDs in the inner-shareable domain, not
+/// every unrelated RAM translation on every seal/unseal. Keep the full
+/// BBM barriers and do not use a last-level-only TLBI shortcut.
+fn invalidate_high_page(pa: u64) {
+    let va = pa.checked_add(super::super::HIGH).expect("direct map VA");
+    assert_eq!(va % 4096, 0);
+    // AArch64 VAAE1IS operand VA[55:12], bits[63:44] RES0.
+    let operand = (va >> 12) & ((1u64 << 44) - 1);
     unsafe {
-        core::arch::asm!(
-            "dsb ishst",
-            "tlbi vmalle1is",
-            "dsb ish",
-            "isb",
-            options(nostack)
-        );
+        core::arch::asm!("dsb ishst","tlbi vaae1is, {}","dsb ish","isb",
+        in(reg)operand,options(nostack));
     }
 }
-fn seal_page(pa: u64) {
+/// Low user leaves are all nG and the role ASID is boot-unique.
+/// The architectural root disconnection still precedes this broadcast
+/// all-level invalidation, and all barriers precede any frame reuse.
+fn invalidate_role_root(index: usize, bank: usize) {
+    let tcr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, tcr_el1",out(reg)tcr,options(nomem,nostack));
+    }
+    // This locked 39-bit/4KiB profile selects an 8-bit TTBR0 ASID.
+    assert_eq!(
+        tcr & ((1 << 36) | (1 << 22)),
+        0,
+        "TTBR0 8-bit ASID contract"
+    );
+    let operand = u64::from(role_asid(index, bank)) << 48;
+    unsafe {
+        core::arch::asm!("dsb ishst","tlbi aside1is, {}","dsb ish","isb",
+        in(reg)operand,options(nostack));
+    }
+}
+fn seal_page(pa: u64, mut checkpoint: impl FnMut(u64)) {
     let leaf = high_leaf(pa);
     let old = unsafe { core::ptr::read_volatile(leaf) };
     assert_eq!(old, pa | 0x0060_0000_0000_0703);
-    // Real break-before-make; secondary business cores never own these
-    // pages, but stale direct-map translations are invalidated globally.
+    // Real break-before-make, globally shared high VA invalidation.
+    // No user root is published while a page is being sealed.
     unsafe {
         core::ptr::write_volatile(leaf, 0);
     }
-    tlbi();
+    invalidate_high_page(pa);
+    // The unpublished page has no active user mapping or DMA. It is
+    // safe to pause here after completed break, before the new make.
+    checkpoint(15);
     unsafe {
         core::ptr::write_volatile(leaf, old | (1 << 7));
     }
-    tlbi();
+    invalidate_high_page(pa);
+    checkpoint(16);
 }
 fn load(index: usize, generation: u64, bank: usize) -> (NativeRole, Running) {
-    load_checkpointed(index, generation, bank, || {})
+    load_checkpointed(index, generation, bank, |_| {})
 }
 fn load_checkpointed(
     index: usize,
     generation: u64,
     bank: usize,
-    mut checkpoint: impl FnMut(),
+    mut checkpoint: impl FnMut(u64),
 ) -> (NativeRole, Running) {
     let role = ROLES[index];
     let pkg = &CATALOG[index];
@@ -491,8 +636,13 @@ fn load_checkpointed(
     let scratch = unsafe { &mut *((disk_pool() + DISK_COPY_OFFSET as u64) as *mut [u8; COPY]) };
     #[cfg(not(feature = "v0199-epoch-disk-selftest"))]
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!(COPY_BUFFER.0) };
-    scratch[..pkg.bytes.len()].copy_from_slice(pkg.bytes);
-    checkpoint();
+    for (dst, src) in scratch[..pkg.bytes.len()]
+        .chunks_mut(PAGE)
+        .zip(pkg.bytes.chunks(PAGE))
+    {
+        dst.copy_from_slice(src);
+        checkpoint(10);
+    }
     let spec = RolePackageSpec {
         role,
         package_id: u64::from(role.id()),
@@ -510,16 +660,16 @@ fn load_checkpointed(
             bytes: &scratch[..pkg.bytes.len()],
             relative: pkg.relative,
         },
-        &mut checkpoint,
+        || checkpoint(11),
     )
     .expect("trusted ABI3 role package");
     let relro = verified.relro();
-    checkpoint();
+    checkpoint(11);
     let image = unsafe { &mut *core::ptr::addr_of_mut!((*b).image) };
     let entry = verified
-        .stage(image, BASE, BASE, BASE + IMAGE as u64)
+        .stage_checkpointed(image, BASE, BASE, BASE + IMAGE as u64, || checkpoint(12))
         .expect("private PIE stage");
-    checkpoint();
+    checkpoint(12);
     let stack = unsafe { &mut *core::ptr::addr_of_mut!((*b).stack) };
     // Diagnostic startup payload is program-specific, not an added ABI
     // field. The generic ABI3 contract supplies arg_va/args_len and SP.
@@ -534,7 +684,7 @@ fn load_checkpointed(
     assert!(stack[..ROLE_STACK_BYTES - 32].iter().all(|&v| v == 0));
     assert_eq!(&stack[ROLE_STACK_BYTES - 32..ROLE_STACK_BYTES - 8], &args);
     assert!(stack[ROLE_STACK_BYTES - 8..].iter().all(|&v| v == 0));
-    checkpoint();
+    checkpoint(13);
     let mut map = [0u8; IMAGE / PAGE];
     for seg in verified.load_segments() {
         let start = seg.virtual_address as usize / PAGE;
@@ -554,15 +704,21 @@ fn load_checkpointed(
             *page = 4; // stage already applied verified relocations; seal now
         }
     }
-    scratch.fill(0);
-    checkpoint();
+    for chunk in scratch.chunks_mut(PAGE) {
+        chunk.fill(0);
+        checkpoint(14);
+    }
     let image_base = b as u64;
     for (i, flags) in map.iter().copied().enumerate() {
         if flags & 1 != 0 {
-            sync_code(image_base + i as u64 * PAGE as u64, PAGE);
-            checkpoint();
+            clean_code(image_base + i as u64 * PAGE as u64, PAGE);
+            checkpoint(14);
         }
     }
+    // One complete broadcast I-cache invalidation after all D-cache
+    // cleans, before any executable low mapping is entered.
+    invalidate_code();
+    checkpoint(14);
     unsafe {
         (*t).root.0[0] = phys(core::ptr::addr_of!((*t).mid) as u64) | 3;
         (*t).mid.0[0] = phys(core::ptr::addr_of!((*t).leaf) as u64) | 3;
@@ -575,8 +731,7 @@ fn load_checkpointed(
         let write = flags & 2 != 0;
         let execute = flags & 1 != 0;
         if !write {
-            seal_page(pa);
-            checkpoint();
+            seal_page(pa, &mut checkpoint);
         }
         let desc = mmu::encode_user_leaf(PhysAddr(pa), write, execute).unwrap();
         unsafe {
@@ -591,10 +746,13 @@ fn load_checkpointed(
                 mmu::encode_user_leaf(PhysAddr(pa), true, false).unwrap();
         }
     }
-    checkpoint();
+    checkpoint(17);
     // Guard and image holes have never had user mappings.
     assert_eq!(unsafe { (*t).leaf.0[STACK_BASE as usize / PAGE - 1] }, 0);
-    tlbi();
+    // No low global mapping is admitted by this loader.
+    assert!(unsafe { (*t).leaf.0.iter().all(|&p| p == 0 || p & (1 << 11) != 0) });
+    invalidate_role_root(index, bank);
+    checkpoint(18);
     let member = NativeRole {
         role,
         actor,
@@ -857,8 +1015,9 @@ fn turn(
     }
     let member = m.manifest().members[index];
     let (class, domain, quota) = class(member.role);
-    let token = match budget.ledger.reserve_validated_role_with_wall(
+    let token = match budget.ledger.reserve_indexed_role_with_wall(
         m,
+        index,
         member.actor,
         cpu::slot(),
         class,
@@ -878,26 +1037,53 @@ fn turn(
     // additional work must be independently admitted under the same 0.5ms
     // combined decision/publication limit for this domain and window.
     let trap_limit = if class == Class::Decision { 1 } else { 32 };
+    let exit_guard = if class == Class::Decision {
+        DECISION_EXIT_GUARD_NS
+    } else {
+        TURN_EXIT_GUARD_NS
+    };
+    // Failure localization: these are cumulative PMU offsets from the
+    // same prepaid turn, not new accounting grants. Their own cost is
+    // included in final settlement. Zero means the phase was not reached.
+    let mut before_enter = 0;
+    let mut after_exit = 0;
+    let mut after_dispatch = 0;
     for _ in 0..trap_limit {
+        // Prepare immutable root identity BEFORE the final admission
+        // sample. The same PMU sample drives the guard and diagnostics;
+        // the old path checked an earlier sample, then measured 109384ns
+        // before entering despite only 100000ns of entry headroom.
+        let root = member.ttbr0_root;
+        assert_eq!(root, root_pa(index, r.bank));
+        let asid = role_asid(index, r.bank);
+        let wall_ticks = timer::ticks();
+        let wall = ns_from_ticks(wall_ticks);
         let actual = timer::cpu_elapsed_ns(began);
-        let wall = now_ns();
         let cpu_left = quota.saturating_sub(actual);
         let wall_left = token.deadline_ns().saturating_sub(wall);
-        if cpu_left <= TURN_EXIT_GUARD_NS || wall_left <= TURN_EXIT_GUARD_NS {
+        if cpu_left <= exit_guard || wall_left <= exit_guard {
             break;
         }
-        let mut interval = (cpu_left - TURN_EXIT_GUARD_NS).min(wall_left - TURN_EXIT_GUARD_NS);
+        let mut interval = (cpu_left - exit_guard).min(wall_left - exit_guard);
         if class == Class::Decision {
             interval = interval.min(DECISION_SLICE_NS);
+            before_enter = actual;
         }
         unsafe {
-            timer::arm(timer::ticks().checked_add(ticks_for(interval)).unwrap());
-            let root = member.ttbr0_root;
-            assert_eq!(root, root_pa(index, r.bank));
+            // Anchor to the sampled physical timer, not a later reading
+            // that would silently extend the original wall allowance.
+            timer::arm(wall_ticks.checked_add(ticks_for(interval)).unwrap());
             // Each live root is immutable, private, and all leaves are nG.
             // Retire_root disconnects it and completes TLBI before reclaim.
-            user::enter_pinned_until_retired(&mut r.context, root, role_asid(index, r.bank));
-            cpu::disable_timer();
+            user::enter_pinned_until_retired(&mut r.context, root, asid);
+            // The dedicated SMP timer IRQ handler has already disabled
+            // CNT(P)_CTL before returning kind9. Sync traps still need it.
+            if cfg!(feature = "unified-runtime") || r.context.kind != 9 {
+                cpu::disable_timer();
+            }
+        }
+        if class == Class::Decision {
+            after_exit = timer::cpu_elapsed_ns(began);
         }
         // Settle immediately after a timer exit instead of re-entering in
         // the same prepaid turn; all measured cost is retained by the ledger.
@@ -923,6 +1109,9 @@ fn turn(
             fatal(600 + index as u64);
         }
         parked = dispatch(index, m, r);
+        if class == Class::Decision {
+            after_dispatch = timer::cpu_elapsed_ns(began);
+        }
         if parked {
             break;
         }
@@ -931,6 +1120,20 @@ fn turn(
     r.charges = r.charges.checked_add(receipt.actual_ns).unwrap();
     r.turns += 1;
     if receipt.overrun || receipt.crossed_window {
+        if class == Class::Decision {
+            report(
+                "V0199_DECISION_OVERRUN_PHASES",
+                before_enter,
+                after_exit,
+                after_dispatch,
+            );
+            report(
+                "V0199_DECISION_OVERRUN_TRAP",
+                r.context.kind as u64,
+                r.context.esr,
+                r.context.regs[8],
+            );
+        }
         report(
             "V0199_BOOTSTRAP_OVERRUN",
             member.role.id() as u64,
@@ -948,17 +1151,23 @@ fn turn(
 /// the old image be made writable again. These static frames are never
 /// attached to DMA or another address space in this diagnostic profile.
 fn retire_root(index: usize, bank: usize) {
+    retire_root_checkpointed(index, bank, |_| {});
+}
+fn retire_root_checkpointed(index: usize, bank: usize, mut checkpoint: impl FnMut(u64)) {
     let t = tables(index, bank);
+    assert!(unsafe { (*t).leaf.0.iter().all(|&p| p == 0 || p & (1 << 11) != 0) });
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*t).root.0[0]), 0);
     }
-    tlbi();
+    invalidate_role_root(index, bank);
+    checkpoint(1);
     // Root disconnected and context returned; all former leaf entries are
     // now inaccessible. This is not proof of a general production DMA join.
     unsafe {
         core::ptr::write_bytes(core::ptr::addr_of_mut!((*t).mid.0).cast::<u8>(), 0, PAGE);
         core::ptr::write_bytes(core::ptr::addr_of_mut!((*t).leaf.0).cast::<u8>(), 0, PAGE);
     }
+    checkpoint(2);
     let b = backing(index) as u64;
     for offset in (0..IMAGE).step_by(PAGE) {
         let pa = phys(b + offset as u64);
@@ -970,16 +1179,22 @@ fn retire_root(index: usize, bank: usize) {
             unsafe {
                 core::ptr::write_volatile(leaf, 0);
             }
-            tlbi();
+            invalidate_high_page(pa);
+            checkpoint(3);
             unsafe {
                 core::ptr::write_volatile(leaf, rw);
             }
-            tlbi();
+            invalidate_high_page(pa);
+            checkpoint(4);
         }
+        checkpoint(4);
     }
     let bytes = unsafe { core::slice::from_raw_parts_mut(b as *mut u8, IMAGE + ROLE_STACK_BYTES) };
-    bytes.fill(0);
-    assert!(bytes.iter().all(|&v| v == 0));
+    for page in bytes.chunks_exact_mut(PAGE) {
+        page.fill(0);
+        assert!(page.iter().all(|&v| v == 0));
+        checkpoint(5);
+    }
 }
 fn restart_each(
     manifest: &mut NativeRoleManifest,
@@ -1088,48 +1303,46 @@ fn restart_each(
             progressed,
             total_delta,
         );
-        let (credit, start) = loop {
-            let (now, start) = budget.sample_gap();
-            if now >= until {
-                fatal(682);
-            }
-            if now % WINDOW_NS > WINDOW_NS - 10_000_000 {
-                budget.idle_retry();
-                continue;
-            }
-            match budget.ledger.reserve_kernel_with_wall(
-                0,
-                Class::Recovery,
-                8_000_000,
-                50_000_000,
-                now,
-            ) {
-                Ok(t) => break (t, start),
-                Err(Error::Exhausted | Error::Busy) => {
-                    budget.idle_retry();
-                    continue;
+        let (mut credit, mut start) = budget.reserve_recovery_slice(until);
+        let mut actual = 0u64;
+        let mut slices = 0u64;
+        let mut largest = 0u64;
+        let mut part = 0u64;
+        let (member, new) = {
+            let mut checkpoint = |phase: u64| {
+                part = part.checked_add(1).unwrap();
+                if timer::cpu_elapsed_ns(start) >= 450_000
+                    || credit.deadline_ns().saturating_sub(now_ns()) < 2_000_000
+                {
+                    let cost = budget.settle_recovery_slice(old.role, credit, start, phase, part);
+                    actual = actual.checked_add(cost).unwrap();
+                    slices += 1;
+                    largest = largest.max(cost);
+                    (credit, start) = budget.reserve_recovery_slice(until);
                 }
-                Err(e) => panic!("recovery reservation: {e:?}"),
-            }
+            };
+            // The old context stays stopped and the new root stays unpublished.
+            // Each break and make finishes its TLBI barriers before a pause.
+            retire_root_checkpointed(i, old_bank, &mut checkpoint);
+            load_checkpointed(i, next, 1, &mut checkpoint)
         };
-        retire_root(i, old_bank);
-        let (member, new) = load(i, next, 1);
         assert!(member.ttbr0_root != old_root && member.actor.generation == next);
         assert_eq!(unsafe { (*tables(i, old_bank)).root.0[0] }, 0);
         assert!(old_cap.selector == 0 || new.cap.selector != old_cap.selector);
         manifest.members[i] = member;
         let checked = manifest.validated().expect("replacement inventory");
-        let receipt = budget.settle(credit, start);
-        let actual = receipt.actual_ns;
-        if receipt.overrun || receipt.crossed_window {
-            report(
-                "V0199_BOOTSTRAP_OVERRUN",
-                old.role.id() as u64,
-                receipt.actual_ns,
-                8_000_000,
-            );
-            fatal(683);
-        }
+        let cost = budget.settle_recovery_slice(old.role, credit, start, 19, part + 1);
+        actual = actual.checked_add(cost).unwrap();
+        slices += 1;
+        largest = largest.max(cost);
+        SMP_EVIDENCE.words[56 + i].store(slices, Ordering::Relaxed);
+        SMP_EVIDENCE.words[64 + i].store(largest, Ordering::Relaxed);
+        report(
+            "V0199_RESTART_RECOVERY_SLICES",
+            old.role.id() as u64,
+            slices,
+            largest,
+        );
         life.reset_complete(1, next).unwrap();
         running[i] = new;
         while running[i].clocks < 2 || running[i].role_calls < 2 {
@@ -1207,6 +1420,7 @@ pub(super) struct DiskSecurityRun {
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 pub(super) fn disk_security_run(generation: u64, bank: usize, stop: bool) -> DiskSecurityRun {
     assert_eq!(cpu::slot(), 0);
+    init_timer_frequency();
     let i = 1usize;
     let (m, mut r) = load(i, generation, bank);
     assert_eq!(m.role, Role::Security);
@@ -1311,6 +1525,7 @@ pub(super) fn run() -> ! {
     unsafe {
         timer::init_cpu_accounting();
     }
+    init_timer_frequency();
     let mut budget = BudgetMeter::new();
     let pairs: [(NativeRole, Running); ROLE_COUNT] =
         core::array::from_fn(|i| budget.load_initial(i));

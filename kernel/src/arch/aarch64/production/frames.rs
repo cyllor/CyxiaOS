@@ -1,34 +1,32 @@
 //! V0.20 wave 11: register the production boot statics in a bounded sparse
 //! FrameMeta ledger before any EL0 entry.
 //!
-//! Registered (8 regions): smp ROOTS/MIDDLES/LEAVES (Metadata), smp
-//! DATA_PAGES/USER_STACKS (Control), production PIE TABLES (Metadata),
-//! production PIE BACKING and EXEC_TARGET (Control). The window runs from the
-//! lowest to the highest registered PA; rows between registered regions (other
-//! kernel statics) are published unowned PERMANENT but are NOT registered and
-//! count toward no class. Evidence word 130 reports registered static pages
-//! only; the serial row `V020_W11_FRAME_META_ROWS a=<registered> b=<all
-//! permanent rows> c=<unregistered permanent gap rows>` reports the rest.
-//! The ledger is a static authority record over linker-placed kernel statics:
-//! it does not move, map, zero or own them.
+//! The static ledger registers SMP and PIE page tables as Metadata, role
+//! memory and the copy buffer as Control, and SMP stacks and the pinned
+//! linker-placed network/staging region as Arena. Gaps between regions remain
+//! unowned permanent rows. Device and guest owners still manage mappings,
+//! DMA transactions and their lifecycle.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
 //! * ROWS_BACKING (static mut): the only `&mut` to it is created once in
 //!   `register_production_statics`, guarded by the REGISTERED swap, on CPU0
 //!   before any secondary CPU or EL0 role runs. The ledger borrowing it is
 //!   dropped before return; nothing else reads or writes the rows.
-//! * REGISTERED / REGISTERED_PAGES / PERMANENT_ROWS (atomics): CPU0 only;
-//!   REGISTERED makes the registration one-shot, the other two carry the
-//!   inventory figures from registration to the evidence seal.
+//! * REGISTERED and the inventory counters (atomics): CPU0 only. REGISTERED
+//!   makes the registration one-shot; the counters carry seal-time evidence.
 //! * `__sec_n_start` / `__sec_n_end` (linker symbols): only their addresses are
-//!   taken (`addr_of!`); the window is checked disjoint from that section.
+//!   taken (`addr_of!`); the linker places the pinned arena on page boundaries.
 //! * Registered statics are only addressed via `addr_of!` (no reference is
 //!   formed); their PA is `VA - HIGH`, checked, failing Range on underflow.
 
 use super::super::{
-    DATA_PAGES, LEAVES, MIDDLES, PRIVATE_SPACES, Page, ROOTS, USER_STACKS, fatal, report,
+    DATA_PAGES, LEAVES, MIDDLES, PRIVATE_SPACES, Page, ROOTS, STACKS, Stacks, USER_STACKS, fatal,
+    report,
 };
-use super::{BACKING, Backing, EXEC_TARGET, ExecTarget, ROLE_COUNT, TABLES, Tables, evidence};
+use super::{
+    BACKING, Backing, COPY_BUFFER, CopyBuffer, EXEC_TARGET, ExecTarget, ROLE_COUNT, TABLES, Tables,
+    evidence,
+};
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind};
@@ -37,11 +35,15 @@ use cyxia_kernel_core::frame_meta_v0199::{
 };
 use cyxia_kernel_core::security::Error as LedgerError;
 
-/// Row capacity of the static backing (4MiB window, 40KiB of rows). The
-/// measured v020-production window is 522 rows; a larger window is Range.
-const ROWS: usize = 1024;
+#[cfg(feature = "v020-production-frame-pool")]
+#[path = "frames/pool.rs"]
+mod pool;
+
+/// 16 MiB physical window, including the 12 MiB SEC-N guest frame pool.
+/// The 160 KiB of row backing fits within the FrameMeta reservation.
+const ROWS: usize = 4096;
 const _: () = assert!(ROWS <= COUNT);
-const STATICS: usize = 8;
+const STATICS: usize = 11;
 /// Fatal code when production static registration fails.
 const FATAL_FRAME_META: u64 = 0x5731_1290;
 
@@ -49,6 +51,7 @@ static mut ROWS_BACKING: [FrameMeta; ROWS] = [FrameMeta::ZERO; ROWS];
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static REGISTERED_PAGES: AtomicU64 = AtomicU64::new(0);
 static PERMANENT_ROWS: AtomicU64 = AtomicU64::new(0);
+static SERVICE_ARENA_PAGES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Error {
@@ -72,8 +75,8 @@ fn region(va: u64, len: usize, class: StaticClass) -> Result<StaticRegion, Error
     })
 }
 
-fn statics() -> Result<[StaticRegion; STATICS], Error> {
-    use StaticClass::{Control, Metadata};
+fn statics(service: StaticRegion) -> Result<[StaticRegion; STATICS], Error> {
+    use StaticClass::{Arena, Control, Metadata};
     let spaces = core::mem::size_of::<[Page; PRIVATE_SPACES]>();
     Ok([
         region(addr_of!(ROOTS) as u64, spaces, Metadata)?,
@@ -96,6 +99,17 @@ fn statics() -> Result<[StaticRegion; STATICS], Error> {
             core::mem::size_of::<ExecTarget>(),
             Control,
         )?,
+        region(
+            addr_of!(COPY_BUFFER) as u64,
+            core::mem::size_of::<CopyBuffer>(),
+            Control,
+        )?,
+        region(
+            addr_of!(STACKS) as u64,
+            core::mem::size_of::<Stacks>(),
+            Arena,
+        )?,
+        service,
     ])
 }
 
@@ -114,36 +128,26 @@ fn window(regions: &[StaticRegion]) -> Result<(u64, u64), Error> {
 }
 
 unsafe extern "C" {
-    /// Linker bounds of the `.bss.sec_n` section (aarch64.ld).
+    /// Page-aligned linker bounds of the `.bss.sec_n` section (aarch64.ld).
     static __sec_n_start: u8;
     static __sec_n_end: u8;
 }
 
-/// The SEC-N guest/net pools (`.bss.sec_n`, unregistered this wave) must lie
-/// wholly outside the registered window, so they never widen it or land in
-/// its unowned gap rows.
-fn outside_sec_n(base: u64, end: u64) -> Result<(), Error> {
-    let start = (addr_of!(__sec_n_start) as u64)
-        .checked_sub(crate::HIGH)
-        .ok_or(Error::Range)?;
-    let stop = (addr_of!(__sec_n_end) as u64)
-        .checked_sub(crate::HIGH)
-        .ok_or(Error::Range)?;
-    if start == stop || stop <= base || start >= end {
-        Ok(())
-    } else {
-        Err(Error::Range)
-    }
+fn service_arena() -> Result<StaticRegion, Error> {
+    let start = addr_of!(__sec_n_start) as usize;
+    let stop = addr_of!(__sec_n_end) as usize;
+    let bytes = stop.checked_sub(start).ok_or(Error::Range)?;
+    region(start as u64, bytes, StaticClass::Arena)
 }
 
 /// Register the production statics once, before any EL0 entry.
-pub(super) fn register_production_statics() -> Result<Inventory, Error> {
+fn register_production_statics() -> Result<(Inventory, u64), Error> {
     if REGISTERED.swap(true, Ordering::AcqRel) {
         return Err(Error::Once);
     }
-    let regions = statics()?;
+    let service = service_arena()?;
+    let regions = statics(service)?;
     let (base, end) = window(&regions)?;
-    outside_sec_n(base, end)?;
     let pages = (end - base).div_ceil(PAGE) as usize;
     if pages > ROWS {
         return Err(Error::Range);
@@ -153,7 +157,8 @@ pub(super) fn register_production_statics() -> Result<Inventory, Error> {
     // ledger borrowing it is dropped before return.
     let rows = unsafe { &mut (&mut *addr_of_mut!(ROWS_BACKING))[..pages] };
     let ledger = Ledger::initialize_static_sparse(rows, base, &regions).map_err(Error::Ledger)?;
-    ledger.inventory().map_err(Error::Ledger)
+    let inventory = ledger.inventory().map_err(Error::Ledger)?;
+    Ok((inventory, service.region.len / PAGE))
 }
 
 /// Registered static pages: the class tallies, never the unregistered gaps.
@@ -168,9 +173,10 @@ fn registered_pages(inv: &Inventory) -> u64 {
 /// run() entry hook: register or stop the boot (word 129 = 0, fatal).
 pub(super) fn register_or_fatal() {
     match register_production_statics() {
-        Ok(inv) if registered_pages(&inv) > 0 => {
+        Ok((inv, service_pages)) if service_pages > 0 => {
             REGISTERED_PAGES.store(registered_pages(&inv), Ordering::Release);
             PERMANENT_ROWS.store(u64::from(inv.permanent), Ordering::Release);
+            SERVICE_ARENA_PAGES.store(service_pages, Ordering::Release);
         }
         _ => {
             evidence::put(evidence::W11_FRAME_META, 0);
@@ -179,17 +185,27 @@ pub(super) fn register_or_fatal() {
     }
 }
 
+#[cfg(feature = "v020-production-frame-pool")]
+pub(super) fn prove_pool_or_fatal(info: &mut cyxia_contracts::BootInfo) {
+    pool::prove_or_fatal(info);
+}
+
 /// Evidence-seal hook: words 129/130 (the page is zeroed before the seal),
 /// plus the serial row with the permanent and unregistered gap row counts.
 pub(super) fn publish() {
     let pages = REGISTERED_PAGES.load(Ordering::Acquire);
     let permanent = PERMANENT_ROWS.load(Ordering::Acquire);
+    let arena = SERVICE_ARENA_PAGES.load(Ordering::Acquire);
     evidence::put(evidence::W11_FRAME_META, u64::from(pages > 0));
     evidence::put(evidence::W11_FRAME_META_REGISTERED_STATIC_PAGES, pages);
+    evidence::put(evidence::W11_FRAME_META_ARENA_PAGES, arena);
     report(
         "V020_W11_FRAME_META_ROWS",
         pages,
         permanent,
         permanent.saturating_sub(pages),
     );
+    report("V020_W11_FRAME_META_ARENA", arena, pages - arena, 0);
+    #[cfg(feature = "v020-production-frame-pool")]
+    pool::publish();
 }

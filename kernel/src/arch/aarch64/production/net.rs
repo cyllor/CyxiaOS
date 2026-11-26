@@ -19,22 +19,24 @@
 //!   a=902/900/901); a remote peer can never halt the boot.
 //! * READ is length-aware (never dequeues more than the guest asked for); a
 //!   closed/reset/failed stream reaches the guest as EOF + disconnected POLL.
-//! * Entropy for the guest's rustls session and the smoltcp seed is the
-//!   deterministic FIXTURE PRNG (`sec_n_broker::fixture_entropy`), NOT a
-//!   production CSPRNG; this is acceptable only because no TLS session completes.
-//! * Word 140 (leases) is INFERRED from the broker trace (connected POLL then
-//!   ENTROPY), not reported by the guest.
-//! * Word 142 `tls_echo_turn_verified` is written 0 by design: the host peer is
-//!   not a pinned TLS client, so no authenticated Echo turn happens.
+//! * The authenticated test profile uses only the pinned VirtIO RNG for
+//!   the smoltcp seed and guest entropy. Its absence ends the relay setup.
+//!   The earlier transport probe retains its fixture entropy source.
+//! * Word 140 counts the admission receipt issued by the guest and accepted by
+//!   the broker for this connection epoch and pinned peer IPv4.
+//! * Word 142 stays zero. The authenticated verifier observes Echo with its
+//!   independent pinned TLS peer and combines that result with this evidence.
+//! * Word 176 counts a normally retired guest Admission credit in the opt-in
+//!   authenticated profile. RX pools and queue memory stay pinned after return.
 //! * No device => `V020_W11_NET_ABSENT`, words 138..142 stay 0, boot continues.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
-//! * TCP_RX / TCP_TX (static mut, `.bss.sec_n` link section, NOT
-//!   FrameMeta-registered this wave): the only `&mut` to them is created once in
+//! * TCP_RX / TCP_TX (static mut) are covered by the FrameMeta Arena registration
+//!   for the pinned `.bss.sec_n` section. Their only `&mut` is created once in
 //!   `open_stream`, guarded by the SERVED swap, on CPU0 after the business CPUs
 //!   stopped; the `Tcp` borrowing them is dropped before `serve` returns.
 //! * SERVED (atomic): CPU0 only; makes `open_stream` (the buffer borrow) one-shot.
-//! * The pinned VirtIO-net DMA pools are owned and registered by net_device.rs;
+//! * net_device.rs manages dynamic descriptor custody for its pinned DMA pools;
 //!   the guest frame pool and broker page by sec_n_broker.rs.
 
 use super::super::{report, sec_n_broker};
@@ -48,6 +50,10 @@ use cyxia_driver_virtio::net::BatchedNet;
 use cyxia_net_transport::device::{self, Port, VirtioPort};
 use cyxia_net_transport::tcp::{self, BUFFER_SIZE, Config, State, Storage, Tcp};
 
+#[cfg(feature = "v020-production-authenticated-net")]
+#[path = "net_entropy.rs"]
+mod net_entropy;
+
 /// Upper bound of accept turns on CPU0.
 const NET_POLL_TURNS: u32 = 20_000;
 /// Minimum spacing between accept turns (bounds the accept window to ~20 s).
@@ -57,9 +63,9 @@ const GUEST_SVC_BUDGET: u64 = 200_000;
 const LOCAL_IP: [u8; 4] = [10, 0, 2, 15];
 const PREFIX_LEN: u8 = 24;
 const LISTEN_PORT: u16 = 7;
+const TCP_SEED_BYTES: usize = 8;
 /// QEMU user-net gateway; must equal the guest's trusted source observation.
 const PEER_IP: [u8; 4] = [10, 0, 2, 2];
-const _: () = assert!(u32::from_be_bytes(PEER_IP) == sec_n_broker::SOURCE_IP);
 
 type Stream<'a> = Tcp<'a, VirtioPort<'a, Board, BatchedNet>>;
 
@@ -76,6 +82,10 @@ pub(super) struct NetOutcome {
     pub(super) tcp_established: bool,
     pub(super) leases: u64,
     pub(super) relayed_bytes: u64,
+    #[cfg(feature = "v020-production-authenticated-net")]
+    rng_bytes: u64,
+    #[cfg(feature = "v020-production-authenticated-net")]
+    pub(super) retired: u64,
 }
 
 /// Byte-stream adapter: the broker's READ/WRITE become TCP payload receive/send
@@ -84,6 +94,19 @@ struct StreamPort<'s, 'a> {
     tcp: &'s mut Stream<'a>,
 }
 impl StreamPort<'_, '_> {
+    #[cfg(feature = "v020-production-authenticated-net")]
+    fn poll_normal_close(&mut self) -> Result<bool, device::Error> {
+        // An idle port only reaps a TX completion when explicitly polled.
+        // BatchedNet::poll_tx checks a used entry and acknowledges its exact token.
+        self.tcp
+            .port_mut()
+            .net
+            .poll_tx(&Board)
+            .map_err(|_| device::Error::Device)?;
+        self.tcp
+            .poll_passive_close(sec_n_broker::now_ms())
+            .map_err(|_| device::Error::Device)
+    }
     fn turn(&mut self) {
         // A failed turn poisons the stream: the following receive/send then
         // returns Closed, which the broker surfaces to the guest as EOF.
@@ -161,7 +184,7 @@ enum AcceptFailure {
 }
 
 /// Bounded polling accept: Ok once the pinned peer is Established.
-fn accept(stream: &mut Stream<'_>) -> Result<(), AcceptFailure> {
+fn accept(stream: &mut Stream<'_>) -> Result<u32, AcceptFailure> {
     for _ in 0..NET_POLL_TURNS {
         let now = sec_n_broker::now_ms();
         stream
@@ -171,7 +194,12 @@ fn accept(stream: &mut Stream<'_>) -> Result<(), AcceptFailure> {
             return Err(AcceptFailure::Peer);
         }
         match stream.poll_egress_phase(now, &mut || {}) {
-            Ok(State::Established) => return Ok(()),
+            Ok(State::Established) => {
+                return stream
+                    .peer_ipv4()
+                    .map(u32::from_be_bytes)
+                    .ok_or(AcceptFailure::Peer);
+            }
             Ok(_) => pace(),
             Err(_) => return Err(AcceptFailure::Stream),
         }
@@ -184,12 +212,11 @@ fn accept(stream: &mut Stream<'_>) -> Result<(), AcceptFailure> {
 fn open_stream<'a>(
     dev: &'a mut NetDevice,
     storage: &'a mut [Storage<'a>; 1],
+    random_seed: u64,
 ) -> Option<Stream<'a>> {
     if SERVED.swap(true, Ordering::AcqRel) {
         return None;
     }
-    let mut seed = [0u8; 8];
-    sec_n_broker::fixture_entropy(&mut seed);
     let config = Config {
         mac: dev.net.mac(),
         local: LOCAL_IP,
@@ -197,7 +224,7 @@ fn open_stream<'a>(
         prefix_len: PREFIX_LEN,
         local_port: LISTEN_PORT,
         peer_port: 0,
-        random_seed: u64::from_le_bytes(seed) | 1,
+        random_seed,
     };
     let port = VirtioPort {
         net: &mut dev.net,
@@ -220,7 +247,11 @@ fn open_stream<'a>(
 /// Relay the established stream to a fresh local-echo guest until it parks.
 /// A guest that does not park (budget, fault) ends the relay; it never halts
 /// the production boot.
-fn relay(stream: &mut Stream<'_>) -> Result<u64, sec_n_broker::GuestStop> {
+fn relay(
+    stream: &mut Stream<'_>,
+    source: u32,
+    entropy: &mut sec_n_broker::EntropyFill<'_>,
+) -> Result<u64, sec_n_broker::GuestStop> {
     let layout = sec_n_broker::load_guest();
     report(
         "V020_W11_NET_GUEST",
@@ -229,9 +260,22 @@ fn relay(stream: &mut Stream<'_>) -> Result<u64, sec_n_broker::GuestStop> {
         sec_n_broker::GUEST_ELF.len() as u64,
     );
     sec_n_broker::reset_guest_data(&layout);
-    sec_n_broker::stage_shared(sec_n_broker::LOCAL_NODE, true, 1);
+    sec_n_broker::stage_connection(sec_n_broker::LOCAL_NODE, true, 1, source);
     let mut port = StreamPort { tcp: stream };
-    sec_n_broker::try_run_until_park(&layout, &mut port, GUEST_SVC_BUDGET)
+    #[cfg(feature = "v020-production-authenticated-net")]
+    {
+        sec_n_broker::run_guest(
+            &layout,
+            &mut port,
+            entropy,
+            GUEST_SVC_BUDGET,
+            Some(StreamPort::poll_normal_close),
+        )
+    }
+    #[cfg(not(feature = "v020-production-authenticated-net"))]
+    {
+        sec_n_broker::try_run_until_park(&layout, &mut port, entropy, GUEST_SVC_BUDGET)
+    }
 }
 
 /// One-shot SEC-N service run on CPU0 (after the advice chain).
@@ -250,10 +294,56 @@ pub(super) fn serve(info: &BootInfo) -> NetOutcome {
             return NetOutcome::default();
         }
     };
+    #[cfg(feature = "v020-production-authenticated-net")]
+    let mut rng = match net_entropy::Entropy::attach(info) {
+        Ok(rng) => rng,
+        Err(error) => {
+            report("V020_W12_NET_ENTROPY_UNAVAILABLE", error as u64, 0, 0);
+            return NetOutcome {
+                device: true,
+                ..NetOutcome::default()
+            };
+        }
+    };
+    #[cfg(feature = "v020-production-authenticated-net")]
+    let mut entropy = |out: &mut [u8]| rng.fill(out);
+    #[cfg(not(feature = "v020-production-authenticated-net"))]
+    let mut entropy = sec_n_broker::fixture_entropy;
+    let mut seed = [0u8; TCP_SEED_BYTES];
+    if !entropy(&mut seed) {
+        report("V020_W12_NET_ENTROPY_UNAVAILABLE", 0, 0, 0);
+        return NetOutcome {
+            device: true,
+            ..NetOutcome::default()
+        };
+    }
+    let outcome = serve_stream(&mut dev, u64::from_le_bytes(seed) | 1, &mut entropy);
+    #[cfg(feature = "v020-production-authenticated-net")]
+    let outcome = {
+        let rng_bytes = rng.supplied - TCP_SEED_BYTES as u64;
+        report(
+            "V020_W12_NET_ENTROPY",
+            TCP_SEED_BYTES as u64,
+            rng_bytes,
+            u64::from(rng.failed),
+        );
+        NetOutcome {
+            rng_bytes,
+            ..outcome
+        }
+    };
+    outcome
+}
+
+fn serve_stream(
+    dev: &mut NetDevice,
+    random_seed: u64,
+    entropy: &mut sec_n_broker::EntropyFill<'_>,
+) -> NetOutcome {
     // Dropping `dev` at return never releases the pinned DMA pools or resets
     // the device (net_device.rs contract).
     let mut storage = [Storage::EMPTY];
-    let Some(mut stream) = open_stream(&mut dev, &mut storage) else {
+    let Some(mut stream) = open_stream(dev, &mut storage, random_seed) else {
         report("V020_W11_NET_STREAM_ERROR", 0, 0, 0);
         return NetOutcome {
             device: true,
@@ -261,24 +351,33 @@ pub(super) fn serve(info: &BootInfo) -> NetOutcome {
         };
     };
     report("V020_W11_NET_LISTEN", u64::from(LISTEN_PORT), 0, 0);
-    if let Err(failure) = accept(&mut stream) {
-        stream.abort();
-        report(
-            "V020_W11_NET_NO_PEER",
-            failure as u64,
-            u64::from(NET_POLL_TURNS),
-            0,
-        );
-        return NetOutcome {
-            device: true,
-            ..NetOutcome::default()
-        };
-    }
-    let (dispatched, stop_code) = match relay(&mut stream) {
+    let source = match accept(&mut stream) {
+        Ok(source) => source,
+        Err(failure) => {
+            stream.abort();
+            report(
+                "V020_W11_NET_NO_PEER",
+                failure as u64,
+                u64::from(NET_POLL_TURNS),
+                0,
+            );
+            return NetOutcome {
+                device: true,
+                ..NetOutcome::default()
+            };
+        }
+    };
+    let (dispatched, stop_code) = match relay(&mut stream, source, entropy) {
         Ok(dispatched) => (dispatched, 0),
         Err(stop) => (stop.dispatched, stop.code),
     };
-    stream.close(sec_n_broker::now_ms());
+    #[cfg(feature = "v020-production-authenticated-net")]
+    let retired = stop_code == 0 && sec_n_broker::retired();
+    #[cfg(not(feature = "v020-production-authenticated-net"))]
+    let retired = false;
+    if !retired {
+        stream.close(sec_n_broker::now_ms());
+    }
     // a = 0 parked / 900 fault / 901 foreign SVC / 902 budget; b = closed-stream
     // events surfaced to the guest as EOF.
     report(
@@ -287,11 +386,22 @@ pub(super) fn serve(info: &BootInfo) -> NetOutcome {
         sec_n_broker::stream_closed(),
         0,
     );
+    let receipt = sec_n_broker::admission_receipt();
+    if let Some((epoch, peer)) = receipt {
+        report("V020_W11_NET_ADMISSION", epoch, u64::from(peer), 1);
+        #[cfg(feature = "v020-production-authenticated-net")]
+        if retired {
+            report("V020_W13_NET_RETIRE", epoch, u64::from(peer), 1);
+        }
+    }
     let outcome = NetOutcome {
         device: true,
         tcp_established: true,
-        leases: sec_n_broker::inferred_leases(),
+        leases: u64::from(receipt.is_some()),
+        #[cfg(feature = "v020-production-authenticated-net")]
+        retired: u64::from(retired),
         relayed_bytes: sec_n_broker::relayed_bytes(),
+        ..NetOutcome::default()
     };
     report(
         "V020_W11_NET_RELAY",
@@ -312,7 +422,11 @@ pub(super) fn publish(outcome: &NetOutcome) {
         u64::from(outcome.tcp_established && outcome.relayed_bytes > 0),
     );
     evidence::put(evidence::W11_ADMISSION_LEASES, outcome.leases);
+    #[cfg(feature = "v020-production-authenticated-net")]
+    evidence::put(evidence::W12_SEC_N_RNG_BYTES, outcome.rng_bytes);
+    #[cfg(feature = "v020-production-authenticated-net")]
+    evidence::put(evidence::W13_NET_RETIREMENTS, outcome.retired);
     evidence::put(evidence::W11_ECHO_BYTES, outcome.relayed_bytes);
-    // By design: no pinned TLS peer, so no authenticated Echo turn is verified.
+    // The authenticated Echo verdict requires the independent host transcript.
     evidence::put(evidence::W11_TLS_ECHO_TURN_VERIFIED, 0);
 }

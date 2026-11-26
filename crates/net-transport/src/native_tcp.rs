@@ -77,7 +77,8 @@ pub fn finish_session<S: NativeSocket>(
     key: ActiveTicket,
     tls: &Session<'_>,
 ) -> Result<(), Error> {
-    if !socket.terminal_tx_quiescent()
+    if !tls.retirement_tls_ready()
+        || !socket.terminal_tx_quiescent()
         || tls.has_pending_plaintext()
         || !tls.pending_tls().is_empty()
     {

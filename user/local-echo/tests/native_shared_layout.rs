@@ -67,3 +67,8 @@ fn native_local_echo_shared_page_matches_kernel_broker_offsets() {
     assert_eq!(limited::SHARED_VA, original::SHARED_VA);
     assert_eq!(limited::PAYLOAD, original::PAYLOAD);
 }
+
+// Exercise the protected broker's receipt decoder on the host as well as the
+// guest-side allowlist and the shared-page layout.
+#[path = "../../../kernel/src/arch/aarch64/sec_n_broker/receipt.rs"]
+mod admission_receipt;

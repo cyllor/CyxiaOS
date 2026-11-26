@@ -229,12 +229,24 @@ fn append_restart(
             }
         })
         .unwrap();
-    let image = gate.after_image(ticket).unwrap();
     assert_eq!(txid % 2, 0);
     let first = 8;
     let lsn = 7 * (txid / 2);
     let proof = scratch
-        .append(disk, sb, first, HOME, txid, lsn, ticket, &image)
+        .append_once(disk, gate, sb, first, HOME, txid, lsn, ticket, |p| {
+            if p.fs_uuid == UUID
+                && p.first == 8
+                && p.state_home == HOME
+                && p.boot_home.is_none()
+                && p.log_epoch == sb.log_epoch
+                && p.txid == txid
+                && p.commit_lsn == lsn
+            {
+                Ok(())
+            } else {
+                Err(SecurityError::Conflict)
+            }
+        })
         .unwrap();
     let receipt = proof.receipt();
     gate.confirm_from_redo(
@@ -265,11 +277,34 @@ fn append_boot(
             panic!("boot does not authorize restart")
         })
         .unwrap();
-    let image = gate.after_image(ticket).unwrap();
     let first = 2;
     let lsn = 7 * (txid / 2) + 4;
     let proof = pair
-        .append(disk, sb, first, HOME, BOOT_HOME, txid, lsn, ticket, &image)
+        .append_once(
+            disk,
+            gate,
+            sb,
+            first,
+            HOME,
+            BOOT_HOME,
+            txid,
+            lsn,
+            ticket,
+            |p| {
+                if p.fs_uuid == UUID
+                    && p.first == 2
+                    && p.state_home == HOME
+                    && p.boot_home == Some(BOOT_HOME)
+                    && p.log_epoch == sb.log_epoch
+                    && p.txid == txid
+                    && p.commit_lsn == lsn
+                {
+                    Ok(())
+                } else {
+                    Err(SecurityError::Conflict)
+                }
+            },
+        )
         .unwrap();
     let receipt = proof.receipt();
     gate.confirm_boot_from_redo(
@@ -519,6 +554,7 @@ pub(super) fn run(info: &BootInfo) -> ! {
         new.root,
         boot,
     );
+    super::v0199_d15_fixture::run(boot, gate.boot_epoch());
     assert_eq!((disk.writes, disk.flushes), (11 + 12 * reset, 6 + reset));
     let final_txid = recovered + 2;
     let final_state = scratch
@@ -545,7 +581,7 @@ pub(super) fn run(info: &BootInfo) -> ! {
     check_failures();
     let row = [
         MAGIC,
-        6,
+        7,
         0,
         prior_boot,
         boot,

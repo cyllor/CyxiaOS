@@ -1,10 +1,12 @@
-//! Baseline-v1 filesystem structural mount scan, V0.19.9 §9.2.1/9.5.
+//! Baseline-v1 and unified-v1 structural mount scans, V0.19.9 §9.2.1/9.5
+//! and G1 D1.2.
 //! Caller holds the actual serialized post-replay volume view, not raw
 //! untrusted EL0 bytes. This scans every inode, every live directory entry,
 //! and the entire allocation bitmap. A pass is not a writable mount:
 //! ACL/system payloads and actual durable checkpoint must also be verified.
 use super::{
     Error,
+    file_media_unified_v1::{RESERVED_INODE_START, UNIFIED_SYSTEM_OBJECTS, UnifiedSystemObject},
     file_media_v0199::{
         BITMAP_START, BLOCK_COUNT, DATA_START, INODE_START, SuperblockV1, crc32c_zeroed,
     },
@@ -194,6 +196,10 @@ impl Workspace {
             block: [0; BLOCK],
         }
     }
+
+    pub(super) fn inodes(&self) -> &[Inode; INODES] {
+        &self.inodes
+    }
 }
 impl Default for Workspace {
     fn default() -> Self {
@@ -219,23 +225,28 @@ fn mark(bits: &mut [u8; BITMAP_BYTES], block: u32) -> Result<(), Error> {
     bits[at] |= bit;
     Ok(())
 }
-fn is_system(id: usize, system: &[SystemObject; 4]) -> bool {
+struct SystemExtent {
+    inode: u16,
+    generation: u64,
+    run: Extent,
+}
+impl SystemExtent {
+    fn new(inode: u16, generation: u64, first_block: u32, blocks: u32) -> Self {
+        Self {
+            inode,
+            generation,
+            run: Extent {
+                logical: 0,
+                physical: first_block,
+                count: blocks,
+            },
+        }
+    }
+}
+fn is_system(id: usize, system: &[SystemExtent]) -> bool {
     system.iter().any(|v| usize::from(v.inode) == id)
 }
-/// Read from the actual committed/replayed owner view under its mount
-/// exclusion. Callback for system contents must validate current schema,
-/// identity, generations and ACL against the entire scanned inode table.
-/// This returns read-only structural evidence, never a production boot grant.
-pub fn scan(
-    sb: SuperblockV1,
-    system: &[SystemObject; 4],
-    w: &mut Workspace,
-    mut read: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
-    verify_system: impl FnOnce(SuperblockV1, &[SystemObject; 4], &[Inode; INODES]) -> Result<(), Error>,
-) -> Result<StructureEvidence, Error> {
-    if sb.fs_uuid == [0; 16] || sb.generation == 0 || sb.log_epoch == 0 {
-        return Err(Error::Invalid);
-    }
+pub(super) fn validate_system_layout(system: &[SystemObject; 4]) -> Result<(), Error> {
     for (i, s) in system.iter().enumerate() {
         if s.inode == 0
             || usize::from(s.inode) >= INODES
@@ -250,6 +261,55 @@ pub fn scan(
         {
             return Err(Error::Invalid);
         }
+    }
+    Ok(())
+}
+/// Read from the actual committed/replayed owner view under its mount
+/// exclusion. Callback for system contents must validate current schema,
+/// identity, generations and ACL against the entire scanned inode table.
+/// This returns read-only structural evidence, never a production boot grant.
+pub fn scan(
+    sb: SuperblockV1,
+    system: &[SystemObject; 4],
+    w: &mut Workspace,
+    read: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
+    verify_system: impl FnOnce(SuperblockV1, &[SystemObject; 4], &[Inode; INODES]) -> Result<(), Error>,
+) -> Result<StructureEvidence, Error> {
+    let evidence = scan_baseline(sb, system, w, read)?;
+    verify_system(sb, system, w.inodes())?;
+    Ok(evidence)
+}
+pub(super) fn scan_baseline(
+    sb: SuperblockV1,
+    system: &[SystemObject; 4],
+    w: &mut Workspace,
+    read: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
+) -> Result<StructureEvidence, Error> {
+    validate_system_layout(system)?;
+    let extents =
+        system.map(|s| SystemExtent::new(s.inode, s.generation, s.first_block, s.kind.blocks()));
+    scan_homes(sb, &extents, INODES, w, read)
+}
+/// Scan the committed homes with the validated unified manifest map.
+pub(super) fn scan_unified(
+    sb: SuperblockV1,
+    system: &[UnifiedSystemObject; UNIFIED_SYSTEM_OBJECTS],
+    w: &mut Workspace,
+    read: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
+) -> Result<StructureEvidence, Error> {
+    let extents =
+        system.map(|s| SystemExtent::new(s.inode, s.generation, s.first_block, s.kind.blocks()));
+    scan_homes(sb, &extents, usize::from(RESERVED_INODE_START), w, read)
+}
+fn scan_homes(
+    sb: SuperblockV1,
+    system: &[SystemExtent],
+    reserved_start: usize,
+    w: &mut Workspace,
+    mut read: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
+) -> Result<StructureEvidence, Error> {
+    if sb.fs_uuid == [0; 16] || sb.generation == 0 || sb.log_epoch == 0 {
+        return Err(Error::Invalid);
     }
     w.owned.fill(0);
     w.references.fill(0);
@@ -267,6 +327,9 @@ pub fn scan(
         for i in 0..16usize {
             let id = page as usize * 16 + i;
             let inode = Inode::decode(&w.block[i * INODE_BYTES..(i + 1) * INODE_BYTES])?;
+            if id >= reserved_start && inode != EMPTY {
+                return Err(Error::Conflict);
+            }
             w.inodes[id] = inode;
             if inode.kind != 0 {
                 live += 1;
@@ -287,14 +350,9 @@ pub fn scan(
         let inode = w.inodes[usize::from(s.inode)];
         if inode.kind != 1
             || inode.generation != s.generation
-            || inode.size != u64::from(s.kind.blocks()) * BLOCK as u64
+            || inode.size != u64::from(s.run.count) * BLOCK as u64
             || inode.extents != 1
-            || inode.runs[0]
-                != (Extent {
-                    logical: 0,
-                    physical: s.first_block,
-                    count: s.kind.blocks(),
-                })
+            || inode.runs[0] != s.run
         {
             return Err(Error::Conflict);
         }
@@ -402,7 +460,6 @@ pub fn scan(
             return Err(Error::Conflict);
         }
     }
-    verify_system(sb, system, &w.inodes)?;
     Ok(StructureEvidence {
         live_inodes: live,
         data_blocks: data,

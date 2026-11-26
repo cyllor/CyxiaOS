@@ -161,6 +161,10 @@ pub fn build() {
     println!("cargo:rerun-if-changed={}", source.display());
     println!("cargo:rerun-if-changed={}", script.display());
     for rel in [
+        "user/v0199-control/audit.rs",
+        "user/v0199-control/audit_hash.rs",
+        "user/v0199-control/catalog.rs",
+        "user/v0199-control/file_read.rs",
         "crates/control-model/src/native_v0199.rs",
         "crates/prototype/src/model.rs",
         "crates/prototype/src/learning/seed.rs",
@@ -169,15 +173,44 @@ pub fn build() {
     }
     println!("cargo:rerun-if-changed=build/v0199_roles.rs");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let snapshot_catalog = env::var_os("CARGO_FEATURE_V020_PRODUCTION_SNAPSHOT_CATALOG").is_some();
+    let file_read = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_READ").is_some();
+    let file_sessions = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_SESSIONS").is_some();
+    let file_volatile_write =
+        env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_VOLATILE_WRITE").is_some();
+    let snapshot_read = env::var_os("CARGO_FEATURE_V020_PRODUCTION_SNAPSHOT_READ").is_some();
     let mut manifest = String::from("[\n");
     let mut hashes = Vec::new();
     for role in ROLES {
         let name = format!("v0199-role-{role}.elf");
         let target = out.join(&name);
-        let status = Command::new(env::var("RUSTC").unwrap())
+        let mut compiler = Command::new(env::var("RUSTC").unwrap());
+        if snapshot_catalog && matches!(role, 6 | 11) {
+            compiler.args(["--cfg", "snapshot_catalog_probe"]);
+        }
+        if file_read && matches!(role, 6 | 11) {
+            compiler.args(["--cfg", "file_read_probe"]);
+        }
+        if file_sessions && role == 11 {
+            compiler.args(["--cfg", "file_sessions_probe"]);
+        }
+        if file_volatile_write && role == 11 {
+            compiler.args(["--cfg", "file_volatile_write_probe"]);
+        }
+        if snapshot_read && role == 11 {
+            compiler.args(["--cfg", "snapshot_read_probe"]);
+        }
+        let status = compiler
             .arg(&source)
             .args([
                 "--edition=2024",
+                "--check-cfg=cfg(control_role, values(\"2\", \"3\", \"6\", \"7\", \"8\", \"9\", \"10\", \"11\"))",
+                "--check-cfg=cfg(snapshot_catalog_probe)",
+                "--check-cfg=cfg(file_read_probe)",
+                "--check-cfg=cfg(file_sessions_probe)",
+                "--check-cfg=cfg(file_volatile_write_probe)",
+                "--check-cfg=cfg(snapshot_read_probe)",
+                "--check-cfg=cfg(test)",
                 "--target",
                 "aarch64-unknown-none-softfloat",
                 "--crate-name",

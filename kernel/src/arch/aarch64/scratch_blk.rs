@@ -16,8 +16,9 @@
 //! * QUEUE (static mut BatchMemory): the device's DMA ring/bounce memory. One
 //!   `&mut` is created by `attach` and moved into the returned BatchedBlock;
 //!   `attach` is called at most once per boot. Under v020-production it lives
-//!   in the dedicated `.bss.sec_n` link section (outside the wave-11 FrameMeta
-//!   window, like the SEC-N pools); it is NOT FrameMeta-registered (open item).
+//!   in the `.bss.sec_n` range registered as permanently pinned static Arena
+//!   pages. This accounts for the storage across requests, independently of
+//!   the device queue's per-request DMA ownership.
 //! * Transport::attach: MMIO window bounded to the virt board's virtio-mmio
 //!   range 0x0a000000..0x0a200000 through the high-half device alias.
 //! * LAST_ERROR_{CODE,SECTOR,SITE}, MAX_LATENCY_{NS,SECTOR}, SLOW (atomics):

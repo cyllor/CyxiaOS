@@ -34,55 +34,92 @@ pub struct DomainObservation {
     pub fields: [Option<u64>; 4],
 }
 #[derive(Clone, Copy)]
+// Retired object IDs retain their highest generation within this boot.
+// Same-ID replacement can reuse the slot, never the old generation.
 struct Row {
     target: Target,
     snapshot: Option<SnapshotReplyV3>,
+    active: bool,
 }
 pub struct SnapshotStore {
     boot: u64,
     sequence: u64,
     last_sample_ns: u64,
+    last_ledger: u64,
+    last_cores: u64,
     targets: [Option<Row>; TARGETS],
     grants: [Option<ViewGrant>; VIEWS],
 }
 impl SnapshotStore {
+    pub const fn empty() -> Self {
+        Self {
+            boot: 0,
+            sequence: 0,
+            last_sample_ns: 0,
+            last_ledger: 0,
+            last_cores: 0,
+            targets: [None; TARGETS],
+            grants: [None; VIEWS],
+        }
+    }
     pub fn new(boot: u64) -> Result<Self, Error> {
+        let mut out = Self::empty();
+        out.bind_boot(boot, || Ok(()))?;
+        Ok(out)
+    }
+    /// Native static storage starts unbound. Bind once after independently
+    /// verified boot confirmation; cannot reset a live registry.
+    pub fn bind_boot(
+        &mut self,
+        boot: u64,
+        verify_boot: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if self.boot != 0 {
+            return Err(Error::Busy);
+        }
         if boot == 0 {
             return Err(Error::Invalid);
         }
-        Ok(Self {
-            boot,
-            sequence: 0,
-            last_sample_ns: 0,
-            targets: [None; TARGETS],
-            grants: [None; VIEWS],
-        })
+        verify_boot()?;
+        self.boot = boot;
+        Ok(())
     }
     pub fn register_target(
         &mut self,
         target: Target,
         verify_native_owner: impl FnOnce(Target) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        if !(1..=15).contains(&target.domain)
-            || !target.object.valid()
-            || !target.owner.valid()
-            || self
-                .targets
-                .iter()
-                .flatten()
-                .any(|r| r.target.domain == target.domain && r.target.object.id == target.object.id)
-        {
+        if self.boot == 0 {
+            return Err(Error::NotReady);
+        }
+        if !(1..=15).contains(&target.domain) || !target.object.valid() || !target.owner.valid() {
             return Err(Error::Denied);
         }
-        let slot = self
-            .targets
-            .iter_mut()
-            .find(|r| r.is_none())
-            .ok_or(Error::Exhausted)?;
+        let old = self.targets.iter().position(|r| {
+            r.is_some_and(|r| {
+                r.target.domain == target.domain && r.target.object.id == target.object.id
+            })
+        });
+        let index = if let Some(i) = old {
+            let r = self.targets[i].unwrap();
+            if r.active {
+                return Err(Error::Busy);
+            }
+            if target.object.generation <= r.target.object.generation {
+                return Err(Error::Stale);
+            }
+            i
+        } else {
+            self.targets
+                .iter()
+                .position(Option::is_none)
+                .ok_or(Error::Exhausted)?
+        };
         verify_native_owner(target)?;
-        *slot = Some(Row {
+        self.targets[index] = Some(Row {
             target,
             snapshot: None,
+            active: true,
         });
         Ok(())
     }
@@ -92,6 +129,9 @@ impl SnapshotStore {
         g: ViewGrant,
         verify_actual_cap: impl FnOnce(ViewGrant) -> Result<(), Error>,
     ) -> Result<(), Error> {
+        if self.boot == 0 {
+            return Err(Error::NotReady);
+        }
         if g.cap == 0
             || g.selector == 0
             || g.allowed_fields == 0
@@ -100,7 +140,7 @@ impl SnapshotStore {
                 .targets
                 .iter()
                 .flatten()
-                .any(|r| r.target.domain == g.domain && r.target.object == g.target)
+                .any(|r| r.active && r.target.domain == g.domain && r.target.object == g.target)
             || self
                 .grants
                 .iter()
@@ -119,6 +159,32 @@ impl SnapshotStore {
         *slot = Some(g);
         Ok(())
     }
+    /// A resource owner can revoke an entire capture at the actual
+    /// generation transition, even if no new observation is available.
+    /// Older snapshots are not kept readable while waiting for sampling.
+    pub fn advance_resources(
+        &mut self,
+        ledger: u64,
+        cores: u64,
+        verify_transition: impl FnOnce(u64, u64) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if self.boot == 0 {
+            return Err(Error::NotReady);
+        }
+        if ledger == 0 || cores == 0 || ledger < self.last_ledger || cores < self.last_cores {
+            return Err(Error::Stale);
+        }
+        if (ledger, cores) == (self.last_ledger, self.last_cores) {
+            return Ok(());
+        }
+        verify_transition(ledger, cores)?;
+        for r in self.targets.iter_mut().flatten() {
+            r.snapshot = None;
+        }
+        self.last_ledger = ledger;
+        self.last_cores = cores;
+        Ok(())
+    }
     /// One frozen common accounting sample plus exact domain-owner
     /// observations. The native caller captures these under the proper
     /// ledger/object lock order; independently verifies live owner and
@@ -132,8 +198,12 @@ impl SnapshotStore {
         observations: &[DomainObservation],
         mut verify_source: impl FnMut(&DomainObservation) -> Result<(), Error>,
     ) -> Result<u64, Error> {
+        if self.boot == 0 {
+            return Err(Error::NotReady);
+        }
         if ledger == 0
             || cores == 0
+            || sampled_ns == 0
             || sampled_ns < self.last_sample_ns
             || observations.is_empty()
             || observations.len() > TARGETS
@@ -141,6 +211,11 @@ impl SnapshotStore {
             || common[7].is_some()
         {
             return Err(Error::Invalid);
+        }
+        // Ledger/core generations are native monotonic identities, not
+        // merely tags for a caller to reuse after a resource replacement.
+        if ledger < self.last_ledger || cores < self.last_cores {
+            return Err(Error::Stale);
         }
         let seq = self.sequence.checked_add(1).ok_or(Error::Exhausted)?;
         // Complete preflight before altering any prior snapshot; no
@@ -164,7 +239,11 @@ impl SnapshotStore {
         };
         for (i, o) in observations.iter().enumerate() {
             if observations[..i].iter().any(|v| v.target == o.target)
-                || !self.targets.iter().flatten().any(|r| r.target == o.target)
+                || !self
+                    .targets
+                    .iter()
+                    .flatten()
+                    .any(|r| r.active && r.target == o.target)
             {
                 return Err(Error::Denied);
             }
@@ -180,13 +259,48 @@ impl SnapshotStore {
             self.targets
                 .iter_mut()
                 .flatten()
-                .find(|r| r.target == o.target)
+                .find(|r| r.active && r.target == o.target)
                 .expect("immutable capture preflight")
                 .snapshot = Some(make(o));
         }
         self.sequence = seq;
         self.last_sample_ns = sampled_ns;
+        self.last_ledger = ledger;
+        self.last_cores = cores;
         Ok(seq)
+    }
+    /// EL1-only owner handoff of exact captured evidence for candidate
+    /// registration. Unlike a redacted user read, preserves the original
+    /// snapshot bytes (including absent age) and requires the registered
+    /// target/owner, current ledger/core generation and native owner check.
+    pub fn frozen_for_owner(
+        &self,
+        target: Target,
+        ledger: u64,
+        cores: u64,
+        now_ns: u64,
+        verify_owner: impl FnOnce(Target) -> Result<(), Error>,
+    ) -> Result<SnapshotReplyV3, Error> {
+        if self.boot == 0 {
+            return Err(Error::NotReady);
+        }
+        let r = self
+            .targets
+            .iter()
+            .flatten()
+            .find(|r| r.active && r.target == target)
+            .ok_or(Error::Stale)?;
+        let snap = r.snapshot.ok_or(Error::NotReady)?;
+        if snap.snapshot_seq != self.sequence
+            || snap.ledger_generation != ledger
+            || snap.core_generation != cores
+            || now_ns < snap.sampled_ns
+            || now_ns - snap.sampled_ns >= MAX_AGE_NS
+        {
+            return Err(Error::Stale);
+        }
+        verify_owner(target)?;
+        Ok(snap)
     }
     // Stable wide snapshot view API; regrouping arguments would change the public contract.
     #[allow(clippy::too_many_arguments)]
@@ -203,6 +317,9 @@ impl SnapshotStore {
         now_ns: u64,
         verify_live_cap: impl FnOnce(ViewGrant) -> Result<(), Error>,
     ) -> Result<[u8; SNAPSHOT_BYTES], Error> {
+        if self.boot == 0 {
+            return Err(Error::NotReady);
+        }
         let grant = *self
             .grants
             .iter()
@@ -217,7 +334,7 @@ impl SnapshotStore {
             .targets
             .iter()
             .flatten()
-            .find(|r| r.target.domain == domain && r.target.object == grant.target)
+            .find(|r| r.active && r.target.domain == domain && r.target.object == grant.target)
             .ok_or(Error::Stale)?;
         let mut snap = r.snapshot.ok_or(Error::NotReady)?;
         if snap.snapshot_seq != self.sequence
@@ -253,13 +370,15 @@ impl SnapshotStore {
         target: Target,
         verify_native_stop: impl FnOnce(Target) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let slot = self
+        let row = self
             .targets
             .iter_mut()
-            .find(|v| v.as_ref().is_some_and(|r| r.target == target))
+            .flatten()
+            .find(|r| r.active && r.target == target)
             .ok_or(Error::Stale)?;
         verify_native_stop(target)?;
-        *slot = None;
+        row.active = false;
+        row.snapshot = None;
         for grant in &mut self.grants {
             if grant
                 .as_ref()
@@ -299,6 +418,162 @@ mod tests {
                 endpoint_id: 10 + i as u64,
             }),
         }
+    }
+    #[test]
+    fn resource_generation_regression_does_not_replace_current_batch() {
+        let mut s = SnapshotStore::new(7).unwrap();
+        let target = Target {
+            domain: 2,
+            object: Identity {
+                id: 2,
+                generation: 1,
+            },
+            owner: Identity {
+                id: 1,
+                generation: 1,
+            },
+        };
+        s.register_target(target, |_| Ok(())).unwrap();
+        let o = DomainObservation {
+            target,
+            fields: [None, Some(1), None, Some(2)],
+        };
+        assert_eq!(s.capture(2, 3, 100, [None; 8], &[o], |_| Ok(())), Ok(1));
+        assert_eq!(
+            s.capture(1, 4, 101, [None; 8], &[o], |_| panic!()),
+            Err(Error::Stale)
+        );
+        assert_eq!(
+            s.capture(3, 2, 101, [None; 8], &[o], |_| panic!()),
+            Err(Error::Stale)
+        );
+        assert_eq!(
+            s.frozen_for_owner(target, 2, 3, 101, |_| Ok(()))
+                .unwrap()
+                .snapshot_seq,
+            1
+        );
+        assert_eq!(
+            s.advance_resources(3, 4, |_, _| Err(Error::NotReady)),
+            Err(Error::NotReady)
+        );
+        assert_eq!(
+            s.frozen_for_owner(target, 2, 3, 102, |_| Ok(()))
+                .unwrap()
+                .snapshot_seq,
+            1
+        );
+        s.advance_resources(3, 4, |l, c| {
+            assert_eq!((l, c), (3, 4));
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            s.frozen_for_owner(target, 2, 3, 102, |_| panic!()),
+            Err(Error::NotReady)
+        ));
+        assert_eq!(
+            s.capture(2, 3, 102, [None; 8], &[o], |_| panic!()),
+            Err(Error::Stale)
+        );
+        assert_eq!(s.capture(3, 4, 102, [None; 8], &[o], |_| Ok(())), Ok(2));
+    }
+    #[test]
+    fn native_frozen_snapshot_requires_bound_boot_and_exact_live_owner() {
+        let mut s = SnapshotStore::empty();
+        let target = Target {
+            domain: 15,
+            object: Identity {
+                id: 15,
+                generation: 1,
+            },
+            owner: Identity {
+                id: 100,
+                generation: 1,
+            },
+        };
+        assert_eq!(
+            s.register_target(target, |_| panic!()),
+            Err(Error::NotReady)
+        );
+        assert_eq!(s.bind_boot(1, || Err(Error::Denied)), Err(Error::Denied));
+        s.bind_boot(7, || Ok(())).unwrap();
+        assert_eq!(s.bind_boot(8, || panic!()), Err(Error::Busy));
+        s.register_target(target, |_| Ok(())).unwrap();
+        let o = DomainObservation {
+            target,
+            fields: [Some(17), None, None, None],
+        };
+        s.capture(2, 3, 100, [None; 8], &[o], |_| Ok(())).unwrap();
+        let v = s.frozen_for_owner(target, 2, 3, 101, |_| Ok(())).unwrap();
+        assert_eq!(v.boot_epoch, 7);
+        assert_eq!(v.snapshot_seq, 1);
+        assert_eq!(v.fields[8], Some(17));
+        assert_eq!(v.fields[6], None);
+        let bad = Target {
+            owner: Identity {
+                generation: 2,
+                ..target.owner
+            },
+            ..target
+        };
+        assert!(matches!(
+            s.frozen_for_owner(bad, 2, 3, 101, |_| panic!()),
+            Err(Error::Stale)
+        ));
+        assert!(matches!(
+            s.frozen_for_owner(target, 3, 3, 101, |_| panic!()),
+            Err(Error::Stale)
+        ));
+        assert!(matches!(
+            s.frozen_for_owner(target, 2, 3, 101, |_| Err(Error::Denied)),
+            Err(Error::Denied)
+        ));
+        s.retire_target(target, |_| Ok(())).unwrap();
+        assert!(matches!(
+            s.frozen_for_owner(target, 2, 3, 101, |_| panic!()),
+            Err(Error::Stale)
+        ));
+        assert_eq!(s.register_target(target, |_| panic!()), Err(Error::Stale));
+        assert_eq!(s.register_target(bad, |_| panic!()), Err(Error::Stale));
+        let next = Target {
+            object: Identity {
+                generation: 2,
+                ..target.object
+            },
+            owner: bad.owner,
+            ..target
+        };
+        s.register_target(next, |_| Ok(())).unwrap();
+        assert!(matches!(
+            s.frozen_for_owner(next, 2, 3, 102, |_| panic!()),
+            Err(Error::NotReady)
+        ));
+        assert_eq!(
+            s.capture(2, 3, 102, [None; 8], &[o], |_| panic!()),
+            Err(Error::Denied)
+        );
+        assert_eq!(
+            s.capture(
+                2,
+                3,
+                102,
+                [None; 8],
+                &[DomainObservation { target: next, ..o }],
+                |_| Ok(())
+            ),
+            Ok(2)
+        );
+        assert_eq!(
+            s.frozen_for_owner(next, 2, 3, 103, |_| Ok(()))
+                .unwrap()
+                .target_generation,
+            2
+        );
+        assert!(matches!(
+            s.frozen_for_owner(target, 2, 3, 103, |_| panic!()),
+            Err(Error::Stale)
+        ));
     }
     #[test]
     fn snapshot_scope_redaction_age_and_retirement() {

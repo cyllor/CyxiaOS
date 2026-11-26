@@ -33,6 +33,11 @@ pub enum Change {
     AllocateBoot,
     Restart(StopEvidence),
     Isolate(StopEvidence),
+    /// Only prepare_offline_install may admit this signed transition.
+    InstallConfig {
+        generation: u64,
+        digest: [u8; 32],
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreparedEpoch {
@@ -61,12 +66,29 @@ pub enum Outcome {
         generation: u64,
         isolated: bool,
     },
+    ConfigInstalled {
+        generation: u64,
+    },
+}
+/// Exact protected journal reservation, bound before the first write.
+/// Not a new on-disk format. The native journal owner validates that this
+/// is the current exclusive extent on the correct mounted device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RedoPlacement {
+    pub fs_uuid: [u8; 16],
+    pub log_epoch: u64,
+    pub first: u32,
+    pub state_home: u32,
+    pub boot_home: Option<u32>,
+    pub txid: u64,
+    pub commit_lsn: u64,
 }
 #[derive(Clone, Copy)]
 struct Pending {
     ticket: PreparedEpoch,
     after: SecurityStateStoreV2,
     outcome: Outcome,
+    placement: Option<RedoPlacement>,
 }
 /// No public method turns a prepared or UNKNOWN update into a boot/service
 /// grant. An in-progress state survives ambiguous callback results; retries
@@ -76,6 +98,7 @@ pub struct DurableEpochGate {
     slots: [SlotBinding; ROLE_COUNT],
     pending: Option<Pending>,
     last: Option<(PreparedEpoch, CommitEvidence, Outcome)>,
+    last_placement: Option<RedoPlacement>,
     boot_confirmed: bool,
     paired_store: bool,
     startup_verified: bool,
@@ -102,6 +125,7 @@ impl DurableEpochGate {
             slots,
             pending: None,
             last: None,
+            last_placement: None,
             boot_confirmed: false,
             paired_store: false,
             startup_verified: false,
@@ -186,6 +210,17 @@ impl DurableEpochGate {
         change: Change,
         verify_stop: impl FnOnce(StopEvidence) -> Result<(), Error>,
     ) -> Result<PreparedEpoch, Error> {
+        // No generic runtime call may install offline configuration,
+        // and the old mount must be revalidated after such a commit.
+        if matches!(change, Change::InstallConfig { .. }) {
+            return Err(Error::Unauthorized);
+        }
+        if self
+            .last
+            .is_some_and(|(_, _, o)| matches!(o, Outcome::ConfigInstalled { .. }))
+        {
+            return Err(Error::Busy);
+        }
         if let Some(p) = self.pending {
             return if p.ticket.change == change {
                 Ok(p.ticket)
@@ -212,6 +247,7 @@ impl DurableEpochGate {
                     epoch: after.last_boot_epoch,
                 }
             }
+            Change::InstallConfig { .. } => return Err(Error::Unauthorized),
             Change::Restart(stop) | Change::Isolate(stop) => {
                 if !self.boot_confirmed || stop.generation == 0 || stop.digest == [0; 32] {
                     return Err(Error::Unauthorized);
@@ -260,8 +296,176 @@ impl DurableEpochGate {
             ticket,
             after,
             outcome,
+            placement: None,
         });
         Ok(ticket)
+    }
+    /// Offline startup only. The caller must supply the actual verified
+    /// signed envelope and independently attest the full stopped/quiescent
+    /// old registry, signed service whitelist, principal/ACL compatibility,
+    /// current rules and each explicitly authorized clearance. No online
+    /// SVC, AI or higher generation alone authorizes an isolation clear.
+    /// This restricted state-block transition does not migrate ACLs,
+    /// change the media format or publish any cap; a successful commit
+    /// requires fresh complete signed-volume validation before boot.
+    pub fn prepare_offline_install(
+        &mut self,
+        config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+        clear: u64,
+        service_generations: [u64; 16],
+        verify_quiesced: impl FnOnce(
+            &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+            &SecurityStateStoreV2,
+            &SecurityStateStoreV2,
+        ) -> Result<(), Error>,
+    ) -> Result<PreparedEpoch, Error> {
+        if !self.paired_store || self.boot_confirmed || self.paired_confirmed {
+            return Err(Error::Unauthorized);
+        }
+        if self
+            .last
+            .is_some_and(|(_, _, o)| matches!(o, Outcome::ConfigInstalled { .. }))
+        {
+            return Err(Error::Busy);
+        }
+        let h = config.header();
+        let old = self.committed;
+        if h.fs_uuid != old.fs_uuid
+            || h.generation <= old.offline_config_generation
+            || h.rule_generation < old.rule_min_generation
+            || h.security_generation < old.security_min_generation
+            || h.key_generation < old.key_generation
+        {
+            return Err(Error::Stale);
+        }
+        if clear & !h.clear_isolation_bitmap != 0 || clear & !old.isolated_service_bitmap != 0 {
+            return Err(Error::Unauthorized);
+        }
+        for (i, (&before, &after)) in old
+            .service_generations
+            .iter()
+            .zip(&service_generations)
+            .enumerate()
+        {
+            if after < before
+                || after != before && before.checked_add(1) != Some(after)
+                || clear & (1u64 << i) != 0 && (after == 0 || before.checked_add(1) != Some(after))
+            {
+                return Err(Error::Conflict);
+            }
+        }
+        let mut after = old;
+        after.state_generation = old
+            .state_generation
+            .checked_add(1)
+            .ok_or(Error::Exhausted)?;
+        after.offline_config_generation = h.generation;
+        after.offline_config_hash = config.digest();
+        after.rule_min_generation = h.rule_generation;
+        after.security_min_generation = h.security_generation;
+        after.key_generation = h.key_generation;
+        after.isolated_service_bitmap &= !clear;
+        after.service_generations = service_generations;
+        // The only monotonic exception is the explicitly signed clear.
+        let mut conservative = after;
+        conservative.isolated_service_bitmap |= clear;
+        if !conservative.no_rollback_from(&old) {
+            return Err(Error::Conflict);
+        }
+        let ticket = PreparedEpoch {
+            change: Change::InstallConfig {
+                generation: h.generation,
+                digest: config.digest(),
+            },
+            fs_uuid: old.fs_uuid,
+            old_state_generation: old.state_generation,
+            new_state_generation: after.state_generation,
+            target_boot_epoch: old.last_boot_epoch,
+            after_digest: hash(&after.encode()?),
+        };
+        if let Some(p) = self.pending {
+            return if p.ticket == ticket && p.after == after {
+                Ok(ticket)
+            } else if p.ticket.change == ticket.change {
+                Err(Error::Conflict)
+            } else {
+                Err(Error::Busy)
+            };
+        }
+        verify_quiesced(config, &old, &after)?;
+        self.startup_verified = false;
+        self.pending = Some(Pending {
+            ticket,
+            after,
+            outcome: Outcome::ConfigInstalled {
+                generation: h.generation,
+            },
+            placement: None,
+        });
+        Ok(ticket)
+    }
+    /// Bind the one actual transaction before any side-effecting I/O.
+    /// A repeat, even with identical bytes, is query-only; callers must
+    /// independently reconcile the retained extent rather than append again.
+    pub fn claim_redo_once(
+        &mut self,
+        ticket: PreparedEpoch,
+        placement: RedoPlacement,
+        verify_reserved_extent: impl FnOnce(&RedoPlacement) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        use super::file_media_v0199::{BLOCK_COUNT, DATA_START};
+        let p = self.pending.as_mut().ok_or(Error::Stale)?;
+        if p.ticket != ticket {
+            return Err(Error::Conflict);
+        }
+        if let Some(prior) = p.placement {
+            return Err(if prior == placement {
+                Error::Busy
+            } else {
+                Error::Conflict
+            });
+        }
+        let paired = self.paired_store && ticket.change == Change::AllocateBoot;
+        if placement.fs_uuid != ticket.fs_uuid
+            || placement.log_epoch == 0
+            || placement.txid == 0
+            || placement.commit_lsn < if paired { 4 } else { 3 }
+            || !(2..=if paired { 4092 } else { 4094 }).contains(&placement.first)
+            || !(DATA_START..BLOCK_COUNT).contains(&placement.state_home)
+            || placement.boot_home.is_some() != paired
+            || placement.boot_home.is_some_and(|b| {
+                b == placement.state_home || !(DATA_START..BLOCK_COUNT).contains(&b)
+            })
+        {
+            return Err(Error::Invalid);
+        }
+        verify_reserved_extent(&placement)?;
+        p.placement = Some(placement);
+        Ok(())
+    }
+    fn check_redo_placement(
+        &self,
+        ticket: PreparedEpoch,
+        placement: RedoPlacement,
+    ) -> Result<(), Error> {
+        if let Some(p) = self.pending {
+            if p.ticket != ticket {
+                return Err(Error::Busy);
+            }
+            return if p.placement == Some(placement) {
+                Ok(())
+            } else if p.placement.is_none() {
+                Err(Error::Unauthorized)
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        if self.last.is_some_and(|(t, _, _)| t == ticket) && self.last_placement == Some(placement)
+        {
+            Ok(())
+        } else {
+            Err(Error::Stale)
+        }
     }
     pub fn after_image(&self, ticket: PreparedEpoch) -> Result<[u8; BLOCK_BYTES], Error> {
         let p = self.pending.ok_or(Error::Stale)?;
@@ -300,6 +504,21 @@ impl DurableEpochGate {
         if superblock.fs_uuid != receipt.fs_uuid || superblock.log_epoch != receipt.log_epoch {
             return Err(Error::Conflict);
         }
+        if redos.len() != 1 {
+            return Err(Error::Conflict);
+        }
+        self.check_redo_placement(
+            ticket,
+            RedoPlacement {
+                fs_uuid: receipt.fs_uuid,
+                log_epoch: receipt.log_epoch,
+                first: first_log_block,
+                state_home: u32::try_from(state_home).map_err(|_| Error::Invalid)?,
+                boot_home: None,
+                txid: receipt.txid,
+                commit_lsn: receipt.commit_lsn,
+            },
+        )?;
         verify_state_redo_v1(
             superblock,
             first_log_block,
@@ -311,7 +530,7 @@ impl DurableEpochGate {
             receipt.txid,
             receipt.commit_lsn,
         )?;
-        self.confirm(ticket, receipt, readback, verify_native)
+        self.confirm_inner(ticket, receipt, readback, false, true, verify_native)
     }
     /// Atomic startup proof: both exact state and BootEpochStore images
     /// appear in the same complete committed transaction, and actual native
@@ -341,6 +560,18 @@ impl DurableEpochGate {
         if sb.fs_uuid != receipt.fs_uuid || sb.log_epoch != receipt.log_epoch {
             return Err(Error::Conflict);
         }
+        self.check_redo_placement(
+            ticket,
+            RedoPlacement {
+                fs_uuid: receipt.fs_uuid,
+                log_epoch: receipt.log_epoch,
+                first: first_log_block,
+                state_home,
+                boot_home: Some(boot_home),
+                txid: receipt.txid,
+                commit_lsn: receipt.commit_lsn,
+            },
+        )?;
         let state = super::boot_epoch_v1::verify_boot_pair(
             sb,
             first_log_block,
@@ -357,7 +588,7 @@ impl DurableEpochGate {
         if state.last_boot_epoch != ticket.target_boot_epoch {
             return Err(Error::Conflict);
         }
-        let outcome = self.confirm_inner(ticket, receipt, readback, true, |t, r| {
+        let outcome = self.confirm_inner(ticket, receipt, readback, true, true, |t, r| {
             verify_native(t, r, boot_readback)
         })?;
         self.paired_confirmed = true;
@@ -377,7 +608,7 @@ impl DurableEpochGate {
         readback: &[u8],
         verify_commit: impl FnOnce(&PreparedEpoch, &CommitEvidence) -> Result<(), Error>,
     ) -> Result<Outcome, Error> {
-        self.confirm_inner(ticket, receipt, readback, false, verify_commit)
+        self.confirm_inner(ticket, receipt, readback, false, false, verify_commit)
     }
     fn confirm_inner(
         &mut self,
@@ -385,9 +616,17 @@ impl DurableEpochGate {
         receipt: CommitEvidence,
         readback: &[u8],
         paired: bool,
+        redo_verified: bool,
         verify_commit: impl FnOnce(&PreparedEpoch, &CommitEvidence) -> Result<(), Error>,
     ) -> Result<Outcome, Error> {
         if self.paired_store && ticket.change == Change::AllocateBoot && !paired {
+            return Err(Error::Unauthorized);
+        }
+        if !redo_verified
+            && (self.paired_store
+                || matches!(ticket.change, Change::InstallConfig { .. })
+                || self.pending.is_some_and(|p| p.placement.is_some()))
+        {
             return Err(Error::Unauthorized);
         }
         // The prior receipt is historical, not current startup authority.
@@ -426,6 +665,7 @@ impl DurableEpochGate {
             self.boot_confirmed = true;
         }
         self.last = Some((ticket, receipt, p.outcome));
+        self.last_placement = p.placement;
         self.pending = None;
         Ok(p.outcome)
     }

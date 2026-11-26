@@ -25,6 +25,7 @@ pub mod file_auth_context_v1;
 pub mod file_auth_v3;
 pub mod file_index_v0199;
 pub mod file_media_v0199;
+pub mod file_receipt_query_v4;
 pub mod file_receipt_store_v0199;
 pub mod file_service_v4;
 pub mod memory;
@@ -44,6 +45,10 @@ pub mod offline_config_v1;
 
 pub mod cap_record_v3;
 
+pub mod snapshot_cow_gate;
+pub mod snapshot_gc_gate;
+pub mod snapshot_list_v4;
+pub mod snapshot_read_v4;
 pub mod snapshot_restore_gate;
 
 pub mod ipc_receive_v3;
@@ -58,3 +63,4 @@ pub mod boot_epoch_v1;
 pub mod file_format_v1;
 pub mod file_media_unified_v1;
 pub mod file_mount_v1;
+pub mod file_read_v4;

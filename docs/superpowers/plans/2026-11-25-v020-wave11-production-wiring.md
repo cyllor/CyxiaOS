@@ -10,6 +10,8 @@
 
 **Spec:** [docs/superpowers/specs/2026-11-25-v020-wave11-production-wiring-design.md](../specs/2026-11-25-v020-wave11-production-wiring-design.md)
 
+**集成后的证据约定。** 以下表格记录初始计划。当前实现用字 133 记录 `RECOVERY_REQUIRED` 下的发布拒绝，字 140 记录 EL0 直接确认的 Admission 收据，字 152–155 分别记录恢复写者交接数、服务 Arena 页数、实际计量超限次数及最长实测耗时。字 144–151 仅用于介质暂存。完成标记跟踪 `media_staging_enabled` 与 `staging_ok`。TCG 泳道核对计量完整性，硬件预算另需取证。 [第十一波实现和复验](../../releases/v0.20.md#2026-11-25-第十一波生产路径接线)
+
 ## Global Constraints
 
 - EL1 闭包保持软浮点，不得引入 `tls` / rustls / ring / NEON；`sec-n-native` 只含 smoltcp。

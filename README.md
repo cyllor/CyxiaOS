@@ -2,9 +2,27 @@
 
 ## V0.20 开发中（未通过 ARM/x86 完整原生验收）
 
-当前开发工作分支 `work/v020-native-control-safety`（基于 `CyxiaOS-V0.20`）使用版本号 `0.20.0-dev`。已收紧 CPU1 单控制核准入和 CPU0 机制核的业务准入边界；这**不是** ARM 控制预算、双大脑独立 EL0 隔离、全本地域 AI 实施、六大安全专项 G2–G4、去分布式或双架构完整回归的完成声明。
+`CyxiaOS-V0.20` 分支的版本号为 `0.20.0-dev`。控制面固定在 CPU0，普通业务只在 CPU1–3 运行。CPU0 失效时停止新的控制发布，业务核不接任控制核。
 
-[**V0.20 原生单机架构规范草案**](docs/design/v0.20-native-local-system.md) · [**V0.20 变更与逐项验收状态**](docs/releases/v0.20.md) · [**V0.20 并行 CI（源码归档/主机测试/两架构构建）**](.github/workflows/v20-native-hardening.yml)。所有关键用例在取得原生证据前仍为 NOT_RUN。
+第十一波在 AArch64 `v020-production` 启动配置接入 FrameMeta 静态页登记、RecoveryProof v2 发布门、建议链桥接计量，以及真实 VirtIO-net TCP 转接和 EL0 Admission 收据校验。
+
+第十三波扩展 AArch64 显式配置，接入测试身份的 TLS 正常关闭与信用回收、Supervisor 易失审计读取与确认，以及签名测试策略绑定的 v1 scratch BootEpoch。 [第十三波接线](docs/releases/v0.20.md#第十三波原生路径接线)
+
+第十四波接入四页动态 FramePool 的 FrameMeta 计账，以及 v1 scratch 卷上四类空快照信封的格式化和重开校验。 [第十四波接线](docs/releases/v0.20.md#第十四波原生路径接线)
+
+第十五波在显式 v1 统一暂存配置中分配八个系统对象，并在 redo 回放前核验 inode、位图、ACL 和空快照信封。 [第十五波接线](docs/releases/v0.20.md#第十五波原生路径接线)
+
+第十六波接入 AArch64 Supervisor 的空快照目录 LIST，读取已签名统一暂存卷的目录见证，并验证拒绝和授权撤销。完整快照端点、G1 介质冻结、生产信任根、持久审计和 ARM/x86 完整原生验收仍待交付。 [第十六波接线](docs/releases/v0.20.md#第十六波原生路径接线)
+
+第十七波接入 G01–G11 候选链，覆盖控制授权、恢复日志、发布与观测、独立学习和快照保护。AArch64 诊断运行了 D02 任务创建、D07 定时器和 D15 串口执行路径。 [第十七波接入](docs/releases/v0.20.md#第十七波候选特性接入)
+
+第十八波接入签名暂存卷的 AArch64 只读文件服务。Supervisor 通过 `0x50` 列目录、打开、读取和关闭盘上的文件，并查询和确认易失结果。 [第十八波接入](docs/releases/v0.20.md#第十八波只读文件服务接线)
+
+第十九波优化原型的历史快照查找，并在 AArch64 `v020-production-snapshot-read` 配置接入签名暂存卷中空快照区的 QUERY 与 HISTORY_OPEN。宿主对照原盘 SlotStore 和两次启动的密封证据。 [第十九波接入](docs/releases/v0.20.md#第十九波快照读取接入)
+
+第二十波通过 AArch64 `v020-production-file-sessions` 为签名暂存卷启用四个独立的只读句柄，核对单句柄关闭、顺序 ACK、精确重放和根授权撤销。 [第二十波接入](docs/releases/v0.20.md#第二十波多句柄只读文件服务)
+
+[**V0.20 原生单机架构设计**](docs/design/v0.20-native-local-system.md) · [**V0.20 变更与逐项验收状态**](docs/releases/v0.20.md) · [**V0.20 生产路径与介质暂存 CI**](.github/workflows/v020-production.yml) · [**V0.20 并行 CI**](.github/workflows/v20-native-hardening.yml)
 
 ---
 

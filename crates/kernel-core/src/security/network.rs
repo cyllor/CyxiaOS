@@ -1296,8 +1296,8 @@ mod tests {
             assert_eq!(proof.generation(), 1);
             assert_eq!(proof.client_isn(), 0x1234_5678);
             assert_eq!(proof.flow(), f);
-            assert!(cookie >> 27 < 32); // time5
-            assert!((cookie >> 24) & 7 < 8); // MSS3
+            assert_eq!(cookie >> 27, 0); // time5 at now_ns=0
+            assert_eq!((cookie >> 24) & 7, index as u32); // MSS3
         }
         assert_eq!(authority.issue_cookie(&f, 0, 8, 0), Err(Error::Invalid));
     }

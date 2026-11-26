@@ -173,7 +173,9 @@ fn own(block: u32, bitmap: &[u8; MAP_BYTES], owners: &mut [u8; MAP_BYTES]) -> Re
     Ok(())
 }
 
-/// Validate one business tree with no allocation proportional to inode count.
+const ANCESTOR_WORDS: usize = (BUSINESS_INODE_COUNT as usize).div_ceil(64);
+
+/// Validate one business tree with fixed scratch space.
 /// Unique ownership is checked independently for each view; valid historical
 /// sharing is accumulated into the optional union mark. Allocated garbage is
 /// retained until collection proves it unreachable from every protected root.
@@ -193,6 +195,7 @@ pub(super) fn validate_disk_tree<D: BlockDevice>(
         owners[block as usize / 8] |= 1 << (block % 8);
     }
     let mut references = [0u16; BUSINESS_INODE_COUNT as usize];
+    let mut rooted = [0u64; ANCESTOR_WORDS];
     let mut cached_inode_page = None;
     for id in 0..BUSINESS_INODE_COUNT as usize {
         // Reuse one scan page until a directory needs the complete name bank.
@@ -243,8 +246,16 @@ pub(super) fn validate_disk_tree<D: BlockDevice>(
         }
         if id != 0 {
             let mut child = inode;
-            let mut reached_root = false;
-            for _ in 0..BUSINESS_INODE_COUNT {
+            let mut child_id = id;
+            let mut path = [0u64; ANCESTOR_WORDS];
+            loop {
+                let bit = 1u64 << (child_id % 64);
+                let word = &mut path[child_id / 64];
+                if *word & bit != 0 {
+                    return Err(Error::Conflict);
+                }
+                *word |= bit;
+
                 let parent_id = child.parent_inode as usize;
                 if parent_id >= BUSINESS_INODE_COUNT as usize {
                     return Err(Error::Conflict);
@@ -255,17 +266,16 @@ pub(super) fn validate_disk_tree<D: BlockDevice>(
                 {
                     return Err(Error::Stale);
                 }
-                if parent_id == 0 {
-                    reached_root = true;
+                if parent_id == 0 || rooted[parent_id / 64] & (1u64 << (parent_id % 64)) != 0 {
                     break;
                 }
-                if parent_id == id {
-                    return Err(Error::Conflict);
-                }
                 child = parent;
+                child_id = parent_id;
             }
-            if !reached_root {
-                return Err(Error::Conflict);
+            // The link into a known ancestor has passed the generation check.
+            // Only a successful walk proves the inodes on this path.
+            for (word, visited) in rooted.iter_mut().zip(path) {
+                *word |= visited;
             }
         }
         if inode.kind != InodeKind::Directory || inode.size == 0 {

@@ -6,7 +6,8 @@
 use super::{
     Error,
     durable_role_epoch_v0199::{
-        Change, CommitEvidence, DurableEpochGate, Outcome, PreparedEpoch, SlotBinding,
+        Change, CommitEvidence, DurableEpochGate, Outcome, PreparedEpoch, RedoPlacement,
+        SlotBinding,
     },
     epoch_redo_v0199::EpochBlockIo,
     file_index_v0199::SecurityStateStoreV2,
@@ -272,9 +273,41 @@ impl BootPairRedo {
         seal(&mut self.commit, 3, 128, txid, sb.log_epoch, lsn)?;
         Ok(())
     }
-    // Stable wide boot-pair append API; regrouping arguments would change the public contract.
+    /// Append once to the authenticated owner's reserved, empty six-block extent.
     #[allow(clippy::too_many_arguments)]
-    pub fn append(
+    pub fn append_once(
+        &mut self,
+        io: &mut impl EpochBlockIo,
+        gate: &mut DurableEpochGate,
+        sb: SuperblockV1,
+        first: u32,
+        state_home: u32,
+        boot_home: u32,
+        txid: u64,
+        lsn: u64,
+        ticket: PreparedEpoch,
+        verify_reserved_extent: impl FnOnce(&RedoPlacement) -> Result<(), Error>,
+    ) -> Result<BootPairCommit, Error> {
+        let state = gate.after_image(ticket)?;
+        gate.claim_redo_once(
+            ticket,
+            RedoPlacement {
+                fs_uuid: sb.fs_uuid,
+                log_epoch: sb.log_epoch,
+                first,
+                state_home,
+                boot_home: Some(boot_home),
+                txid,
+                commit_lsn: lsn,
+            },
+            verify_reserved_extent,
+        )?;
+        self.append(
+            io, sb, first, state_home, boot_home, txid, lsn, ticket, &state,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn append(
         &mut self,
         io: &mut impl EpochBlockIo,
         sb: SuperblockV1,
@@ -431,7 +464,7 @@ impl BootEpochGrant {
 ///    the durable boot epoch. Issuing actual control roots additionally
 ///    requires the signed-config `confirmed_config_boot` path on the gate.
 /// 7. Fail-closed: on `Error::Unknown` do NOT retry under this authority — the
-///    pending transition is preserved, no epoch is published, and the dirty
+///    pending transition is preserved, no epoch is published, and the claimed
 ///    extent fences retries with `Error::Conflict`. Cold-recover from durable
 ///    evidence instead; generation continuity then allocates the next epoch
 ///    exactly once. One boot epoch per boot: a second `allocate` after a
@@ -456,6 +489,34 @@ impl BootEpochAuthority {
         Ok(Self {
             gate: DurableEpochGate::recovered_pair(state_raw, boot_raw, slots, verify_recovered)?,
         })
+    }
+
+    /// Open the paired authority only after the signed configuration agrees
+    /// with the decoded home and the caller authenticates the mounted volume.
+    pub fn open_for_startup(
+        state_raw: &[u8],
+        boot_raw: &[u8],
+        slots: [SlotBinding; ROLE_COUNT],
+        config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+        verify_volume: impl FnOnce(&SecurityStateStoreV2) -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            gate: DurableEpochGate::recovered_for_startup(
+                state_raw,
+                boot_raw,
+                slots,
+                config,
+                verify_volume,
+            )?,
+        })
+    }
+
+    /// Recheck the signed policy against the durably confirmed pair.
+    pub fn confirmed_config_boot(
+        &self,
+        config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+    ) -> Result<u64, Error> {
+        self.gate.confirmed_config_boot(config)
     }
 
     /// The confirmed boot epoch, if a paired transaction was fully confirmed
@@ -486,18 +547,30 @@ impl BootEpochAuthority {
         let ticket = self
             .gate
             .prepare(Change::AllocateBoot, |_| Err(Error::Unauthorized))?;
-        let image = self.gate.after_image(ticket)?;
-        let proof = pair.append(
-            io,
-            sb,
-            tx.first_log_block,
-            tx.state_home,
-            tx.boot_home,
-            tx.txid,
-            tx.commit_lsn,
-            ticket,
-            &image,
-        )?;
+        // The mounted-volume owner supplies the authenticated reservation in tx.
+        // The append checks the empty extent against the device before writing.
+        let proof = pair
+            .append_once(
+                io,
+                &mut self.gate,
+                sb,
+                tx.first_log_block,
+                tx.state_home,
+                tx.boot_home,
+                tx.txid,
+                tx.commit_lsn,
+                ticket,
+                |placement| {
+                    if placement.commit_lsn - 3 <= sb.checkpoint_lsn {
+                        return Err(Error::Invalid);
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|error| match error {
+                Error::Busy => Error::Conflict,
+                other => other,
+            })?;
         let receipt = proof.receipt();
         let outcome = self.gate.confirm_boot_from_redo(
             ticket,
@@ -592,7 +665,6 @@ mod tests {
         ));
         let mut gate = DurableEpochGate::recovered_pair(&state, &boot, slots, |_| Ok(())).unwrap();
         let ticket = gate.prepare(Change::AllocateBoot, |_| panic!()).unwrap();
-        let image = gate.after_image(ticket).unwrap();
         let mut pair = BootPairRedo::new();
         let sb = SuperblockV1 {
             fs_uuid: [1; 16],
@@ -607,14 +679,36 @@ mod tests {
             fail_second: true,
         };
         assert!(matches!(
-            pair.append(&mut disk, sb, 2, 7000, 7002, 1, 4, ticket, &image),
+            pair.append_once(
+                &mut disk,
+                &mut gate,
+                sb,
+                2,
+                7000,
+                7002,
+                1,
+                4,
+                ticket,
+                |_| Ok(())
+            ),
             Err(Error::Unknown)
         ));
         assert_eq!(gate.boot_epoch(), None);
         assert_eq!((disk.writes, disk.flushes), (6, 2));
         assert!(matches!(
-            pair.append(&mut disk, sb, 2, 7000, 7002, 1, 4, ticket, &image),
-            Err(Error::Conflict)
+            pair.append_once(
+                &mut disk,
+                &mut gate,
+                sb,
+                2,
+                7000,
+                7002,
+                1,
+                4,
+                ticket,
+                |_| panic!()
+            ),
+            Err(Error::Busy)
         ));
         // Separate successful native-owner fixture. Do not retry the
         // ambiguous transaction on another device under the old gate.
@@ -628,7 +722,18 @@ mod tests {
             fail_second: false,
         };
         let proof = pair
-            .append(&mut disk, sb, 2, 7000, 7002, 1, 4, ticket, &image)
+            .append_once(
+                &mut disk,
+                &mut gate,
+                sb,
+                2,
+                7000,
+                7002,
+                1,
+                4,
+                ticket,
+                |_| Ok(()),
+            )
             .unwrap();
         let receipt = proof.receipt();
         assert_eq!(
@@ -867,11 +972,17 @@ mod tests {
         let tx = prod_tx(&sb_raw, 2, 1, 4);
         assert_eq!(auth.allocate(&mut disk, &mut pair, tx), Err(Error::Unknown));
         assert_eq!(auth.confirmed_epoch(), None);
-        // Fenced: the dirty extent refuses a retry under the same authority.
+        // The claim fences retry on both the original and a different extent.
         assert_eq!(
             auth.allocate(&mut disk, &mut pair, tx),
             Err(Error::Conflict)
         );
+        assert_eq!(
+            auth.allocate(&mut disk, &mut pair, prod_tx(&sb_raw, 8, 2, 8)),
+            Err(Error::Conflict)
+        );
+        assert_eq!(disk.flushes, 2);
+        assert!(disk.blocks[8..14].iter().flatten().all(|&byte| byte == 0));
         assert_eq!(auth.confirmed_epoch(), None);
         // The uncertain commit did not burn the epoch globally: a clean cold
         // recovery from the original committed image allocates epoch 6 once.

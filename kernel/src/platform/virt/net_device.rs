@@ -11,9 +11,8 @@
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
 //! * CLAIMED (atomic): admits CPU0 once; `init` is therefore one-shot per boot.
 //! * RX / TX (static mut BatchMemory): the device's DMA pools. Under
-//!   `v020-production` they live in the dedicated `.bss.sec_n` link section,
-//!   outside the wave-11 FrameMeta window, and are NOT FrameMeta-registered
-//!   (open item). `init` forms the only `&mut` to each and moves both borrows
+//!   `v020-production` they live in the pinned `.bss.sec_n` arena, registered
+//!   as permanent FrameMeta rows at boot. `init` forms the only `&mut` to each and moves both borrows
 //!   into the driver: they are borrowed for the DEVICE'S LIFETIME, not for one
 //!   call. In production the `NetDevice` holding them lives across the whole of
 //!   `net::serve`, driven synchronously by CPU0 only (no IRQ handler or
@@ -31,13 +30,12 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_contracts::BootInfo;
 use cyxia_driver_virtio::{Error, Transport, net::BatchedNet, queue::BatchMemory};
 
-/// Net MMIO window decoded from the DTB (same window as the legacy bring-up).
-const NET_WINDOW_START: u64 = 0x0a00_0000;
-const NET_WINDOW_END: u64 = 0x0a20_0000;
+/// Board VirtIO MMIO window decoded from the DTB.
+const VIRTIO_WINDOW_START: u64 = 0x0a00_0000;
+const VIRTIO_WINDOW_END: u64 = 0x0a20_0000;
 
 static CLAIMED: AtomicBool = AtomicBool::new(false);
-// v020-production keeps the pinned DMA pools in the dedicated `.bss.sec_n` link
-// section, outside the wave-11 FrameMeta window (not FrameMeta-registered yet).
+// The statically registered production arena includes both pinned DMA pools.
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut RX: BatchMemory = BatchMemory::zeroed();
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
@@ -57,14 +55,30 @@ pub fn init(info: &BootInfo) -> Result<NetDevice, Error> {
     if cyxia_arch_aarch64::cpu::slot() != 0 || CLAIMED.swap(true, Ordering::AcqRel) {
         return Err(Error::Busy);
     }
+    let transport = find_transport(info, 1)?;
+    // SAFETY: single CPU0 foreground owner; the static pools are exclusively
+    // borrowed here and stay pinned through every error path.
+    let net = unsafe {
+        BatchedNet::initialize(
+            transport,
+            &mut *core::ptr::addr_of_mut!(RX),
+            &mut *core::ptr::addr_of_mut!(TX),
+            &Board,
+        )
+    }?;
+    Ok(NetDevice { net })
+}
+
+/// Find one transport of the expected device type in the board window.
+pub(crate) fn find_transport(info: &BootInfo, device_id: u32) -> Result<Transport, Error> {
     let mut selected = None;
     for resource in info.virtio.get(..info.virtio_count).ok_or(Error::Address)? {
-        if resource.base.0 < NET_WINDOW_START
+        if resource.base.0 < VIRTIO_WINDOW_START
             || resource
                 .base
                 .0
                 .checked_add(resource.len)
-                .is_none_or(|end| end > NET_WINDOW_END)
+                .is_none_or(|end| end > VIRTIO_WINDOW_END)
         {
             continue;
         }
@@ -78,23 +92,12 @@ pub fn init(info: &BootInfo) -> Result<NetDevice, Error> {
         }) else {
             continue;
         };
-        if transport.device_id() == 1 {
+        if transport.device_id() == device_id {
             if selected.is_some() {
                 return Err(Error::Device);
             }
             selected = Some(transport);
         }
     }
-    let transport = selected.ok_or(Error::Device)?;
-    // SAFETY: single CPU0 foreground owner; the static pools are exclusively
-    // borrowed here and stay pinned through every error path.
-    let net = unsafe {
-        BatchedNet::initialize(
-            transport,
-            &mut *core::ptr::addr_of_mut!(RX),
-            &mut *core::ptr::addr_of_mut!(TX),
-            &Board,
-        )
-    }?;
-    Ok(NetDevice { net })
+    selected.ok_or(Error::Device)
 }

@@ -172,8 +172,19 @@ class EpochFixture:
     def verify_qemu(self,binary,version):
         verify_smp.require(version.splitlines()[0].startswith('QEMU emulator version 10.2.2')
                            and verify_smp.sha(binary)==self.qemu_hash,'pinned QEMU mismatch')
-    @staticmethod
-    def profile(elf):
+    def profile(self,elf):
+        # Independently bind the actual loaded diagnostic code to the
+        # immutable executable bytes of this exact verified kernel ELF.
+        start=verify_smp.symbol(elf,'smp_user_start')['pa']
+        end=verify_smp.symbol(elf,'smp_user_end')['pa']
+        verify_smp.require(start%BLOCK==0 and 0<end-start<=BLOCK,'D02 ELF code extent')
+        matches=[]
+        for seg in verify_smp.inspect_elf(elf)['loads']:
+            delta=start-seg['pa']
+            if 0<=delta and delta+end-start<=seg['size']:
+                matches.append(elf[seg['offset']+delta:seg['offset']+delta+end-start])
+        verify_smp.require(len(matches)==1,'D02 code not uniquely backed by ELF')
+        self.d02_code=(start,end-start,hashlib.sha256(matches[0]).digest())
         return verify_smp.profile(elf)
     @staticmethod
     def metadata():
@@ -190,7 +201,7 @@ class EpochFixture:
         txid=2*e
         replay=e-1
         flushes=6+replay
-        require(w[:11]==(MAGIC,6,1,e-1,e,txid-1,txid+1,txid,7*e,8,flushes),
+        require(w[:11]==(MAGIC,7,1,e-1,e,txid-1,txid+1,txid,7*e,8,flushes),
                 'wrong durable boot/service transition identity')
         require(w[11]>=4096 and w[12:14]==(11+12*replay,HOME),'missing actual full-log scan or block I/O counts')
         require(page[14*8:18*8]==hashlib.sha256(state(txid)).digest(),'native afterimage digest mismatch')
@@ -240,7 +251,157 @@ class EpochFixture:
                 'redo buffers are not in the actual progress pool')
         require(serial.count(f'V0199_FRAME_LEDGER a=262144 b={permanent} c={free}\n'.encode())==1,
                 'frame ledger UART/memory mismatch')
-        require(all(v==0 for v in w[80:]),'nonzero reserved evidence')
+        magic,baseline,bc,bmax,bcpu,applied,ac,amax,acpu,limit,chars,before,after,version,start,finished,first_cpu,written,rlen,retained,sampled,accepted=w[80:102]
+        require(magic==0x4359443135465831 and w[102:104]==(0,0),'missing real D15 effect record')
+        base_payload=b'V0199_D15_BASELINE actual ordinary UART frame 0123456789abcdef\n'
+        applied_payload=b'V0199_D15_APPLIED actual ordinary UART frame 0123456789abcdef\n'
+        require(serial.count(base_payload)==serial.count(applied_payload)==1
+                and serial.index(base_payload)<serial.index(applied_payload),'actual queued UART frames lost, duplicated or reordered')
+        require((baseline,applied)==(28+len(base_payload),28+len(applied_payload))
+                and written==baseline+applied and 0<bmax<=8<amax<=32 and limit==32
+                and 0<chars<=limit and before-after==chars and before==applied
+                and version==1 and bc>=((baseline+7)//8) and ac>=((applied+31)//32)
+                and bcpu>0 and acpu>=first_cpu>0 and sampled<=accepted<=start<=finished
+                and retained==1 and rlen==98,'D15 actual hardware effect/cost conservation mismatch')
+        require(serial.count(f'V0199_D15_EFFECT a={bmax} b={amax} c=1\n'.encode())==1,
+                'D15 UART effect summary mismatch')
+        snapshot=page[104*8:137*8]
+        rules=page[137*8:148*8]
+        plan=page[148*8:148*8+212]
+        decision=page[175*8:207*8]
+        report=page[207*8:207*8+rlen]
+        require(page[148*8+212:175*8]==bytes(4) and page[207*8+rlen:220*8]==bytes(6),
+                'nonzero D15 evidence padding')
+        require(struct.unpack_from('<IHH',snapshot)==(0x4359534e,3,72)
+                and struct.unpack_from('<7Q',snapshot,8)==(1,e,1,1,15,1,sampled)
+                and struct.unpack_from('<HHI',snapshot,64)==(15,12,0),'wrong live D15 snapshot scope')
+        fields=[]
+        for i in range(12):
+            fid,present,value=struct.unpack_from('<HB5xQ',snapshot,72+i*16)
+            require(fid==16+i and present in (0,1) and (present or value==0),'noncanonical D15 snapshot')
+            require(snapshot[72+i*16+3:72+i*16+8]==bytes(5),'snapshot reserved bytes')
+            fields.append(value if present else None)
+        require(fields[:8]==[None]*8 and fields[8]==applied,'D15 real queue depth or absent fields changed')
+        expected_rules=bytearray(88)
+        put(expected_rules,0,'IHHQIIQ',0x43595255,2,32,1,1,88,0)
+        put(expected_rules,32,'IHHQHHHHII',1,15,1,15,0,1,1,0,56,0)
+        put(expected_rules,64,'HB5xQ',1,3,1)
+        put(expected_rules,80,'HHI',2,0,0)
+        require(rules==bytes(expected_rules),'frozen diagnostic rules differ')
+        h=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
+        h.update(hashlib.sha256(b'CYX/D15-FIXTURE-ORDINALS/0=1,1=8,2=32,3=64').digest())
+        h.update(snapshot);h.update(bytes(1))
+        for v in fields[8:12]+[1,applied,1]:
+            h.update(bytes([v is not None]));h.update(struct.pack('<Q',0 if v is None else v))
+        h.update(struct.pack('<H',4))
+        for i,v in enumerate((1,8,32,64)):h.update(struct.pack('<HBH',i,2,v))
+        candidate_hash=h.digest()
+        require(plan[176:208]==candidate_hash and plan[208:212]==struct.pack('<HH',2,32)
+                and struct.unpack_from('<IHHIHH6Q',plan)==(0x43594c31,2,64,212,1,0,1,0,0,1,1,sampled+10_000_000_000),
+                'D15 exact plan differs from approved rule/snapshot')
+        require(decision[160:192]==hashlib.sha256(rules).digest()
+                and decision[192:224]==hashlib.sha256(plan).digest()
+                and decision[224:256]==candidate_hash
+                and struct.unpack_from('<10Q',decision,8)==(e,1,1,1,1,15,1,1,1,1)
+                and struct.unpack_from('<HHH',decision,92)==(0,15,1)
+                and decision[98:102]==bytes(4)
+                and struct.unpack_from('<HH',decision,102)==(2,65535)
+                and struct.unpack_from('<IHH',decision,152)==(4,2,0),'D15 decision is not exact RULE_ONLY fallback')
+        require(struct.unpack_from('<QQQHHHHQQQQiIQ',report)==(e,1,1,0,15,1,0,15,1,1,1,0,2,finished)
+                and report[80:96]==bytes(16) and report[96:]==struct.pack('<H',32),
+                'D15 ApplyReport does not match actual retained effect')
+        # D07 uses the next sequence in the same protected registry and
+        # gate. Independently recompute the timer grid and verify the real
+        # comparator values, status-confirmed wakeups and exact report.
+        (magic7,freq,b_req,b_prog,b_cmp,b_wake,h_req,h_prog,h_cmp,h_wake,
+         s_req,s_prog,s_cmp,s_wake,s_start,s_done,s_sample,s_accept,s_version,
+         s_rlen,s_retained,slack,coalesce,serial7)=w[220:244]
+        require(magic7==0x4359443037465831 and freq>0 and 1_000_000_000%freq==0,
+                'missing actual D07 timer evidence')
+        tick=1_000_000_000//freq
+        require((slack,coalesce,s_version,s_rlen,s_retained,serial7)==(80_000,200,2,98,2,2),
+                'D07 policy or effect identity mismatch')
+        q=coalesce*1000
+        expected_soft=min(((s_req+q-1)//q)*q,s_req+slack)
+        require(b_req==b_prog==b_cmp*tick and h_req==h_prog==h_cmp*tick
+                and s_prog==s_cmp*tick==expected_soft and s_req<s_prog<=s_req+slack
+                and b_wake>=b_prog and h_wake>=h_prog and s_wake>=s_prog
+                and b_wake<=s_sample<=s_accept<=h_wake<=s_start<=s_done<=s_wake
+                and s_accept<=s_sample+100_000_000 and s_start<s_sample+10_000_000_000,
+                'D07 actual comparator, slack, hard deadline or wake evidence mismatch')
+        require(serial.count(f'V0199_D07_EFFECT a={s_req} b={s_prog} c={s_wake}\n'.encode())==1,
+                'D07 UART and stopped-memory evidence mismatch')
+        ss=page[244*8:277*8];rr=page[277*8:288*8]
+        pp=page[288*8:288*8+212];dd=page[315*8:347*8]
+        ar=page[347*8:347*8+s_rlen]
+        require(page[288*8+212:315*8]==bytes(4) and page[347*8+s_rlen:360*8]==bytes(6),
+                'nonzero D07 evidence padding')
+        require(struct.unpack_from('<IHH',ss)==(0x4359534e,3,72)
+                and struct.unpack_from('<7Q',ss,8)==(2,e,1,1,7,1,s_sample)
+                and struct.unpack_from('<HHI',ss,64)==(7,12,0),'wrong D07 snapshot scope')
+        sf=[]
+        for i in range(12):
+            fid,present,value=struct.unpack_from('<HB5xQ',ss,72+i*16)
+            require(fid==16+i and present in (0,1) and (present or value==0)
+                    and ss[72+i*16+3:72+i*16+8]==bytes(5),'noncanonical D07 snapshot')
+            sf.append(value if present else None)
+        require(sf==[None]*8+[1,None,80,None],'D07 actual registered timer/slack or missing sample changed')
+        expected7=bytearray(88)
+        put(expected7,0,'IHHQIIQ',0x43595255,2,32,2,1,88,0)
+        put(expected7,32,'IHHQHHHHII',2,7,1,7,0,1,1,0,56,0)
+        put(expected7,64,'HB5xQ',1,3,1)
+        put(expected7,80,'HHI',2,0,0)
+        require(rr==bytes(expected7),'D07 diagnostic rule bytes differ')
+        dh=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
+        dh.update(hashlib.sha256(b'CYX/D07-FIXTURE-ORDINALS/0=0,1=50,2=200,3=1000').digest())
+        dh.update(ss);dh.update(bytes(1))
+        for v in sf[8:12]+[0,1,1]:
+            dh.update(bytes([v is not None]));dh.update(struct.pack('<Q',0 if v is None else v))
+        dh.update(struct.pack('<H',4))
+        for i,v in enumerate((0,50,200,1000)):dh.update(struct.pack('<HBH',i,2,v))
+        d7hash=dh.digest()
+        require(pp[176:208]==d7hash and pp[208:212]==struct.pack('<HH',2,200)
+                and struct.unpack_from('<IHHIHH6Q',pp)==(0x43594c31,2,64,212,1,0,2,1,0,1,2,s_sample+10_000_000_000)
+                and struct.unpack_from('<IHHHHI8Q',pp,64)==(0x43595031,2,144,7,1,4,1,2,2,7,1,1,1,s_sample+100_000_000)
+                and pp[144:176]==bytes(32),'D07 plan differs from exact current rule/snapshot')
+        require(dd[160:192]==hashlib.sha256(rr).digest() and dd[192:224]==hashlib.sha256(pp).digest()
+                and dd[224:256]==d7hash and struct.unpack_from('<10Q',dd,8)==(e,1,2,2,2,7,1,1,1,2)
+                and struct.unpack_from('<IHHH',dd,88)==(2,0,7,1) and dd[98:102]==bytes(4)
+                and struct.unpack_from('<HH',dd,102)==(2,65535)
+                and struct.unpack_from('<IHH',dd,152)==(4,2,0),'D07 decision not exact RULE_ONLY')
+        require(struct.unpack_from('<QQQHHHHQQQQiIQ',ar)==(e,1,2,0,7,1,0,7,1,1,2,0,2,s_done)
+                and ar[80:96]==bytes(16) and ar[96:]==struct.pack('<H',200),
+                'D07 ApplyReport differs from actual retained comparator effect')
+        # Writable owner metadata is within the exact pre-reserved control
+        # pool, following the 8 role backings, 16 three-page table sets and
+        # 128KiB stable-copy scratch; no extra physical pool.
+        magic_pool,owners,owner_bytes,loader_end=w[360:364]
+        expected_loader_end=8*(65536+32768)+16*3*4096+131072
+        require(magic_pool==0x435944504f4f4c31 and loader_end==expected_loader_end
+                and owners==control+loader_end and owners%4096==0
+                and 0<owner_bytes<=1024*1024 and owner_bytes%4096==0
+                and owners+owner_bytes<=control+control_bytes,'invalid native effect metadata arena')
+        last=0
+        for i,cap in enumerate((65536,65536,65536,65536,98304)):
+            off,size=w[364+i*2:366+i*2]
+            require(off%8==0 and last<=off and 0<size<=cap and off+size<=owner_bytes,
+                    'overlapping or out-of-pool native owner table')
+            last=off+size
+        task_off,task_size,proof_off,proof_size,unused=w[374:379]
+        require(task_off%8==0 and last<=task_off and 0<task_size<=65536
+                and task_off+task_size<=proof_off and proof_size==2048
+                and proof_off+proof_size<=owner_bytes and unused==0,
+                'D02 owner/proof outside reserved control pool')
+        magic2,base_win,apply_win,base_count,apply_count,version2,sample2,accept2,completed2,rlen2,retained2,used2=w[379:391]
+        require(magic2==0x4359443032465831 and base_win<apply_win
+                and (base_count,apply_count,version2,rlen2,retained2,used2)==(2,4,3,98,3,2006)
+                and sample2<=accept2<sample2+100_000_000 and accept2<=completed2,
+                'D02 token windows or report custody mismatch')
+        require(w[395]%BLOCK==0 and 0x40000000<=w[395]<0x44000000
+                and 0<w[396]<=BLOCK and (w[395],w[396])==self.d02_code[:2],
+                'invalid D02 diagnostic package extent or ELF mismatch')
+        require(serial.count(b'V0199_D02_EFFECT a=2 b=4 c=3\n')==1,'missing actual D02 UART evidence')
+        require(all(v==0 for v in w[397:]),'nonzero reserved evidence')
         expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c={flushes}\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
         return dict(previous_boot_epoch=e-1,boot_epoch=e,state_generation=txid+1,txid=txid,
@@ -250,8 +411,19 @@ class EpochFixture:
                     formatted_v1_structure_verified=True,system_objects_verified=4,acl_slots_verified=256,
                     checkpoint_generation=e+1,checkpoint_log_epoch=e+1,checkpoint_lsn=7*replay,
                     native_checkpoint_flush_verified=True,
+                    native_d15_effect_fixture_verified=True,d15_baseline_max_chars=bmax,d15_approved_max_chars=amax,
+                    d15_baseline_pump_cpu_ns=bcpu,d15_approved_pump_cpu_ns=acpu,d15_feedback_records=retained,
+                    production_d15_el0_control_verified=False,
+                    native_d07_effect_fixture_verified=True,d07_soft_deferral_ns=s_prog-s_req,
+                    d07_hard_deferral_ns=h_prog-h_req,d07_soft_actual_wake_ns=s_wake,
+                    d07_feedback_records=s_retained,production_d07_business_scheduler_verified=False,
+                    d02_baseline_creations=base_count,d02_approved_creations=apply_count,
+                    d02_fixture_feedback_records=retained2,native_d02_effect_fixture_verified=False,
+                    production_d02_task_loader_verified=False,
                     frame_count=frame_count,frame_meta_bytes=meta_bytes,frame_meta_pa=meta,
                     control_pool_pa=control,progress_pool_pa=progress,ordinary_free_frames=free,
+                    effect_owner_pool_pa=owners,effect_owner_pool_bytes=owner_bytes,
+                    effect_owner_pool_bounds_verified=True,
                     permanent_frames=permanent,frame_meta_physical_dump_verified=False,
                     paired_boot_epoch_redo_verified=True,
                     previous_service_generation=old,new_service_generation=new,old_root=old_root,new_root=new_root,
@@ -291,8 +463,117 @@ class EpochFixture:
         sample=out/'reclaimed-frame.bin'
         qmp.execute('pmemsave',{'val':page_pa,'size':BLOCK,'filename':str(sample)})
         require(sample.read_bytes()==bytes(BLOCK),'secret page was not actually zero after reclaim')
+        # Read the actual stopped-guest owner arena. Independently match
+        # BOTH exact decision and ApplyReport byte strings inside its
+        # designated feedback table. No Rust struct ABI is inferred.
+        owners,owner_bytes=w[361:363]
+        off,size=w[372:374]
+        owner_path=out/'effect-owners.bin'
+        qmp.execute('pmemsave',{'val':owners,'size':owner_bytes,'filename':str(owner_path)})
+        owner_raw=owner_path.read_bytes()
+        require(len(owner_raw)==owner_bytes,'incomplete effect owner physical dump')
+        custody=owner_raw[off:off+size]
+        for d,r in ((page[175*8:207*8],page[207*8:207*8+w[98]]),
+                    (page[315*8:347*8],page[347*8:347*8+w[239]])):
+            require(len(d)==256 and len(r)==98 and custody.count(d)==1 and custody.count(r)==1,
+                    'actual feedback table missing or duplicating exact retained effect bytes')
+        # D02 actual business-core context proof: six completed creations,
+        # ABI3 EXIT and private EL0 writes, original policy versions, exact
+        # raw snapshot/decision/report, and actual post-retirement pages.
+        proof_off,proof_size=w[376:378]
+        proof=owner_raw[proof_off:proof_off+proof_size]
+        require(hashlib.sha256(proof).digest()==page[391*8:395*8]
+                and proof[w[390]:]==bytes(proof_size-w[390]),'D02 proof digest/padding mismatch')
+        rows=list(struct.iter_unpack('<16Q',proof[:768]))
+        require(len(rows)==6,'missing native D02 creation rows')
+        previous=0
+        pages=rows[0][3:8]
+        require(len(set(pages))==5 and all(p%BLOCK==0 and 0x40000000<=p<0x44000000 for p in pages)
+                and w[395] not in pages,'invalid private diagnostic pages')
+        for i,row in enumerate(rows,1):
+            serial,task,cpu,*_=row
+            marker,count,kind,esr,syscall,began,done,cost=row[8:16]
+            window=w[380] if i<=2 else w[381]
+            require((serial,task,cpu)==(i,0xd0203,1) and row[3:8]==pages
+                    and (marker,count,kind,esr,syscall)==(0xd0200000+i,16,8,0x56000000,1)
+                    and previous<=began<=done and began//100_000_000==done//100_000_000==window
+                    and cost>0,'D02 actual CPU1 task/trap/completion evidence mismatch')
+            previous=done
+        require(rows[1][14]<=w[385]<=w[386]<=rows[2][13]
+                and rows[2][14]==w[387] and rows[-1][14]<w[385]+10_000_000_000,
+                'D02 actual execution not within original policy window')
+        snap=proof[768:1032];rules=proof[1032:1120];plan=proof[1120:1332]
+        decision=proof[1332:1588];report=proof[1588:1686];package=proof[1686:1718]
+        # Independent reconstruction of the exact CPU1 constructor ticket.
+        # Its acknowledgement must bind actual boot, request/package/group,
+        # original admission time/version and request digest, not just a
+        # sequential slot number echoed by CPU0.
+        for i,row in enumerate(rows,1):
+            at=1718+(i-1)*48
+            started,policy=struct.unpack_from('<2Q',proof,at)
+            require(policy==(0 if i<=2 else 3)
+                    and (0 if i==1 else rows[i-2][14])<=started<=row[13]
+                    and started//100_000_000==row[13]//100_000_000,
+                    'D02 asynchronous ticket timing or original policy mismatch')
+            rd=hashlib.sha256(b'CYX/D02-NATIVE-FIXTURE/v0199'
+                +struct.pack('<2Q',self.epoch,i)+package).digest()
+            ticket=struct.pack('<12Q',self.epoch,1,0xd0201,1,i,0xd0202,1,2,1,i,started,policy)+rd
+            require(hashlib.sha256(b'CYX/D02-STARTED/v0199'+ticket).digest()==proof[at+16:at+48],
+                    'D02 business worker exact ticket acknowledgement mismatch')
+        require(struct.unpack_from('<IHH',snap)==(0x4359534e,3,72)
+                and struct.unpack_from('<7Q',snap,8)==(3,self.epoch,1,1,2,1,w[385])
+                and struct.unpack_from('<HHI',snap,64)==(2,12,0),'D02 exact observation scope mismatch')
+        fields=[]
+        for i in range(12):
+            at=72+i*16
+            fid,present,value=struct.unpack_from('<HB5xQ',snap,at)
+            require(fid==16+i and present in (0,1) and (present or value==0)
+                    and snap[at+3:at+8]==bytes(5),'D02 snapshot field format')
+            fields.append(value if present else None)
+        require(fields==[None]*8+[None,3,None,5],'D02 actual thread/queued observation mismatch')
+        expected=bytearray(88)
+        put(expected,0,'IHHQIIQ',0x43595255,2,32,3,1,88,0)
+        put(expected,32,'IHHQHHHHII',3,2,1,2,0,1,1,0,56,0)
+        put(expected,64,'HB5xQ',4,3,1)
+        put(expected,80,'HHI',2,0,0)
+        require(rules==bytes(expected),'D02 diagnostic rules mismatch')
+        h=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
+        h.update(hashlib.sha256(b'CYX/D02-FIXTURE-ORDINALS/0=1,1=2,2=4,3=8').digest())
+        h.update(snap);h.update(bytes(1))
+        for v in fields[8:12]+[1,5,1]:
+            h.update(bytes([v is not None]));h.update(struct.pack('<Q',0 if v is None else v))
+        h.update(struct.pack('<H',4))
+        for i,v in enumerate((1,2,4,8)):h.update(struct.pack('<HBH',i,2,v))
+        digest=h.digest()
+        sample=w[385]
+        require(struct.unpack_from('<IHHIHH6Q',plan)==(0x43594c31,2,64,212,1,0,3,2,0,1,3,sample+10_000_000_000)
+                and struct.unpack_from('<IHHHHI8Q',plan,64)==(0x43595031,2,144,2,1,4,1,3,3,2,1,1,1,sample+100_000_000)
+                and plan[144:176]==bytes(32) and plan[176:208]==digest
+                and plan[208:]==struct.pack('<HH',2,4),'D02 published plan differs from exact rule/snapshot')
+        require(struct.unpack_from('<10Q',decision,8)==(self.epoch,1,3,3,3,2,1,1,1,3)
+                and struct.unpack_from('<IHHH',decision,88)==(3,0,2,1)
+                and decision[98:102]==bytes(4) and struct.unpack_from('<HH',decision,102)==(2,65535)
+                and struct.unpack_from('<IHH',decision,152)==(4,2,0)
+                and decision[160:192]==hashlib.sha256(rules).digest()
+                and decision[192:224]==hashlib.sha256(plan).digest() and decision[224:256]==digest,
+                'D02 decision/causal policy mismatch')
+        require(struct.unpack_from('<QQQHHHHQQQQiIQ',report)==(self.epoch,1,3,0,2,1,0,2,1,1,3,0,2,rows[2][14])
+                and report[80:96]==bytes(16) and report[96:]==struct.pack('<H',4)
+                and custody.count(decision)==custody.count(report)==1,'D02 actual report/feedback mismatch')
+        code_path=out/'d02-package.bin'
+        qmp.execute('pmemsave',{'val':w[395],'size':w[396],'filename':str(code_path)})
+        require(hashlib.sha256(code_path.read_bytes()).digest()==package==self.d02_code[2],
+                'D02 actual package differs from exact ELF bytes')
+        for i,pa in enumerate(pages):
+            path=out/f'd02-retired-page-{i}.bin'
+            qmp.execute('pmemsave',{'val':pa,'size':BLOCK,'filename':str(path)})
+            require(path.read_bytes()==bytes(BLOCK),'D02 retired mapping/data/stack was not scrubbed')
         return dict(frame_meta_physical_dump_verified=True,frame_meta_sha256=hashlib.sha256(raw).hexdigest(),
-                    reclaimed_page_zero_verified=True)
+                    reclaimed_page_zero_verified=True,effect_owner_pool_dump_verified=True,
+                    effect_owner_pool_sha256=hashlib.sha256(owner_raw).hexdigest(),
+                    native_d02_effect_fixture_verified=True,d02_retired_pages_verified=True,
+                    d02_actual_cpu1_creations=6,d02_async_ticket_acknowledgements_verified=6,
+                    d02_diagnostic_package_sha256=package.hex())
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -320,13 +601,20 @@ def main():
             check_disk(disk,epoch,capture)
             previous=verify_smp.sha(disk)
             verify_smp.require(summary.get('scratch_disk_after_sha256')==previous,'disk changed after capture')
-        result['status']='PASS'
+        verify_smp.require(len(result['boots'])==2 and all(
+            b.get('observations',{}).get('native_d02_effect_fixture_verified') is True
+            for b in result['boots']),'missing D02 actual physical proof')
         result['cross_process_boot_epoch_fixture_verified']=True
         result['cross_process_service_generation_fixture_verified']=True
         result['cross_process_merged_home_replay_fixture_verified']=True
         result['cross_process_paired_boot_epoch_fixture_verified']=True
         result['cross_process_formatted_mount_checkpoint_verified']=True
+        result['native_d15_actual_effect_fixture_verified']=True
+        result['native_d07_actual_effect_fixture_verified']=True
+        result['native_d02_actual_effect_fixture_verified']=True
+        result['status']='PASS'
     except (OSError,ValueError,RuntimeError) as e:
+        result['status']='FAIL'
         result['error']=str(e)
     (out/'summary.json').write_text(json.dumps(result,indent=2)+'\n')
     print(json.dumps(result,indent=2))

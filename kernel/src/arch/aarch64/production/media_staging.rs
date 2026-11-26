@@ -3,38 +3,51 @@
 //! `v020-production` build never reads or writes any v1 on-disk layout.
 //!
 //! After the business CPUs stopped (and after SEC-N), CPU0 attaches ONE
-//! dedicated, throw-away, all-zero 512 MiB scratch VirtIO-blk device through
+//! dedicated 512 MiB scratch VirtIO-blk device through
 //! the shared format-fixture plumbing (`scratch_blk`) and runs, each step only
 //! if the previous one passed (fail-closed chain):
-//! 1. the frozen `file_format_v1` formatter (fixed unsigned TEST manifest);
-//! 2. `file_mount_v1::validate` on the written image;
-//! 3. the ratified N=8 `file_media_unified_v1` map + on-disk superblock pair;
-//! 4. `BootEpochAuthority::{open, allocate, confirmed_epoch}` (staged verify,
-//!    no signed config — see authority.rs);
+//! 1. the frozen `file_format_v1` formatter on all-zero media or, in the
+//!    separate reopen-only build, identification of an existing staging pair;
+//! 2. readback of every zeroed redo block and `file_mount_v1::validate` on
+//!    fresh media, or exact boot-pair replay/checkpoint on repeated boots;
+//! 3. the ratified N=8 `file_media_unified_v1` map + on-disk superblock pair.
+//!    The envelopes lane writes empty D1.5 heads during format and validates
+//!    the snapshot ranges before replay on reopen;
+//! 4. paired BootEpoch allocation on the mounted volume. The explicitly
+//!    signed lane additionally verifies an immutable public test config;
 //! 5. `file_admission_flow_v1::run_admission_flow` under the confirmed epoch.
+//!    The file layouts then seal the reread owner ACL, root slot and file
+//!    bytes for the client turn under that epoch.
 //!
 //! The in-vector snapshot SVC 0x40 is routed here and answers EAGAIN: the
 //! snapshot backend (catalog/slot payloads, SnapshotStore, live ViewGrant) is
 //! golden-vector-pending, so the only honest answer is fail-closed.
+//! SecurityAudit v2 uses protected volatile slots (baseline §安0.9). The v1
+//! manifest provides no persistent audit object or recovery binding.
 //!
 //! HONEST SCOPE: golden_vector_pending=1. This proves the lane boots and its
-//! fail-closed paths behave; it claims NO persistence (the disk is discarded),
-//! NO format correctness against golden vectors, NO signed catalog/config and
-//! NO production mount. Missing disk => `V020_W11_MEDIA_ABSENT`, words
+//! fail-closed paths behave. Cross-boot evidence applies only to the supplied
+//! throw-away scratch image. Production catalog/config and deployed media are
+//! outside this lane. Missing disk => `V020_W11_MEDIA_ABSENT`, words
 //! 145..149 stay 0 (word 150 records the 0x40 fail-closed answer, which does
 //! not depend on the disk), the boot continues.
 //! Serial: `V020_W11_MEDIA_STAGING golden_vector_pending=1` is emitted only
-//! when all five steps passed; otherwise `V020_W11_MEDIA_STAGING_INCOMPLETE
-//! step=<first step that did not pass>` (1 also when the disk is absent). The
+//! when all five disk steps passed and an authenticated 0x40 hit the refusal
+//! path. Otherwise `V020_W11_MEDIA_STAGING_INCOMPLETE step=<first failed step>`
+//! identifies the missing evidence (1 for absent disk, 6 for absent 0x40). The
 //! completion marker carries `media_staging_enabled=1` (word 144: the lane ran)
-//! and a separate `staging_ok` flag derived from words 145..150.
+//! and `staging_ok` from the mount, map, epoch, admission and snapshot rows
+//! plus the mode-specific format (145) or reopen (162) row.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
 //! * Second DMA user of the production boot: the scratch VirtIO-blk device and
 //!   its queue (registered in scratch_blk.rs), driven synchronously by CPU0 in
 //!   `stage` only, after the business CPUs stopped; completion IRQs are off.
-//! * Workspaces FORMAT/MOUNT (volume.rs) and PAIR (authority.rs): static mut in
-//!   `.bss.sec_n`, NOT FrameMeta-registered; borrowed only inside `stage`.
+//! * Workspaces FORMAT/MOUNT (volume.rs), RECOVERY (reopen.rs), and PAIR (authority.rs): static mut in
+//!   `.bss.sec_n`, counted as static FrameMeta Arena pages; borrowed only
+//!   inside `stage`. The static registration does not track DMA pins.
+//! * Signed scratch uses the FrameMeta Control COPY_BUFFER after role loading
+//!   and business CPU stop, exclusively on CPU0 for signature verification.
 //! * STAGED (atomic): CPU0 only; makes `stage` (and so every workspace borrow
 //!   and the one-shot `scratch_blk::attach`) one-shot.
 //! * SNAPSHOT_FAIL_CLOSED (atomic): incremented only by the CPU0 in-vector
@@ -51,6 +64,11 @@ use cyxia_kernel_core::security::{
 
 #[path = "media_staging/authority.rs"]
 mod authority;
+#[path = "media_staging/reopen.rs"]
+mod reopen;
+#[cfg(feature = "v020-production-media-signed")]
+#[path = "media_staging/signed.rs"]
+mod signed;
 #[path = "media_staging/volume.rs"]
 mod volume;
 
@@ -61,22 +79,36 @@ static SNAPSHOT_FAIL_CLOSED: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Default)]
 pub(super) struct StagingOutcome {
     pub(super) formatted: bool,
+    identified: bool,
+    reopened: bool,
+    prior_epoch: u64,
     pub(super) mount_validated: bool,
     pub(super) unified_map_validated: bool,
     /// `BootEpochAuthority::confirmed_epoch`, 0 = not confirmed.
     pub(super) confirmed_epoch: u64,
     pub(super) admission_flow_ok: bool,
+    #[cfg(feature = "v020-production-media-unified")]
+    unified_mount_counts: [u64; 3],
+    #[cfg(feature = "v020-production-snapshot-catalog")]
+    pub(super) snapshot_catalog: Option<super::snapshot_catalog::MountedCatalog>,
+    #[cfg(feature = "v020-production-file-read")]
+    pub(super) file_read: Option<cyxia_kernel_core::security::file_read_v4::StagedFile>,
 }
 
 impl StagingOutcome {
-    /// First chain step (1..=5) that did not pass, or `None` if all passed.
-    fn first_incomplete_step(&self) -> Option<u8> {
+    /// First missing staging result, including the independent in-vector probe.
+    fn first_incomplete_step(&self, snapshot_refused: bool) -> Option<u8> {
         [
-            self.formatted,
+            self.formatted || self.identified,
             self.mount_validated,
             self.unified_map_validated,
             self.confirmed_epoch != 0,
             self.admission_flow_ok,
+            snapshot_refused,
+            #[cfg(feature = "v020-production-file-read")]
+            self.file_read.is_some(),
+            #[cfg(feature = "v020-production-snapshot-catalog")]
+            self.snapshot_catalog.is_some(),
         ]
         .iter()
         .position(|passed| !passed)
@@ -140,22 +172,128 @@ fn step(index: u64, result: Result<u64, SecurityError>) -> Option<u64> {
 }
 
 fn run_chain(disk: &mut Disk, out: &mut StagingOutcome) -> Option<()> {
-    let sb = volume::format(disk);
+    const REOPEN: bool = cfg!(feature = "v020-production-media-reopen");
+    const LAYOUT: volume::SnapshotLayout = if cfg!(feature = "v020-production-file-volatile-write")
+    {
+        volume::SnapshotLayout::AllocatedEnvelopesWithWritableFile
+    } else if cfg!(feature = "v020-production-file-read") {
+        volume::SnapshotLayout::AllocatedEnvelopesWithFile
+    } else if cfg!(feature = "v020-production-media-unified") {
+        volume::SnapshotLayout::AllocatedEnvelopes
+    } else if cfg!(feature = "v020-production-media-envelopes") {
+        volume::SnapshotLayout::EmptyEnvelopes
+    } else {
+        volume::SnapshotLayout::LegacyZero
+    };
+    #[cfg(feature = "v020-production-media-signed")]
+    let verified = {
+        // SAFETY: CPU0 has joined the business CPUs; package loading is over.
+        // This is the existing FrameMeta Control scratch, exclusively borrowed
+        // for this synchronous verification and wiped by the Ed25519 wrapper.
+        let scratch = unsafe { &mut *core::ptr::addr_of_mut!(super::COPY_BUFFER.0) };
+        signed::verify(signed::WIRE, scratch)
+            .inspect_err(|e| report("V020_W13_CONFIG_ERROR", *e as u64, 0, 0))
+            .ok()?
+    };
+    #[cfg(feature = "v020-production-media-signed")]
+    let config = Some(&verified);
+    #[cfg(not(feature = "v020-production-media-signed"))]
+    let config = None;
+    let sb = if REOPEN {
+        reopen::identify(disk)
+    } else {
+        volume::format(disk, config, LAYOUT)
+    };
     step(1, sb.map(|s| s.generation))?;
-    out.formatted = true;
+    out.formatted = !REOPEN;
+    out.identified = REOPEN;
     let sb = sb.ok()?;
-    let mounted = volume::mount(disk, sb);
-    step(2, mounted.map(|m| u64::from(m.structure.live_inodes)))?;
+    let mounted = if REOPEN {
+        reopen::recover(disk, sb, config, LAYOUT)
+    } else {
+        volume::mount(disk, sb, config, LAYOUT).map(|mounted| (sb, mounted))
+    };
+    step(2, mounted.map(|(_, m)| u64::from(m.structure.live_inodes)))?;
+    let (checkpoint, mounted) = mounted.ok()?;
+    out.reopened = REOPEN;
     out.mount_validated = true;
-    step(3, volume::unified_map(disk, sb).map(u64::from))?;
+    step(
+        3,
+        volume::unified_map(disk, checkpoint, LAYOUT).map(u64::from),
+    )?;
     out.unified_map_validated = true;
-    let security = mounted.ok()?.security;
-    out.confirmed_epoch = step(4, authority::boot_epoch(disk, &security))?;
+    #[cfg(feature = "v020-production-media-unified")]
+    {
+        let ordinary = mounted.usage.iter().map(|u| u.inodes).sum::<u32>();
+        let hidden = u32::from(mounted.structure.live_inodes).checked_sub(ordinary)?;
+        out.unified_mount_counts = [
+            u64::from(hidden),
+            u64::from(mounted.system_blocks),
+            u64::from(mounted.structure.data_blocks),
+        ];
+    }
+    out.prior_epoch = mounted.boot.boot_epoch;
+    out.confirmed_epoch = step(
+        4,
+        authority::boot_epoch(disk, checkpoint, &mounted.security, config),
+    )?;
     step(
         5,
         authority::admission_flow(out.confirmed_epoch).map(|()| 1),
     )?;
     out.admission_flow_ok = true;
+    #[cfg(feature = "v020-production-file-read")]
+    {
+        use cyxia_kernel_core::security::file_read_v4::StagedFile;
+
+        let file = volume::read_scratch_file(
+            disk,
+            &mut [0; BLOCK_BYTES],
+            LAYOUT,
+            verified.principals()[0],
+        )
+        .ok()?;
+        out.file_read = Some(
+            StagedFile::new_with_owner_rights(
+                out.confirmed_epoch,
+                file.acl.principal,
+                file.dirent,
+                file.data,
+                file.acl.owner_rights,
+            )
+            .ok()?,
+        );
+    }
+    #[cfg(feature = "v020-production-snapshot-catalog")]
+    {
+        use cyxia_kernel_core::security::{
+            file_media_unified_v1::SNAPSHOT_CATALOG_BLOCK, snapshot_list_v4::EmptyCatalog,
+        };
+        // Re-read the verified catalogue from this same exclusive disk
+        // after confirming its BootEpoch. Only the sealed witness survives
+        // into the client turn, with no access to the device.
+        let catalog = {
+            let mut raw = [0; BLOCK_BYTES];
+            disk.read(SNAPSHOT_CATALOG_BLOCK, &mut raw).ok()?;
+            EmptyCatalog::verify(
+                &raw,
+                checkpoint.fs_uuid,
+                volume::SNAPSHOT_ENVELOPE_GENERATION,
+                out.confirmed_epoch,
+            )
+            .ok()?
+        };
+        #[cfg(feature = "v020-production-snapshot-read")]
+        let catalog = super::snapshot_catalog::MountedCatalog::verify(catalog, |block, raw| {
+            disk.read(
+                u32::try_from(block).map_err(|_| SecurityError::Invalid)?,
+                raw,
+            )
+        })
+        .inspect_err(|error| report("V020_W19_SLOT_ERROR", *error as u64, 0, 0))
+        .ok()?;
+        out.snapshot_catalog = Some(catalog);
+    }
     Some(())
 }
 
@@ -231,16 +369,72 @@ pub(super) fn publish(outcome: &StagingOutcome) {
         u64::from(fail_closed > 0),
     );
     evidence::put(evidence::W11_STAGING_GOLDEN_VECTOR_PENDING, 1);
+    #[cfg(feature = "v020-production-media-reopen")]
+    {
+        evidence::put(evidence::W12_STAGING_REOPENED, u64::from(outcome.reopened));
+        evidence::put(evidence::W12_STAGING_PRIOR_EPOCH, outcome.prior_epoch);
+    }
+    report(
+        "V020_W12_MEDIA_EPOCH",
+        outcome.prior_epoch,
+        outcome.confirmed_epoch,
+        u64::from(outcome.reopened),
+    );
     report(
         "V020_W11_MEDIA_SNAPSHOT_0X40",
         fail_closed,
         EAGAIN as u64,
         0,
     );
-    super::super::super::log(
-        b"V020_W11_MEDIA_SCOPE persistence=false format_golden=false signed_config=false\n",
-    );
-    match outcome.first_incomplete_step() {
+    #[cfg(feature = "v020-production-media-envelopes")]
+    {
+        let verified = u64::from(outcome.unified_map_validated);
+        let count = verified * volume::SNAPSHOT_ENVELOPE_COUNT as u64;
+        let generation = verified * volume::SNAPSHOT_ENVELOPE_GENERATION;
+        evidence::put(evidence::W14_SNAPSHOT_ENVELOPES, count);
+        evidence::put(evidence::W14_SNAPSHOT_ENVELOPE_GENERATION, generation);
+        evidence::put(evidence::W14_SNAPSHOT_ENVELOPE_VERIFIED, verified);
+        report("V020_W14_SNAPSHOT_ENVELOPES", count, generation, verified);
+    }
+    #[cfg(feature = "v020-production-media-unified")]
+    {
+        let [objects, system_blocks, data_blocks] = outcome.unified_mount_counts;
+        evidence::put(evidence::W15_UNIFIED_SYSTEM_INODES, objects);
+        evidence::put(evidence::W15_UNIFIED_SYSTEM_BLOCKS, system_blocks);
+        evidence::put(evidence::W15_UNIFIED_DATA_BLOCKS, data_blocks);
+        report(
+            "V020_W15_UNIFIED_MOUNT",
+            objects,
+            system_blocks,
+            data_blocks,
+        );
+    }
+    #[cfg(feature = "v020-production-media-signed")]
+    {
+        let verified = u64::from(outcome.mount_validated);
+        evidence::put(evidence::W13_SIGNED_CONFIG_VERIFIED, verified);
+        evidence::put(evidence::W13_SIGNED_BOOT_EPOCH, outcome.confirmed_epoch);
+        report(
+            "V020_W13_SIGNED_SCRATCH",
+            verified,
+            outcome.confirmed_epoch,
+            outcome.prior_epoch,
+        );
+        super::super::super::log(
+            b"V020_W13_MEDIA_SCOPE test_key=true format_golden=false signed_config=true\n",
+        );
+    }
+    #[cfg(not(feature = "v020-production-media-signed"))]
+    if cfg!(feature = "v020-production-media-reopen") {
+        super::super::super::log(
+            b"V020_W12_MEDIA_SCOPE reopen_only=true format_golden=false signed_config=false\n",
+        );
+    } else {
+        super::super::super::log(
+            b"V020_W11_MEDIA_SCOPE persistence=false format_golden=false signed_config=false\n",
+        );
+    }
+    match outcome.first_incomplete_step(fail_closed > 0) {
         None => super::super::super::log(b"V020_W11_MEDIA_STAGING golden_vector_pending=1\n"),
         Some(step) => {
             let mut line = *b"V020_W11_MEDIA_STAGING_INCOMPLETE step=0\n";

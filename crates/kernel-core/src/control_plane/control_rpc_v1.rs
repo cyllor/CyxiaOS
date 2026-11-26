@@ -401,6 +401,32 @@ impl RpcTable {
             .find(|s| s.caller == Some(caller))
             .ok_or(Error::Auth)
     }
+    /// Native admission additionally authenticates the current endpoint
+    /// and task for *every* call, including ACK and read-only replay.
+    /// The operation verifier is still invoked only on new execution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_live(
+        &mut self,
+        caller: Caller,
+        wire: &[u8],
+        reply_cap: usize,
+        now: u64,
+        parent_deadline: u64,
+        observed_generation: u64,
+        verify_live: impl FnOnce(Caller) -> Result<(), Error>,
+        authorize_operation: impl FnOnce(&Request<'_>) -> Result<(), Error>,
+    ) -> Result<Admission, Error> {
+        verify_live(caller)?;
+        self.admit(
+            caller,
+            wire,
+            reply_cap,
+            now,
+            parent_deadline,
+            observed_generation,
+            authorize_operation,
+        )
+    }
     /// Input is a stable copied request; output span and real completion
     /// resource reservation are independently checked by the caller. On
     /// new admission, authorize_operation must check the actual cap label,
@@ -537,8 +563,9 @@ impl RpcTable {
         });
         Ok(Admission::Execute(ticket))
     }
-    /// The native backend reports actual completion. UNKNOWN is sticky
-    /// until independent recovery, never a reason to execute a retry.
+    /// The ordinary native backend reports actual completion for a live
+    /// pending request. Once UNKNOWN or fenced, only independent recovery
+    /// can establish a new terminal result. Exact terminal replay is read-only.
     pub fn complete(
         &mut self,
         ticket: Ticket,
@@ -569,10 +596,58 @@ impl RpcTable {
                 Err(Error::Conflict)
             };
         }
+        if slot.closed || e.reply.state() == State::Unknown {
+            return Err(Error::Busy);
+        }
         if state == State::Pending {
             return Err(Error::Busy);
         }
         verify_native()?;
+        e.reply = next;
+        Ok(next)
+    }
+    /// Serialized protected recovery entry, not reachable through a user's
+    /// retry or ACK. Verify exact original request, old retained reply and
+    /// proposed terminal bytes against independent current native evidence.
+    /// A failed verifier leaves the original obligation unchanged.
+    pub fn reconcile(
+        &mut self,
+        ticket: Ticket,
+        result: i32,
+        observed: u64,
+        payload: &[u8],
+        verify_independent: impl FnOnce(Caller, &[u8], &Frame, &Frame) -> Result<(), Error>,
+    ) -> Result<Frame, Error> {
+        let slot = self.slot(ticket.caller)?;
+        let e = slot.entry.as_mut().ok_or(Error::Stale)?;
+        if e.ticket != ticket {
+            return Err(Error::Stale);
+        }
+        let next = Frame::reply(
+            ticket.caller,
+            e.op,
+            ticket.seq,
+            State::Done,
+            result,
+            observed,
+            payload,
+        )?;
+        if e.reply.state() == State::Done {
+            return if e.reply == next {
+                Ok(e.reply)
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        if !slot.closed && e.reply.state() != State::Unknown {
+            return Err(Error::Busy);
+        }
+        verify_independent(
+            ticket.caller,
+            &e.request[..usize::from(e.len)],
+            &e.reply,
+            &next,
+        )?;
         e.reply = next;
         Ok(next)
     }
@@ -591,6 +666,11 @@ impl RpcTable {
         let slot = self.slot(caller)?;
         if !slot.closed {
             return Err(Error::Busy);
+        }
+        // A repeated retirement is query-only. Never invoke a native
+        // custody writer twice after the previous terminal was retained.
+        if slot.rebind_ready {
+            return Ok(());
         }
         if slot
             .entry
@@ -677,6 +757,72 @@ mod tests {
             put64(&mut b, 48, 7);
         }
         (b, n)
+    }
+    #[test]
+    fn stale_live_cap_cannot_read_or_ack_retained_reply() {
+        let mut t = RpcTable::new();
+        let c = caller();
+        t.bind(c, false).unwrap();
+        let (r, n) = req(Op::AuditRead, 1, 0);
+        let Admission::Execute(k) = t
+            .admit_live(
+                c,
+                &r[..n],
+                192,
+                10,
+                1000,
+                7,
+                |a| {
+                    assert_eq!(a, c);
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let f = t
+            .complete(k, State::Done, 0, 7, &[0; 144], || Ok(()))
+            .unwrap();
+        let (ack, m) = req(Op::Ack, 1, 1);
+        assert_eq!(
+            t.admit_live(
+                c,
+                &r[..n],
+                192,
+                20,
+                1000,
+                7,
+                |_| Err(Error::Auth),
+                |_| panic!()
+            ),
+            Err(Error::Auth)
+        );
+        assert_eq!(
+            t.admit_live(
+                c,
+                &ack[..m],
+                48,
+                20,
+                1000,
+                7,
+                |_| Err(Error::Auth),
+                |_| panic!()
+            ),
+            Err(Error::Auth)
+        );
+        assert_eq!(
+            t.admit_live(c, &r[..n], 192, 20, 1000, 7, |_| Ok(()), |_| panic!()),
+            Ok(Admission::Replay(f))
+        );
+        t.close(c).unwrap();
+        t.retire_closed(c, |e| {
+            assert!(e.is_some());
+            Ok(())
+        })
+        .unwrap();
+        t.retire_closed(c, |_| panic!()).unwrap();
     }
     #[test]
     fn exactly_once_lost_reply_ack_and_next_sequence() {
@@ -767,10 +913,23 @@ mod tests {
         );
         assert_eq!(t.retire_closed(c, |_| panic!()), Err(Error::Busy));
         assert_eq!(
-            t.complete(k, State::Done, -16, 7, &[], || Err(Error::Io)),
+            t.complete(k, State::Done, -16, 7, &[], || panic!()),
+            Err(Error::Busy)
+        );
+        assert_eq!(
+            t.reconcile(k, -16, 7, &[], |_, _, _, _| Err(Error::Io)),
             Err(Error::Io)
         );
-        t.complete(k, State::Done, -16, 7, &[], || Ok(())).unwrap();
+        let done = t
+            .reconcile(k, -16, 7, &[], |actor, request, prior, proposed| {
+                assert_eq!(actor, c);
+                assert_eq!(request, &r[..n]);
+                assert_eq!(*prior, unknown);
+                assert_eq!(proposed.state(), State::Done);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(t.reconcile(k, -16, 7, &[], |_, _, _, _| panic!()), Ok(done));
         assert_eq!(t.retire_closed(c, |_| Err(Error::Io)), Err(Error::Io));
         t.retire_closed(c, |e| {
             assert!(e.is_some());
@@ -787,6 +946,57 @@ mod tests {
             t.admit(c, &r[..n], 192, 10, 1000, 7, |_| panic!()),
             Err(Error::Auth)
         );
+    }
+    #[test]
+    fn live_unknown_and_stopped_pending_require_independent_reconciliation() {
+        for close in [false, true] {
+            let mut t = RpcTable::new();
+            let c = caller();
+            t.bind(c, false).unwrap();
+            let (r, n) = req(Op::AuditRead, 1, 0);
+            let Admission::Execute(k) = t.admit(c, &r[..n], 192, 10, 1000, 7, |_| Ok(())).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(
+                t.reconcile(k, -16, 7, &[], |_, _, _, _| panic!()),
+                Err(Error::Busy)
+            );
+            if close {
+                t.close(c).unwrap();
+            } else {
+                t.complete(k, State::Unknown, -16, 7, &[], || Ok(()))
+                    .unwrap();
+            }
+            assert_eq!(
+                t.complete(k, State::Done, 0, 7, &[0; 144], || panic!()),
+                Err(Error::Busy)
+            );
+            let done = t
+                .reconcile(k, 0, 7, &[0; 144], |actor, wire, prior, next| {
+                    assert_eq!(actor, c);
+                    assert_eq!(wire, &r[..n]);
+                    assert_eq!(
+                        prior.state(),
+                        if close {
+                            State::Pending
+                        } else {
+                            State::Unknown
+                        }
+                    );
+                    assert_eq!(next.state(), State::Done);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                t.reconcile(k, -16, 7, &[], |_, _, _, _| panic!()),
+                Err(Error::Conflict)
+            );
+            assert_eq!(
+                t.complete(k, State::Done, 0, 7, &[0; 144], || panic!()),
+                Ok(done)
+            );
+        }
     }
     #[test]
     fn ordinary_role_slots_and_executor_capacity_do_not_borrow_recovery() {

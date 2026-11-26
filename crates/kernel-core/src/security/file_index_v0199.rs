@@ -1,4 +1,4 @@
-//! Read-only V0.19.9 FileStreamIndex v4 and SecurityStateStore v2 checks.
+//! V0.19.9 FileStreamIndex v4 and SecurityStateStore v2 codecs.
 //!
 //! The caller MUST read the *entire* stable 4096-byte block from native
 //! storage, validate it together with the superblock/manifest, and reject
@@ -17,6 +17,7 @@ pub const STREAM_BASE: usize = 448;
 pub const RESERVED_BASE: usize = 3520;
 pub const CRC_OFFSET: usize = 4092;
 pub const MAX_ISSUED: u64 = (1u64 << 53) - 1;
+const INDEX_ROW_BYTES: usize = 24;
 
 pub const SECURITY_MAGIC: u32 = 0x4359_5353;
 pub const SECURITY_VERSION: u16 = 2;
@@ -72,6 +73,44 @@ pub struct FileStreamIndexV4 {
     pub streams: [StreamIndex; STREAM_COUNT],
 }
 impl FileStreamIndexV4 {
+    /// Encode one canonical index block, preserving `dst` on validation
+    /// failure. The caller supplies the mounted principal and receipt state
+    /// for the separate transaction checks.
+    pub fn encode_into(&self, dst: &mut [u8; BLOCK_BYTES]) -> Result<(), Error> {
+        let mut out = [0; BLOCK_BYTES];
+        out[0..4].copy_from_slice(&INDEX_MAGIC.to_le_bytes());
+        out[4..6].copy_from_slice(&INDEX_VERSION.to_le_bytes());
+        out[6..8].copy_from_slice(&(INDEX_HEADER as u16).to_le_bytes());
+        out[8..24].copy_from_slice(&self.fs_uuid);
+        out[24..32].copy_from_slice(&self.global_request_id_hi.to_le_bytes());
+        out[32..40].copy_from_slice(&self.generation.to_le_bytes());
+        for (row, group) in out[INDEX_HEADER..STREAM_BASE]
+            .chunks_exact_mut(INDEX_ROW_BYTES)
+            .zip(&self.groups)
+        {
+            row[0..4].copy_from_slice(&group.generation.to_le_bytes());
+            row[4..8].copy_from_slice(&group.flags.to_le_bytes());
+            row[8..16].copy_from_slice(&group.boot_epoch.to_le_bytes());
+            row[16..24].copy_from_slice(&group.manifest_principal_id.to_le_bytes());
+        }
+        for (row, stream) in out[STREAM_BASE..RESERVED_BASE]
+            .chunks_exact_mut(INDEX_ROW_BYTES)
+            .zip(&self.streams)
+        {
+            row[0..4].copy_from_slice(&stream.generation.to_le_bytes());
+            row[4..8].copy_from_slice(&stream.flags.to_le_bytes());
+            row[8..16].copy_from_slice(&stream.issued_hi.to_le_bytes());
+            row[16..24].copy_from_slice(&stream.retired_through.to_le_bytes());
+        }
+        let crc = crc32c_zeroed(&out, CRC_OFFSET)?;
+        out[CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+        if Self::decode(&out)? != *self {
+            return Err(Error::Invalid);
+        }
+        *dst = out;
+        Ok(())
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() != BLOCK_BYTES
             || u32_at(bytes, 0)? != INDEX_MAGIC
@@ -94,7 +133,7 @@ impl FileStreamIndexV4 {
             manifest_principal_id: 0,
         }; GROUP_COUNT];
         for (i, group_slot) in groups.iter_mut().enumerate() {
-            let at = INDEX_HEADER + i * 24;
+            let at = INDEX_HEADER + i * INDEX_ROW_BYTES;
             let group = GroupIndex {
                 generation: u32_at(bytes, at)?,
                 flags: u32_at(bytes, at + 4)?,
@@ -110,7 +149,9 @@ impl FileStreamIndexV4 {
             }
             // Each group slot is permanently tied to a unique principal.
             for old in 0..i {
-                if u64_at(bytes, INDEX_HEADER + old * 24 + 16)? == group.manifest_principal_id {
+                if u64_at(bytes, INDEX_HEADER + old * INDEX_ROW_BYTES + 16)?
+                    == group.manifest_principal_id
+                {
                     return Err(Error::Invalid);
                 }
             }
@@ -123,7 +164,7 @@ impl FileStreamIndexV4 {
             retired_through: 0,
         }; STREAM_COUNT];
         for i in 0..STREAM_COUNT {
-            let at = STREAM_BASE + i * 24;
+            let at = STREAM_BASE + i * INDEX_ROW_BYTES;
             let stream = StreamIndex {
                 generation: u32_at(bytes, at)?,
                 flags: u32_at(bytes, at + 4)?,
@@ -410,9 +451,67 @@ mod tests {
             generation: 1,
             root_hash: [8; 32],
         };
+        // The preparation write may already be durable even though
+        // its response was lost. No second writer or different request.
+        assert!(matches!(
+            RestoreGate::from_frozen(
+                view,
+                owner,
+                Identity {
+                    id: owner.id,
+                    generation: owner.generation + 1
+                },
+                |_| panic!()
+            ),
+            Err(Error::Invalid)
+        ));
+        assert_eq!(
+            gate.prepare(owner, key, snap, [7; 32], &idx, &sec, |_| Err(
+                Error::Unknown
+            )),
+            Err(Error::Unknown)
+        );
+        assert_eq!(gate.phase(), Phase::PreparingUnknown);
+        assert!(!gate.may_write(view.live_epoch, view.protection_generation));
+        assert_eq!(
+            gate.prepare(owner, key, snap, [7; 32], &idx, &sec, |_| panic!()),
+            Err(Error::Unknown)
+        );
+        assert_eq!(
+            gate.prepare(owner, key, snap, [8; 32], &idx, &sec, |_| panic!()),
+            Err(Error::Conflict)
+        );
+        assert_eq!(
+            gate.prepare(
+                owner,
+                RestoreKey {
+                    request_seq: 8,
+                    ..key
+                },
+                snap,
+                [7; 32],
+                &idx,
+                &sec,
+                |_| panic!()
+            ),
+            Err(Error::Busy)
+        );
+        assert_eq!(
+            gate.reconcile_prepare(reopen, key, [7; 32], |_| panic!()),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            gate.reconcile_prepare(owner, key, [7; 32], |_| Err(Error::Unknown)),
+            Err(Error::Unknown)
+        );
         let p = gate
-            .prepare(owner, key, snap, [7; 32], &idx, &sec, |_| Ok(()))
+            .reconcile_prepare(owner, key, [7; 32], |p| {
+                assert_eq!(p.snapshot, snap);
+                assert_eq!(p.prior, view);
+                Ok(())
+            })
             .unwrap();
+        assert_eq!(gate.phase(), Phase::Prepared);
         assert_eq!(
             gate.prepare(owner, key, snap, [7; 32], &idx, &sec, |_| panic!()),
             Ok(p)
@@ -466,6 +565,190 @@ mod tests {
         assert_eq!(gate.reopen(reopen, restored, |_, _| Ok(())), Ok(()));
         assert!(!gate.may_write(3, 5));
         assert!(gate.may_write(4, 5));
+    }
+    #[test]
+    fn snapshot_restore_restart_preserves_pending_and_ambiguous_open_custody() {
+        use super::super::snapshot_restore_gate::{
+            Commit, Phase, Recovered, RestoreGate, RestoreKey, SnapshotKey, View,
+        };
+        use crate::control_plane::Identity;
+        let idx = index();
+        let sec = security();
+        let recovery = Identity {
+            id: 4,
+            generation: 2,
+        };
+        let opener = Identity {
+            id: 11,
+            generation: 3,
+        };
+        let view = View {
+            fs_uuid: [1; 16],
+            live_epoch: 3,
+            protection_generation: 5,
+            root_hash: [6; 32],
+            retention_watermark: 9,
+        };
+        let key = RestoreKey {
+            principal: Identity {
+                id: 9,
+                generation: 1,
+            },
+            request_seq: 7,
+        };
+        let snapshot = SnapshotKey {
+            fs_uuid: view.fs_uuid,
+            snapshot_id: 4,
+            slot: 0,
+            generation: 1,
+            root_hash: [8; 32],
+        };
+        let mut first = RestoreGate::from_frozen(view, recovery, opener, |_| Ok(())).unwrap();
+        let p = first
+            .prepare(recovery, key, snapshot, [7; 32], &idx, &sec, |_| Ok(()))
+            .unwrap();
+        first
+            .submit(recovery, p, || Err(Error::Unknown))
+            .unwrap_err();
+        let owner2 = Identity {
+            generation: 3,
+            ..recovery
+        };
+        let opener2 = Identity {
+            generation: 4,
+            ..opener
+        };
+        let mut gate = RestoreGate::recover_frozen(
+            view,
+            owner2,
+            opener2,
+            Recovered::CommitUnknown(p),
+            &idx,
+            &sec,
+            |v, state| {
+                assert_eq!(v, view);
+                assert_eq!(state, Recovered::CommitUnknown(p));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(gate.phase(), Phase::Unknown);
+        assert_eq!(
+            gate.submit(owner2, p, || panic!("no repeated writer after restart")),
+            Err(Error::Busy)
+        );
+        assert_eq!(
+            gate.prepare(owner2, key, snapshot, [7; 32], &idx, &sec, |_| panic!()),
+            Err(Error::Unknown)
+        );
+        assert_eq!(
+            gate.prepare(
+                owner2,
+                RestoreKey {
+                    request_seq: 8,
+                    ..key
+                },
+                snapshot,
+                [7; 32],
+                &idx,
+                &sec,
+                |_| panic!()
+            ),
+            Err(Error::Busy)
+        );
+        let restored = View {
+            live_epoch: 4,
+            root_hash: [8; 32],
+            ..view
+        };
+        let c = Commit {
+            key,
+            txid: 1,
+            log_epoch: 1,
+            commit_lsn: 3,
+            view: restored,
+            request_hash: [7; 32],
+        };
+        assert_eq!(
+            gate.confirm(recovery, p, c, &idx, &sec, &idx, &sec, |_, _| panic!()),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            gate.confirm(owner2, p, c, &idx, &sec, &idx, &sec, |_, _| Ok(())),
+            Ok(restored)
+        );
+        assert_eq!(
+            gate.reopen(opener2, restored, |_, _| Err(Error::Unknown)),
+            Err(Error::Unknown)
+        );
+        assert_eq!(gate.phase(), Phase::ReopeningUnknown);
+        assert!(!gate.may_write(4, 5));
+        assert_eq!(
+            gate.reopen(opener2, restored, |_, _| panic!()),
+            Err(Error::Busy)
+        );
+        assert!(matches!(
+            RestoreGate::recover_frozen(
+                restored,
+                owner2,
+                opener2,
+                Recovered::RestoredFrozen(
+                    p,
+                    Commit {
+                        view: View {
+                            retention_watermark: 8,
+                            ..restored
+                        },
+                        ..c
+                    }
+                ),
+                &idx,
+                &sec,
+                |_, _| panic!()
+            ),
+            Err(Error::Conflict)
+        ));
+        assert!(matches!(
+            RestoreGate::recover_frozen(
+                restored,
+                owner2,
+                opener2,
+                Recovered::ReopeningUnknown(p, c),
+                &idx,
+                &sec,
+                |_, _| Err(Error::Unknown)
+            ),
+            Err(Error::Unknown)
+        ));
+        let mut gate = RestoreGate::recover_frozen(
+            restored,
+            owner2,
+            opener2,
+            Recovered::ReopeningUnknown(p, c),
+            &idx,
+            &sec,
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert!(!gate.may_write(4, 5));
+        assert_eq!(
+            gate.reconcile_reopen(opener, restored, |_, _| panic!()),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            gate.reconcile_reopen(opener2, restored, |_, _| Err(Error::Unknown)),
+            Err(Error::Unknown)
+        );
+        assert_eq!(
+            gate.reconcile_reopen(opener2, restored, |v, commit| {
+                assert_eq!(v, restored);
+                assert_eq!(commit, c);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert!(gate.may_write(4, 5));
+        assert!(!gate.may_write(3, 5));
     }
     #[test]
     fn snapshot_restore_preserves_current_system_state_exactly() {
@@ -540,7 +823,79 @@ mod tests {
         assert!(fresh.no_counter_rollback_from(&baseline));
         assert!(!baseline.no_counter_rollback_from(&fresh));
         assert_eq!(fresh.streams[0].issued_hi, 3);
+        let mut encoded = [0xa5; BLOCK_BYTES];
+        assert_eq!(fresh.encode_into(&mut encoded), Ok(()));
+        assert_eq!(encoded, next);
     }
+
+    #[test]
+    fn index_v4_encode_writes_last_group_and_stream_in_the_frozen_layout() {
+        let mut wire = index();
+        let mut value = FileStreamIndexV4::decode(&wire).unwrap();
+        value.global_request_id_hi = 0x1122_3344_5566_7788;
+        value.generation = 0x0102_0304_0506_0708;
+        value.groups[15] = GroupIndex {
+            generation: 0x1122_3344,
+            flags: 2,
+            boot_epoch: 0x0102_0304_0506_0708,
+            manifest_principal_id: 16,
+        };
+        value.streams[127] = StreamIndex {
+            generation: 0x5566_7788,
+            flags: 2,
+            issued_hi: (1 << 53) - 1,
+            retired_through: (1 << 53) - 2,
+        };
+        wire[24..40]
+            .copy_from_slice(b"\x88\x77\x66\x55\x44\x33\x22\x11\x08\x07\x06\x05\x04\x03\x02\x01");
+        wire[424..448].copy_from_slice(
+            b"\
+            \x44\x33\x22\x11\x02\x00\x00\x00\x08\x07\x06\x05\x04\x03\x02\x01\
+            \x10\x00\x00\x00\x00\x00\x00\x00",
+        );
+        wire[3496..3520].copy_from_slice(
+            b"\
+            \x88\x77\x66\x55\x02\x00\x00\x00\xff\xff\xff\xff\xff\xff\x1f\x00\
+            \xfe\xff\xff\xff\xff\xff\x1f\x00",
+        );
+        wire[4092..4096].copy_from_slice(b"\x5e\xa4\xad\xa4");
+
+        let mut out = [0xa5; BLOCK_BYTES];
+        assert_eq!(value.encode_into(&mut out), Ok(()));
+        assert_eq!(out, wire);
+        assert_eq!(FileStreamIndexV4::decode(&out), Ok(value));
+    }
+
+    #[test]
+    fn index_v4_encode_preserves_destination_on_validation_failure() {
+        let original = FileStreamIndexV4::decode(&index()).unwrap();
+        let check = |value: &FileStreamIndexV4| {
+            let mut dst = [0xa5; BLOCK_BYTES];
+            assert_eq!(value.encode_into(&mut dst), Err(Error::Invalid));
+            assert_eq!(dst, [0xa5; BLOCK_BYTES]);
+        };
+
+        let mut invalid = original;
+        invalid.groups[1].manifest_principal_id = invalid.groups[0].manifest_principal_id;
+        check(&invalid);
+        invalid = original;
+        invalid.groups[1].manifest_principal_id = 0;
+        check(&invalid);
+
+        invalid = original;
+        invalid.streams[0].flags = 1;
+        invalid.streams[0].generation = 1;
+        check(&invalid); // Missing active or retired owner group.
+        invalid.groups[0].generation = 1;
+        invalid.groups[0].flags = 1;
+        invalid.groups[0].boot_epoch = 1;
+        invalid.streams[0].issued_hi = MAX_ISSUED + 1;
+        check(&invalid);
+        invalid.streams[0].issued_hi = 1;
+        invalid.streams[0].retired_through = 2;
+        check(&invalid);
+    }
+
     #[test]
     fn index_rejects_duplicate_principal_bad_crc_reserved_and_impossible_streams() {
         let mut bad = index();

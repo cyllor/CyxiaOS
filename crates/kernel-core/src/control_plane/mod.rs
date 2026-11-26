@@ -16,6 +16,7 @@ pub mod apply_report_v1;
 pub mod budget;
 pub mod cores;
 pub mod decision_record_v3;
+pub mod desired_plan_v0199;
 pub mod plan_wire_v2;
 pub mod policy;
 pub mod queue;
@@ -103,3 +104,12 @@ pub mod control_rpc_v1;
 pub mod snapshot_store_v3;
 
 pub mod trial_permit_v1;
+
+pub mod d02_owner_v0199;
+pub mod d05_owner_v0199;
+pub mod d07_owner_v0199;
+pub mod d15_owner_v0199;
+
+pub mod candidate_registry_v0199;
+
+pub mod learning_data_v0199;

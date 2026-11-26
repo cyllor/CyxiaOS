@@ -149,7 +149,7 @@ pub struct FeedbackInbox {
     rows: [Option<FeedbackRecord>; FEEDBACK_SLOTS],
 }
 impl FeedbackInbox {
-    pub fn new(supervisor: Identity, learner: Identity) -> Result<Self, Error> {
+    pub const fn new(supervisor: Identity, learner: Identity) -> Result<Self, Error> {
         if !supervisor.valid() || !learner.valid() || supervisor.id == learner.id {
             return Err(Error::Invalid);
         }
