@@ -213,7 +213,7 @@ class Production:
             "policy_lock_timing_emulated": True,
             "policy_lock_budget_verified": False,
             "policy_lock_note": ("TCG diagnostic timing separates measured overruns from "
-                                 "attempts the meter could not measure."),
+                                 "attempts with invalid clock samples; all completed bridge calls are observed."),
             "admission_leases_inferred": False,
             "entropy_production": False,
             "host_peer_sample": "fixed 512-byte non-TLS pattern (not a ClientHello)",
@@ -424,8 +424,8 @@ def check_w11_baseline(words: tuple) -> None:
     require(words[152] == SECONDARY_CPU_MASK.bit_count(),
             "RecoveryProof writer takeover must cover the three stopped CPUs (word 152)")
     require(0 < words[153] < words[130], "FrameMeta Arena pages missing or inconsistent (word 153)")
-    require(words[154] <= min(1, words[137])
-            and (words[155] > POLICY_LOCK_WORK_BUDGET_NS) == (words[154] == 1),
+    require(words[154] <= words[137]
+            and (words[155] > POLICY_LOCK_WORK_BUDGET_NS) == (words[154] > 0),
             "policy_lock measured overrun disagrees with the maximum elapsed time")
     require(words[136] + words[154] > 0, "policy_lock requires a settled measurement")
     require(all(v == 0 for v in words[156:W11_END]), "nonzero wave-11 reserved words")

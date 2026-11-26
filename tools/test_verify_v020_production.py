@@ -156,6 +156,24 @@ class W11Validation(unittest.TestCase):
         words[153] = 0
         self.rejects("FrameMeta Arena", words=words)
 
+    def test_multiple_completed_overruns_remain_visible(self):
+        words = w11_words()
+        words[136:138] = [2, 2]
+        words[154:156] = [2, 90_000]
+        lines = ["V020_W11_POLICY_LOCK_METER a=2 b=2 c=0"
+                 if line.startswith("V020_W11_POLICY_LOCK_METER") else line
+                 for line in w11_lines()]
+        obs = self.check(words=words, lines=lines)
+        self.assertEqual(obs["policy_lock_measured_overruns"], 2)
+        self.assertEqual(obs["policy_lock_max_elapsed_ns"], 90_000)
+        self.assertEqual(obs["policy_lock_unmeasured"], 0)
+
+    def test_overrun_count_cannot_exceed_non_budget_attempts(self):
+        words = w11_words()
+        words[136:138] = [2, 2]
+        words[154:156] = [3, 90_000]
+        self.rejects("policy_lock measured overrun", words=words)
+
     def test_measured_overrun_must_exceed_the_work_budget(self):
         words = w11_words()
         words[154:156] = [1, 45_000]
