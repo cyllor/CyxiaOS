@@ -213,9 +213,12 @@ impl Cpu0BudgetLedger {
             ))
         };
         let (before, early_overrun) = checked_upper(self)?;
-        let crossed = start_ns / WINDOW_NS != now_ns / WINDOW_NS;
+        // Debit only windows touched by the half-open interval. A zero-wall
+        // interval can still have a CPU delta at the sampling resolution.
+        let ending_ns = now_ns.saturating_sub(1).max(start_ns);
+        let crossed = start_ns / WINDOW_NS != ending_ns / WINDOW_NS;
         self.time(now_ns)?;
-        self.enter_window(now_ns)?;
+        self.enter_window(ending_ns)?;
         let (after, late_overrun) = checked_upper(self)?;
         self.max_window_upper_ns = self.max_window_upper_ns.max(before).max(after);
         self.spent[idx] = self.spent[idx]
@@ -482,6 +485,7 @@ impl Cpu0BudgetLedger {
             requested,
             wall_ns,
             now,
+            false,
         )
     }
     /// Separate trusted EL1 recovery/coordination entry. There is no user
@@ -509,7 +513,31 @@ impl Cpu0BudgetLedger {
         if wall_ns == 0 || wall_ns > 50_000_000 {
             return Err(Error::Invalid);
         }
-        self.reserve(None, None, class, 0, requested, wall_ns, now)
+        self.reserve(None, None, class, 0, requested, wall_ns, now, false)
+    }
+
+    /// Prepay a trusted, read-only EL1 health diagnostic during containment.
+    /// This uses the existing coordination limit and leaves the ordinary
+    /// admission latch set. The caller must expose no ordinary control work.
+    pub fn reserve_readonly_diagnostic(
+        &mut self,
+        cpu: usize,
+        requested: u64,
+        now: u64,
+    ) -> Result<Turn, Error> {
+        if cpu != CONTROL_CPU {
+            return Err(Error::Denied);
+        }
+        self.reserve(
+            None,
+            None,
+            Class::Coordination,
+            0,
+            requested,
+            requested,
+            now,
+            true,
+        )
     }
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -522,6 +550,7 @@ impl Cpu0BudgetLedger {
         requested: u64,
         wall_ns: u64,
         now: u64,
+        readonly_diagnostic: bool,
     ) -> Result<Turn, Error> {
         if self.active.is_some() {
             return Err(Error::Busy);
@@ -531,7 +560,7 @@ impl Cpu0BudgetLedger {
             return Err(Error::Clock);
         }
         self.time(now)?;
-        if self.ordinary_closed && class != Class::Recovery {
+        if self.ordinary_closed && class != Class::Recovery && !readonly_diagnostic {
             return Err(Error::Denied);
         }
         let end = self.enter_window(now)?;
@@ -725,7 +754,8 @@ impl Cpu0BudgetLedger {
     /// actual CPU counter interval is known. A bad clock retains ownership.
     /// Actual overrun is charged, never clamped to the prepaid reservation.
     /// Cross-window completion conservatively carries the entire observed
-    /// charge into the new window and closes ordinary admission.
+    /// charge into the last touched window and closes ordinary admission.
+    /// Stopping at the aligned boundary still belongs to the prepaid window.
     pub fn settle(
         &mut self,
         cpu: usize,
@@ -740,7 +770,9 @@ impl Cpu0BudgetLedger {
             return Err(Error::Stale);
         }
         self.time(now)?;
-        let crossed = now / WINDOW_NS != turn.window;
+        let ending_ns = now.saturating_sub(1).max(self.active_start_ns);
+        let ending_window = ending_ns / WINDOW_NS;
+        let crossed = ending_window != turn.window;
         let overrun = actual > turn.reserved_ns || now > turn.deadline_ns;
         let idx = turn.class.index();
         let total = self.spent[idx]
@@ -780,7 +812,7 @@ impl Cpu0BudgetLedger {
             self.kernel_coordination_spent
         };
         if crossed {
-            self.window = Some(now / WINDOW_NS);
+            self.window = Some(ending_window);
             self.spent = [0; 6];
             self.role_spent = [0; ROLE_COUNT];
             self.kernel_coordination_spent = if kernel_coordination { actual } else { 0 };
@@ -1183,6 +1215,47 @@ mod tests {
         assert_eq!(q.kernel_coordination_spent(), 1_000_000);
     }
     #[test]
+    fn scalar_turn_stopped_at_boundary_uses_prepaid_window() {
+        let m = manifest();
+        let mut q = Cpu0BudgetLedger::new();
+        let began = WINDOW_NS - 100;
+        q.start_continuous(0, began, || Ok(())).unwrap();
+        let turn = q
+            .reserve_role(&m, m.members[0].actor, 0, Class::Operations, 1, 100, began)
+            .unwrap();
+        let receipt = q.settle(0, turn, 100, WINDOW_NS).unwrap();
+        assert!(!receipt.crossed_window && !receipt.overrun);
+        assert_eq!(q.spent(Class::Operations), 100);
+        let next = q
+            .reserve_kernel(0, Class::Coordination, 100, WINDOW_NS)
+            .unwrap();
+        q.settle(0, next, 100, WINDOW_NS + 100).unwrap();
+        assert_eq!(q.spent(Class::Operations), 0);
+        assert_eq!(q.lifetime_total(), Ok(200));
+    }
+    #[test]
+    fn scalar_coordination_ending_at_boundary_does_not_debit_empty_window() {
+        let mut q = Cpu0BudgetLedger::new();
+        let began = WINDOW_NS - KERNEL_COORDINATION_LIMIT_NS;
+        q.start_continuous(0, began, || Ok(())).unwrap();
+        let receipt = q
+            .account_coordination_gap(0, began, WINDOW_NS, KERNEL_COORDINATION_LIMIT_NS)
+            .unwrap();
+        assert!(!receipt.crossed_window && !receipt.overrun);
+        assert_eq!(q.kernel_coordination_spent(), KERNEL_COORDINATION_LIMIT_NS);
+        let next = q
+            .reserve_kernel(
+                0,
+                Class::Coordination,
+                KERNEL_COORDINATION_LIMIT_NS,
+                WINDOW_NS,
+            )
+            .unwrap();
+        q.settle(0, next, 100, WINDOW_NS + 100).unwrap();
+        assert_eq!(q.kernel_coordination_spent(), 100);
+        assert_eq!(q.lifetime_total(), Ok(KERNEL_COORDINATION_LIMIT_NS + 100));
+    }
+    #[test]
     fn continuous_gap_accounting_charges_once_and_bounds_both_windows() {
         let mut q = Cpu0BudgetLedger::new();
         let a = q.account_coordination_gap(0, 0, 10, 1_000_000).unwrap();
@@ -1320,6 +1393,32 @@ mod tests {
             ),
             Err(Error::Exhausted)
         );
+    }
+    #[test]
+    fn overrun_keeps_diagnostics_in_coordination_and_ordinary_admission_closed() {
+        let mut q = Cpu0BudgetLedger::new();
+        let turn = q
+            .reserve_kernel(0, Class::Coordination, 1_000_000, 0)
+            .unwrap();
+        let late = KERNEL_COORDINATION_LIMIT_NS + 1;
+        assert!(q.settle(0, turn, late, late).unwrap().overrun);
+        assert_eq!(
+            q.reserve_readonly_diagnostic(0, 100, late),
+            Err(Error::Exhausted)
+        );
+        assert_eq!(
+            q.reserve_readonly_diagnostic(1, 100, WINDOW_NS),
+            Err(Error::Denied)
+        );
+        let diagnostic = q.reserve_readonly_diagnostic(0, 100, WINDOW_NS).unwrap();
+        q.settle(0, diagnostic, 100, WINDOW_NS + 100).unwrap();
+        assert_eq!(q.kernel_coordination_spent(), 100);
+        assert!(q.ordinary_closed());
+        assert_eq!(
+            q.reserve_kernel(0, Class::Coordination, 1, WINDOW_NS + 100),
+            Err(Error::Denied)
+        );
+        assert_eq!(q.spent(Class::Recovery), 0);
     }
     #[test]
     fn actual_overrun_and_late_copy_never_refill_ordinary_budget() {

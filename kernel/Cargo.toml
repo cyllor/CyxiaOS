@@ -10,10 +10,8 @@ test = false
 bench = false
 
 [features]
-# V0.20 canonical default (wave 11 integration): the production boot +
-# in-vector SVC dispatch skeleton is the default aarch64 profile. v020-production
-# implies the proven smp-selftest bring-up, so the default boot runs
-# production::run and the default exception path is the production dispatcher.
+# V0.20 canonical default: resident AArch64 startup.
+# With no deployment startup authority, it runs trusted read-only diagnostics.
 # The isolated fixed-CPU0 fixture stays reachable via
 # --no-default-features --features smp-selftest; the retired CPU0 desktop path
 # requires the explicit legacy-desktop feature.
@@ -69,32 +67,23 @@ v0199-cpu0-role-selftest = ["smp-selftest"]
 v0199-advice-e2e-selftest = ["smp-selftest", "dep:sha2"]
 # Alternate opt-in name for the CPU0 ABI3 registration and publication fixture.
 v0199-cpu0-svc-selftest = ["v0199-advice-e2e-selftest"]
-# V0.20 production boot + in-vector SVC dispatch SKELETON (wave 10 T1). Elevates
-# the proven advice-e2e SvcV3Bridge dispatch (0x50 intake/register, 0x41 publish)
-# out of the fixture turn loop and into the production exception-vector path, and
-# loads the eight ABI3 PIE role packages through the existing build catalog.
-# Wave 11 integration: this is the DEFAULT aarch64 profile (see `default` above).
-# The bounded acceptance fixtures remain isolated opt-in profiles; build them
-# with --no-default-features so the production control plane does not unify in.
-# HONEST SCOPE: this is a skeleton, NOT full production authority. The boot epoch
-# is staged (volatile), the executor is a bounded fixture target, no real model is
-# active, and the snapshot backend stays fail-closed (EAGAIN). See production.rs
-# scope markers (production_skeleton=true full_authority=false real_models=false).
-v020-production = ["smp-selftest", "dep:sha2", "sec-n-native"]
-# Wave 11 opt-in media-staging lane; adds only the prototype-memory topology.
-v020-production-media-staging = ["v020-production", "prototype-memory"]
-v020-production-authenticated-net = ["v020-production"]
+# The production entry shares fixed SMP bring-up. Native diagnostic builds
+# opt in to bounded ABI3/trap, network and scratch-media evidence.
+v020-production = ["smp-selftest"]
+v020-production-diagnostic = ["v020-production", "dep:sha2", "sec-n-native"]
+v020-production-media-staging = ["v020-production-diagnostic", "prototype-memory"]
+v020-production-authenticated-net = ["v020-production-diagnostic"]
 v020-production-media-reopen = ["v020-production-media-staging"]
 v020-production-media-signed = ["v020-production-media-staging"]
 v020-production-media-envelopes = ["v020-production-media-staging"]
 v020-production-media-unified = ["v020-production-media-envelopes"]
-v020-production-live-control = ["v020-production"]
+v020-production-live-control = ["v020-production-diagnostic"]
 v020-production-snapshot-catalog = ["v020-production-media-unified", "v020-production-media-signed", "v020-production-live-control"]
 v020-production-file-read = ["v020-production-media-unified", "v020-production-media-signed", "v020-production-live-control"]
 v020-production-snapshot-read = ["v020-production-snapshot-catalog", "v020-production-file-read"]
 v020-production-file-sessions = ["v020-production-file-read"]
 v020-production-file-volatile-write = ["v020-production-file-read"]
-v020-production-frame-pool = ["v020-production"]
+v020-production-frame-pool = ["v020-production-diagnostic"]
 # Explicit native ABI3 role bootstrap. Never a production G0/BootEpoch claim.
 v0199-control-bringup = ["v0199-cpu0-role-selftest"]
 # Same diagnostic program inventory with the normative RAM topology; not G0.

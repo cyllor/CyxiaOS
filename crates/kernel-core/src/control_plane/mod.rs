@@ -113,3 +113,4 @@ pub mod d15_owner_v0199;
 pub mod candidate_registry_v0199;
 
 pub mod learning_data_v0199;
+pub mod model_lifecycle_v0199;

@@ -1,20 +1,23 @@
-//! Baseline-v1 mount recovery, §9.3–9.5. No allocations or new wire ABI.
+//! Baseline-v1 redo append and mount recovery, §9.3–9.5.
 //! The mounted-device owner must exclude all other writers throughout scan,
 //! replay, post-replay structural/system validation and checkpoint. A
 //! successful scan is not a mount. No ordinary service opens on an I/O
 //! error, an ambiguous record, or a failed structural/ACL validation.
 use super::{
     Error,
-    epoch_redo_v0199::EpochBlockIo,
+    epoch_redo_v0199::{EpochBlockIo, RedoEncoding},
     file_media_v0199::{
         BITMAP_START, BLOCK_COUNT, SUPER_BYTES as BLOCK, SuperblockV1, crc32c_payload,
-        crc32c_zeroed, preflight_baseline_checkpoint,
+        crc32c_zeroed, has_later_log_header, preflight_baseline_log,
     },
 };
 use sha2::{Digest, Sha256};
 
 const FIRST: u32 = 2;
-const END: u32 = 4098;
+const END: u32 = BITMAP_START;
+const LOG_BLOCKS: usize = (END - FIRST) as usize;
+const OLD_RECORD: u8 = 1;
+const OLD_CONTINUATION: u8 = 2;
 const MAX_REDO: usize = 128;
 // Each REDO occupies two physical blocks. Includes metadata afterimages.
 const MAX_HOME: usize = ((END - FIRST) / 2) as usize;
@@ -56,6 +59,10 @@ pub struct RecoveryWorkspace {
     second: [u8; BLOCK],
     evidence: Option<RecoveryEvidence>,
     selected: u32,
+    next_log_block: u32,
+    last_txid: u64,
+    checkpoint_required: bool,
+    obsolete: [u8; LOG_BLOCKS],
 }
 impl RecoveryWorkspace {
     pub const fn new() -> Self {
@@ -68,10 +75,30 @@ impl RecoveryWorkspace {
             second: [0; BLOCK],
             evidence: None,
             selected: 0,
+            next_log_block: FIRST,
+            last_txid: 0,
+            checkpoint_required: false,
+            obsolete: [0; LOG_BLOCKS],
         }
     }
     pub fn evidence(&self) -> Option<RecoveryEvidence> {
         self.evidence
+    }
+
+    fn publish_rows(&mut self, count: usize, commit_lsn: u64) -> Result<(), Error> {
+        for mut row in self.pending[..count].iter().copied() {
+            row.commit_lsn = commit_lsn;
+            if let Some(previous) = self.rows[..self.count]
+                .iter_mut()
+                .find(|previous| previous.home == row.home)
+            {
+                *previous = row;
+            } else {
+                *self.rows.get_mut(self.count).ok_or(Error::Capacity)? = row;
+                self.count += 1;
+            }
+        }
+        Ok(())
     }
 }
 impl Default for RecoveryWorkspace {
@@ -172,19 +199,22 @@ pub fn scan(
 ) -> Result<RecoveryEvidence, Error> {
     w.evidence = None;
     w.count = 0;
+    w.obsolete.fill(0);
     io.read(0, &mut w.first)?;
     io.read(1, &mut w.second)?;
-    let epoch = super::file_media_v0199::probe_snapshot_media_pair(&w.first, &w.second)?.log_epoch;
-    let mut last_current = 0u32;
-    // Track aligned current-epoch header candidates during the mandatory
-    // full area scan. Avoid rescanning 4096 blocks after an empty suffix.
-    let sb = preflight_baseline_checkpoint(&w.first, &w.second, &mut w.raw, |b, out| {
-        io.read(b, out)?;
-        if u32at(out, 0) == MAGIC && u64at(out, 32) == epoch {
-            last_current = last_current.max(b);
-        }
-        Ok(())
-    })?;
+    let (sb, last_current) = preflight_baseline_log(
+        &w.first,
+        &w.second,
+        &mut w.raw,
+        |b, out| io.read(b, out),
+        |first, blocks| {
+            let index = (first - FIRST) as usize;
+            w.obsolete[index] = OLD_RECORD;
+            if blocks == 2 {
+                w.obsolete[index + 1] = OLD_CONTINUATION;
+            }
+        },
+    )?;
     w.selected = if SuperblockV1::decode(&w.first)? == sb {
         0
     } else {
@@ -263,18 +293,7 @@ pub fn scan(
         {
             return Err(Error::Conflict);
         }
-        for row in &mut w.pending[..n] {
-            row.commit_lsn = commit.lsn;
-            if let Some(old) = w.rows[..w.count].iter_mut().find(|r| r.home == row.home) {
-                *old = *row;
-            } else {
-                if w.count >= MAX_HOME {
-                    return Err(Error::Capacity);
-                }
-                w.rows[w.count] = *row;
-                w.count += 1;
-            }
-        }
+        w.publish_rows(n, commit.lsn)?;
         last = commit.lsn;
         last_tx = commit.txid;
         transactions += 1;
@@ -288,6 +307,8 @@ pub fn scan(
         incomplete_tail: incomplete,
     };
     w.evidence = Some(e);
+    w.next_log_block = at;
+    w.last_txid = last_tx;
     Ok(e)
 }
 fn same_superblocks(io: &mut impl EpochBlockIo, w: &mut RecoveryWorkspace) -> Result<(), Error> {
@@ -318,6 +339,239 @@ fn read_exact_image(
     }
     Ok(())
 }
+
+/// One complete home-block image from the protected file transaction owner.
+pub struct RedoImage<'a> {
+    pub home: u32,
+    pub contents: &'a [u8; BLOCK],
+}
+
+/// Position assigned before building after-images that carry a transaction
+/// key, such as inode/receipt closure. It becomes durable only after append.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RedoTransaction {
+    pub fs_uuid: [u8; 16],
+    pub log_epoch: u64,
+    pub txid: u64,
+    pub begin_lsn: u64,
+    pub commit_lsn: u64,
+    pub first_log_block: u32,
+    pub log_blocks: u32,
+}
+
+/// Verified ordered FLUSH completions and matching device readback.
+pub struct CommittedRedo {
+    transaction: RedoTransaction,
+    ordered_digest: [u8; 32],
+}
+
+impl CommittedRedo {
+    pub const fn transaction(&self) -> RedoTransaction {
+        self.transaction
+    }
+
+    pub const fn ordered_digest(&self) -> [u8; 32] {
+        self.ordered_digest
+    }
+}
+
+/// An exclusive serialized append session on an already validated mount.
+/// The caller owns authorization, home mapping and I/O slot reservation.
+/// The workspace stores the bounded overlay of latest committed images.
+pub struct RedoWriter<'a, I> {
+    io: &'a mut I,
+    workspace: &'a mut RecoveryWorkspace,
+}
+
+impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
+    pub fn open(
+        io: &'a mut I,
+        workspace: &'a mut RecoveryWorkspace,
+        mounted: SuperblockV1,
+    ) -> Result<Self, Error> {
+        if workspace.checkpoint_required {
+            return Err(Error::Unknown);
+        }
+        let evidence = scan(io, workspace)?;
+        if evidence.superblock != mounted || evidence.incomplete_tail {
+            workspace.evidence = None;
+            return Err(Error::Conflict);
+        }
+        Ok(Self { io, workspace })
+    }
+
+    pub fn prepare(&self, images: usize) -> Result<RedoTransaction, Error> {
+        let w = &self.workspace;
+        let e = w.evidence.ok_or(Error::Unknown)?;
+        if !(1..=MAX_REDO).contains(&images) {
+            return Err(Error::Capacity);
+        }
+        let log_blocks = 2 + 2 * images as u32;
+        if w.next_log_block + log_blocks > END {
+            return Err(Error::Capacity);
+        }
+        let begin_lsn = e.last_commit_lsn.checked_add(1).ok_or(Error::Exhausted)?;
+        Ok(RedoTransaction {
+            fs_uuid: e.superblock.fs_uuid,
+            log_epoch: e.superblock.log_epoch,
+            txid: w.last_txid.checked_add(1).ok_or(Error::Exhausted)?,
+            begin_lsn,
+            commit_lsn: begin_lsn
+                .checked_add(images as u64 + 1)
+                .ok_or(Error::Exhausted)?,
+            first_log_block: w.next_log_block,
+            log_blocks,
+        })
+    }
+
+    /// Append into a reserved span of blank blocks and verified obsolete
+    /// records. A span that strands a nonzero REDO continuation is busy.
+    /// The owner holds data/log/flush/completion reservations from BEGIN
+    /// through reply. After uncertain I/O the workspace requires recovery.
+    pub fn append(
+        &mut self,
+        plan: RedoTransaction,
+        images: &[RedoImage<'_>],
+        reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
+    ) -> Result<CommittedRedo, Error> {
+        if self.prepare(images.len())? != plan {
+            return Err(Error::Stale);
+        }
+        let mut digest = Sha256::new();
+        for (index, image) in images.iter().enumerate() {
+            if !(BITMAP_START..BLOCK_COUNT).contains(&image.home)
+                || images[..index].iter().any(|prior| prior.home == image.home)
+                || has_later_log_header(&image.contents[BLOCK - 64..], plan.log_epoch)
+            {
+                return Err(Error::Conflict);
+            }
+            digest.update(u64::from(image.home).to_le_bytes());
+            digest.update(image.contents);
+        }
+        let digest = digest.finalize().into();
+        reserve(&plan)?;
+        same_superblocks(self.io, self.workspace)?;
+        let w = &mut self.workspace;
+        let scratch: &mut [u8; BLOCK] = (&mut w.raw[..BLOCK]).try_into().unwrap();
+        let end = plan.first_log_block + plan.log_blocks;
+        if end < END && w.obsolete[(end - FIRST) as usize] == OLD_CONTINUATION {
+            self.io.read(end, scratch)?;
+            if scratch.iter().any(|&byte| byte != 0) {
+                return Err(Error::Busy);
+            }
+        }
+        for block in plan.first_log_block..end {
+            self.io.read(block, scratch)?;
+            if w.obsolete[(block - FIRST) as usize] == 0 && scratch.iter().any(|&byte| byte != 0) {
+                return Err(Error::Busy);
+            }
+        }
+        if self.write_and_verify(plan, images, digest).is_err()
+            || self
+                .workspace
+                .publish_rows(images.len(), plan.commit_lsn)
+                .is_err()
+        {
+            self.workspace.evidence = None;
+            self.workspace.checkpoint_required = true;
+            return Err(Error::Unknown);
+        }
+        let w = &mut self.workspace;
+        w.next_log_block += plan.log_blocks;
+        w.last_txid = plan.txid;
+        let e = w.evidence.as_mut().unwrap();
+        e.last_commit_lsn = plan.commit_lsn;
+        e.transactions += 1;
+        e.distinct_home_blocks = w.count as u32;
+        Ok(CommittedRedo {
+            transaction: plan,
+            ordered_digest: digest,
+        })
+    }
+
+    fn write_and_verify(
+        &mut self,
+        plan: RedoTransaction,
+        images: &[RedoImage<'_>],
+        digest: [u8; 32],
+    ) -> Result<(), Error> {
+        let w = &mut self.workspace;
+        let io = &mut self.io;
+        let encoding = RedoEncoding {
+            epoch: plan.log_epoch,
+            txid: plan.txid,
+            begin_lsn: plan.begin_lsn,
+            count: images.len() as u32,
+        };
+        let begin_block = plan.first_log_block;
+        let commit_block = begin_block + plan.log_blocks - 1;
+        let scratch: &mut [u8; BLOCK] = (&mut w.raw[..BLOCK]).try_into().unwrap();
+        encoding.begin(scratch)?;
+        let begin_digest = hash(scratch);
+        io.write(begin_block, scratch)?;
+        for (index, image) in images.iter().enumerate() {
+            encoding.after_image(&mut w.raw, index as u32, image.home, image.contents)?;
+            let log = begin_block + 1 + 2 * index as u32;
+            let (left, right) = w.raw.split_at(BLOCK);
+            io.write(log, left.try_into().unwrap())?;
+            io.write(log + 1, right.try_into().unwrap())?;
+            w.pending[index] = Row {
+                home: image.home,
+                log,
+                commit_lsn: plan.commit_lsn,
+                digest: hash(&w.raw),
+            };
+        }
+        io.flush()?;
+        let scratch: &mut [u8; BLOCK] = (&mut w.raw[..BLOCK]).try_into().unwrap();
+        encoding.commit(scratch, digest)?;
+        let commit_digest = hash(scratch);
+        io.write(commit_block, scratch)?;
+        io.flush()?;
+        io.read(begin_block, scratch)?;
+        if hash(scratch) != begin_digest {
+            return Err(Error::Conflict);
+        }
+        io.read(commit_block, scratch)?;
+        if hash(scratch) != commit_digest {
+            return Err(Error::Conflict);
+        }
+        for &row in &w.pending[..images.len()] {
+            read_exact_image(*io, row, plan.log_epoch, &mut w.raw)?;
+        }
+        Ok(())
+    }
+
+    /// Consult the verified overlay before the older checkpoint homes.
+    pub fn read_committed(&mut self, home: u32, out: &mut [u8; BLOCK]) -> Result<(), Error> {
+        let w = &mut self.workspace;
+        let e = w.evidence.ok_or(Error::Unknown)?;
+        if !(BITMAP_START..BLOCK_COUNT).contains(&home) {
+            return Err(Error::Invalid);
+        }
+        let result = if let Some(&row) = w.rows[..w.count].iter().find(|row| row.home == home) {
+            read_exact_image(self.io, row, e.superblock.log_epoch, &mut w.raw)
+                .map(|()| &w.raw[64..64 + BLOCK])
+        } else {
+            let block = &mut w.raw[..BLOCK];
+            self.io
+                .read(home, block.try_into().unwrap())
+                .map(|()| &w.raw[..BLOCK])
+        };
+        match result {
+            Ok(bytes) => {
+                out.copy_from_slice(bytes);
+                Ok(())
+            }
+            Err(_) => {
+                w.evidence = None;
+                w.checkpoint_required = true;
+                Err(Error::Unknown)
+            }
+        }
+    }
+}
+
 /// Idempotent home replay while old checkpoint remains selected. Preflight
 /// all retained afterimages before first write, then verify again on use.
 /// Any I/O uncertainty leaves the old log authoritative. Caller's exclusive
@@ -331,6 +585,7 @@ pub fn replay_home(
     for i in 0..w.count {
         read_exact_image(io, w.rows[i], e.superblock.log_epoch, &mut w.raw)?;
     }
+    w.checkpoint_required = true;
     for i in 0..w.count {
         let row = w.rows[i];
         read_exact_image(io, row, e.superblock.log_epoch, &mut w.raw)
@@ -410,6 +665,7 @@ pub fn recover_checkpoint_with_evidence<I: EpochBlockIo>(
         return Err(Error::Unknown);
     }
     w.evidence = None;
+    w.checkpoint_required = false;
     Ok((e, next))
 }
 
@@ -417,6 +673,12 @@ pub fn recover_checkpoint_with_evidence<I: EpochBlockIo>(
 mod tests {
     extern crate std;
     use super::*;
+    use crate::security::{
+        file_index_v0199::{FileStreamIndexV4, GroupIndex, STREAM_COUNT, StreamIndex},
+        file_media_v0199::{FileReceiptV4, INODE_START, RECEIPT_BYTES, local_request_id},
+        file_receipt_store_v0199::{RECEIPT_STORE_BYTES, scan_receipts_with_index},
+        file_structure_v1::{INODE_BYTES, Inode},
+    };
     use std::{boxed::Box, collections::BTreeMap, vec::Vec};
     #[derive(Default)]
     struct Disk {
@@ -534,14 +796,335 @@ mod tests {
         }
         at + 1
     }
-    fn disk() -> Disk {
+    fn blank_disk() -> Disk {
         let mut d = Disk::default();
         d.blocks.insert(0, Box::new(superblock()));
         d.blocks.insert(1, Box::new(superblock()));
+        d
+    }
+
+    fn disk() -> Disk {
+        let mut d = blank_disk();
         let next = append(&mut d, 2, 1, 1, &[(7000, 1)], true);
         let next = append(&mut d, next, 2, 4, &[(7000, 2), (7001, 3)], true);
         append(&mut d, next, 3, 8, &[(7001, 4)], false);
         d
+    }
+
+    #[test]
+    fn writer_recovers_file_inode_and_cross_block_receipt_together() {
+        const DATA_HOME: u32 = 7000;
+        const RECEIPT_HOME: u32 = 7001;
+        const INDEX_HOME: u32 = RECEIPT_HOME + 6;
+        let mut d = blank_disk();
+        let mut w = RecoveryWorkspace::new();
+        let mut data = [5; BLOCK];
+        let mut archived_header = [0; BLOCK];
+        RedoEncoding {
+            epoch: 1,
+            txid: 1,
+            begin_lsn: 1,
+            count: 1,
+        }
+        .begin(&mut archived_header)
+        .unwrap();
+        // Ordinary file content may include archival bytes from a journal.
+        data[BLOCK - 64..].copy_from_slice(&archived_header[..64]);
+
+        let mut inode_page = [0; BLOCK];
+        let inode = &mut inode_page[..INODE_BYTES];
+        p32(inode, 0, 0x4359494e);
+        p16(inode, 4, 1);
+        p64(inode, 8, 1);
+        p64(inode, 16, BLOCK as u64);
+        p64(inode, 24, 3);
+        p16(inode, 32, 1);
+        p64(inode, 40, 1);
+        p32(inode, 52, DATA_HOME);
+        p32(inode, 56, 1);
+        let crc = crc32c_zeroed(inode, 252).unwrap();
+        p32(inode, 252, crc);
+
+        let sb = SuperblockV1::decode(&superblock()).unwrap();
+        let mut writer = RedoWriter::open(&mut d, &mut w, sb).unwrap();
+        let plan = writer.prepare(5).unwrap();
+        let receipt = FileReceiptV4 {
+            fs_uuid: sb.fs_uuid,
+            issued_boot_epoch: 1,
+            group_id: 0,
+            group_generation: 1,
+            stream_slot: 0,
+            stream_generation: 1,
+            request_seq: 1,
+            log_epoch: plan.log_epoch,
+            txid: plan.txid,
+            commit_lsn: plan.commit_lsn,
+            write_seq: 3,
+            status: 3,
+            result: 0,
+            completed_prefix: BLOCK as u32,
+            operation_digest: hash(b"test durable write"),
+            output_digest: hash(&data),
+            request_id: local_request_id(0, 0, 1).unwrap(),
+            owner_principal_id: 1,
+        };
+        let mut receipts = [0; RECEIPT_STORE_BYTES];
+        let start = 21 * RECEIPT_BYTES;
+        receipts[start..start + RECEIPT_BYTES].copy_from_slice(&receipt.encode().unwrap());
+        let mut index = FileStreamIndexV4 {
+            fs_uuid: sb.fs_uuid,
+            global_request_id_hi: 0,
+            generation: 2,
+            groups: core::array::from_fn(|i| GroupIndex {
+                generation: 0,
+                flags: 0,
+                boot_epoch: 0,
+                manifest_principal_id: i as u64 + 1,
+            }),
+            streams: [StreamIndex {
+                generation: 0,
+                flags: 0,
+                issued_hi: 0,
+                retired_through: 0,
+            }; STREAM_COUNT],
+        };
+        index.groups[0].generation = 1;
+        index.groups[0].flags = 1;
+        index.groups[0].boot_epoch = 1;
+        index.streams[0].generation = 1;
+        index.streams[0].flags = 1;
+        index.streams[0].issued_hi = 1;
+        let mut index_image = [0; BLOCK];
+        index.encode_into(&mut index_image).unwrap();
+
+        {
+            let images = [
+                RedoImage {
+                    home: DATA_HOME,
+                    contents: &data,
+                },
+                RedoImage {
+                    home: INODE_START,
+                    contents: &inode_page,
+                },
+                RedoImage {
+                    home: RECEIPT_HOME,
+                    contents: receipts[..BLOCK].try_into().unwrap(),
+                },
+                RedoImage {
+                    home: RECEIPT_HOME + 1,
+                    contents: receipts[BLOCK..2 * BLOCK].try_into().unwrap(),
+                },
+                RedoImage {
+                    home: INDEX_HOME,
+                    contents: &index_image,
+                },
+            ];
+            let committed = writer
+                .append(plan, &images, |extent| {
+                    assert_eq!((extent.first_log_block, extent.log_blocks), (2, 12));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(committed.transaction(), plan);
+            let mut read = [0; BLOCK];
+            writer.read_committed(DATA_HOME, &mut read).unwrap();
+            assert!(read == data);
+            writer.read_committed(INDEX_HOME, &mut read).unwrap();
+            assert!(read == index_image);
+        }
+        assert_eq!(
+            d.events,
+            [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, u32::MAX, 13, u32::MAX]
+        );
+        assert!(!d.blocks.contains_key(&DATA_HOME));
+        let mut reopened = Disk {
+            blocks: d.blocks,
+            ..Disk::default()
+        };
+        let mut independent = RecoveryWorkspace::new();
+        let (replayed, next) =
+            recover_checkpoint_with_evidence(&mut reopened, &mut independent, |io, _| {
+                let mut block = [0; BLOCK];
+                io.read(DATA_HOME, &mut block)?;
+                assert_eq!(hash(&block), receipt.output_digest);
+                io.read(INODE_START, &mut block)?;
+                let inode = Inode::decode(&block[..INODE_BYTES])?;
+                assert_eq!(
+                    (inode.durable_write_seq, inode.size),
+                    (receipt.write_seq, BLOCK as u64)
+                );
+                let mut recovered = [0; RECEIPT_STORE_BYTES];
+                for (offset, dst) in recovered.chunks_exact_mut(BLOCK).enumerate() {
+                    io.read(RECEIPT_HOME + offset as u32, dst.try_into().unwrap())?;
+                }
+                io.read(INDEX_HOME, &mut block)?;
+                let summary = scan_receipts_with_index(&recovered, &block, sb.fs_uuid)?;
+                assert_eq!(
+                    (summary.occupied, summary.unresolved, summary.across_block),
+                    (1, 0, 1)
+                );
+                assert_eq!(
+                    FileReceiptV4::decode(&recovered[start..start + RECEIPT_BYTES])?,
+                    receipt
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            (replayed.transactions, replayed.distinct_home_blocks),
+            (1, 5)
+        );
+        assert_eq!(next.checkpoint_lsn, plan.commit_lsn);
+    }
+
+    #[test]
+    fn writer_requires_exact_reservation_and_rejects_unproven_log_bytes() {
+        let sb = SuperblockV1::decode(&superblock()).unwrap();
+        let mut d = blank_disk();
+        d.blocks.insert(3, Box::new([4; BLOCK]));
+        let mut w = RecoveryWorkspace::new();
+        let mut writer = RedoWriter::open(&mut d, &mut w, sb).unwrap();
+        assert_eq!(writer.prepare(129), Err(Error::Capacity));
+        let plan = writer.prepare(1).unwrap();
+        let contents = [0; BLOCK];
+        let image = RedoImage {
+            home: 7000,
+            contents: &contents,
+        };
+        let images = [image];
+        let mut stale = plan;
+        stale.commit_lsn += 1;
+        assert_eq!(
+            writer
+                .append(stale, &images, |_| panic!("stale plan"))
+                .err(),
+            Some(Error::Stale)
+        );
+        assert_eq!(
+            writer.append(plan, &images, |_| Err(Error::Capacity)).err(),
+            Some(Error::Capacity)
+        );
+        assert_eq!(
+            writer.append(plan, &images, |_| Ok(())).err(),
+            Some(Error::Busy)
+        );
+        assert!(d.events.is_empty());
+        assert!(d.blocks[&3].iter().all(|&byte| byte == 4));
+    }
+
+    #[test]
+    fn writer_reuses_verified_old_records_after_checkpoint() {
+        let sb = SuperblockV1::decode(&superblock()).unwrap();
+        let mut d = blank_disk();
+        let mut w = RecoveryWorkspace::new();
+        let first_data = [31; BLOCK];
+        let second_data = [71; BLOCK];
+        let first = [
+            RedoImage {
+                home: 7000,
+                contents: &first_data,
+            },
+            RedoImage {
+                home: 7001,
+                contents: &first_data,
+            },
+        ];
+        let mut writer = RedoWriter::open(&mut d, &mut w, sb).unwrap();
+        let first_plan = writer.prepare(first.len()).unwrap();
+        writer.append(first_plan, &first, |_| Ok(())).unwrap();
+        let checkpoint = recover_checkpoint(&mut d, &mut w, |_, _| Ok(())).unwrap();
+        d.events.clear();
+        assert_eq!(checkpoint.checkpoint_lsn, first_plan.commit_lsn);
+
+        let mut reopened = RecoveryWorkspace::new();
+        let mut writer = RedoWriter::open(&mut d, &mut reopened, checkpoint).unwrap();
+        let next = [
+            RedoImage {
+                home: 7000,
+                contents: &second_data,
+            },
+            RedoImage {
+                home: 7001,
+                contents: &second_data,
+            },
+        ];
+        let short = writer.prepare(1).unwrap();
+        // A shorter span would leave the old second image tail unframed.
+        assert_eq!(
+            writer.append(short, &next[..1], |_| Ok(())).err(),
+            Some(Error::Busy)
+        );
+        let plan = writer.prepare(next.len()).unwrap();
+        assert_eq!(plan.first_log_block, first_plan.first_log_block);
+        assert_eq!(plan.log_epoch, first_plan.log_epoch + 1);
+        assert_eq!(plan.begin_lsn, first_plan.commit_lsn + 1);
+        writer.append(plan, &next, |_| Ok(())).unwrap();
+        assert_eq!(d.events, [2, 3, 4, 5, 6, u32::MAX, 7, u32::MAX]);
+        let mut independent = RecoveryWorkspace::new();
+        let (evidence, next_checkpoint) =
+            recover_checkpoint_with_evidence(&mut d, &mut independent, |io, _| {
+                for home in [7000, 7001] {
+                    let mut out = [0; BLOCK];
+                    io.read(home, &mut out)?;
+                    assert!(out == second_data);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            (evidence.transactions, evidence.distinct_home_blocks),
+            (1, 2)
+        );
+        assert_eq!(next_checkpoint.checkpoint_lsn, plan.commit_lsn);
+    }
+
+    #[test]
+    fn writer_stops_on_uncertain_flush_until_independent_recovery() {
+        let sb = SuperblockV1::decode(&superblock()).unwrap();
+        for (fail_flush, committed) in [(1, false), (2, true)] {
+            let mut d = blank_disk();
+            d.fail_flush = fail_flush;
+            let mut w = RecoveryWorkspace::new();
+            let mut writer = RedoWriter::open(&mut d, &mut w, sb).unwrap();
+            let plan = writer.prepare(1).unwrap();
+            let data = [9; BLOCK];
+            let images = [RedoImage {
+                home: 7000,
+                contents: &data,
+            }];
+            assert_eq!(
+                writer.append(plan, &images, |_| Ok(())).err(),
+                Some(Error::Unknown)
+            );
+            assert_eq!(writer.prepare(1), Err(Error::Unknown));
+            let mut out = [42; BLOCK];
+            assert_eq!(writer.read_committed(7000, &mut out), Err(Error::Unknown));
+            assert!(out.iter().all(|&byte| byte == 42));
+            assert_eq!(
+                RedoWriter::open(&mut d, &mut w, sb).err(),
+                Some(Error::Unknown)
+            );
+            assert!(!d.blocks.contains_key(&7000));
+
+            // The test disk accepts writes before a FLUSH can report failure.
+            // Reopen determines which records are actually present.
+            let mut reopened = Disk {
+                blocks: d.blocks,
+                ..Disk::default()
+            };
+            let mut independent = RecoveryWorkspace::new();
+            let (evidence, _) =
+                recover_checkpoint_with_evidence(&mut reopened, &mut independent, |_, _| Ok(()))
+                    .unwrap();
+            assert_eq!(evidence.transactions, u32::from(committed));
+            assert_eq!(evidence.incomplete_tail, !committed);
+            if committed {
+                assert!(reopened.blocks[&7000].as_ref() == &data);
+            } else {
+                assert!(!reopened.blocks.contains_key(&7000));
+            }
+        }
     }
     #[test]
     fn highest_committed_afterimage_once_then_flush_validate_and_checkpoint() {
@@ -591,6 +1174,11 @@ mod tests {
         );
         assert!(!d.events.contains(&1));
         assert_eq!(SuperblockV1::decode(&*d.blocks[&1]).unwrap().generation, 1);
+        let mounted = SuperblockV1::decode(&superblock()).unwrap();
+        assert_eq!(
+            RedoWriter::open(&mut d, &mut w, mounted).err(),
+            Some(Error::Unknown)
+        );
         d.fail_flush = 0;
         d.events.clear();
         assert_eq!(

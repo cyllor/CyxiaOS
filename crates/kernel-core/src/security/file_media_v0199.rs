@@ -232,8 +232,59 @@ pub fn preflight_baseline_checkpoint(
     first: &[u8],
     second: &[u8],
     scratch: &mut [u8; 2 * SUPER_BYTES],
-    mut read_block: impl FnMut(u32, &mut [u8; SUPER_BYTES]) -> Result<(), Error>,
+    read_block: impl FnMut(u32, &mut [u8; SUPER_BYTES]) -> Result<(), Error>,
 ) -> Result<SuperblockV1, Error> {
+    preflight_baseline_log(first, second, scratch, read_block, |_, _| {})
+        .map(|(selected, _)| selected)
+}
+
+fn preflight_header(head: &[u8]) -> Result<(u16, usize, usize, u64), Error> {
+    let kind = le16(head, 6)?;
+    let (length, padded) = match kind {
+        1 => (80, SUPER_BYTES),
+        2 => (4160, 2 * SUPER_BYTES),
+        3 => (128, SUPER_BYTES),
+        _ => return Err(Error::Unknown),
+    };
+    let epoch = le64(head, 32)?;
+    if le32(head, 0)? != 0x4359_4c47
+        || le16(head, 4)? != 1
+        || le32(head, 8)? as usize != length
+        || epoch == 0
+        || le64(head, 16)? == 0
+        || le64(head, 24)? == 0
+        || le32(head, 60)? != 0
+        || le32(head, 56)? != crc32c_zeroed(&head[..64], 56)?
+        || (kind != 2 && head[40..56].iter().any(|&v| v != 0))
+    {
+        return Err(Error::Unknown);
+    }
+    if kind == 2
+        && (!(u64::from(BITMAP_START)..u64::from(BLOCK_COUNT)).contains(&le64(head, 40)?)
+            || le32(head, 52)? == 0
+            || le32(head, 52)? > 128
+            || le32(head, 48)? >= le32(head, 52)?)
+    {
+        return Err(Error::Unknown);
+    }
+    Ok((kind, length, padded, epoch))
+}
+
+/// Detect an independently credible newer header where the enclosing
+/// record says the bytes are opaque. Treat the overlap as ambiguous.
+pub(super) fn has_later_log_header(bytes: &[u8], epoch: u64) -> bool {
+    bytes.len() >= 64 && preflight_header(bytes).is_ok_and(|(_, _, _, candidate)| candidate > epoch)
+}
+
+/// Select the checkpoint and locate the last record in its epoch with a
+/// full-area scan. Valid REDO continuations belong to their enclosing record.
+pub(super) fn preflight_baseline_log(
+    first: &[u8],
+    second: &[u8],
+    scratch: &mut [u8; 2 * SUPER_BYTES],
+    mut read_block: impl FnMut(u32, &mut [u8; SUPER_BYTES]) -> Result<(), Error>,
+    mut obsolete_record: impl FnMut(u32, u32),
+) -> Result<(SuperblockV1, u32), Error> {
     let probe = probe_snapshot_media_pair(first, second)?;
     if probe.kind != SnapshotMediaKind::BaselineV1 {
         return Err(Error::Unauthorized);
@@ -243,41 +294,18 @@ pub fn preflight_baseline_checkpoint(
     } else {
         SuperblockV1::decode(second)?
     };
-    // This scans physical candidates, including possible header-like
-    // bytes in an afterimage. Conservative denial of ambiguous evidence
-    // is intentional; never silently infer that a newer log is absent.
-    for block in 2u32..4098 {
+    let mut block = 2;
+    let mut last_current = 0;
+    while block < BITMAP_START {
         let (head, tail) = scratch.split_at_mut(SUPER_BYTES);
         read_block(block, head.try_into().map_err(|_| Error::Invalid)?)?;
         if le32(head, 0)? != 0x4359_4c47 {
+            block += 1;
             continue;
         }
-        let kind = le16(head, 6)?;
-        let (length, padded) = match kind {
-            1 => (80usize, 4096usize),
-            2 => (4160, 8192),
-            3 => (128, 4096),
-            _ => return Err(Error::Unknown),
-        };
-        let epoch = le64(head, 32)?;
-        if le16(head, 4)? != 1
-            || le32(head, 8)? as usize != length
-            || epoch == 0
-            || le64(head, 16)? == 0
-            || le64(head, 24)? == 0
-            || le32(head, 60)? != 0
-            || le32(head, 56)? != crc32c_zeroed(&head[..64], 56)?
-            || (kind != 2 && head[40..56].iter().any(|&v| v != 0))
-        {
-            return Err(Error::Unknown);
-        }
+        let (kind, length, padded, epoch) = preflight_header(head)?;
         if kind == 2 {
-            if block == 4097
-                || !(u64::from(BITMAP_START)..u64::from(BLOCK_COUNT)).contains(&le64(head, 40)?)
-                || le32(head, 52)? == 0
-                || le32(head, 52)? > 128
-                || le32(head, 48)? >= le32(head, 52)?
-            {
+            if block + 1 >= BITMAP_START {
                 return Err(Error::Unknown);
             }
             read_block(block + 1, tail.try_into().map_err(|_| Error::Invalid)?)?;
@@ -287,11 +315,22 @@ pub fn preflight_baseline_checkpoint(
         {
             return Err(Error::Unknown);
         }
-        if epoch > selected.log_epoch {
+        if epoch > selected.log_epoch
+            || (kind == 2 && has_later_log_header(&scratch[SUPER_BYTES..], epoch))
+        {
             return Err(Error::Conflict);
         }
+        let blocks = if kind == 2 { 2 } else { 1 };
+        if epoch == selected.log_epoch {
+            last_current = block;
+        } else {
+            obsolete_record(block, blocks);
+        }
+        // The verified header, payload CRC and padding account for every
+        // byte of this record, including opaque file bytes on the next block.
+        block += blocks;
     }
-    Ok(selected)
+    Ok((selected, last_current))
 }
 
 /// Read-only verification of one complete baseline-v1 redo transaction.

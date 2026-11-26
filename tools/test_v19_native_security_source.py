@@ -506,18 +506,20 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertTrue(workflow_path.is_file())
         workflow = source(workflow_path)
         self.assertIn(
-            "cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production",
+            "cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v020-production-diagnostic",
             workflow,
         )
         self.assertIn("name: V0.20 production-wiring skeleton (NOT G4 acceptance)", workflow)
         self.assertIn('"lane_scope": "production-skeleton"', workflow)
-        self.assertIn("branches: [CyxiaOS-V0.20]", workflow)
+        self.assertRegex(workflow, r"(?m)^    branches: \[CyxiaOS-V0\.20(?:,|\])")
         self.assertIn("- 'kernel/**'", workflow)
         self.assertIn("RUSTUP_TOOLCHAIN: '1.95.0'", workflow)
         self.assertIn("f8ed81651e61d9c2166df6121ce2af0f44f06b3e", workflow)
         self.assertIn("tools/qemu/cyxia-per-vcpu-pmu.patch", workflow)
         self.assertIn("python3 -B tools/verify_v020_production.py", workflow)
         self.assertIn("--elf artifacts/v020-production/kernel.elf", workflow)
+        self.assertIn("python3 -B tools/verify_v020_resident.py", workflow)
+        self.assertIn("--elf artifacts/v020-production/kernel-resident.elf", workflow)
 
     def test_v020_default_production_keeps_fixture_builds_isolated(self):
         # Default production must not silently change a historical fixture.
@@ -551,13 +553,11 @@ class NativeSecurityWiring(unittest.TestCase):
             self.assertIn("work/v020-integrated-eleven-gate-custody", workflow)
 
     def test_v020_wave10_structural_pins_t1_production_skeleton(self):
-        # Wave 10 (T1): the production boot + in-vector SVC dispatch skeleton is
-        # the canonical default feature that elevates the proven advice-e2e SvcV3Bridge
-        # dispatch into the exception vector. It is a SKELETON, not full
-        # production authority: the scope marker must keep full_authority=false
-        # and real_models=false; isolated fixture profiles opt out of defaults.
+        # The default resident has no fixture dependencies. The explicit
+        # diagnostic build retains the SvcV3Bridge exception-vector coverage.
         manifest = source(ROOT / "kernel/Cargo.toml")
-        self.assertIn('v020-production = ["smp-selftest", "dep:sha2", "sec-n-native"]', manifest)
+        self.assertIn('v020-production = ["smp-selftest"]', manifest)
+        self.assertIn('v020-production-diagnostic = ["v020-production", "dep:sha2", "sec-n-native"]', manifest)
         boot = source(ROOT / "kernel/src/arch/aarch64/boot.rs")
         self.assertIn('feature = "v020-production"))]\n    smp::production::run(&info);', boot)
         exceptions = source(ROOT / "kernel/src/arch/aarch64/exceptions.rs")
@@ -579,22 +579,25 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn(".claim_apply_work(", prod)
         self.assertIn(".settle_verified_apply_reports_with_feedback(", prod)
         # The production profile owns CPU0 and must not mix with other fixtures.
-        self.assertIn('compile_error!("v020-production requires the plain smp-selftest profile");', prod)
-        # The role catalog is built for the production feature too.
+        smp = source(ROOT / "kernel/src/arch/aarch64/smp.rs")
+        self.assertIn('compile_error!("v020-production requires the plain smp-selftest profile");', smp)
+        self.assertIn('#[cfg(feature = "v020-production-diagnostic")]\n#[path = "production.rs"]', smp)
+        self.assertIn('#[path = "production/resident.rs"]', smp)
+        # The role catalog is built for the diagnostic feature.
         build = source(ROOT / "kernel/build/aarch64.rs")
-        self.assertIn('env::var_os("CARGO_FEATURE_V020_PRODUCTION").is_some()', build)
+        self.assertIn('env::var_os("CARGO_FEATURE_V020_PRODUCTION_DIAGNOSTIC").is_some()', build)
         self.assertTrue((ROOT / "tools/verify_v020_production.py").is_file())
 
     def test_v020_wave11_feature_gating(self):
         manifest = source(ROOT / "kernel/Cargo.toml")
-        self.assertRegex(manifest, r'(?m)^v020-production = \[[^\]]*"sec-n-native"[^\]]*\]')
+        self.assertRegex(manifest, r'(?m)^v020-production-diagnostic = \[[^\]]*"sec-n-native"[^\]]*\]')
         self.assertRegex(
             manifest,
-            r'(?m)^v020-production-media-staging = \[[^\]]*"v020-production"[^\]]*\]',
+            r'(?m)^v020-production-media-staging = \[[^\]]*"v020-production-diagnostic"[^\]]*\]',
         )
         comp = source(ROOT / "kernel/src/composition/aarch64.rs")
         gate = comp.split('mod virtio_platform;')[0].rsplit("#[cfg(any(", 1)[1]
-        self.assertIn('feature = "v020-production"', gate)
+        self.assertIn('feature = "v020-production-diagnostic"', gate)
         near = comp.split("mod net_device;")[0][-700:]
         self.assertNotIn("allow(dead_code)", near)
         self.assertNotIn("not yet wired by default", near)
@@ -618,8 +621,8 @@ class NativeSecurityWiring(unittest.TestCase):
 
     def test_v020_wave12_modes_are_explicit(self):
         manifest = source(ROOT / "kernel/Cargo.toml")
-        self.assertIn('v020-production-authenticated-net = ["v020-production"]', manifest)
-        self.assertIn('v020-production-live-control = ["v020-production"]', manifest)
+        self.assertIn('v020-production-authenticated-net = ["v020-production-diagnostic"]', manifest)
+        self.assertIn('v020-production-live-control = ["v020-production-diagnostic"]', manifest)
         self.assertIn('v020-production-media-reopen = ["v020-production-media-staging"]', manifest)
         self.assertIn('v020-production-media-signed = ["v020-production-media-staging"]', manifest)
         self.assertIn('v020-production-media-envelopes = ["v020-production-media-staging"]', manifest)
@@ -631,7 +634,7 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn('v020-production-snapshot-read = ["v020-production-snapshot-catalog", "v020-production-file-read"]',
                       manifest)
         self.assertIn('v020-production-file-sessions = ["v020-production-file-read"]', manifest)
-        self.assertIn('v020-production-frame-pool = ["v020-production"]', manifest)
+        self.assertIn('v020-production-frame-pool = ["v020-production-diagnostic"]', manifest)
         for base in ("default", "v020-production", "v020-production-media-staging"):
             line = next(line for line in manifest.splitlines() if line.startswith(base + " = "))
             for feature in ("authenticated-net", "live-control", "media-reopen", "media-signed",
@@ -727,8 +730,8 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertEqual(prod.count("meter::metered("), 2)
         # EL0 aborts feed the faulting CPU's accumulator in the vector.
         exc = source(arm / "exceptions.rs")
-        prod_block = exc.split('#[cfg(feature = "v020-production")]', 1)[1].split(
-            "smp::production::exception(f, kind);", 1)[0]
+        prod_block = exc.split('#[cfg(feature = "v020-production-diagnostic")]', 1)[1].split(
+            '#[cfg(feature = "v020-production")]', 1)[0]
         self.assertIn("smp::production::recovery::record_fault(", prod_block)
         # The callees are the real implementations, not stubs.
         frames = source(arm / "production/frames.rs")
@@ -738,7 +741,21 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("acc.takeover_stopped_writer(", recovery)
         self.assertIn("acc.record(&ev)", recovery)
         meter = source(arm / "production/meter.rs")
-        self.assertIn("m.begin(SectionKind::EffectiveWork, now_ns())", meter)
+        # Keep both live call sites pinned above, and pin the complete interval
+        # observer instead of the retired diagnostic-only begin/end latch.
+        self.assertIn("static mut OBSERVATIONS: CompletedSectionObservations", meter)
+        scope = meter.split(
+            "pub(super) fn metered<T>(f: impl FnOnce() -> T) -> T {", 1
+        )[1].split("\n}", 1)[0]
+        start = scope.index("let start_ns = now_ns();")
+        call = scope.index("let out = f();")
+        end = scope.index("let end_ns = now_ns();")
+        record = scope.index("m.record(SectionKind::EffectiveWork, start_ns, end_ns)")
+        self.assertLess(start, call)
+        self.assertLess(call, end)
+        self.assertLess(end, record)
+        self.assertEqual(scope.count("f()"), 1)
+        self.assertTrue(scope.rstrip().endswith("\n    out"))
         net = source(arm / "production/net.rs")
         self.assertIn("pub(super) fn serve(info: &BootInfo) -> NetOutcome", net)
 

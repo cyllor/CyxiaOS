@@ -37,7 +37,7 @@ pub struct SchemaBinding {
     pub learning: [u8; 32],
 }
 impl SchemaBinding {
-    fn valid(self) -> bool {
+    pub(super) fn valid(self) -> bool {
         [self.feature, self.action, self.reward, self.learning]
             .iter()
             .all(|h| *h != [0; 32])
@@ -448,6 +448,7 @@ pub struct ShadowGate {
     boot: u64,
     active_generation: u64,
     binding: ValidationEvidence,
+    schemas: SchemaBinding,
     claim_head: [u8; 32],
     next_window: u64,
     windows: u64,
@@ -459,6 +460,8 @@ pub struct ShadowGate {
 /// This is not an action authorization or an Active model transition.
 #[derive(Debug)]
 pub struct ShadowReady {
+    manager: Identity,
+    schemas: SchemaBinding,
     boot: u64,
     active_generation: u64,
     binding: ValidationEvidence,
@@ -467,6 +470,35 @@ pub struct ShadowReady {
     target: Identity,
 }
 impl ShadowReady {
+    pub fn manager(&self) -> Identity {
+        self.manager
+    }
+
+    pub fn schemas(&self) -> SchemaBinding {
+        self.schemas
+    }
+
+    #[cfg(test)]
+    pub(super) fn lifecycle_fixture(
+        manager: Identity,
+        boot: u64,
+        active_generation: u64,
+        binding: ValidationEvidence,
+        schemas: SchemaBinding,
+        target: Identity,
+    ) -> Self {
+        Self {
+            manager,
+            schemas,
+            boot,
+            active_generation,
+            binding,
+            claim_head: [5; 32],
+            evidence: [6; 32],
+            target,
+        }
+    }
+
     /// Read-only evidence projection; only the independent gate can
     /// construct this token. A manager still needs a real trial permit.
     pub fn scope(&self) -> (u64, u64, ValidationEvidence, [u8; 32], [u8; 32], Identity) {
@@ -514,6 +546,7 @@ impl ShadowGate {
             boot,
             active_generation,
             binding: proof.binding,
+            schemas: candidate.schemas,
             claim_head: proof.claim_head,
             next_window: first_window,
             windows: 0,
@@ -604,6 +637,8 @@ impl ShadowGate {
         // target. This does not create or spend a TrialPermit.
         verify_target_and_history(target, self.head)?;
         Ok(ShadowReady {
+            manager: self.manager,
+            schemas: self.schemas,
             boot: self.boot,
             active_generation: self.active_generation,
             binding: self.binding,
@@ -1292,6 +1327,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ready.binding, binding);
+        assert_eq!(ready.manager(), manager);
+        assert_eq!(ready.schemas(), SCHEMAS);
     }
     #[test]
     fn shadow_preflight_binds_exact_candidate_and_independent_manager() {

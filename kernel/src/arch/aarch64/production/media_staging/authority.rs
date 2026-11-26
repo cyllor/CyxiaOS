@@ -141,12 +141,17 @@ pub(super) fn boot_epoch(
     };
     // SAFETY: one-shot CPU0 call (module header); the borrow ends on return.
     let pair = unsafe { &mut *core::ptr::addr_of_mut!(PAIR) };
-    let grant = authority.allocate(disk, pair, tx)?;
     let confirmed = match config {
-        Some(verified) => authority.confirmed_config_boot(verified)?,
-        None => authority.confirmed_epoch().ok_or(SecurityError::Conflict)?,
+        Some(verified) => {
+            let binding = authority.allocate_for_startup(disk, pair, tx, verified)?;
+            // allocate replaced the workspace images with device readback.
+            // Verify the signed startup identity before exposing its epoch.
+            binding.verify_state(&SecurityStateStoreV2::decode(pair.state_image())?)?;
+            binding.epoch()
+        }
+        None => authority.allocate(disk, pair, tx)?.epoch(),
     };
-    if confirmed != grant.epoch() || confirmed != next {
+    if authority.confirmed_epoch() != Some(confirmed) || confirmed != next {
         return Err(SecurityError::Conflict);
     }
     // One boot epoch per boot: a retry must be fenced before any I/O.

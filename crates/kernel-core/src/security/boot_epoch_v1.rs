@@ -439,6 +439,33 @@ impl BootEpochGrant {
     }
 }
 
+/// The identity shared by the signed policy, confirmed BootEpoch and exact
+/// committed security state. Service authorization also checks the deployed
+/// catalog, role identity and live task.
+#[derive(Debug, Eq, PartialEq)]
+pub struct StartupEpochBinding {
+    grant: BootEpochGrant,
+    config_digest: [u8; 32],
+}
+
+impl StartupEpochBinding {
+    pub fn epoch(&self) -> u64 {
+        self.grant.epoch()
+    }
+
+    pub fn verify_state(&self, state: &SecurityStateStoreV2) -> Result<(), Error> {
+        let receipt = self.grant.receipt();
+        if state.fs_uuid != receipt.fs_uuid
+            || state.last_boot_epoch != self.epoch()
+            || state.offline_config_hash != self.config_digest
+            || hash(&state.encode()?) != receipt.after_digest
+        {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+}
+
 /// Durable monotonic boot-epoch authority for the production boot path.
 /// Wraps the paired-home [`DurableEpochGate`] custody and the atomic
 /// [`BootPairRedo`] transaction so the production boot owner can allocate and
@@ -461,8 +488,8 @@ impl BootEpochGrant {
 /// 5. Place a [`BootPairRedo`] workspace in the preallocated progress pool.
 /// 6. [`BootEpochAuthority::allocate`]`(&mut io, &mut pair, tx)` returns a
 ///    [`BootEpochGrant`] ONLY on full durable evidence. Use `grant.epoch()` as
-///    the durable boot epoch. Issuing actual control roots additionally
-///    requires the signed-config `confirmed_config_boot` path on the gate.
+///    the durable boot epoch. The signed startup owner uses
+///    [`BootEpochAuthority::allocate_for_startup`] before clearing startup.
 /// 7. Fail-closed: on `Error::Unknown` do NOT retry under this authority — the
 ///    pending transition is preserved, no epoch is published, and the claimed
 ///    extent fences retries with `Error::Conflict`. Cold-recover from durable
@@ -524,6 +551,26 @@ impl BootEpochAuthority {
     /// an uncertain commit is pending.
     pub fn confirmed_epoch(&self) -> Option<u64> {
         self.gate.boot_epoch()
+    }
+
+    /// Verify the signed startup authority before attempting journal I/O,
+    /// then bind the committed pair to the same policy after device readback.
+    pub fn allocate_for_startup(
+        &mut self,
+        io: &mut impl EpochBlockIo,
+        pair: &mut BootPairRedo,
+        tx: BootEpochTx<'_>,
+        config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+    ) -> Result<StartupEpochBinding, Error> {
+        self.gate.verify_startup_config(config)?;
+        let grant = self.allocate(io, pair, tx)?;
+        if self.confirmed_config_boot(config)? != grant.epoch() {
+            return Err(Error::Conflict);
+        }
+        Ok(StartupEpochBinding {
+            grant,
+            config_digest: config.digest(),
+        })
     }
 
     /// Allocate and durably commit the next monotonic boot epoch in one call:

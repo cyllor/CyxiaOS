@@ -56,12 +56,8 @@ extern "C" fn boot_entry() -> ! {
     unsafe {
         timer::init_cpu_accounting();
     }
-    // V0.20 canonical boot: production::run(info) performs the same proven
-    // SMP bring-up and then initializes the production control plane with
-    // in-vector SVC dispatch. This is the DEFAULT profile (v020-production is
-    // a default feature and implies smp-selftest). The isolated
-    // --no-default-features smp-selftest fixture keeps smp::run; the retired
-    // legacy desktop requires the explicit legacy-desktop feature.
+    // Default V0.20 enters the resident startup path. The ABI3, network and
+    // scratch-media evidence build selects the diagnostic entry explicitly.
     #[cfg(all(feature = "smp-selftest", feature = "v020-production"))]
     smp::production::run(&info);
     #[cfg(all(feature = "smp-selftest", not(feature = "v020-production")))]

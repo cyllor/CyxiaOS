@@ -129,6 +129,72 @@ fn add(a: &mut u64, b: u64) -> Result<(), Error> {
     *a = a.checked_add(b).ok_or(Error::Numeric)?;
     Ok(())
 }
+fn performance(
+    requests: &[Request],
+    start_ns: u64,
+    end_ns: u64,
+    latencies: &mut [u64],
+) -> Result<Performance, Error> {
+    if requests.len() < 100 {
+        return Err(Error::Incomplete);
+    }
+    if requests.len() > MAX_REQUESTS || requests.len() > latencies.len() {
+        return Err(Error::Capacity);
+    }
+    let mut counts = [0u64; 4];
+    let mut n = 0;
+    for (i, r) in requests.iter().enumerate() {
+        if r.id == 0
+            || r.arrived_ns < start_ns
+            || r.arrived_ns >= end_ns
+            || requests[..i].iter().any(|p| p.id == r.id)
+        {
+            return Err(Error::Invalid);
+        }
+        match r.result {
+            RequestResult::Completed { finished_ns } => {
+                if finished_ns < r.arrived_ns || finished_ns > end_ns {
+                    return Err(Error::Invalid);
+                }
+                latencies[n] = finished_ns - r.arrived_ns;
+                n += 1;
+                counts[0] += 1;
+            }
+            RequestResult::Rejected => counts[1] += 1,
+            RequestResult::TimedOut => counts[2] += 1,
+            RequestResult::Pending => counts[3] += 1,
+        }
+    }
+    latencies[..n].sort_unstable();
+    let actual = if n == 0 {
+        None
+    } else {
+        Some(latencies[(99 * n).div_ceil(100) - 1])
+    };
+    latencies[n..requests.len()].fill(WINDOW_NS);
+    latencies[..requests.len()].sort_unstable();
+    Ok(Performance {
+        emitted: requests.len() as u64,
+        completed: counts[0],
+        rejected: counts[1],
+        timed_out: counts[2],
+        pending: counts[3],
+        penalty_p99_ns: latencies[(99 * requests.len()).div_ceil(100) - 1],
+        actual_p99_ns: actual,
+    })
+}
+
+/// One Canary decision interval with the RewardSchema v2 10 s penalty
+/// for rejected, timed-out and pending requests.
+pub fn inspect_canary_second(
+    requests: &[Request],
+    start_ns: u64,
+    latencies: &mut [u64],
+) -> Result<Performance, Error> {
+    let end_ns = start_ns.checked_add(1_000_000_000).ok_or(Error::Numeric)?;
+    performance(requests, start_ns, end_ns, latencies)
+}
+
 fn observe(t: Trace<'_>, w: &mut Workspace) -> Result<Metrics, Error> {
     let end = t.start_ns.checked_add(WINDOW_NS).ok_or(Error::Numeric)?;
     if !(1..=15).contains(&t.domain)
@@ -143,53 +209,10 @@ fn observe(t: Trace<'_>, w: &mut Workspace) -> Result<Metrics, Error> {
     if t.required != mask || t.reported != mask {
         return Err(Error::Incomplete);
     }
-    if t.requests.len() < 100 {
-        return Err(Error::Incomplete);
-    }
     if t.requests.len() > MAX_REQUESTS || t.cpu.len() > MAX_INTERVALS {
         return Err(Error::Capacity);
     }
-    let mut counts = [0u64; 4];
-    let mut n = 0;
-    for (i, r) in t.requests.iter().enumerate() {
-        if r.id == 0
-            || r.arrived_ns < t.start_ns
-            || r.arrived_ns >= end
-            || t.requests[..i].iter().any(|p| p.id == r.id)
-        {
-            return Err(Error::Invalid);
-        }
-        match r.result {
-            RequestResult::Completed { finished_ns } => {
-                if finished_ns < r.arrived_ns || finished_ns > end {
-                    return Err(Error::Invalid);
-                }
-                w.latencies[n] = finished_ns - r.arrived_ns;
-                n += 1;
-                counts[0] += 1;
-            }
-            RequestResult::Rejected => counts[1] += 1,
-            RequestResult::TimedOut => counts[2] += 1,
-            RequestResult::Pending => counts[3] += 1,
-        }
-    }
-    w.latencies[..n].sort_unstable();
-    let actual = if n == 0 {
-        None
-    } else {
-        Some(w.latencies[(99 * n).div_ceil(100) - 1])
-    };
-    w.latencies[n..t.requests.len()].fill(WINDOW_NS);
-    w.latencies[..t.requests.len()].sort_unstable();
-    let performance = Performance {
-        emitted: t.requests.len() as u64,
-        completed: counts[0],
-        rejected: counts[1],
-        timed_out: counts[2],
-        pending: counts[3],
-        penalty_p99_ns: w.latencies[(99 * t.requests.len()).div_ceil(100) - 1],
-        actual_p99_ns: actual,
-    };
+    let performance = performance(t.requests, t.start_ns, end, &mut w.latencies)?;
     let mut cost = Cost {
         union_ns: 0,
         by_class: [0; 3],

@@ -59,7 +59,7 @@ class Modes:
         if self.media_reopen:
             base = "v020-production-media-reopen"
         else:
-            base = "v020-production-media-staging" if staging else "v020-production"
+            base = "v020-production-media-staging" if staging else "v020-production-diagnostic"
         features = [base]
         if self.authenticated_net:
             features.append("v020-production-authenticated-net")

@@ -46,6 +46,62 @@ fn seal(b: &mut [u8], kind: u16, len: usize, txid: u64, epoch: u64, lsn: u64) ->
     put32(b, 56, crc);
     Ok(())
 }
+
+/// Record headers and counters shared by the v1 journal append paths.
+pub(super) struct RedoEncoding {
+    pub(super) epoch: u64,
+    pub(super) txid: u64,
+    pub(super) begin_lsn: u64,
+    pub(super) count: u32,
+}
+
+impl RedoEncoding {
+    pub(super) fn begin(&self, out: &mut [u8; BLOCK_BYTES]) -> Result<(), Error> {
+        out.fill(0);
+        put32(out, 64, self.count);
+        put64(out, 72, u64::from(self.count) * BLOCK_BYTES as u64);
+        seal(out, 1, 80, self.txid, self.epoch, self.begin_lsn)
+    }
+
+    pub(super) fn after_image(
+        &self,
+        out: &mut [u8; 2 * BLOCK_BYTES],
+        index: u32,
+        home: u32,
+        image: &[u8; BLOCK_BYTES],
+    ) -> Result<(), Error> {
+        let lsn = self
+            .begin_lsn
+            .checked_add(u64::from(index) + 1)
+            .ok_or(Error::Exhausted)?;
+        out.fill(0);
+        put64(out, 40, u64::from(home));
+        put32(out, 48, index);
+        put32(out, 52, self.count);
+        out[64..64 + BLOCK_BYTES].copy_from_slice(image);
+        seal(out, 2, 4160, self.txid, self.epoch, lsn)
+    }
+
+    pub(super) fn commit(
+        &self,
+        out: &mut [u8; BLOCK_BYTES],
+        digest: [u8; 32],
+    ) -> Result<(), Error> {
+        let last_redo = self
+            .begin_lsn
+            .checked_add(u64::from(self.count))
+            .ok_or(Error::Exhausted)?;
+        let lsn = last_redo.checked_add(1).ok_or(Error::Exhausted)?;
+        out.fill(0);
+        put64(out, 64, self.txid);
+        put64(out, 72, self.begin_lsn);
+        put64(out, 80, last_redo);
+        put32(out, 88, self.count);
+        out[96..128].copy_from_slice(&digest);
+        seal(out, 3, 128, self.txid, self.epoch, lsn)
+    }
+}
+
 pub struct OneStateRedo {
     pub begin: [u8; BLOCK_BYTES],
     pub redo: [u8; 2 * BLOCK_BYTES],
@@ -121,25 +177,18 @@ impl OneStateRedo {
         if begin <= sb.checkpoint_lsn || txid == 0 || !(DATA_START..BLOCK_COUNT).contains(&home) {
             return Err(Error::Invalid);
         }
-        self.begin.fill(0);
-        self.redo.fill(0);
-        self.commit.fill(0);
-        put32(&mut self.begin, 64, 1);
-        put64(&mut self.begin, 72, BLOCK_BYTES as u64);
-        seal(&mut self.begin, 1, 80, txid, sb.log_epoch, begin)?;
-        put64(&mut self.redo, 40, u64::from(home));
-        put32(&mut self.redo, 52, 1);
-        self.redo[64..64 + BLOCK_BYTES].copy_from_slice(image);
-        seal(&mut self.redo, 2, 4160, txid, sb.log_epoch, begin + 1)?;
+        let encoding = RedoEncoding {
+            epoch: sb.log_epoch,
+            txid,
+            begin_lsn: begin,
+            count: 1,
+        };
+        encoding.begin(&mut self.begin)?;
+        encoding.after_image(&mut self.redo, 0, home, image)?;
         let mut h = Sha256::new();
         h.update(u64::from(home).to_le_bytes());
         h.update(image);
-        put64(&mut self.commit, 64, txid);
-        put64(&mut self.commit, 72, begin);
-        put64(&mut self.commit, 80, begin + 1);
-        put32(&mut self.commit, 88, 1);
-        self.commit[96..128].copy_from_slice(&h.finalize());
-        seal(&mut self.commit, 3, 128, txid, sb.log_epoch, commit_lsn)?;
+        encoding.commit(&mut self.commit, h.finalize().into())?;
         Ok(())
     }
     /// Append one transaction only to a reserved empty four-block extent.

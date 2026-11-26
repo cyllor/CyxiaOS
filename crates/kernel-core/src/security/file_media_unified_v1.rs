@@ -583,13 +583,21 @@ const _: () = assert!(REQUEST_HEADER == 32 && REPLY_HEADER == 128);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SlotContinuity {
     pub slot_generation: u64,
+    /// A retired free slot retains its generation and has no retained root.
+    pub retained: Option<RetainedSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedSnapshot {
+    pub snapshot_id: u64,
     pub retention_deadline: u64,
+    /// Digest of the verified logical tree, independent of physical relocation.
+    pub logical_tree_digest: [u8; 32],
 }
 
 /// Per-item monotonicity witness for the v2 -> unified import proof (I1/I3/I4).
-/// Conservative fail-closed contract: every carried generation/deadline/water-
-/// mark must be non-regressing; proven DELETE_EXPIRED discharge records belong
-/// to the later full migration protocol deliverable.
+/// The offline import owner supplies both verified witnesses. Removing a
+/// retained root requires an authenticated retention-discharge proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MigrationWitness {
     pub fs_uuid: [u8; 16],
@@ -600,20 +608,43 @@ pub struct MigrationWitness {
     pub rule_min_generation: u64,
     pub security_min_generation: u64,
     pub key_generation: u64,
+    pub service_generations: [u64; 16],
     pub request_watermark: u64,
     pub snapshot_id_hi: u64,
     pub slots: [SlotContinuity; SNAPSHOT_SLOTS as usize],
 }
 
-/// Import continuity gate. Identity mismatch or any regression -> Conflict
-/// (no writable migration without proof, I2). Zero UUIDs are invalid input.
+impl MigrationWitness {
+    fn validate(&self) -> Result<(), Error> {
+        if self.fs_uuid == [0; 16] {
+            return Err(Error::Invalid);
+        }
+        for (index, slot) in self.slots.iter().enumerate() {
+            if let Some(retained) = slot.retained {
+                if slot.slot_generation == 0
+                    || retained.snapshot_id == 0
+                    || retained.snapshot_id > self.snapshot_id_hi
+                    || retained.logical_tree_digest == [0; 32]
+                    || self.slots[..index]
+                        .iter()
+                        .filter_map(|previous| previous.retained)
+                        .any(|previous| previous.snapshot_id == retained.snapshot_id)
+                {
+                    return Err(Error::Invalid);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Check identity, retained history and monotonicity of the supplied evidence.
 pub fn check_migration_continuity(
     old: &MigrationWitness,
     new: &MigrationWitness,
 ) -> Result<(), Error> {
-    if old.fs_uuid == [0; 16] || new.fs_uuid == [0; 16] {
-        return Err(Error::Invalid);
-    }
+    old.validate()?;
+    new.validate()?;
     if old.fs_uuid != new.fs_uuid {
         return Err(Error::Conflict);
     }
@@ -626,17 +657,29 @@ pub fn check_migration_continuity(
         || new.key_generation < old.key_generation
         || new.request_watermark < old.request_watermark
         || new.snapshot_id_hi < old.snapshot_id_hi
+        || old
+            .service_generations
+            .iter()
+            .zip(new.service_generations)
+            .any(|(before, after)| after < *before)
     {
         return Err(Error::Conflict);
     }
-    for (o, n) in old.slots.iter().zip(new.slots.iter()) {
-        if n.slot_generation < o.slot_generation {
+    for (before, after) in old.slots.iter().zip(&new.slots) {
+        if after.slot_generation < before.slot_generation {
             return Err(Error::Conflict);
         }
-        // An occupied exported slot must survive import with a non-shortened
-        // deadline (retention only extends). A vanished slot loses history.
-        if o.slot_generation > 0 && n.retention_deadline < o.retention_deadline {
-            return Err(Error::Conflict);
+        match (before.retained, after.retained) {
+            (Some(previous), Some(retained))
+                if after.slot_generation == before.slot_generation
+                    && retained.snapshot_id == previous.snapshot_id
+                    && retained.logical_tree_digest == previous.logical_tree_digest
+                    && retained.retention_deadline >= previous.retention_deadline => {}
+            (None, Some(retained))
+                if after.slot_generation > before.slot_generation
+                    && retained.snapshot_id > old.snapshot_id_hi => {}
+            (None, None) => {}
+            _ => return Err(Error::Conflict),
         }
     }
     Ok(())
@@ -1162,12 +1205,17 @@ mod tests {
             rule_min_generation: 1,
             security_min_generation: 1,
             key_generation: 2,
+            service_generations: core::array::from_fn(|index| index as u64 + 1),
             request_watermark: 100,
             snapshot_id_hi: 9,
-            slots: [SlotContinuity {
+            slots: core::array::from_fn(|index| SlotContinuity {
                 slot_generation: 1,
-                retention_deadline: 1000,
-            }; SNAPSHOT_SLOTS as usize],
+                retained: Some(RetainedSnapshot {
+                    snapshot_id: index as u64 + 1,
+                    retention_deadline: 1000,
+                    logical_tree_digest: [index as u8 + 1; 32],
+                }),
+            }),
         }
     }
 
@@ -1179,7 +1227,8 @@ mod tests {
         new.boot_epoch += 1;
         new.protection_generation += 1;
         new.request_watermark += 10;
-        new.slots[0].retention_deadline += 60;
+        new.service_generations[0] += 1;
+        new.slots[0].retained.as_mut().unwrap().retention_deadline += 60;
         assert_eq!(check_migration_continuity(&old, &new), Ok(()));
         // Every scalar field is individually monotonic.
         let regressions: [fn(&mut MigrationWitness); 9] = [
@@ -1198,6 +1247,11 @@ mod tests {
             f(&mut bad);
             assert_eq!(check_migration_continuity(&old, &bad), Err(Error::Conflict));
         }
+        for index in 0..old.service_generations.len() {
+            let mut bad = witness();
+            bad.service_generations[index] -= 1;
+            assert_eq!(check_migration_continuity(&old, &bad), Err(Error::Conflict));
+        }
         let mut bad = witness();
         bad.fs_uuid = [2; 16];
         assert_eq!(check_migration_continuity(&old, &bad), Err(Error::Conflict));
@@ -1210,32 +1264,79 @@ mod tests {
     fn migration_slot_history_cannot_vanish_or_shorten() {
         let old = witness();
         let mut new = witness();
-        new.slots[3].retention_deadline -= 1;
+        new.slots[3].retained.as_mut().unwrap().retention_deadline -= 1;
         assert_eq!(check_migration_continuity(&old, &new), Err(Error::Conflict));
         let mut new = witness();
-        new.slots[3].slot_generation = 0;
-        new.slots[3].retention_deadline = 0;
+        new.slots[3].retained = None;
         assert_eq!(check_migration_continuity(&old, &new), Err(Error::Conflict));
         let mut new = witness();
-        new.slots[3].slot_generation -= 1;
+        new.slots[3].retained.as_mut().unwrap().logical_tree_digest = [17; 32];
         assert_eq!(check_migration_continuity(&old, &new), Err(Error::Conflict));
-        // Generation advance with a non-shortened deadline is legal reuse.
         let mut new = witness();
+        new.slots[3].retained.as_mut().unwrap().snapshot_id = old.snapshot_id_hi;
+        assert_eq!(check_migration_continuity(&old, &new), Err(Error::Conflict));
+        let mut new = witness();
+        // The slot generation is part of the retained snapshot key.
         new.slots[3].slot_generation += 1;
-        new.slots[3].retention_deadline += 1;
+        new.slots[3].retained.as_mut().unwrap().retention_deadline += 1;
+        assert_eq!(check_migration_continuity(&old, &new), Err(Error::Conflict));
+    }
+
+    #[test]
+    fn migration_retires_free_slots_without_reusing_identity() {
+        let mut old = witness();
+        old.slots[6] = SlotContinuity {
+            slot_generation: 9,
+            retained: None,
+        };
+        assert_eq!(check_migration_continuity(&old, &old), Ok(()));
+        let mut new = old;
+        new.slots[6].slot_generation -= 1;
+        assert_eq!(check_migration_continuity(&old, &new), Err(Error::Conflict));
+
+        new = old;
+        new.slots[6].retained = Some(RetainedSnapshot {
+            snapshot_id: old.snapshot_id_hi,
+            retention_deadline: 1234,
+            logical_tree_digest: [7; 32],
+        });
+        new.slots[6].slot_generation += 1;
+        assert_eq!(check_migration_continuity(&old, &new), Err(Error::Conflict));
+        new.snapshot_id_hi += 1;
+        new.slots[6].retained.as_mut().unwrap().snapshot_id = new.snapshot_id_hi;
+        new.slots[6].slot_generation -= 1;
+        assert_eq!(check_migration_continuity(&old, &new), Err(Error::Conflict));
+        new.slots[6].slot_generation += 1;
         assert_eq!(check_migration_continuity(&old, &new), Ok(()));
-        // An empty exported slot imposes no obligation.
-        let mut old_empty = witness();
-        old_empty.slots[6] = SlotContinuity {
-            slot_generation: 0,
-            retention_deadline: 0,
-        };
-        let mut new = witness();
-        new.slots[6] = SlotContinuity {
-            slot_generation: 1,
-            retention_deadline: 5,
-        };
-        assert_eq!(check_migration_continuity(&old_empty, &new), Ok(()));
+    }
+
+    #[test]
+    fn migration_rejects_malformed_retained_identities() {
+        let old = witness();
+        let mut invalid = old;
+        invalid.slots[0].slot_generation = 0;
+        assert_eq!(
+            check_migration_continuity(&old, &invalid),
+            Err(Error::Invalid)
+        );
+        let mut invalid = old;
+        invalid.slots[0]
+            .retained
+            .as_mut()
+            .unwrap()
+            .logical_tree_digest = [0; 32];
+        assert_eq!(
+            check_migration_continuity(&old, &invalid),
+            Err(Error::Invalid)
+        );
+        for snapshot_id in [0, 2, old.snapshot_id_hi + 1] {
+            let mut invalid = old;
+            invalid.slots[0].retained.as_mut().unwrap().snapshot_id = snapshot_id;
+            assert_eq!(
+                check_migration_continuity(&old, &invalid),
+                Err(Error::Invalid)
+            );
+        }
     }
 
     #[test]
