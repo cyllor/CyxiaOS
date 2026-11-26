@@ -14,10 +14,11 @@
 use super::frames::{FrameError, FrameSnapshot};
 use cyxia_contracts::TaskId;
 
-// Wave 8 confirmed near-baseline cost at 4/8 after restoring sparse
-// slots, but measured regressions at 9/16 and gains at 32/64. Extend the
-// sparse path to 16. The 17..31 crossover remains a measurement question.
-const SMALL_RUN_LIMIT: usize = 16;
+// Wave 9 measured regressions at 17..27, mixed results at 28..30, and
+// gains at 31/32/64. Prefer the historical sparse path through 30 to
+// avoid sacrificing dense workloads for small fragmentation-only gains.
+// This host-derived cutoff is provisional pending target measurements.
+const SMALL_RUN_LIMIT: usize = 30;
 
 #[derive(Debug, Clone, Copy)]
 struct Run {
@@ -401,9 +402,121 @@ mod tests {
         exercise_capacity::<16>();
         exercise_capacity::<17>();
         exercise_capacity::<24>();
+        exercise_capacity::<28>();
+        exercise_capacity::<30>();
         exercise_capacity::<31>();
         exercise_capacity::<32>();
         exercise_capacity::<64>();
+    }
+
+    fn exercise_randomized<const N: usize>(base: u64) {
+        let capacity = 3 * N;
+        let mut pool = ContigFramePool::<N>::new(base, capacity).unwrap();
+        let mut live: [Option<(usize, usize, TaskId)>; N] = [None; N];
+        let mut seed = 0x9a62_c15bu32 ^ N as u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 16) as usize
+        };
+        for step in 0..2048 {
+            let op = next() % 5;
+            let count = live.iter().flatten().count();
+            let who = owner((next() % 11 + 1) as u32);
+            if op < 2 {
+                let pages = if next() % 12 == 0 {
+                    capacity + 1
+                } else {
+                    next() % 9
+                };
+                let expected = if pages == 0 || pages > capacity {
+                    Err(FrameError::Invalid)
+                } else if count == N {
+                    Err(FrameError::Capacity)
+                } else {
+                    let mut used = [false; 192];
+                    for &(at, len, _) in live.iter().flatten() {
+                        used[at..at + len].fill(true);
+                    }
+                    (0..=capacity - pages)
+                        .find(|&at| used[at..at + pages].iter().all(|bit| !bit))
+                        .map(|at| base + at as u64 * 4096)
+                        .ok_or(FrameError::Exhausted)
+                };
+                assert_eq!(pool.allocate(pages, who), expected, "N={N} step={step}");
+                if let Ok(address) = expected {
+                    let at = ((address - base) / 4096) as usize;
+                    let slot = live.iter_mut().find(|r| r.is_none()).unwrap();
+                    *slot = Some((at, pages, who));
+                }
+            } else {
+                let mut request = (next() % capacity, next() % 6 + 1, who);
+                if op < 4
+                    && let Some(&entry) = live.iter().flatten().nth(next() % count.max(1))
+                {
+                    request = entry;
+                    if op == 3 {
+                        request.2 = if entry.2 == owner(1) {
+                            owner(2)
+                        } else {
+                            owner(1)
+                        };
+                    }
+                }
+                let (at, pages, who) = request;
+                let address = base + at as u64 * 4096;
+                let slot = live.iter().position(|r| {
+                    r.is_some_and(|(start, len, _)| start == at && len == pages)
+                });
+                let expected = match slot {
+                    None => Err(FrameError::Stale),
+                    Some(i) if live[i].unwrap().2 != who => Err(FrameError::Owner),
+                    Some(_) => Ok(()),
+                };
+                assert_eq!(
+                    pool.release(address, pages, who),
+                    expected,
+                    "N={N} step={step}"
+                );
+                if expected.is_ok() {
+                    live[slot.unwrap()] = None;
+                }
+            }
+            let used: usize = live.iter().flatten().map(|r| r.1).sum();
+            assert_eq!(
+                pool.snapshot(),
+                FrameSnapshot {
+                    capacity,
+                    used,
+                    free: capacity - used,
+                }
+            );
+        }
+        for (at, pages, who) in live.into_iter().flatten() {
+            pool.release(base + at as u64 * 4096, pages, who).unwrap();
+        }
+        assert_eq!(pool.snapshot().free, capacity);
+    }
+
+    #[test]
+    fn wave10_randomized_public_allocator_matches_independent_occupancy() {
+        fn both<const N: usize>() {
+            exercise_randomized::<N>(4096);
+            exercise_randomized::<N>(u64::MAX - 4095 - 3 * N as u64 * 4096);
+        }
+        both::<1>();
+        both::<2>();
+        both::<4>();
+        both::<8>();
+        both::<9>();
+        both::<16>();
+        both::<17>();
+        both::<20>();
+        both::<24>();
+        both::<28>();
+        both::<30>();
+        both::<31>();
+        both::<32>();
+        both::<64>();
     }
 
     #[test]

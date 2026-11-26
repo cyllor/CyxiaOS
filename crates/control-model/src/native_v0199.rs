@@ -230,8 +230,15 @@ impl Features {
     fn set(&mut self, i: usize, value: Option<u64>, h: u64) {
         if let Some(v) = value {
             assert!(h > 0);
-            self.values[i] =
-                ((512u128 * u128::from(v.min(h)) + u128::from(h)) / (2 * u128::from(h))) as i16;
+            // All current schema scales are small enough for exact u64
+            // arithmetic. Preserve the wide fallback for future scales.
+            self.values[i] = if v >= h {
+                256
+            } else if h <= u64::MAX / 513 {
+                ((512 * v + h) / (2 * h)) as i16
+            } else {
+                ((512u128 * u128::from(v) + u128::from(h)) / (2 * u128::from(h))) as i16
+            };
             if v > h {
                 self.clipped |= 1u64 << i;
             }
@@ -462,6 +469,61 @@ mod tests {
             ],
         }
     }
+    #[test]
+    fn wave10_normalization_matches_wide_reference_and_clipping() {
+        let mut seed = 0x7c50_189d_2468_1357u64;
+        let scales = [
+            1,
+            2,
+            3,
+            8,
+            16,
+            50,
+            64,
+            100,
+            128,
+            255,
+            256,
+            400,
+            512,
+            750,
+            900,
+            1000,
+            4096,
+            5000,
+            10000,
+            100000,
+            262144,
+            1000000,
+            u64::MAX / 513,
+            u64::MAX / 513 + 1,
+            u64::MAX,
+        ];
+        for h in scales {
+            for v in [0, 1, h / 2, h - 1, h, h.saturating_add(1), u64::MAX] {
+                let mut f = Features::new();
+                f.set(63, Some(v), h);
+                let expected = ((512u128 * u128::from(v.min(h)) + u128::from(h))
+                    / (2 * u128::from(h))) as i16;
+                assert_eq!(f.values[63], expected);
+                assert_eq!(f.clipped, if v > h { 1 << 63 } else { 0 });
+            }
+            for _ in 0..256 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let v = if seed & 1 == 0 { seed % h } else { seed };
+                let mut f = Features::new();
+                f.set(17, Some(v), h);
+                let expected = ((512u128 * u128::from(v.min(h)) + u128::from(h))
+                    / (2 * u128::from(h))) as i16;
+                assert_eq!(f.values[17], expected);
+                assert_eq!(f.clipped, if v > h { 1 << 17 } else { 0 });
+            }
+        }
+        let mut f = Features::new();
+        f.set(23, None, 0);
+        assert_eq!(f, Features::new());
+    }
+
     #[test]
     fn exact_snapshot_shape_presence_width_and_age() {
         let s = sample(1);

@@ -331,7 +331,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Compile exact V0.20 baseline, wave 8 and current implementation
+      - name: Compile exact V0.20 baseline, wave 9 and current implementation
         run: |
           set -euo pipefail
           rustup toolchain install 1.95.0 --profile minimal --no-self-update
@@ -340,9 +340,9 @@ jobs:
           rustc +1.95.0 -vV > artifacts/v0201-baseline-bench/toolchain.txt
           lscpu > artifacts/v0201-baseline-bench/cpu.txt
           base=4912423cf2bc26ddf5c38eeea0f64190ce07a085
-          prior=60cd9583342931eaed7ca099b99713a7150ad75c
+          prior=88d1fc966374396d67e5b3cd7cf8537fe4867ecb
           test "$(git rev-parse "$base^{tree}")" = abf743f697c434c88b0a908a3fd0f93ea4d8bb74
-          test "$(git rev-parse "$prior^{tree}")" = b684d66510d177e5170036307855b07c10999c74
+          test "$(git rev-parse "$prior^{tree}")" = d6f21750df448823f0fff3b31437d760b7a042d5
           printf '%s\n' "$base" > artifacts/v0201-baseline-bench/baseline-commit.txt
           printf '%s\n' "$prior" > artifacts/v0201-baseline-bench/previous-commit.txt
           harness=crates/kernel-core/examples/v0201_kernel_bench.rs
@@ -376,7 +376,11 @@ jobs:
           expected = {f"contig-{kind}-{n}" for kind in ("dense", "fragmented")
                       for n in capacities}
           expected |= {f"operations-d{domain:02}" for domain in range(1, 16)}
-          assert len(expected) == 57
+          expected |= {f"security-kind{kind:02}" for kind in range(1, 6)}
+          expected |= {"frame-clean-64", "frame-clean-256",
+                       "ipc-roundtrip-8", "ipc-roundtrip-64",
+                       "console-wrap-64", "console-wrap-257", "timer-rounding-32"}
+          assert len(expected) == 69
           for label in ("base-1", "prior-1", "new-1", "new-2", "prior-2", "base-2"):
               side = label.split("-")[0]
               observed = {}
@@ -398,7 +402,7 @@ jobs:
               assert counts == dict.fromkeys(expected, 7)
               checks[label] = observed
           assert all(value == checks["base-1"] for value in checks.values()), checks
-          print("scope=host_only; exact pinned baseline and wave8; checks=match; samples=14 per side; rounds=4096; workloads=57")
+          print("scope=host_only; exact pinned baseline and wave9; checks=match; samples=14 per side; rounds=4096 (frame-clean/ipc-roundtrip=512); workloads=69")
           for name in sorted(expected):
               old = median(samples["base"][name])
               prior = median(samples["prior"][name])
