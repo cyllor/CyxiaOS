@@ -3,12 +3,10 @@
 //! issuance requires a confirmed durable boot, actual role registry and
 //! the independently signed startup catalog. This module covers static
 //! control roots, not general business object creation/derived-cap graph.
-use super::{
-    Error, durable_role_epoch_v0199::DurableEpochGate, offline_config_v1::VerifiedOfflineConfig,
-};
+use super::{Error, durable_role_epoch_v0199::ConfirmedBootPolicy};
 use crate::control_plane::{
     Identity,
-    role_manifest_v0199::{self as rm, NativeRoleManifest, Role},
+    role_manifest_v0199::{self as rm, NativeRoleManifest, Role, ValidatedRoleManifest},
 };
 pub const RECORD_BYTES: usize = 128;
 pub const IPC_SEND: u64 = 1 << 16;
@@ -243,21 +241,25 @@ struct Entry {
 /// no slot reuse or old-generation handle resurrection.
 pub struct StaticControlCaps<const N: usize> {
     boot: u64,
+    config_digest: [u8; 32],
     rows: [Option<Entry>; N],
     // Fixed role identities, independent of whether a root was ever issued.
     fenced: [Option<Identity>; rm::ROLE_COUNT],
 }
 impl<const N: usize> StaticControlCaps<N> {
-    pub fn new(
-        epochs: &DurableEpochGate,
-        config: &VerifiedOfflineConfig<'_>,
-    ) -> Result<Self, Error> {
-        let boot = epochs.confirmed_config_boot(config)?;
-        Ok(Self {
-            boot,
+    pub fn new(policy: &ConfirmedBootPolicy<'_>) -> Self {
+        Self {
+            boot: policy.boot_epoch(),
+            config_digest: policy.config_digest(),
             rows: [None; N],
             fenced: [None; rm::ROLE_COUNT],
-        })
+        }
+    }
+    fn check_policy(&self, policy: &ConfirmedBootPolicy<'_>) -> Result<(), Error> {
+        if self.boot != policy.boot_epoch() || self.config_digest != policy.config_digest() {
+            return Err(Error::Stale);
+        }
+        Ok(())
     }
     fn issue_checked(
         &mut self,
@@ -311,18 +313,15 @@ impl<const N: usize> StaticControlCaps<N> {
     /// lifetime. Manifest permission masks alone are not an issued cap.
     pub fn issue_root(
         &mut self,
-        epochs: &DurableEpochGate,
-        config: &VerifiedOfflineConfig<'_>,
+        policy: &ConfirmedBootPolicy<'_>,
         manifest: &NativeRoleManifest,
         label: Label,
         r: CapRecordV3,
         verify_catalog_and_object: impl FnOnce(Label, &CapRecordV3) -> Result<(), Error>,
     ) -> Result<u64, Error> {
-        if epochs.confirmed_config_boot(config)? != self.boot {
-            return Err(Error::Stale);
-        }
+        self.check_policy(policy)?;
         let role = label.requirement(r.source_role)?.0;
-        if epochs.service_generation(role)? != r.holder.generation {
+        if policy.service_generation(role)? != r.holder.generation {
             return Err(Error::Stale);
         }
         self.issue_checked(manifest, label, r, verify_catalog_and_object)
@@ -331,9 +330,8 @@ impl<const N: usize> StaticControlCaps<N> {
     /// object generation at every use. Source-role wire fields confer nothing.
     // Stable wide cap-lookup API; regrouping arguments would change the public contract.
     #[allow(clippy::too_many_arguments)]
-    pub fn lookup(
+    fn lookup(
         &self,
-        boot: u64,
         holder: Identity,
         cpu: usize,
         handle: u64,
@@ -341,7 +339,7 @@ impl<const N: usize> StaticControlCaps<N> {
         target: Identity,
         verify_live: impl FnOnce(&CapRecordV3) -> Result<(), Error>,
     ) -> Result<CapRecordV3, Error> {
-        if boot != self.boot || cpu != 0 || !holder.valid() {
+        if cpu != rm::CONTROL_CPU || !holder.valid() {
             return Err(Error::Unauthorized);
         }
         let entry = self
@@ -372,9 +370,8 @@ impl<const N: usize> StaticControlCaps<N> {
     #[allow(clippy::too_many_arguments)]
     pub fn lookup_current(
         &self,
-        epochs: &DurableEpochGate,
-        config: &VerifiedOfflineConfig<'_>,
-        manifest: &NativeRoleManifest,
+        policy: &ConfirmedBootPolicy<'_>,
+        manifest: &ValidatedRoleManifest<'_>,
         holder: Identity,
         cpu: usize,
         handle: u64,
@@ -382,10 +379,10 @@ impl<const N: usize> StaticControlCaps<N> {
         target: Identity,
         verify_live: impl FnOnce(&CapRecordV3) -> Result<(), Error>,
     ) -> Result<CapRecordV3, Error> {
-        let boot = epochs.confirmed_config_boot(config)?;
-        self.lookup(boot, holder, cpu, handle, label, target, |r| {
+        self.check_policy(policy)?;
+        self.lookup(holder, cpu, handle, label, target, |r| {
             let (role, authority, _, _) = label.requirement(r.source_role)?;
-            if epochs.service_generation(role)? != holder.generation {
+            if policy.service_generation(role)? != holder.generation {
                 return Err(Error::Stale);
             }
             manifest
@@ -528,6 +525,7 @@ mod tests {
         let r = publisher();
         let mut table = StaticControlCaps::<2> {
             boot: 1,
+            config_digest: [0; 32],
             rows: [None; 2],
             fenced: [None; rm::ROLE_COUNT],
         };
@@ -571,6 +569,7 @@ mod tests {
         let r = publisher();
         let mut table = StaticControlCaps::<3> {
             boot: 1,
+            config_digest: [0; 32],
             rows: [None; 3],
             fenced: [None; rm::ROLE_COUNT],
         };
@@ -602,7 +601,6 @@ mod tests {
         for i in 0..3u64 {
             assert_eq!(
                 table.lookup(
-                    1,
                     r.holder,
                     0,
                     (1u64 << 32) | i,
@@ -636,6 +634,7 @@ mod tests {
         // durable generation is issued as a real production credential.
         let mut table = StaticControlCaps::<2> {
             boot: 1,
+            config_digest: [0; 32],
             rows: [None; 2],
             fenced: [None; rm::ROLE_COUNT],
         };
@@ -652,12 +651,11 @@ mod tests {
             .issue_checked(&m, Label::Publish, r, |_, _| Ok(()))
             .unwrap();
         assert_eq!(
-            table.lookup(1, r.holder, 0, h, Label::Publish, r.target, |_| Ok(())),
+            table.lookup(r.holder, 0, h, Label::Publish, r.target, |_| Ok(())),
             Ok(r)
         );
         assert_eq!(
             table.lookup(
-                1,
                 m.members[0].actor,
                 0,
                 h,
@@ -668,12 +666,11 @@ mod tests {
             Err(Error::Unauthorized)
         );
         assert_eq!(
-            table.lookup(1, r.holder, 1, h, Label::Publish, r.target, |_| panic!()),
+            table.lookup(r.holder, 1, h, Label::Publish, r.target, |_| panic!()),
             Err(Error::Unauthorized)
         );
         assert_eq!(
             table.lookup(
-                1,
                 r.holder,
                 0,
                 h,
@@ -715,7 +712,7 @@ mod tests {
             Err(Error::Unauthorized)
         );
         assert_eq!(
-            table.lookup(1, r.holder, 0, h, Label::Publish, r.target, |_| panic!()),
+            table.lookup(r.holder, 0, h, Label::Publish, r.target, |_| panic!()),
             Err(Error::Stale)
         );
         assert_eq!(
@@ -742,12 +739,11 @@ mod tests {
             .unwrap();
         assert_ne!(h, new_handle);
         assert_eq!(
-            table.lookup(1, r.holder, 0, h, Label::Publish, r.target, |_| panic!()),
+            table.lookup(r.holder, 0, h, Label::Publish, r.target, |_| panic!()),
             Err(Error::Stale)
         );
         assert_eq!(
             table.lookup(
-                1,
                 replacement.holder,
                 0,
                 new_handle,

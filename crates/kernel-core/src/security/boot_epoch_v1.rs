@@ -6,8 +6,8 @@
 use super::{
     Error,
     durable_role_epoch_v0199::{
-        Change, CommitEvidence, DurableEpochGate, Outcome, PreparedEpoch, RedoPlacement,
-        SlotBinding,
+        Change, CommitEvidence, ConfirmedBootPolicy, DurableEpochGate, Outcome, PreparedEpoch,
+        RedoPlacement, SlotBinding,
     },
     epoch_redo_v0199::EpochBlockIo,
     file_index_v0199::SecurityStateStoreV2,
@@ -479,10 +479,9 @@ impl StartupEpochBinding {
 ///    signed offline config and the mounted-volume identity (native owner;
 ///    never EL0 or a model). Recover/replay to the latest committed pair.
 /// 2. Read the two committed protected home images (state, boot).
-/// 3. [`BootEpochAuthority::open`]`(state_raw, boot_raw, slots, real_verify)`.
-///    `real_verify` MUST perform the full startup verification (the duties
-///    `DurableEpochGate::recovered_for_startup` enforces); a scratch/diagnostic
-///    callback is not production authority.
+/// 3. Use [`BootEpochAuthority::open_for_startup`] with the exact signed config.
+///    The storage callback must establish the actual mounted volume identity
+///    and recovered commit chain.
 /// 4. Reserve an EMPTY six-block log extent and an exclusive nonzero
 ///    txid/commit_lsn; build a [`BootEpochTx`] from the authenticated layout.
 /// 5. Place a [`BootPairRedo`] workspace in the preallocated progress pool.
@@ -546,6 +545,16 @@ impl BootEpochAuthority {
         self.gate.confirmed_config_boot(config)
     }
 
+    /// Borrow the current signed policy and confirmed epoch for capability
+    /// checks. The native owner separately authenticates its live role and
+    /// object registries.
+    pub fn confirmed_boot_policy(
+        &self,
+        config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+    ) -> Result<ConfirmedBootPolicy<'_>, Error> {
+        self.gate.confirmed_boot_policy(config)
+    }
+
     /// The confirmed boot epoch, if a paired transaction was fully confirmed
     /// and no newer transition fences it. `None` before confirmation and while
     /// an uncertain commit is pending.
@@ -564,12 +573,13 @@ impl BootEpochAuthority {
     ) -> Result<StartupEpochBinding, Error> {
         self.gate.verify_startup_config(config)?;
         let grant = self.allocate(io, pair, tx)?;
-        if self.confirmed_config_boot(config)? != grant.epoch() {
+        let policy = self.confirmed_boot_policy(config)?;
+        if policy.boot_epoch() != grant.epoch() {
             return Err(Error::Conflict);
         }
         Ok(StartupEpochBinding {
             grant,
-            config_digest: config.digest(),
+            config_digest: policy.config_digest(),
         })
     }
 

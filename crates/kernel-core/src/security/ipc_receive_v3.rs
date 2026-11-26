@@ -375,28 +375,32 @@ impl<const N: usize> DirectionalEndpoint<N> {
 /// before consuming a queue slot or a receive completion credit.
 pub mod svc {
     use super::*;
+    use crate::control_plane::role_manifest_v0199::ValidatedRoleManifest;
     use crate::security::{
         cap_record_v3::{CapRecordV3, Label, StaticControlCaps},
+        durable_role_epoch_v0199::ConfirmedBootPolicy,
         syscall::Syscall,
         syscall_v3::{ValidatedCall, decode_aarch64_svc_v3},
     };
     #[derive(Clone, Copy)]
-    pub struct Caller {
-        pub boot: u64,
+    pub struct Caller<'a> {
+        pub policy: &'a ConfirmedBootPolicy<'a>,
+        pub manifest: &'a ValidatedRoleManifest<'a>,
         pub actor: Identity,
         pub cpu: usize,
         pub abi: u16,
     }
     fn authorize<const M: usize>(
         caps: &StaticControlCaps<M>,
-        caller: Caller,
+        caller: Caller<'_>,
         cap: u64,
         label: Label,
         ep: Endpoint,
         verify_live: impl FnOnce(&CapRecordV3) -> Result<(), crate::security::Error>,
     ) -> Result<(), Error> {
-        caps.lookup(
-            caller.boot,
+        caps.lookup_current(
+            caller.policy,
+            caller.manifest,
             caller.actor,
             caller.cpu,
             cap,
@@ -413,7 +417,12 @@ pub mod svc {
             _ => Error::Auth,
         })
     }
-    fn call(c: Caller, esr: u64, regs: &[u64; 31], op: Syscall) -> Result<ValidatedCall, Error> {
+    fn call(
+        c: Caller<'_>,
+        esr: u64,
+        regs: &[u64; 31],
+        op: Syscall,
+    ) -> Result<ValidatedCall, Error> {
         let v = decode_aarch64_svc_v3(c.abi, esr, regs).map_err(|_| Error::Format)?;
         if v.operation != op {
             return Err(Error::Format);
@@ -425,7 +434,7 @@ pub mod svc {
     pub fn send<const N: usize, const M: usize>(
         q: &mut DirectionalEndpoint<N>,
         caps: &StaticControlCaps<M>,
-        caller: Caller,
+        caller: Caller<'_>,
         esr: u64,
         regs: &[u64; 31],
         label: Label,
@@ -461,7 +470,7 @@ pub mod svc {
     pub fn receive<const N: usize, const M: usize>(
         q: &mut DirectionalEndpoint<N>,
         caps: &StaticControlCaps<M>,
-        caller: Caller,
+        caller: Caller<'_>,
         esr: u64,
         regs: &[u64; 31],
         label: Label,
@@ -500,7 +509,7 @@ pub mod svc {
     pub fn ack<const N: usize, const M: usize>(
         q: &mut DirectionalEndpoint<N>,
         caps: &StaticControlCaps<M>,
-        caller: Caller,
+        caller: Caller<'_>,
         esr: u64,
         regs: &[u64; 31],
         label: Label,

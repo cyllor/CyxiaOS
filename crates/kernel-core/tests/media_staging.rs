@@ -377,16 +377,27 @@ fn signed_startup_requires_authority_before_io_and_binds_exact_committed_state()
     );
     assert_eq!((disk.reads, disk.writes, disk.flushes), before);
     assert_eq!(recovered.confirmed_epoch(), None);
+    assert!(matches!(
+        recovered.confirmed_boot_policy(&verified),
+        Err(Error::Unauthorized)
+    ));
 
     let mut startup =
         BootEpochAuthority::open_for_startup(&state_raw, &boot_raw, slots, &verified, |_| Ok(()))
             .unwrap();
+    assert!(matches!(
+        startup.confirmed_boot_policy(&verified),
+        Err(Error::Unauthorized)
+    ));
     let binding = startup
         .allocate_for_startup(&mut disk, &mut pair, tx, &verified)
         .unwrap();
     assert_eq!(binding.epoch(), 1);
     let state = authority::verified_pair_state(&mut disk, sb, Some(&verified)).unwrap();
     assert_eq!(binding.verify_state(&state), Ok(()));
+    let policy = startup.confirmed_boot_policy(&verified).unwrap();
+    assert_eq!(policy.boot_epoch(), binding.epoch());
+    check_boot_scoped_ipc(&policy);
     let mut other = state;
     other.service_generations[0] += 1;
     assert_eq!(verified.check_committed(&other), Ok(()));
@@ -397,6 +408,146 @@ fn signed_startup_requires_authority_before_io_and_binds_exact_committed_state()
         Err(Error::Conflict)
     );
     assert_eq!((disk.reads, disk.writes, disk.flushes), before_retry);
+}
+
+fn check_boot_scoped_ipc(
+    policy: &cyxia_kernel_core::security::durable_role_epoch_v0199::ConfirmedBootPolicy<'_>,
+) {
+    use cyxia_kernel_core::{
+        control_plane::{
+            Identity,
+            control_rpc_v1::Error as IpcError,
+            role_manifest_v0199::{NativeRole, NativeRoleManifest, PrivateRegion, ROLES},
+        },
+        security::{
+            cap_record_v3::{CapRecordV3, IPC_SEND, Label, StaticControlCaps},
+            ipc_receive_v3::{DirectionalEndpoint, Endpoint, svc},
+        },
+    };
+    // Host fixture for the independently authorized catalog and live registry.
+    let manifest = NativeRoleManifest {
+        online_mask: 15,
+        other_protected_pool_bytes: 4096,
+        other_control_ns_per_100ms: 100,
+        members: core::array::from_fn(|index| NativeRole {
+            role: ROLES[index],
+            actor: Identity {
+                id: u64::from(ROLES[index].id()),
+                generation: policy.service_generation(ROLES[index]).unwrap(),
+            },
+            ttbr0_root: 0x100000 + index as u64 * 4096,
+            private_rw: PrivateRegion {
+                base: 0x200000 + index as u64 * 4096,
+                bytes: 4096,
+            },
+            caps: ROLES[index].allowed_caps(),
+            control_ns_per_100ms: 100,
+            cpu_mask: 1,
+            thread_count: 1,
+            endpoint_id: 10 + index as u64,
+        }),
+    };
+    let sender = manifest.members[0].actor;
+    let receiver = manifest.members[2].actor;
+    let target = Identity {
+        id: 20,
+        generation: 1,
+    };
+    let label = Label::AdviceSend;
+    let record = CapRecordV3 {
+        cap_id: 1,
+        holder: sender,
+        target,
+        parent_cap_id: 0,
+        parent_generation: 0,
+        deny_generation: 1,
+        rights: IPC_SEND,
+        object_kind: 4,
+        state: 1,
+        depth: 0,
+        source_role: u32::from(ROLES[0].id()),
+        owner_group: u32::MAX,
+        record_generation: 1,
+    };
+    let mut caps = StaticControlCaps::<2>::new(policy);
+    assert_eq!(
+        caps.issue_root(policy, &manifest, label, record, |_, _| Err(
+            Error::Unauthorized
+        )),
+        Err(Error::Unauthorized)
+    );
+    let handle = caps
+        .issue_root(
+            policy,
+            &manifest,
+            label,
+            record,
+            |actual_label, actual_record| {
+                assert_eq!((actual_label, *actual_record), (label, record));
+                Ok(())
+            },
+        )
+        .unwrap();
+    let endpoint = Endpoint {
+        id: target.id,
+        generation: target.generation,
+        receiver,
+    };
+    let mut queue = DirectionalEndpoint::<2>::new(endpoint, sender).unwrap();
+    let mut regs = [0; 31];
+    regs[..6].copy_from_slice(&[handle, 0x1000, 1, 1, 0, 1]);
+    regs[8] = 0x30;
+    let valid = manifest.validated().unwrap();
+    let caller = svc::Caller {
+        policy,
+        manifest: &valid,
+        actor: sender,
+        cpu: 0,
+        abi: 3,
+    };
+    assert_eq!(
+        svc::send(
+            &mut queue,
+            &caps,
+            caller,
+            0x5600_0000,
+            &regs,
+            label,
+            b"A",
+            |actual| {
+                assert_eq!(*actual, record);
+                Ok(())
+            },
+            0,
+            |_| Ok(())
+        ),
+        Ok(())
+    );
+
+    let mut replacement = manifest;
+    replacement.members[0].actor.generation += 1;
+    let replaced = replacement.validated().unwrap();
+    let stale = svc::Caller {
+        manifest: &replaced,
+        ..caller
+    };
+    regs[3] = 2;
+    assert_eq!(
+        svc::send(
+            &mut queue,
+            &caps,
+            stale,
+            0x5600_0000,
+            &regs,
+            label,
+            b"B",
+            |_| panic!("stale actor reached live object check"),
+            0,
+            |_| panic!("stale actor reached IPC payload admission")
+        ),
+        Err(IpcError::Auth)
+    );
+    assert_eq!(queue.pending(), 1);
 }
 
 #[test]
