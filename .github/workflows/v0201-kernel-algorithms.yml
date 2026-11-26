@@ -1,0 +1,47 @@
+name: V0.20.1 kernel algorithm host regression
+on:
+  push:
+    branches: [V0.20.1]
+    paths:
+      - 'crates/kernel-core/**'
+      - '.github/workflows/v0201-kernel-algorithms.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: v0201-kernel-algorithms-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  modules:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        seam: ['contig_frames::tests', 'console::tests']
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update
+      - name: Run module regression
+        env:
+          SEAM: ${{ matrix.seam }}
+        run: cargo +1.95.0 test --locked -p cyxia-kernel-core "$SEAM"
+  integration:
+    needs: modules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt
+      - name: Check format
+        run: cargo +1.95.0 fmt --all --check
+      - name: Kernel-core suite
+        run: cargo +1.95.0 test --locked -p cyxia-kernel-core
+      - name: Default workspace regression
+        run: cargo +1.95.0 test --locked
