@@ -156,10 +156,12 @@ impl BatchedBlock {
             16
         };
         let writable = if kind == 0 { 513 } else { 1 };
-        let token = match self.queue.enqueue(
+        // Like the single-request block owner, require an explicit device
+        // status write. A correct used length alone is not proof of success.
+        let token = match self.queue.enqueue_with_response_tail(
             &mut self.transport,
             &request[..len],
-            writable,
+            (writable, Some(0xff)),
             synchronous || kind == 4,
             isolated,
             p,
@@ -328,6 +330,10 @@ mod tests {
         )
     }
     unsafe fn complete(base: usize, slot: u8, read: bool, status: u8) {
+        unsafe { complete_with_status(base, slot, read, Some(status)) }
+    }
+
+    unsafe fn complete_with_status(base: usize, slot: u8, read: bool, status: Option<u8>) {
         unsafe {
             let desc = base + usize::from(slot) * 32 + 16;
             let response = u64::from_le(read_volatile(desc as *const u64)) as usize;
@@ -336,7 +342,9 @@ mod tests {
                     write_volatile((response + i) as *mut u8, 0x5a);
                 }
             }
-            write_volatile((response + if read { 512 } else { 0 }) as *mut u8, status);
+            if let Some(status) = status {
+                write_volatile((response + if read { 512 } else { 0 }) as *mut u8, status);
+            }
             let used = base + 8192;
             let n = u16::from_le(read_volatile((used + 2) as *const u16));
             let at = used + 4 + usize::from(n % 16) * 8;
@@ -504,6 +512,49 @@ mod tests {
         block.acknowledge(first).unwrap();
         assert!(!block.is_quiescent());
         assert_eq!(block.free(), block.capacity() - 1);
+    }
+
+    #[test]
+    fn missing_block_status_never_publishes_success_or_releases_dma() {
+        for reused in [false, true] {
+            for operation in [Operation::Read(1), Operation::Write(1), Operation::Flush] {
+                let (mut b, p, m) = fixture();
+                if reused {
+                    b.set_notify_policy(1, 1, 1_000_000, 0).unwrap();
+                    let prior = b
+                        .begin(Operation::Read(0), &[0; 512], true, true, &p)
+                        .unwrap();
+                    unsafe { complete(m, prior.slot, true, 0) };
+                    let c = b.poll(&mut [0; 512], &p).unwrap().unwrap();
+                    b.acknowledge(c.token).unwrap();
+                    assert_eq!(b.free(), b.capacity());
+                }
+                b.set_notify_policy(1, 2, 1_000_000, 0).unwrap();
+                let token = b.begin(operation, &[0; 512], true, true, &p).unwrap();
+                assert_eq!(token.slot, 0);
+                let mut out = [0xaa; 512];
+                // A device publishes a full used record but omits the status
+                // byte. Neither a fresh zero nor a released zero is evidence.
+                unsafe {
+                    complete_with_status(
+                        m,
+                        token.slot,
+                        matches!(operation, Operation::Read(_)),
+                        None,
+                    )
+                };
+                assert_eq!(b.poll(&mut out, &p), Err(Error::Response));
+                assert_eq!(out, [0xaa; 512]);
+                assert_eq!(b.notify_stats().last_completed_version, u64::from(reused));
+                assert_eq!(b.acknowledge(token), Err(Error::Response));
+                assert!(!b.is_quiescent());
+                assert_eq!(b.free(), b.capacity() - 1);
+                assert_eq!(
+                    b.begin(Operation::Flush, &[0; 512], true, true, &p),
+                    Err(Error::Device)
+                );
+            }
+        }
     }
 
     #[test]

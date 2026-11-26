@@ -159,6 +159,7 @@ jobs:
           rustup override set 1.95.0
           cargo fetch --locked
           rustc -vV > artifacts/v020-production/toolchain.txt
+          cargo test --locked --offline -p cyxia-driver-virtio --lib 2>&1 | tee artifacts/v020-production/driver-virtio-tests.log
           # The kernel include_bytes!-embeds the fixture-identity local-echo guest:
           # build it first with the exact helper verify_v0199_sec_n.py uses.
           python3 -B -c 'import sys; sys.path.insert(0, "tools"); import verify_v0199_sec_n as s; s.build_guest()' 2>&1 | tee artifacts/v020-production/build-guest.log
