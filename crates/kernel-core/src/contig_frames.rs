@@ -9,14 +9,15 @@
 //! interval list for first-fit. Larger tables use an ordered occupied prefix
 //! and avoid sorting scratch. Both keep one authoritative ownership table;
 //! gaps coalesce implicitly. A full table and an exhausted address window
-//! remain distinct failures. The compile-time cutoff is provisional until
-//! same-runner measurements confirm the small-table regression correction.
+//! remain distinct failures. The compile-time cutoff is measurement-driven
+//! and provisional until the expanded same-runner size sweep is verified.
 use super::frames::{FrameError, FrameSnapshot};
 use cyxia_contracts::TaskId;
 
-// Wave 7 measured a regression at N=8 and a gain at N=64. Do not
-// generalize the cutoff to other unmeasured sizes or change it at runtime.
-const SMALL_RUN_LIMIT: usize = 8;
+// Wave 8 confirmed near-baseline cost at 4/8 after restoring sparse
+// slots, but measured regressions at 9/16 and gains at 32/64. Extend the
+// sparse path to 16. The 17..31 crossover remains a measurement question.
+const SMALL_RUN_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
 struct Run {
@@ -398,6 +399,10 @@ mod tests {
         exercise_capacity::<8>();
         exercise_capacity::<9>();
         exercise_capacity::<16>();
+        exercise_capacity::<17>();
+        exercise_capacity::<24>();
+        exercise_capacity::<31>();
+        exercise_capacity::<32>();
         exercise_capacity::<64>();
     }
 

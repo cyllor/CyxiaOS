@@ -1,4 +1,4 @@
-//! Compare actual public algorithms compiled from two immutable source trees.
+//! Compare actual public algorithms compiled from three source trees.
 //! Synthetic metadata and model workloads only; no physical pages or native
 //! control-core latency claims. All timings include setup for that workload.
 use cyxia_contracts::TaskId;
@@ -76,6 +76,21 @@ fn main() {
     measure_contig::<8>();
     measure_contig::<9>();
     measure_contig::<16>();
+    measure_contig::<17>();
+    measure_contig::<18>();
+    measure_contig::<19>();
+    measure_contig::<20>();
+    measure_contig::<21>();
+    measure_contig::<22>();
+    measure_contig::<23>();
+    measure_contig::<24>();
+    measure_contig::<25>();
+    measure_contig::<26>();
+    measure_contig::<27>();
+    measure_contig::<28>();
+    measure_contig::<29>();
+    measure_contig::<30>();
+    measure_contig::<31>();
     measure_contig::<32>();
     measure_contig::<64>();
     let mut parameters = [0u8; integer_model::MODEL_BYTES];
@@ -109,21 +124,48 @@ fn main() {
             Some(1),
         ],
     };
-    let d01 = [1, 2, 4, 8].map(|a1| Candidate {
-        a1,
-        a2: None,
-        cpu: [None; 4],
-    });
-    let d06 = [1, 2, 3].map(|a1| Candidate {
-        a1,
-        a2: None,
-        cpu: [Some(a1 * 100), Some(256), Some(10), Some(1)],
-    });
-    measure("operations-d01", || {
-        operations(black_box(&s), black_box(&d01), black_box(&parameters))
-    });
-    let irq = SnapshotReplyV3 { domain: 6, ..s };
-    measure("operations-d06", || {
-        operations(black_box(&irq), black_box(&d06), black_box(&parameters))
-    });
+    // Frozen ActionSchema v2 values for every local resource domain.
+    // These are scoring inputs only; no candidate is granted authority.
+    for domain in 1..=15 {
+        let actions: &[(u64, Option<u64>)] = match domain {
+            1 | 2 | 8 | 11 => &[(1, None), (2, None), (4, None), (8, None)],
+            3 => &[
+                (64, Some(4)),
+                (256, Some(16)),
+                (1024, Some(32)),
+                (4096, Some(64)),
+            ],
+            4 => &[(0, Some(4)), (2, Some(8)), (8, Some(16)), (16, Some(32))],
+            5 => &[(8, Some(1)), (32, Some(4)), (64, Some(8)), (128, Some(16))],
+            6 => &[(1, None), (2, None), (3, None)],
+            7 => &[(0, None), (50, None), (200, None), (1000, None)],
+            9 => &[(100, None), (250, None), (500, None), (750, None)],
+            10 => &[(1, None), (4, None), (8, None), (16, None)],
+            12 => &[(4, None), (8, None), (16, None), (32, None)],
+            13 => &[(50, None), (100, None), (200, None), (400, None)],
+            14 => &[(0, None), (1, None), (2, None)],
+            15 => &[(1, None), (8, None), (32, None), (64, None)],
+            _ => unreachable!(),
+        };
+        let candidates: Vec<_> = actions
+            .iter()
+            .map(|&(a1, a2)| Candidate {
+                a1,
+                a2,
+                cpu: if domain == 6 {
+                    [Some(a1 * 100), Some(256), Some(10), Some(1)]
+                } else {
+                    [None; 4]
+                },
+            })
+            .collect();
+        let snapshot = SnapshotReplyV3 { domain, ..s };
+        measure(&format!("operations-d{domain:02}"), || {
+            operations(
+                black_box(&snapshot),
+                black_box(candidates.as_slice()),
+                black_box(&parameters),
+            )
+        });
+    }
 }
