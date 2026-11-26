@@ -3,7 +3,7 @@ name: V0.20 two-architecture native mechanism capture (WIP)
 
 on:
   push:
-    branches: [CyxiaOS-V0.20, work/v020-native-control-safety, fix/v020-v0199-contract-gaps, work/v020-gap-x86-native-firmware]
+    branches: [CyxiaOS-V0.20, work/v020-native-control-safety, fix/v020-v0199-contract-gaps, work/v020-gap-x86-native-firmware, work/v020-wave22-native-entry-guards]
     paths:
       - '.github/workflows/v20-native-mechanism.yml'
       - 'kernel/**'

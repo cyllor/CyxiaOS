@@ -2,6 +2,8 @@
 # eight fully operational services, resource execution and real restart proof.
 name: V0.20 eight native ABI3 package bring-up
 on:
+  push:
+    branches: [work/v020-wave22-native-entry-guards]
   pull_request:
     branches: [CyxiaOS-V0.20]
     paths:

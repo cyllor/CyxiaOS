@@ -24,7 +24,7 @@ on:
       - 'tools/test_a10_write_backpressure.py'
       - '.github/workflows/v20-snapshot-components.yml'
   push:
-    branches: [CyxiaOS-V0.20, 'work/v020-snapshot-*']
+    branches: [CyxiaOS-V0.20, 'work/v020-snapshot-*', work/v020-wave22-native-entry-guards]
   workflow_dispatch:
 
 permissions:

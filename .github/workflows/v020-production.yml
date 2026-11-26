@@ -36,7 +36,7 @@
 name: V0.20 production-wiring skeleton (NOT G4 acceptance)
 on:
   push:
-    branches: [CyxiaOS-V0.20]
+    branches: [CyxiaOS-V0.20, work/v020-wave22-native-entry-guards]
     paths:
       - 'kernel/**'
       - 'crates/**'
