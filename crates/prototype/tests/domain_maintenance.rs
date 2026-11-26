@@ -391,7 +391,10 @@ fn wave6_optional_budget_keeps_partial_and_cross_group_debits() {
     assert_eq!(b.reserve(key(), 1, WINDOW_NS), Err(Error::Busy));
     b.complete(held, 1_000_000, WINDOW_NS + 1).unwrap();
     assert_eq!(b.peek_status(key(), WINDOW_NS + 1).unwrap().reserved_ns, 0);
-    assert_eq!(b.peek_status(key(), WINDOW_NS + 1).unwrap().spent_ns, 1_000_000);
+    assert_eq!(
+        b.peek_status(key(), WINDOW_NS + 1).unwrap().spent_ns,
+        1_000_000
+    );
     assert_eq!(b.peek_status(other, WINDOW_NS + 1), Err(Error::Busy));
     assert_eq!(b.complete(held, 0, WINDOW_NS + 1), Err(Error::Stale));
     b.complete(independent, 0, WINDOW_NS + 2).unwrap();

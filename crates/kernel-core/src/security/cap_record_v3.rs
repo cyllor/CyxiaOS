@@ -588,10 +588,7 @@ mod tests {
             table.issue_checked(&m, Label::Publish, r, |_, _| panic!()),
             Err(Error::Unauthorized)
         );
-        let extra = CapRecordV3 {
-            cap_id: 100,
-            ..r
-        };
+        let extra = CapRecordV3 { cap_id: 100, ..r };
         assert_eq!(
             table.issue_checked(&m, Label::Publish, extra, |_, _| panic!()),
             Err(Error::Capacity)

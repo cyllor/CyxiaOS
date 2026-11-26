@@ -543,9 +543,7 @@ impl RecoverySupervisor {
         {
             return Err(Error::Again);
         }
-        let slot = vacant
-            .or(oldest.map(|(at, _)| at))
-            .ok_or(Error::Capacity)?;
+        let slot = vacant.or(oldest.map(|(at, _)| at)).ok_or(Error::Capacity)?;
         self.sequence = self.sequence.checked_add(1).ok_or(Error::Overflow)?;
         let generation = if recipe == 0 {
             apply.target.generation
