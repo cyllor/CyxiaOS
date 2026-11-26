@@ -1,5 +1,6 @@
 """Two-boot fixture and independent disk checks for V0.20 scratch media."""
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import struct
@@ -43,6 +44,17 @@ def verify_signed_disk(path: Path, epoch: int) -> str:
                     and state[88:120].hex() == SIGNED_POLICY_SHA256,
                     "signed policy digest or epoch in the scratch disk differs from the fixture")
     return SIGNED_POLICY_SHA256
+
+
+def verify_signed_receipt_view(path: Path, expected: str) -> str:
+    """Independently bind the protected witness to six receipt and one index block."""
+    with path.open("rb") as disk:
+        disk.seek((DATA_START + 1) * BLOCK_BYTES)
+        image = disk.read(7 * BLOCK_BYTES)
+    require(len(image) == 7 * BLOCK_BYTES, "short signed receipt/index image")
+    digest = hashlib.sha256(image).hexdigest()
+    require(digest == expected, "signed receipt view differs from actual scratch media")
+    return digest
 
 
 def require_read_only_refusal(report: dict, lines: list, output: Path, step: int) -> tuple:

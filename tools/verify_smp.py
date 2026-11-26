@@ -25,6 +25,7 @@ import time
 
 from check_elf import inspect_elf, symbol
 from run_qemu import Qmp
+from qmp_stdio import PipeTransport
 from transport import FrameDecoder
 from build_sources import working_tree_names
 
@@ -252,7 +253,7 @@ def boot_ram_mib(elf: bytes) -> int:
     raise ValueError('boot profile not backed by loaded ELF bytes')
 
 
-def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptance=None, ram_mib: int = 256, scratch_disk: Path | None = None, legacy: bool = False) -> dict:
+def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptance=None, ram_mib: int = 256, scratch_disk: Path | None = None, legacy: bool = False, qmp_stdio: bool = False) -> dict:
     require(1 <= timeout <= 60 and cpus in (1, 4) and ram_mib in (256, 1024),
             'invalid execution budget/configuration')
     elf = elf.resolve(strict=True)
@@ -297,7 +298,8 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                     '-cpu', 'cortex-a53', '-smp', str(cpus), '-m', f'{ram_mib}M', '-accel', 'tcg,thread=multi',
                     '-display', 'none', '-monitor', 'none', '-nic', 'none',
                     '-chardev', 'ringbuf,id=cyxlog,size=1048576', '-serial', 'chardev:cyxlog',
-                    '-qmp', f'unix:{path},server=on,wait=off', '-kernel', str(elf), '-no-reboot']
+                    '-qmp', 'stdio' if qmp_stdio else f'unix:{path},server=on,wait=off',
+                    '-kernel', str(elf), '-no-reboot']
             if scratch_disk is not None:
                 require(getattr(acceptance, 'scratch_epoch_disk', False) and ram_mib == 1024,
                         'disk restricted to explicit native epoch scratch fixture')
@@ -310,14 +312,20 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                          '-drive', f'file={scratch_disk},if=none,id=epoch,format=raw,cache=none',
                          '-device', 'virtio-blk-device,drive=epoch']
             report['argv'] = args
-            proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=err)
+            report['qmp_transport'] = 'stdio' if qmp_stdio else 'unix'
+            proc = subprocess.Popen(args, stdin=subprocess.PIPE if qmp_stdio else None,
+                                    stdout=subprocess.PIPE if qmp_stdio else subprocess.DEVNULL,
+                                    stderr=err, bufsize=0)
             end = started + timeout
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            while True:
-                require(proc.poll() is None, 'QEMU exited before handshake')
-                if time.monotonic() >= end: raise TimeoutError('QMP handshake deadline')
-                try: sock.connect(path); break
-                except (FileNotFoundError, ConnectionRefusedError): time.sleep(.01)
+            if qmp_stdio:
+                sock = PipeTransport(proc)
+            else:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                while True:
+                    require(proc.poll() is None, 'QEMU exited before handshake')
+                    if time.monotonic() >= end: raise TimeoutError('QMP handshake deadline')
+                    try: sock.connect(path); break
+                    except (FileNotFoundError, ConnectionRefusedError): time.sleep(.01)
             qmp = Qmp(sock); greeting = qmp.receive(end)
             require('QMP' in greeting, 'invalid QMP greeting')
             qmp.execute('qmp_capabilities')
@@ -413,13 +421,15 @@ def main() -> int:
     parser.add_argument('--elf', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--timeout', type=float, default=20)
+    parser.add_argument('--qmp-stdio', action='store_true', help='use owned pipes instead of a Unix socket')
     parser.add_argument('--cpus', type=int, choices=(1, 4), default=4,
                         help='1 is a negative admission test; it must not pass')
     parser.add_argument('--legacy-coreset', action='store_true',
                         help='validate the retired dynamic CoreSet fixture; requires a kernel '
                              'built with --features smp-selftest,legacy-coreset')
     args = parser.parse_args()
-    try: report = run(args.elf, args.output, args.timeout, args.cpus, legacy=args.legacy_coreset)
+    try: report = run(args.elf, args.output, args.timeout, args.cpus, legacy=args.legacy_coreset,
+                     qmp_stdio=args.qmp_stdio)
     except (OSError, ValueError) as error:
         print(str(error), file=__import__('sys').stderr); return 1
     print(json.dumps(report, indent=2))

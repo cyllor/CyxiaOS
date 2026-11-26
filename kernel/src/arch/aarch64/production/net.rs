@@ -398,6 +398,10 @@ fn serve_stream(
         device: true,
         tcp_established: true,
         leases: u64::from(receipt.is_some()),
+        // The stream does not own the entropy source. serve() replaces this
+        // initial value with the actual guest delivery count before publish.
+        #[cfg(feature = "v020-production-authenticated-net")]
+        rng_bytes: 0,
         #[cfg(feature = "v020-production-authenticated-net")]
         retired: u64::from(retired),
         relayed_bytes: sec_n_broker::relayed_bytes(),

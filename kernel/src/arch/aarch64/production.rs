@@ -959,10 +959,6 @@ fn reject_service_preflight(index: usize, args: [u64; 6]) -> Option<u64> {
     }
 }
 
-#[cfg(any(
-    feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read"
-))]
 fn registered_pie_cap(index: usize, member: NativeRole) -> Option<u64> {
     if ROLES.get(index) != Some(&member.role)
         || member != pie_member(index)
@@ -974,10 +970,6 @@ fn registered_pie_cap(index: usize, member: NativeRole) -> Option<u64> {
     (cap != 0 && cap == pie_cap_selector(index)).then_some(cap)
 }
 
-#[cfg(any(
-    feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read"
-))]
 fn trapped_pie_cap(index: usize, member: NativeRole) -> Result<u64, i64> {
     if cpu::slot() != 0 || VECTOR_CALLER[0].load(Ordering::Acquire) != index as u64 {
         return Err(E_AUTH);
@@ -1024,8 +1016,16 @@ fn wait_for_role_yield(
 /// In-vector snapshot/audit and optional catalogue requests share the
 /// protected PIE membership. Clock, yield and sleep use the turn loop.
 fn pie_dispatch(index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u64 {
+    if index >= ROLE_COUNT {
+        return E_AUTH as u64;
+    }
     let member = pie_member(index);
-    let cap = PIE_CAP[index].load(Ordering::Acquire);
+    // Authenticate the live CPU, task and TTBR0 for every PIE endpoint, not
+    // only the optional file and snapshot services.
+    let cap = match trapped_pie_cap(index, member) {
+        Ok(cap) => cap,
+        Err(error) => return error as u64,
+    };
     match x8 {
         0x40 => {
             // ReadSnapshot: cap + domain + writable reply span, then EAGAIN.
@@ -2040,11 +2040,11 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     #[cfg(feature = "v020-production-live-control")]
     observations::drive(&mut pie_ctx, &pie_manifest);
     #[cfg(feature = "v020-production-file-read")]
-    if let Some(view) = staging_outcome.file_read {
+    if staging_outcome.services_ready() && let Some(view) = staging_outcome.file_read {
         file_read::drive(&mut pie_ctx, &pie_manifest, view);
     }
     #[cfg(feature = "v020-production-snapshot-catalog")]
-    if let Some(view) = staging_outcome.snapshot_catalog {
+    if staging_outcome.services_ready() && let Some(view) = staging_outcome.snapshot_catalog {
         snapshot_catalog::drive(&mut pie_ctx, &pie_manifest, view);
     }
     words.words[2].store(1, Ordering::Release);

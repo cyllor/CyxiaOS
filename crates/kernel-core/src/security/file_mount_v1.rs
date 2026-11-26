@@ -18,6 +18,7 @@ use super::{
     file_structure_v1::{self, BLOCK, INODES, Inode, StructureEvidence, SystemKind, SystemObject},
     offline_config_v1::{Principal, VerifiedOfflineConfig},
 };
+use sha2::{Digest, Sha256};
 const ACL_BYTES: usize = 64;
 const ACL_STORE: usize = INODES * ACL_BYTES;
 const FILE_RIGHTS: u32 = (1 << 8) | (1 << 9) | (1 << 13);
@@ -104,6 +105,57 @@ impl Workspace {
             receipts: [0; RECEIPT_STORE_BYTES],
             acl: [0; ACL_STORE],
         }
+    }
+
+    /// Check the receipt/query view captured by a successful exclusive mount
+    /// after the owner independently verifies the single paired BootEpoch redo.
+    /// That transaction changes only the boot and security homes, so the
+    /// receipt and index images from the same mount remain valid. This is
+    /// read-only custody evidence, not a FILE_RECEIPT_QUERY role qualification.
+    pub fn confirmed_receipt_query_digest(
+        &self,
+        prior: &MountEvidence,
+        committed: &SecurityStateStoreV2,
+        config: &VerifiedOfflineConfig<'_>,
+    ) -> Result<[u8; 32], Error> {
+        let old_boot = BootEpochStoreV1::decode(&self.boot)?;
+        let old_security = SecurityStateStoreV2::decode(&self.security)?;
+        let receipts = file_receipt_store_v0199::scan_receipts_with_index(
+            &self.receipts,
+            &self.index,
+            old_boot.fs_uuid,
+        )?;
+        if old_boot != prior.boot
+            || old_security != prior.security
+            || !old_boot.matches(&old_security)
+            || receipts != prior.receipts
+        {
+            return Err(Error::Conflict);
+        }
+        let expected = SecurityStateStoreV2 {
+            state_generation: old_security
+                .state_generation
+                .checked_add(1)
+                .ok_or(Error::Exhausted)?,
+            last_boot_epoch: old_security
+                .last_boot_epoch
+                .checked_add(1)
+                .ok_or(Error::Exhausted)?,
+            ..old_security
+        };
+        if committed != &expected {
+            return Err(Error::Conflict);
+        }
+        let _view = super::file_receipt_query_v4::MountedReceiptQuery::new(
+            &self.receipts,
+            &self.index,
+            config,
+            committed,
+        )?;
+        let mut digest = Sha256::new();
+        digest.update(self.receipts.as_slice());
+        digest.update(self.index.as_slice());
+        Ok(digest.finalize().into())
     }
 }
 impl Default for Workspace {
@@ -335,9 +387,12 @@ pub fn validate_unified(
     policy: impl FnMut(Acl, Inode, Option<UnifiedSystemKind>) -> Result<(), Error>,
 ) -> Result<MountEvidence, Error> {
     let system = unified_map_from_baseline(baseline, snapshot)?;
-    let payloads = read_baseline_payloads(io, sb, baseline, principals, w)?;
-    // Baseline payload validation has consumed the index; reuse its buffer.
+    // Use the index buffer only before reading the protected index. The
+    // mount's receipt query custody must retain its exact validated bytes
+    // across the later paired BootEpoch transaction. No extra workspace or
+    // disk reads are required under the same exclusive read-only mount.
     verify_snapshot_objects(io, sb, snapshot, &mut w.index)?;
+    let payloads = read_baseline_payloads(io, sb, baseline, principals, w)?;
     let structure =
         file_structure_v1::scan_unified(sb, &system, &mut w.structure, |b, out| io.read(b, out))?;
     let counters = inspect_acls(
@@ -701,6 +756,101 @@ mod tests {
             }
         );
         assert!(e.usage[1..].iter().all(|u| *u == Usage::default()));
+    }
+
+    #[test]
+    fn unified_mount_retains_signed_receipt_query_inputs_after_snapshot_scan() {
+        use crate::security::offline_config_v1::{CatalogBindings, SIGNATURE_LABEL};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let (mut disk, baseline, snapshot) = unified_fixture();
+        // A host-only signature, using the fixture's actual UUID and principals.
+        let mut wire = [0u8; 577];
+        p32(&mut wire, 0, 0x4359_4f46);
+        p16(&mut wire, 4, 1);
+        p16(&mut wire, 6, 256);
+        p32(&mut wire, 8, 577);
+        p32(&mut wire, 12, 257);
+        wire[16..32].copy_from_slice(&CHECKPOINT.fs_uuid);
+        for at in [32, 40, 48, 56] {
+            p64(&mut wire, at, 1);
+        }
+        wire[64..96].fill(2);
+        wire[96..128].fill(3);
+        wire[128..160].fill(4);
+        for (i, principal) in principals().iter().enumerate() {
+            p64(&mut wire, 256 + i * 16, principal.id);
+            p64(&mut wire, 264 + i * 16, principal.generation);
+        }
+        wire[512] = 42;
+        let payload_hash = Sha256::digest(&wire[256..513]);
+        wire[160..192].copy_from_slice(&payload_hash);
+        let signer = SigningKey::from_bytes(&[0x37; 32]);
+        let mut message = [0u8; SIGNATURE_LABEL.len() + 513];
+        message[..SIGNATURE_LABEL.len()].copy_from_slice(SIGNATURE_LABEL);
+        message[SIGNATURE_LABEL.len()..].copy_from_slice(&wire[..513]);
+        wire[513..].copy_from_slice(&signer.sign(&message).to_bytes());
+        let catalog = CatalogBindings {
+            rule_generation: 1,
+            security_generation: 1,
+            key_generation: 1,
+            rule_hash: [2; 32],
+            security_hash: [3; 32],
+            key_manifest_hash: [4; 32],
+        };
+        let mut scratch = [0u8; SIGNATURE_LABEL.len() + 513];
+        let config = VerifiedOfflineConfig::verify(
+            &wire,
+            &signer.verifying_key().to_bytes(),
+            catalog,
+            &mut scratch,
+            |_, _, payload| {
+                if payload == [42] {
+                    Ok(())
+                } else {
+                    Err(Error::Invalid)
+                }
+            },
+        )
+        .unwrap();
+
+        let mut state =
+            SecurityStateStoreV2::decode(disk.0.get(&STATE_HOME).unwrap().as_ref()).unwrap();
+        state.offline_config_hash = config.digest();
+        disk.0.insert(STATE_HOME, Box::new(state.encode().unwrap()));
+        let mut expected = Sha256::new();
+        for block in RECEIPTS..RECEIPTS + 7 {
+            let mut raw = [0; BLOCK];
+            disk.read(block, &mut raw).unwrap();
+            expected.update(raw);
+        }
+        let expected: [u8; 32] = expected.finalize().into();
+
+        let mut w = Workspace::new();
+        let prior = validate_unified(
+            &mut disk,
+            CHECKPOINT,
+            &baseline,
+            &snapshot,
+            config.principals(),
+            &mut w,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        // The mount owner supplies the independently confirmed paired state.
+        let committed = SecurityStateStoreV2 {
+            state_generation: state.state_generation + 1,
+            last_boot_epoch: state.last_boot_epoch + 1,
+            ..state
+        };
+        assert_eq!(
+            w.confirmed_receipt_query_digest(&prior, &committed, &config),
+            Ok(expected)
+        );
+        assert_eq!(
+            w.confirmed_receipt_query_digest(&prior, &state, &config),
+            Err(Error::Conflict)
+        );
     }
 
     #[test]

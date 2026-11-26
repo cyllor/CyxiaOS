@@ -84,6 +84,10 @@ pub const W13_AUDIT_REPLAYS: usize = 180;
 pub const W13_SIGNED_CONFIG_VERIFIED: usize = 181;
 #[cfg(feature = "v020-production-media-signed")]
 pub const W13_SIGNED_BOOT_EPOCH: usize = 182;
+#[cfg(feature = "v020-production-media-signed")]
+pub const W23_RECEIPT_VIEW_BOOT: usize = 183;
+#[cfg(feature = "v020-production-media-signed")]
+pub const W23_RECEIPT_VIEW_DIGEST: usize = 184;
 #[cfg(feature = "v020-production-frame-pool")]
 pub const W14_FRAME_POOL_LIFECYCLE: usize = 192;
 #[cfg(feature = "v020-production-frame-pool")]
@@ -197,6 +201,15 @@ pub fn log_completion() {
         && SMP_EVIDENCE.words[W11_STAGING_STEPS.start + 1..W11_STAGING_STEPS.end]
             .iter()
             .all(|w| w.load(Ordering::Relaxed) != 0);
+    #[cfg(feature = "v020-production-media-signed")]
+    let staging_ok = staging_ok
+        && flag(
+            W23_RECEIPT_VIEW_BOOT,
+            SMP_EVIDENCE.words[W11_STAGING_CONFIRMED_EPOCH].load(Ordering::Relaxed),
+        )
+        && SMP_EVIDENCE.words[W23_RECEIPT_VIEW_DIGEST..W23_RECEIPT_VIEW_DIGEST + 4]
+            .iter()
+            .any(|word| word.load(Ordering::Relaxed) != 0);
     #[cfg(feature = "v020-production-snapshot-catalog")]
     let staging_ok = staging_ok && flag(W16_CATALOG_READS, 2) && flag(W16_CATALOG_STALE, 1);
     #[cfg(feature = "v020-production-file-read")]

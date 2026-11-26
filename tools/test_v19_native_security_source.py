@@ -519,12 +519,43 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("python3 -B tools/verify_v020_production.py", workflow)
         self.assertIn("--elf artifacts/v020-production/kernel.elf", workflow)
 
+    def test_v020_default_production_keeps_fixture_builds_isolated(self):
+        # Default production must not silently change a historical fixture.
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        self.assertIn('default = ["v0199-local-native", "v020-production"]', manifest)
+        cases = (
+            ("ai-control-native", 3),
+            ("smp-native", 4),
+            ("v20-cpu0-role-native", 1),
+            ("v20-cpu0-role-replay", 1),
+            ("v20-native-eight-role-bringup", 2),
+            ("v20-native-hardening", 1),
+            ("v20-native-mechanism", 2),
+            ("validate-current", 1),
+        )
+        for name, expected in cases:
+            with self.subTest(workflow=name):
+                workflow = source(ROOT / ".github/workflows" / (name + ".yml"))
+                commands = [
+                    line for line in workflow.splitlines()
+                    if ("cargo build " in line or "cargo clippy " in line)
+                    and "--target aarch64-unknown-none-softfloat" in line
+                ]
+                self.assertEqual(len(commands), expected)
+                for command in commands:
+                    self.assertIn("--no-default-features", command)
+                    self.assertNotIn("--features v020-production", command)
+        for name in ("v20-native-eight-role-bringup", "v20-native-hardening",
+                     "v20-native-mechanism"):
+            workflow = source(ROOT / ".github/workflows" / (name + ".yml"))
+            self.assertIn("work/v020-integrated-eleven-gate-custody", workflow)
+
     def test_v020_wave10_structural_pins_t1_production_skeleton(self):
         # Wave 10 (T1): the production boot + in-vector SVC dispatch skeleton is
-        # an opt-in feature that elevates the proven advice-e2e SvcV3Bridge
+        # the canonical default feature that elevates the proven advice-e2e SvcV3Bridge
         # dispatch into the exception vector. It is a SKELETON, not full
         # production authority: the scope marker must keep full_authority=false
-        # and real_models=false, and the default/fixture profiles stay intact.
+        # and real_models=false; isolated fixture profiles opt out of defaults.
         manifest = source(ROOT / "kernel/Cargo.toml")
         self.assertIn('v020-production = ["smp-selftest", "dep:sha2", "sec-n-native"]', manifest)
         boot = source(ROOT / "kernel/src/arch/aarch64/boot.rs")
@@ -722,6 +753,36 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertNotIn("wfe", prod)
         verifier = source(ROOT / "tools/verify_v020_production.py")
         self.assertIn('"kernel/src/arch/aarch64/console.rs",', verifier)
+
+    def test_v020_live_pie_dispatch_checks_trapped_identity(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        prod = source(arm / "production.rs")
+        dispatch = prod.split("fn pie_dispatch(", 1)[1].split("fn advice_dispatch(", 1)[0]
+        self.assertIn("trapped_pie_cap(index, member)", dispatch)
+        self.assertLess(dispatch.index("trapped_pie_cap("), dispatch.index("match x8"))
+        observations = source(arm / "production/observations.rs")
+        snap = observations.split("pub(super) fn snapshot(", 1)[1].split(
+            "pub(super) fn audit(", 1
+        )[0]
+        self.assertIn("trapped_pie_cap(index, m)", snap)
+        self.assertIn("endpoint_cap: cap", snap)
+        audit = source(arm / "production/observations/audit_rpc.rs")
+        self.assertIn("table.admit_live(", audit)
+        self.assertIn("trapped_pie_cap(index, m)", audit)
+        self.assertNotIn("table.admit(", audit)
+
+    def test_v020_combined_mount_gates_both_native_services(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        prod = source(arm / "production.rs")
+        normalized = " ".join(prod.split())
+        self.assertIn("staging_outcome.services_ready() && let Some(view) = staging_outcome.file_read",
+                      normalized)
+        self.assertIn("staging_outcome.services_ready() && let Some(view) = staging_outcome.snapshot_catalog",
+                      normalized)
+        staging = source(arm / "production/media_staging.rs")
+        self.assertIn("out.chain_complete = run_chain(&mut disk, &mut out).is_some()", staging)
+        self.assertIn("authority::verified_pair_state(disk, checkpoint, config)", staging)
+        self.assertIn("volume::confirmed_receipt_query_digest(&mounted, &committed, &verified)", staging)
 
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")

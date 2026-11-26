@@ -1,5 +1,7 @@
 name: V0.20 protected control gate components
 on:
+  push:
+    branches: [work/v020-integrated-eleven-gate-custody]
   pull_request:
     branches: [CyxiaOS-V0.20]
     paths:
@@ -63,6 +65,7 @@ jobs:
           cargo test --locked --offline -p cyxia-kernel-core --lib boot_epoch_v1 2>&1 | tee artifacts/control-gates/boot-pair.log
           cargo test --locked --offline -p cyxia-kernel-core --lib epoch_redo_v0199 2>&1 | tee artifacts/control-gates/epoch-redo.log
           cargo test --locked --offline -p cyxia-kernel-core --lib file_receipt_store_v0199 2>&1 | tee artifacts/control-gates/receipt-retirement.log
+          cargo test --locked --offline -p cyxia-kernel-core --lib file_receipt_query_v4 2>&1 | tee artifacts/control-gates/receipt-query.log
           cargo test --locked --offline -p cyxia-prototype --lib snapshot::tests 2>&1 | tee artifacts/control-gates/snapshot-retention.log
           cargo test --locked --offline -p cyxia-kernel-core --lib file_mount_v1 2>&1 | tee artifacts/control-gates/file-mount-v1.log
           cargo test --locked --offline -p cyxia-kernel-core --lib frame_meta_v0199 2>&1 | tee artifacts/control-gates/frame-meta.log

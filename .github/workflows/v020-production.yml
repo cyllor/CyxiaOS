@@ -36,7 +36,7 @@
 name: V0.20 production-wiring skeleton (NOT G4 acceptance)
 on:
   push:
-    branches: [CyxiaOS-V0.20]
+    branches: [CyxiaOS-V0.20, work/v020-integrated-eleven-gate-custody]
     paths:
       - 'kernel/**'
       - 'crates/**'
@@ -46,6 +46,8 @@ on:
       - '.github/workflows/v020-production.yml'
       - 'tools/verify_v020_production.py'
       - 'tools/test_verify_v020_production.py'
+      - 'tools/qmp_stdio.py'
+      - 'tools/test_qmp_stdio.py'
       - 'tools/v020_production_*.py'
       - 'tools/v020_tls_peer.py'
       - 'tools/test_v020_tls_peer.py'
@@ -64,6 +66,8 @@ on:
       - '.github/workflows/v020-production.yml'
       - 'tools/verify_v020_production.py'
       - 'tools/test_verify_v020_production.py'
+      - 'tools/qmp_stdio.py'
+      - 'tools/test_qmp_stdio.py'
       - 'tools/v020_production_*.py'
       - 'tools/v020_tls_peer.py'
       - 'tools/test_v020_tls_peer.py'
@@ -119,7 +123,7 @@ jobs:
           if scope["feature_present"]:
               scope["build_status"] = "delegated-to-arm-build-job"
           if scope["verifier_present"]:
-              scope["run_status"] = "delegated-to-native-run-and-media-staging-run-jobs"
+              scope["run_status"] = "delegated-to-native-run-and-both-media-staging-jobs"
           with open("artifacts/v020-production/scope.json", "w", encoding="utf-8") as handle:
               json.dump(scope, handle, indent=2, sort_keys=True)
               handle.write("\n")
@@ -129,7 +133,7 @@ jobs:
         run: |
           set -euo pipefail
           openssl version
-          python3 -m unittest -v tools/test_verify_v020_production.py tools/test_v020_tls_peer.py tools/test_v020_signed_scratch_vector.py tools/test_v020_snapshot_envelopes.py 2>&1 | tee artifacts/v020-production/unit-tests.log
+          python3 -m unittest -v tools/test_verify_v020_production.py tools/test_v020_tls_peer.py tools/test_v020_signed_scratch_vector.py tools/test_v020_snapshot_envelopes.py tools/test_qmp_stdio.py 2>&1 | tee artifacts/v020-production/unit-tests.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -159,6 +163,7 @@ jobs:
           rustup override set 1.95.0
           cargo fetch --locked
           rustc -vV > artifacts/v020-production/toolchain.txt
+          cargo test --locked --offline -p cyxia-driver-virtio --lib 2>&1 | tee artifacts/v020-production/driver-virtio-tests.log
           # The kernel include_bytes!-embeds the fixture-identity local-echo guest:
           # build it first with the exact helper verify_v0199_sec_n.py uses.
           python3 -B -c 'import sys; sys.path.insert(0, "tools"); import verify_v0199_sec_n as s; s.build_guest()' 2>&1 | tee artifacts/v020-production/build-guest.log
@@ -257,6 +262,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/artifacts/v020-production-qemu"
           bin/qemu-system-aarch64 --version > version.txt
           sha256sum bin/qemu-system-aarch64 > binary.sha256
+          bash "$GITHUB_WORKSPACE/tools/v020_qemu_host_evidence.sh" bin/qemu-system-aarch64 host-evidence
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -369,6 +375,7 @@ jobs:
           (cd artifacts/v020-production-qemu; sha256sum -c binary.sha256)
           chmod +x artifacts/v020-production-qemu/bin/qemu-system-aarch64
           sha256sum -c artifacts/v020-production-qemu/patch.sha256
+          bash tools/v020_qemu_host_evidence.sh artifacts/v020-production-qemu/bin/qemu-system-aarch64 artifacts/v020-production/host-media-evidence
           # Staging lane: -m 1024M (prototype-memory) + fresh all-zero scratch
           # disk per run. Boot + fail-closed paths only; NOT persistence, NOT a
           # format golden vector, NOT signed config, NOT G4.
@@ -402,6 +409,50 @@ jobs:
             --output artifacts/v020-production/run-media-unified \
             --timeout 240 --media-reopen --signed-media --media-unified \
             --frame-pool --authenticated-net --live-control
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-production-media-core-staging-run-${{ github.sha }}
+          path: |
+            artifacts/v020-production/host-media-evidence/
+            artifacts/v020-production/run-media-staging/
+            artifacts/v020-production/run-media-reopen/
+            artifacts/v020-production/run-media-signed/
+            artifacts/v020-production/run-media-envelopes/
+            artifacts/v020-production/run-media-unified/
+          retention-days: 7
+  media-file-staging-run:
+    needs: [scope, arm-build, qemu-pinned]
+    if: needs.scope.outputs.verifier_present == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-production-build-${{ github.sha }}
+          path: artifacts/v020-production
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-production-qemu-${{ github.sha }}
+          path: artifacts/v020-production-qemu
+      - name: Verify provenance, then run independent file/snapshot staging lane (opt-in, golden_vector_pending)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
+          test "$(cat artifacts/v020-production/commit.txt)" = "$(git rev-parse HEAD)"
+          (cd artifacts/v020-production; sha256sum -c image.sha256)
+          (cd artifacts/v020-production-qemu; sha256sum -c binary.sha256)
+          chmod +x artifacts/v020-production-qemu/bin/qemu-system-aarch64
+          sha256sum -c artifacts/v020-production-qemu/patch.sha256
+          bash tools/v020_qemu_host_evidence.sh artifacts/v020-production-qemu/bin/qemu-system-aarch64 artifacts/v020-production/host-media-evidence
+          # Staging lane: -m 1024M (prototype-memory) + fresh all-zero scratch
+          # disk per run. Boot + fail-closed paths only; NOT persistence, NOT a
+          # format golden vector, NOT signed config, NOT G4.
+          export PATH="$PWD/artifacts/v020-production-qemu/bin:$PATH"
           python3 -B tools/verify_v020_production.py \
             --fresh-elf artifacts/v020-production/kernel-catalog.elf \
             --unsigned-fresh-elf artifacts/v020-production/kernel-unified-unsigned.elf \
@@ -436,13 +487,9 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: v020-production-media-staging-run-${{ github.sha }}
+          name: v020-production-media-files-staging-run-${{ github.sha }}
           path: |
-            artifacts/v020-production/run-media-staging/
-            artifacts/v020-production/run-media-reopen/
-            artifacts/v020-production/run-media-signed/
-            artifacts/v020-production/run-media-envelopes/
-            artifacts/v020-production/run-media-unified/
+            artifacts/v020-production/host-media-evidence/
             artifacts/v020-production/run-snapshot-catalog/
             artifacts/v020-production/run-file-read/
             artifacts/v020-production/run-snapshot-read/

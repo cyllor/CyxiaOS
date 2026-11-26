@@ -5,6 +5,7 @@
 //! service authority explicitly deny new side effects. The workflow uses
 //! the repository's pinned per-vCPU PMU patch, not stock QEMU accounting.
 use super::*;
+use cyxia_arch_aarch64::memory::scrub_retired_page;
 use cyxia_kernel_core::control_plane::{
     Error, Identity,
     pie_image_v0199::{
@@ -1191,9 +1192,9 @@ fn retire_root_checkpointed(index: usize, bank: usize, mut checkpoint: impl FnMu
     }
     let bytes = unsafe { core::slice::from_raw_parts_mut(b as *mut u8, IMAGE + ROLE_STACK_BYTES) };
     for page in bytes.chunks_exact_mut(PAGE) {
-        page.fill(0);
-        assert!(page.iter().all(|&v| v == 0));
-        checkpoint(5);
+        assert!(scrub_retired_page(page.try_into().unwrap(), || checkpoint(
+            5
+        )));
     }
 }
 fn restart_each(

@@ -4,6 +4,7 @@ Every page and serial stream here is SYNTHETIC (built in-test); these tests
 check the verifier's acceptance logic only and are not runtime evidence.
 """
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import io
 from pathlib import Path
 import struct
@@ -279,11 +280,20 @@ class W11Validation(unittest.TestCase):
         self.rejects("refusal counter", lines=lines)
 
     def test_rejects_nonzero_reserved_tail(self):
-        for at in (156, 159, 161, 177, 183, 195, 199, 211, 223, 231, 236, 252,
+        for at in (156, 159, 161, 177, 188, 189, 190, 191, 195, 199, 211, 223, 231, 236, 252,
                    261, 263, 268, 271, 281, 287, 296, 303, 304, 511):
             words = w11_words()
             words[at] = 1
             self.rejects("reserved", words=words)
+
+    def test_unsigned_lane_rejects_each_signed_receipt_word(self):
+        # Words 183..187 belong only to the signed receipt view.
+        # Reclassifying them must not weaken the inactive-lane rejection.
+        for at in range(183, 188):
+            with self.subTest(word=at):
+                words = w11_words()
+                words[at] = 1
+                self.rejects("unexpected signed scratch", words=words)
 
     def test_recovery_handoff_matches_the_parked_cpus(self):
         words = w11_words()
@@ -375,6 +385,22 @@ class W11Validation(unittest.TestCase):
         self.assertFalse(obs["tls_echo_turn_verified"], "page evidence alone cannot prove TLS")
         self.rejects("unexpected authenticated RNG", words=words, lines=lines)
 
+    def test_authenticated_rng_rejects_unsealed_or_inconsistent_delivery(self):
+        modes = v.Modes(authenticated_net=True)
+        for count, serial_count, failed in ((0, 96, 0), (96, 0, 0),
+                                            (96, 104, 0), (96, 96, 1),
+                                            (31, 31, 0)):
+            with self.subTest(count=count, serial_count=serial_count, failed=failed):
+                words = w11_words()
+                words[160] = count
+                words[176] = 1
+                lines = w11_lines() + [
+                    f"V020_W12_NET_ENTROPY a=8 b={serial_count} c={failed}",
+                    f"V020_W13_NET_RETIRE a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
+                ]
+                self.rejects("matching VirtIO RNG evidence", words=words,
+                             lines=lines, modes=modes)
+
     def test_authenticated_eof_keeps_the_admission_credit(self):
         words = w11_words()
         words[160] = 96
@@ -423,8 +449,9 @@ class W11Validation(unittest.TestCase):
 
     def test_signed_scratch_needs_the_selected_epoch_and_scope(self):
         words = w11_words(staging=True)
-        words[181:183] = [1, 1]
+        words[181:188] = [1, 1, 1, 2, 3, 4, 5]
         lines = w11_lines(staging=True) + [
+            "V020_W23_RECEIPT_VIEW a=1 b=7 c=2",
             "V020_W13_SIGNED_SCRATCH a=1 b=1 c=0",
             "V020_W13_MEDIA_SCOPE test_key=true format_golden=false signed_config=true",
         ]
@@ -432,10 +459,39 @@ class W11Validation(unittest.TestCase):
         obs = self.check(words=words, lines=lines, staging=True, modes=modes)
         self.assertTrue(obs["signed_test_config_verified"])
         self.assertEqual(obs["signed_config_bound_boot_epoch"], 1)
+        self.assertEqual(obs["signed_receipt_view_sha256"],
+                         b"".join(word.to_bytes(8, "little") for word in (2, 3, 4, 5)).hex())
+        self.rejects("signed receipt view", words=words,
+                     lines=[line for line in lines if not line.startswith("V020_W23_RECEIPT_VIEW")],
+                     staging=True, modes=modes)
+        words[183] = 2
+        self.rejects("signed receipt view", words=words, lines=lines, staging=True, modes=modes)
+        words[183] = 1
         self.rejects("unexpected signed scratch", words=words, lines=lines, staging=True)
         self.rejects("signed scratch test scope", words=words, lines=lines[:-1], staging=True, modes=modes)
         words[182] = 2
         self.rejects("signed scratch verdict and BootEpoch", words=words, lines=lines, staging=True, modes=modes)
+
+    def test_signed_receipt_view_host_disk_hash_rejects_modified_or_short_image(self):
+        # Synthetic sparse file, not evidence of a native device run.
+        with tempfile.TemporaryDirectory() as tmp:
+            disk = Path(tmp) / "receipt-view.raw"
+            offset = (media.DATA_START + 1) * media.BLOCK_BYTES
+            image = bytes([0x5a]) * (7 * media.BLOCK_BYTES)
+            expected = hashlib.sha256(image).hexdigest()
+            with disk.open("wb") as stream:
+                stream.seek(offset)
+                stream.write(image)
+            self.assertEqual(media.verify_signed_receipt_view(disk, expected), expected)
+            with disk.open("r+b") as stream:
+                stream.seek(offset + 6 * media.BLOCK_BYTES)
+                stream.write(b"\\x01")
+            with self.assertRaisesRegex(ValueError, "differs from actual scratch media"):
+                media.verify_signed_receipt_view(disk, expected)
+            with disk.open("r+b") as stream:
+                stream.truncate(offset + len(image) - 1)
+            with self.assertRaisesRegex(ValueError, "short signed receipt/index image"):
+                media.verify_signed_receipt_view(disk, expected)
 
     def test_frame_pool_requires_conservation_and_matching_uart(self):
         modes = v.Modes(frame_pool=True)
@@ -1027,6 +1083,64 @@ class Argv(unittest.TestCase):
                 self.assertFalse(fresh.media_reopen)
                 self.assertTrue(reopen.media_reopen)
                 self.assertEqual(unsigned, v.Modes(media_unified=True, live_control=True))
+
+
+
+class MediaWorkflowPartition(unittest.TestCase):
+    def test_independent_media_jobs_keep_all_ten_bounded_verifier_runs(self):
+        # Host wall-clock partition only: do not weaken guest timeouts,
+        # fail-closed checks, SHA provenance or the ten scratch scenarios.
+        workflow = (Path(__file__).resolve().parents[1] / ".github" /
+                    "workflows" / "v020-production.yml").read_text(encoding="utf-8")
+        core_marker = "\n  media-staging-run:\n"
+        files_marker = "\n  media-file-staging-run:\n"
+        self.assertEqual(workflow.count(core_marker), 1)
+        self.assertEqual(workflow.count(files_marker), 1)
+        core, files = workflow.split(core_marker, 1)[1].split(files_marker, 1)
+        groups = (
+            (core, "core", ("media-staging", "media-reopen", "media-signed",
+                            "media-envelopes", "media-unified")),
+            (files, "files", ("snapshot-catalog", "file-read", "snapshot-read",
+                              "file-sessions", "file-volatile-write")),
+        )
+        for job, suffix, names in groups:
+            with self.subTest(group=suffix):
+                self.assertIn("needs: [scope, arm-build, qemu-pinned]", job)
+                self.assertIn("if: needs.scope.outputs.verifier_present == 'true'", job)
+                self.assertIn("timeout-minutes: 20", job)
+                self.assertIn("set -euo pipefail", job)
+                self.assertIn('test "$(cat artifacts/v020-production/commit.txt)" = "$(git rev-parse HEAD)"', job)
+                for check in ("sha256sum -c image.sha256", "sha256sum -c binary.sha256",
+                              "sha256sum -c artifacts/v020-production-qemu/patch.sha256"):
+                    self.assertIn(check, job)
+                self.assertEqual(job.count("python3 -B tools/verify_v020_production.py"), 5)
+                self.assertEqual(job.count("--timeout 240"), 5)
+                self.assertNotIn("continue-on-error", job)
+                self.assertIn("if: always()", job)
+                self.assertIn("name: v020-production-media-" + suffix + "-staging-run-", job)
+                for name in names:
+                    self.assertEqual(job.count("--output artifacts/v020-production/run-" + name + " "), 1)
+                    self.assertIn("artifacts/v020-production/run-" + name + "/\n", job)
+
+
+    def test_qemu_host_evidence_is_retained_without_replacing_provenance(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github" /
+                    "workflows" / "v020-production.yml").read_text(encoding="utf-8")
+        build = workflow.split("\n  qemu-pinned:\n", 1)[1].split("\n  native-run:\n", 1)[0]
+        self.assertIn('bash "$GITHUB_WORKSPACE/tools/v020_qemu_host_evidence.sh" '
+                      'bin/qemu-system-aarch64 host-evidence', build)
+        self.assertLess(build.index("sha256sum bin/qemu-system-aarch64 > binary.sha256"),
+                        build.index("v020_qemu_host_evidence.sh"))
+        core, files = workflow.split("\n  media-staging-run:\n", 1)[1].split(
+            "\n  media-file-staging-run:\n", 1)
+        for job in (core, files):
+            capture = "bash tools/v020_qemu_host_evidence.sh "
+            self.assertEqual(job.count(capture), 1)
+            self.assertLess(job.index("sha256sum -c artifacts/v020-production-qemu/patch.sha256"),
+                            job.index(capture))
+            self.assertLess(job.index(capture), job.index("python3 -B tools/verify_v020_production.py"))
+            self.assertIn("artifacts/v020-production/host-media-evidence/\n", job)
+            self.assertIn("if: always()", job)
 
 
 if __name__ == "__main__":

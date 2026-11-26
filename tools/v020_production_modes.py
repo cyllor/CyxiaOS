@@ -138,7 +138,7 @@ def control_observations(words: tuple, lines: list, enabled: bool) -> dict:
 
 def validate_extensions(words: tuple, lines: list, modes: Modes) -> dict:
     require(words[161] == 0 and not any(words[168:W12_END]), "nonzero reserved evidence words")
-    require(words[177] == 0 and not any(words[183:W13_END]), "nonzero reserved evidence words")
+    require(words[177] == 0 and not any(words[188:W13_END]), "nonzero reserved evidence words")
     require(words[195] == 0 and not any(words[199:W14_END]), "nonzero reserved evidence words")
     require(not any(words[211:W15_END]), "nonzero reserved evidence words")
     require(words[231] == 0 and not any(words[236:W16_END]), "nonzero reserved evidence words")
@@ -182,15 +182,24 @@ def audit_session(words: tuple, lines: list, enabled: bool) -> dict:
 def signed_media_authority(words: tuple, lines: list, modes: Modes) -> dict:
     verified, epoch = words[181:183]
     marker = rows(lines, "V020_W13_SIGNED_SCRATCH")
+    receipt_epoch = words[183]
+    receipt_words = words[184:188]
+    receipt_marker = rows(lines, "V020_W23_RECEIPT_VIEW")
     if not modes.signed_media:
-        require(verified == epoch == 0 and not marker, "unexpected signed scratch authority")
+        require(verified == epoch == receipt_epoch == 0 and not any(receipt_words)
+                and not marker and not receipt_marker, "unexpected signed scratch authority")
         return {}
     require(verified == 1 and epoch == words[148]
             and marker == [(1, epoch, words[163])],
             "signed scratch verdict and BootEpoch must agree with mounted evidence")
     require(lines.count("V020_W13_MEDIA_SCOPE test_key=true format_golden=false signed_config=true") == 1,
             "expected signed scratch test scope")
-    return {"signed_test_config_verified": True, "signed_config_bound_boot_epoch": epoch}
+    require(receipt_epoch == epoch and any(receipt_words)
+            and receipt_marker == [(epoch, 7, receipt_words[0])],
+            "signed receipt view must bind the confirmed BootEpoch and all seven blocks")
+    digest = b"".join(word.to_bytes(8, "little") for word in receipt_words).hex()
+    return {"signed_test_config_verified": True, "signed_config_bound_boot_epoch": epoch,
+            "signed_receipt_view_sha256": digest}
 
 
 def frame_pool_evidence(words: tuple, lines: list, enabled: bool) -> dict:

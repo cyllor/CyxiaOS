@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import base64
 from dataclasses import replace
+from functools import partial
 import json
 from pathlib import Path
 import shutil
@@ -50,8 +51,11 @@ import time
 
 import verify_smp
 from run_qemu import Qmp
+from qmp_stdio import PipeTransport
 from transport import FrameDecoder
-from v020_production_media import run_media_reopen, verify_signed_disk
+from v020_production_media import (
+    run_media_reopen, verify_signed_disk, verify_signed_receipt_view,
+)
 from v020_production_modes import (
     Modes, QEMU_GATEWAY_IPV4, W21_END, authenticated_echo, file_read_evidence, file_sessions_evidence,
     file_volatile_write_evidence, rows as w11_rows, signed_media_authority, snapshot_catalog_evidence,
@@ -113,6 +117,10 @@ PRODUCTION_SOURCES = [
     "crates/kernel-core/src/security/file_format_v1.rs",
     "crates/kernel-core/src/security/file_media_unified_v1.rs",
     "crates/kernel-core/src/security/file_mount_v1.rs",
+    "crates/kernel-core/src/security/file_receipt_query_v4.rs",
+    "crates/kernel-core/src/security/file_receipt_store_v0199.rs",
+    "crates/kernel-core/src/security/file_index_v0199.rs",
+    "crates/kernel-core/src/security/file_media_v0199.rs",
     "crates/kernel-core/src/security/file_structure_v1.rs",
     "crates/kernel-core/src/security/file_service_v4.rs",
     "crates/kernel-core/src/security/file_read_v4.rs",
@@ -142,6 +150,7 @@ PRODUCTION_SOURCES = [
     "user/local-echo/src/lib.rs",
     "user/local-echo/src/runtime.rs",
     "tools/verify_v020_production.py",
+    "tools/qmp_stdio.py",
     "tools/v020_production_media.py",
     "tools/v020_production_modes.py",
     "tools/v020_production_qemu.py",
@@ -587,7 +596,8 @@ def source_manifest() -> dict:
 
 def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
         nic: bool = True, connect_peer: bool = True, *, modes: Modes = Modes(),
-        rng_present: bool = True, boot_disk: Path | None = None) -> dict:
+        rng_present: bool = True, boot_disk: Path | None = None,
+        qmp_stdio: bool = False) -> dict:
     require = verify_smp.require
     require(1 <= timeout <= 300, "invalid execution budget")
     require(not staging or (nic and connect_peer), "network negative controls are G-A only")
@@ -654,14 +664,17 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
             port = free_port()
             path = str(Path(td) / "q.sock")
             args = qemu_args(binary, path, elf, port, scratch=scratch, nic=nic,
-                            rng=modes.authenticated_net and rng_present)
+                            rng=modes.authenticated_net and rng_present, qmp_stdio=qmp_stdio)
             report["argv"] = args
-            proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=err)
+            report["qmp_transport"] = "stdio" if qmp_stdio else "unix"
+            proc = subprocess.Popen(args, stdin=subprocess.PIPE if qmp_stdio else None,
+                                    stdout=subprocess.PIPE if qmp_stdio else subprocess.DEVNULL,
+                                    stderr=err, bufsize=0)
             if nic and connect_peer:
                 peer = HostPeer(port, modes.authenticated_net, modes.orderly_close)
                 peer.start()
             end = started + timeout
-            sock = connect_qmp(proc, path, end)
+            sock = PipeTransport(proc) if qmp_stdio else connect_qmp(proc, path, end)
             qmp = Qmp(sock)
             require("QMP" in qmp.receive(end), "invalid QMP greeting")
             qmp.execute("qmp_capabilities")
@@ -700,6 +713,8 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                     if modes.signed_media:
                         epoch = report["observations"]["signed_config_bound_boot_epoch"]
                         report["signed_scratch_policy_sha256"] = verify_signed_disk(scratch, epoch)
+                        report["signed_receipt_view_disk_sha256"] = verify_signed_receipt_view(
+                            scratch, report["observations"]["signed_receipt_view_sha256"])
                         report["signed_config"] = True
                     if modes.snapshot_envelopes:
                         disk_evidence = verify_envelopes(
@@ -788,6 +803,7 @@ def main() -> int:
     parser.add_argument("--elf", type=Path, help="kernel ELF; omitted -> build guest + kernel first")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--qmp-stdio", action="store_true", help="use owned pipes instead of a Unix socket")
     media = parser.add_mutually_exclusive_group()
     media.add_argument("--media-staging", action="store_true",
                        help="staging boot with an all-zero scratch disk")
@@ -859,6 +875,7 @@ def main() -> int:
         parser.error("prebuilt signed reopen also requires --unsigned-fresh-elf")
     if (args.abrupt_peer or args.no_rng) and not args.authenticated_net:
         parser.error("--abrupt-peer and --no-rng require --authenticated-net")
+    runner = partial(run, qmp_stdio=True) if args.qmp_stdio else run
     try:
         if args.media_reopen:
             with tempfile.TemporaryDirectory(prefix="cyx-v020-images-") as temp:
@@ -871,10 +888,10 @@ def main() -> int:
                         unsigned = Path(temp) / "unsigned.elf"
                         shutil.copyfile(build(True, modes.unsigned_fixture()), unsigned)
                 elf = args.elf if args.elf is not None else build(True, modes)
-                result = run_media_reopen(run, fresh, elf, args.output, args.timeout, modes, unsigned)
+                result = run_media_reopen(runner, fresh, elf, args.output, args.timeout, modes, unsigned)
         else:
             elf = args.elf if args.elf is not None else build(args.media_staging, modes)
-            result = run(elf, args.output, args.timeout, staging=args.media_staging,
+            result = runner(elf, args.output, args.timeout, staging=args.media_staging,
                          nic=not args.no_nic, connect_peer=not args.no_peer, modes=modes,
                          rng_present=not args.no_rng)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:

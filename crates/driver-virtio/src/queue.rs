@@ -296,6 +296,22 @@ impl BatchQueue {
         isolated: bool,
         p: &impl Platform,
     ) -> Result<Token, Error> {
+        self.enqueue_with_response_tail(t, request, (writable, None), synchronous, isolated, p)
+    }
+
+    /// Optionally initialize the final device-writable byte while the slot
+    /// is still private. Block status must not inherit a successful zero
+    /// from initial allocation or the preceding release.
+    pub(crate) fn enqueue_with_response_tail(
+        &mut self,
+        t: &mut Transport,
+        request: &[u8],
+        response: (usize, Option<u8>),
+        synchronous: bool,
+        isolated: bool,
+        p: &impl Platform,
+    ) -> Result<Token, Error> {
+        let (writable, tail) = response;
         if self.poisoned {
             return Err(Error::Device);
         }
@@ -303,7 +319,11 @@ impl BatchQueue {
             self.poison(t, p);
             return Err(Error::Device);
         }
-        if request.len() > 4096 || writable > 4096 || (request.is_empty() && writable == 0) {
+        if request.len() > 4096
+            || writable > 4096
+            || (request.is_empty() && writable == 0)
+            || (tail.is_some() && writable == 0)
+        {
             return Err(Error::Address);
         }
         // A stale used head must be rejected before its descriptor can become
@@ -323,6 +343,9 @@ impl BatchQueue {
         // A later wider descriptor exposes only the still-zero initial tail,
         // so rewriting the writable buffer here is redundant and would put a
         // second full DMA-range clear in the RX completion segment.
+        if let Some(value) = tail {
+            m.response[at].put8(writable - 1, value);
+        }
         let head = at * 2;
         let desc = head * 16;
         let descriptors = u16::from(!request.is_empty()) + u16::from(writable != 0);
