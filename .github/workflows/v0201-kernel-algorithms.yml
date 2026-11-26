@@ -11,7 +11,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: v0201-kernel-algorithms-${{ github.ref }}
+  group: v0201-kernel-algorithms-${{ github.sha }}
   cancel-in-progress: true
 jobs:
   modules:
@@ -33,6 +33,12 @@ jobs:
             seam: 'd02_owner_v0199::tests'
           - package: cyxia-kernel-core
             seam: 'd07_owner_v0199::tests'
+          - package: cyxia-kernel-core
+            seam: 'ipc_receive_v3::tests'
+          - package: cyxia-kernel-core
+            seam: 'file_structure_v1::tests'
+          - package: cyxia-kernel-core
+            seam: 'd15_owner_v0199::tests'
           - package: cyxia-control-model
             seam: 'native_v0199'
           - package: cyxia-prototype
@@ -48,6 +54,17 @@ jobs:
           PACKAGE: ${{ matrix.package }}
           SEAM: ${{ matrix.seam }}
         run: cargo +1.95.0 test --locked -p "$PACKAGE" "$SEAM"
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt
+      - name: Check format
+        run: cargo +1.95.0 fmt --all --check
   integration:
     needs: modules
     runs-on: ubuntu-24.04
@@ -57,9 +74,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned Rust
-        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt
-      - name: Check format
-        run: cargo +1.95.0 fmt --all --check
+        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update
       - name: Kernel-core suite
         run: cargo +1.95.0 test --locked -p cyxia-kernel-core
       - name: Default workspace regression

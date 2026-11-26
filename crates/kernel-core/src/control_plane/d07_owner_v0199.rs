@@ -201,27 +201,22 @@ impl Owner {
         if !id.valid() || class != TimerClass::Soft {
             return Err(Error::Denied);
         }
-        // Retain a bounded generation tombstone. Unrelated object IDs
-        // may not evict it and thereby resurrect stale timer tickets.
-        let old = self
+        // Slots form an occupied prefix: unregister keeps a generation
+        // tombstone, and a new ID always occupies the first empty slot.
+        // The first empty slot therefore also proves the ID is absent.
+        let i = self
             .entries
             .iter()
-            .position(|v| v.is_some_and(|e| e.timer.id == id.id));
-        let i = if let Some(i) = old {
-            let e = self.entries[i].unwrap();
+            .position(|v| v.is_none_or(|e| e.timer.id == id.id))
+            .ok_or(Error::Exhausted)?;
+        if let Some(e) = self.entries[i] {
             if e.live || e.active.is_some() || e.pending.is_some() {
                 return Err(Error::Busy);
             }
             if id.generation <= e.timer.generation {
                 return Err(Error::Stale);
             }
-            i
-        } else {
-            self.entries
-                .iter()
-                .position(Option::is_none)
-                .ok_or(Error::Exhausted)?
-        };
+        }
         verify()?;
         self.entries[i] = Some(Entry {
             timer: id,
@@ -263,10 +258,10 @@ impl Owner {
             .filter(|e| e.live && e.class == TimerClass::Soft)
         {
             n += 1;
-            let us = e.slack_ns / 1000;
-            slack = Some(slack.map_or(us, |old: u64| old.min(us)));
+            slack = Some(slack.map_or(e.slack_ns, |old: u64| old.min(e.slack_ns)));
         }
-        Ok([Some(n), None, slack, None])
+        // Integer division by a positive constant is monotone.
+        Ok([Some(n), None, slack.map(|ns| ns / 1000), None])
     }
     pub fn legal(&self, us: u16, now: u64) -> bool {
         if self.ready(now).is_err() || self.work.is_some() || !ActionV2::SoftCoalesce(us).valid() {
@@ -638,6 +633,58 @@ mod tests {
             payload: &[200, 0],
         }
     }
+    #[test]
+    fn full_timer_registry_preserves_tombstones_and_minimum_slack() {
+        let mut o = owner();
+        for id in 1000..1000 + CAPACITY as u64 - 1 {
+            o.register(
+                Identity { id, generation: 1 },
+                TimerClass::Soft,
+                if id == 1000 { 1999 } else { 3001 },
+                || Ok(()),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            o.observe(1),
+            Ok([Some(CAPACITY as u64), None, Some(1), None])
+        );
+        o.unregister(SOFT, || Ok(())).unwrap();
+        assert_eq!(
+            o.register(SOFT, TimerClass::Soft, 0, || panic!()),
+            Err(Error::Stale)
+        );
+        assert_eq!(
+            o.register(
+                Identity {
+                    id: 9999,
+                    generation: 1,
+                },
+                TimerClass::Soft,
+                0,
+                || panic!()
+            ),
+            Err(Error::Exhausted)
+        );
+        let next = Identity {
+            generation: 2,
+            ..SOFT
+        };
+        assert_eq!(
+            o.register(next, TimerClass::Soft, 999, || Err(Error::NotReady)),
+            Err(Error::NotReady)
+        );
+        assert_eq!(
+            o.observe(1),
+            Ok([Some(CAPACITY as u64 - 1), None, Some(1), None])
+        );
+        o.register(next, TimerClass::Soft, 999, || Ok(())).unwrap();
+        assert_eq!(
+            o.observe(1),
+            Ok([Some(CAPACITY as u64), None, Some(0), None])
+        );
+    }
+
     #[test]
     fn exact_grid_slack_and_hard_deadlines() {
         assert_eq!(
