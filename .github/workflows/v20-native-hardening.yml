@@ -104,7 +104,7 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts/v020-arm
           rustc -vV > artifacts/v020-arm/toolchain.txt
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest 2>&1 | tee artifacts/v020-arm/build.log
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features smp-selftest 2>&1 | tee artifacts/v020-arm/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-arm/kernel.elf
           readelf -h artifacts/v020-arm/kernel.elf > artifacts/v020-arm/elf.txt
           (cd artifacts/v020-arm && sha256sum kernel.elf > elf.sha256)

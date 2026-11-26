@@ -1,10 +1,11 @@
 use super::*;
 
-#[cfg(not(feature = "smp-selftest"))]
+// Retired legacy-desktop expected-fault probe state; offline reference only.
+#[cfg(all(feature = "legacy-desktop", not(feature = "smp-selftest")))]
 static EXPECTED_PC: AtomicU64 = AtomicU64::new(0);
-#[cfg(not(feature = "smp-selftest"))]
+#[cfg(all(feature = "legacy-desktop", not(feature = "smp-selftest")))]
 static EXPECTED_FAR: AtomicU64 = AtomicU64::new(0);
-#[cfg(not(feature = "smp-selftest"))]
+#[cfg(all(feature = "legacy-desktop", not(feature = "smp-selftest")))]
 pub(super) static FAULT_COUNT: AtomicU64 = AtomicU64::new(0);
 #[repr(C)]
 pub struct ExceptionFrame {
@@ -17,37 +18,48 @@ pub struct ExceptionFrame {
 }
 #[unsafe(no_mangle)]
 extern "C" fn exception_dispatch(f: &mut ExceptionFrame, kind: u64) {
-    // V0.20 production skeleton: EL0 sync ABI-v3 SVCs (0x40/0x41/0x50) are
-    // dispatched IN-VECTOR by the production dispatcher and return straight to
-    // EL0; all other exceptions fall through to the proven smp capture path.
-    #[cfg(feature = "v020-production")]
+    // V0.20 canonical dispatcher: ONE SMP/production entry for every
+    // smp-selftest profile. Under the default v020-production profile the
+    // production dispatcher services EL0 sync ABI-v3 SVCs (0x40/0x41/0x50)
+    // IN-VECTOR and returns straight to EL0; all other exceptions fall through
+    // to the proven smp capture path. production::run initializes the control
+    // plane before the first EL0 turn, and svc_dispatch additionally
+    // fail-closes (returns None -> smp path) whenever no registered caller is
+    // present, so an uninitialized state can never dispatch a production SVC.
+    #[cfg(feature = "smp-selftest")]
     {
-        // A lower-EL AArch64 synchronous fault, including a permission abort,
-        // enters its CPU's summary. SVCs are requests; ESR and FAR come from
-        // the EL1 vector. FAR contributes only for instruction and data aborts.
-        let ec = f.esr >> 26;
-        if kind == 8 && ec != 0x15 {
-            let far = if matches!(ec, 0x20 | 0x24) && f.esr & (1 << 10) == 0 {
-                f.far
-            } else {
-                0
-            };
-            smp::production::recovery::record_fault(
-                cyxia_arch_aarch64::cpu::slot() as u32,
-                f.esr,
-                far,
-            );
+        #[cfg(feature = "v020-production")]
+        {
+            // A lower-EL AArch64 synchronous fault, including a permission abort,
+            // enters its CPU's summary. SVCs are requests; ESR and FAR come from
+            // the EL1 vector. FAR contributes only for instruction and data aborts.
+            let ec = f.esr >> 26;
+            if kind == 8 && ec != 0x15 {
+                let far = if matches!(ec, 0x20 | 0x24) && f.esr & (1 << 10) == 0 {
+                    f.far
+                } else {
+                    0
+                };
+                smp::production::recovery::record_fault(
+                    cyxia_arch_aarch64::cpu::slot() as u32,
+                    f.esr,
+                    far,
+                );
+            }
+            smp::production::exception(f, kind);
         }
-        smp::production::exception(f, kind);
-    }
-    #[cfg(all(feature = "smp-selftest", not(feature = "v020-production")))]
-    {
+        // Isolated --no-default-features smp-selftest fixture: no production
+        // control plane is compiled there, so the proven smp capture path (the
+        // production dispatcher's own fall-through target) is the whole entry.
+        #[cfg(not(feature = "v020-production"))]
         smp::exception(f, kind);
     }
-    #[cfg(not(feature = "smp-selftest"))]
+    // Retired legacy CPU0 desktop path: explicit legacy-desktop feature only,
+    // never the default V0.20 aarch64 production profile.
+    #[cfg(all(feature = "legacy-desktop", not(feature = "smp-selftest")))]
     exception_dispatch_primary(f, kind);
 }
-#[cfg(not(feature = "smp-selftest"))]
+#[cfg(all(feature = "legacy-desktop", not(feature = "smp-selftest")))]
 fn exception_dispatch_primary(f: &mut ExceptionFrame, kind: u64) {
     #[cfg(not(feature = "selftest"))]
     if kind == 8 || kind == 9 {
@@ -103,7 +115,11 @@ pub(crate) fn hex(v: u64) {
     }
     log(&b);
 }
-#[cfg(all(feature = "selftest", not(feature = "smp-selftest")))]
+#[cfg(all(
+    feature = "selftest",
+    feature = "legacy-desktop",
+    not(feature = "smp-selftest")
+))]
 pub(super) fn fault_probe(addr: u64, write: bool) {
     EXPECTED_FAR.store(addr, Ordering::Relaxed);
     EXPECTED_PC.store(

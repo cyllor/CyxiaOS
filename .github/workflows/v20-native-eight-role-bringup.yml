@@ -56,7 +56,7 @@ jobs:
           cargo fetch --locked
           feature=v0199-control-bringup
           if [ '${{ matrix.ram }}' = 1024 ]; then feature=v0199-control-bringup-1g; fi
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features "$feature" 2>&1 | tee artifacts/eight-native/build.log
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features "$feature" 2>&1 | tee artifacts/eight-native/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/eight-native/kernel.elf
           catalog=$(find target/aarch64-unknown-none-softfloat/debug/build -name v0199-role-catalog.rs)
           test "$(printf '%s\n' "$catalog" | wc -l)" = 1
@@ -196,7 +196,7 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
           rustup override set 1.95.0
           cargo fetch --locked
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v0199-epoch-disk-selftest 2>&1 | tee artifacts/epoch-disk/build.log
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features v0199-epoch-disk-selftest 2>&1 | tee artifacts/epoch-disk/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/epoch-disk/kernel.elf
           catalog=$(find target/aarch64-unknown-none-softfloat/debug/build -name v0199-role-catalog.rs)
           test "$(printf '%s\n' "$catalog" | wc -l)" = 1

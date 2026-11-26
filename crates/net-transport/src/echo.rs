@@ -44,6 +44,9 @@ impl<'a> Request<'a> {
 /// contain a prefix of a frame or several complete frames; neither is an
 /// invalid protocol message by itself. The exact-only public parse_request
 /// remains strict and is called on precisely the returned prefix.
+// Consumed only by the tls-gated admission ledger; dead in the smoltcp-only
+// EL1 (sec-n-native) closure, which never compiles admission.
+#[allow(dead_code)]
 pub(crate) fn next_frame_len(input: &[u8]) -> Result<Option<usize>, Error> {
     if input.len() < HEADER_BYTES {
         return Ok(None);

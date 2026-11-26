@@ -1,6 +1,18 @@
-#[cfg(all(feature = "selftest", not(feature = "smp-selftest")))]
+#[cfg(all(
+    feature = "selftest",
+    feature = "legacy-desktop",
+    not(feature = "smp-selftest")
+))]
 use super::exceptions::{FAULT_COUNT, fault_probe};
 use super::*;
+
+// The V0.20 aarch64 boot is either an SMP/production profile (the default
+// v020-production implies smp-selftest) or the explicitly retired legacy-desktop
+// reference path. A build with neither has no boot mechanism.
+#[cfg(all(not(feature = "smp-selftest"), not(feature = "legacy-desktop")))]
+compile_error!(
+    "V0.20 aarch64 boot requires the default v020-production profile, an explicit smp-selftest fixture, or the retired legacy-desktop feature"
+);
 
 #[unsafe(no_mangle)]
 extern "C" fn boot_entry() -> ! {
@@ -44,17 +56,20 @@ extern "C" fn boot_entry() -> ! {
     unsafe {
         timer::init_cpu_accounting();
     }
-    // V0.20 production skeleton: production::run(info) performs the same proven
+    // V0.20 canonical boot: production::run(info) performs the same proven
     // SMP bring-up and then initializes the production control plane with
-    // in-vector SVC dispatch. Every other smp-selftest profile keeps smp::run.
+    // in-vector SVC dispatch. This is the DEFAULT profile (v020-production is
+    // a default feature and implies smp-selftest). The isolated
+    // --no-default-features smp-selftest fixture keeps smp::run; the retired
+    // legacy desktop requires the explicit legacy-desktop feature.
     #[cfg(all(feature = "smp-selftest", feature = "v020-production"))]
     smp::production::run(&info);
     #[cfg(all(feature = "smp-selftest", not(feature = "v020-production")))]
     smp::run(&info);
-    #[cfg(not(feature = "smp-selftest"))]
+    #[cfg(all(feature = "legacy-desktop", not(feature = "smp-selftest")))]
     primary_services(info)
 }
-#[cfg(not(feature = "smp-selftest"))]
+#[cfg(all(feature = "legacy-desktop", not(feature = "smp-selftest")))]
 fn primary_services(info: BootInfo) -> ! {
     #[cfg(feature = "selftest")]
     {

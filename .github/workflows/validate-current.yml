@@ -29,7 +29,7 @@ jobs:
       - name: Check formatting and native clippy gate
         run: |
           cargo fmt --all -- --check
-          cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest -- -D warnings
+          cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features smp-selftest -- -D warnings
       - name: Run Rust workspace tests
         run: cargo test --locked --offline --workspace --exclude cyxia-kernel
       - name: Prepare pinned host test inputs

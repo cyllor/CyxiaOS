@@ -300,6 +300,9 @@ pub(super) fn publish() {
         fatal(FATAL_TAKEOVER);
     }
     let mut events = 0u64;
+    // i indexes a static mut MaybeUninit array via addr_of_mut!; an iterator
+    // would obscure the raw-pointer slot arithmetic the SAFETY note relies on.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..ACCUMULATOR_COUNT {
         // SAFETY: CPU0 owns slot 0 and checked that all secondary slots have
         // completed takeover. This seal cannot run concurrently with CPU0 EL0.

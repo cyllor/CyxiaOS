@@ -7,7 +7,10 @@ pub fn build() {
             runtime
                 || !key.starts_with("CARGO_FEATURE_")
                 || key == "CARGO_FEATURE_SELFTEST"
-                || key == "CARGO_FEATURE_SMP_SELFTEST",
+                || key == "CARGO_FEATURE_SMP_SELFTEST"
+                // Inert aarch64 retirement marker carried by the selftest
+                // feature chain (kernel/Cargo.toml); no x86 code reads it.
+                || key == "CARGO_FEATURE_LEGACY_DESKTOP",
             "x86-64 currently supports only the base/selftest/smp-selftest platform profiles: {key}"
         );
     }

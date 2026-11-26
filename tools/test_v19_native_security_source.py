@@ -519,12 +519,43 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("python3 -B tools/verify_v020_production.py", workflow)
         self.assertIn("--elf artifacts/v020-production/kernel.elf", workflow)
 
+    def test_v020_default_production_keeps_fixture_builds_isolated(self):
+        # Default production must not silently change a historical fixture.
+        manifest = source(ROOT / "kernel/Cargo.toml")
+        self.assertIn('default = ["v0199-local-native", "v020-production"]', manifest)
+        cases = (
+            ("ai-control-native", 3),
+            ("smp-native", 4),
+            ("v20-cpu0-role-native", 1),
+            ("v20-cpu0-role-replay", 1),
+            ("v20-native-eight-role-bringup", 2),
+            ("v20-native-hardening", 1),
+            ("v20-native-mechanism", 2),
+            ("validate-current", 1),
+        )
+        for name, expected in cases:
+            with self.subTest(workflow=name):
+                workflow = source(ROOT / ".github/workflows" / (name + ".yml"))
+                commands = [
+                    line for line in workflow.splitlines()
+                    if ("cargo build " in line or "cargo clippy " in line)
+                    and "--target aarch64-unknown-none-softfloat" in line
+                ]
+                self.assertEqual(len(commands), expected)
+                for command in commands:
+                    self.assertIn("--no-default-features", command)
+                    self.assertNotIn("--features v020-production", command)
+        for name in ("v20-native-eight-role-bringup", "v20-native-hardening",
+                     "v20-native-mechanism"):
+            workflow = source(ROOT / ".github/workflows" / (name + ".yml"))
+            self.assertIn("work/v020-integrated-eleven-gate-custody", workflow)
+
     def test_v020_wave10_structural_pins_t1_production_skeleton(self):
         # Wave 10 (T1): the production boot + in-vector SVC dispatch skeleton is
-        # an opt-in feature that elevates the proven advice-e2e SvcV3Bridge
+        # the canonical default feature that elevates the proven advice-e2e SvcV3Bridge
         # dispatch into the exception vector. It is a SKELETON, not full
         # production authority: the scope marker must keep full_authority=false
-        # and real_models=false, and the default/fixture profiles stay intact.
+        # and real_models=false; isolated fixture profiles opt out of defaults.
         manifest = source(ROOT / "kernel/Cargo.toml")
         self.assertIn('v020-production = ["smp-selftest", "dep:sha2", "sec-n-native"]', manifest)
         boot = source(ROOT / "kernel/src/arch/aarch64/boot.rs")

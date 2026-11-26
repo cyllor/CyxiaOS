@@ -103,7 +103,7 @@ jobs:
           # build emits compile_error by design; the fixture replays only under
           # the explicit legacy-coreset umbrella (design §2 fixes control EL0 to
           # CPU0). This lane is a retired-history replay, not a live topology.
-          cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,ai-control-selftest,legacy-coreset -- -D warnings
+          cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features smp-selftest,ai-control-selftest,legacy-coreset -- -D warnings
           cargo test --locked --offline -p cyxia-control-model -p cyxia-kernel-core
           python3 -B -m unittest discover -s tests/host -p test_verify_ai_control.py -v
       - name: Run retired model-driven native profile (legacy-coreset replay)
@@ -111,7 +111,7 @@ jobs:
           for profile in debug release; do
             flags=()
             if [ "$profile" = release ]; then flags+=(--release); fi
-            cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,ai-control-selftest,legacy-coreset --target-dir "$RUNNER_TEMP/ai-target" "${flags[@]}"
+            cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features smp-selftest,ai-control-selftest,legacy-coreset --target-dir "$RUNNER_TEMP/ai-target" "${flags[@]}"
             for iteration in 1 2 3; do
               python3 tools/verify_ai_control.py --elf "$RUNNER_TEMP/ai-target/aarch64-unknown-none-softfloat/$profile/cyxia-kernel" --output "$RUNNER_TEMP/native-evidence/$profile-$iteration"
             done
@@ -119,7 +119,7 @@ jobs:
       - name: Run separately compiled malicious controllers (legacy-coreset replay)
         run: |
           for fault in hang bad-mask snapshot-write model-write; do
-            CYXIA_CONTROL_FAULT="$fault" cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,ai-control-selftest,legacy-coreset --target-dir "$RUNNER_TEMP/ai-fault-$fault"
+            CYXIA_CONTROL_FAULT="$fault" cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features smp-selftest,ai-control-selftest,legacy-coreset --target-dir "$RUNNER_TEMP/ai-fault-$fault"
             python3 tools/verify_ai_control.py --fault "$fault" --elf "$RUNNER_TEMP/ai-fault-$fault/aarch64-unknown-none-softfloat/debug/cyxia-kernel" --output "$RUNNER_TEMP/native-evidence/fault-$fault"
           done
       - name: Retain raw evidence even on failure
