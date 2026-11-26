@@ -49,6 +49,9 @@ impl Turn {
     pub fn reserved_ns(self) -> u64 {
         self.reserved_ns
     }
+    pub fn accounting_scope(self) -> (Class, Option<(usize, Identity)>, u16) {
+        (self.class, self.role_index.zip(self.actor), self.domain)
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Settlement {

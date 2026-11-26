@@ -11,8 +11,11 @@ on:
       - 'user/v0199-control/**'
       - 'kernel/build/v0199_roles.rs'
       - 'kernel/src/arch/aarch64/v0199_control_bringup.rs'
+      - 'kernel/src/arch/aarch64/v0199_control_bringup/**'
       - 'crates/kernel-core/src/control_plane/role_budget_v0199.rs'
       - 'tools/verify_v0199_eight_packages.py'
+      - 'tools/v0199_budget_trace.py'
+      - 'tools/test_v0199_budget_trace.py'
       - 'tools/verify_smp.py'
       - 'tools/qmp_stdio.py'
       - 'tools/test_qmp_stdio.py'
@@ -176,6 +179,7 @@ jobs:
           cargo fetch --locked
           mkdir -p artifacts/epoch-components
           python3 -B -m unittest -v tools.test_qmp_stdio 2>&1 | tee artifacts/epoch-components/qmp-stdio.log
+          PYTHONPATH=tools python3 -B -m unittest -v tools.test_v0199_budget_trace 2>&1 | tee artifacts/epoch-components/cpu0-budget-trace.log
           cargo test --locked --offline -p cyxia-arch-aarch64 2>&1 | tee artifacts/epoch-components/arch-memory.log
           cargo test --locked --offline -p cyxia-control-model native_v0199 2>&1 | tee artifacts/epoch-components/model.log
           cargo test --locked --offline -p cyxia-kernel-core epoch_redo_v0199 2>&1 | tee artifacts/epoch-components/redo.log

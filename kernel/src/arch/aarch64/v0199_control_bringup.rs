@@ -23,6 +23,9 @@ use cyxia_kernel_core::control_plane::{
 use cyxia_kernel_core::security::syscall::{StableCopy, Syscall};
 use cyxia_kernel_core::security::syscall_v3::decode_aarch64_svc_v3;
 
+#[path = "v0199_control_bringup/budget_trace.rs"]
+mod budget_trace;
+
 const PAGE: usize = 4096;
 const IMAGE: usize = 64 * 1024;
 const COPY: usize = 128 * 1024;
@@ -212,6 +215,25 @@ fn ticks_for(ns: u64) -> u64 {
         .expect("timer ticks")
         .max(1)
 }
+
+fn observe_budget_clock() -> budget_trace::Sample {
+    let tick_ns = 1_000_000_000u64.div_ceil(timer_frequency());
+    for _ in 0..8 {
+        let before_ns = now_ns();
+        let cpu_tick = timer::cpu_ticks();
+        // Include the complete timer quantum. A record may use these
+        // observations only if they prove the PMU read's containing window.
+        let wall_ns = now_ns().checked_add(tick_ns).expect("monotonic ns");
+        if before_ns < wall_ns && before_ns / WINDOW_NS == wall_ns / WINDOW_NS {
+            return budget_trace::Sample {
+                before_ns,
+                wall_ns,
+                cpu_tick,
+            };
+        }
+    }
+    fatal(692);
+}
 /// Continuous attribution from BEFORE the first role package load through
 /// the final UART output. Every interval is charged exactly once: admitted
 /// role/recovery work or the protected EL1 coordination envelope.
@@ -224,11 +246,13 @@ struct BudgetMeter {
     cursor: u64,
     wall: u64,
     crossed_gaps: u64,
+    trace: budget_trace::Trace,
 }
 impl BudgetMeter {
     fn new() -> Self {
-        let wall = now_ns();
-        let tick = timer::cpu_ticks();
+        let sample = observe_budget_clock();
+        let wall = sample.wall_ns;
+        let tick = sample.cpu_tick;
         let mut ledger = Cpu0BudgetLedger::new();
         ledger
             .start_continuous(cpu::slot(), wall, || Ok(()))
@@ -240,11 +264,13 @@ impl BudgetMeter {
             cursor: tick,
             wall,
             crossed_gaps: 0,
+            trace: budget_trace::Trace::new(sample),
         }
     }
     fn sample_gap(&mut self) -> (u64, u64) {
-        let wall = now_ns();
-        let tick = timer::cpu_ticks();
+        let sample = observe_budget_clock();
+        let wall = sample.wall_ns;
+        let tick = sample.cpu_tick;
         let actual = timer::cpu_ns(
             tick.checked_sub(self.cursor)
                 .expect("PMU counter regressed"),
@@ -255,6 +281,7 @@ impl BudgetMeter {
             .expect("continuous EL1 coordination interval");
         self.cursor = tick;
         self.wall = wall;
+        self.trace.record(sample, None);
         if receipt.crossed_window {
             self.crossed_gaps += 1;
         }
@@ -271,8 +298,9 @@ impl BudgetMeter {
     }
     fn settle(&mut self, token: Turn, began: u64) -> Settlement {
         assert_eq!(began, self.cursor);
-        let wall = now_ns();
-        let tick = timer::cpu_ticks();
+        let sample = observe_budget_clock();
+        let wall = sample.wall_ns;
+        let tick = sample.cpu_tick;
         let actual = timer::cpu_ns(tick.checked_sub(began).expect("PMU counter regressed"));
         let receipt = self
             .ledger
@@ -280,6 +308,7 @@ impl BudgetMeter {
             .expect("same CPU0 owner");
         self.cursor = tick;
         self.wall = wall;
+        self.trace.record(sample, Some(token));
         receipt
     }
     /// No work was admitted. Use a real masked physical timer wakeup rather
@@ -1539,6 +1568,7 @@ pub(super) fn run() -> ! {
         // one-MiB bootstrap metadata allowance inside the control pool.
         other_protected_pool_bytes: core::mem::size_of::<[Tables; 2 * ROLE_COUNT]>()
             + COPY
+            + budget_trace::BYTES
             + 1024 * 1024,
         other_control_ns_per_100ms: OTHER_CPU_NS,
     };
@@ -1767,6 +1797,7 @@ pub(super) fn run() -> ! {
     for (i, value) in ledger_row.into_iter().enumerate() {
         SMP_EVIDENCE.words[481 + i].store(value, Ordering::Relaxed);
     }
+    budget.trace.seal();
     SMP_EVIDENCE.words[2].store(1, Ordering::Release);
     super::super::halt()
 }
