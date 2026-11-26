@@ -186,17 +186,24 @@ impl Admission {
         if self.tokens < TOKEN {
             return Err(Error::RateLimited);
         }
-        let (source_at, current) = if let Some(i) = self
-            .sources
-            .iter()
-            .position(|s| s.is_some_and(|s| s.ip == ip))
-        {
-            (i, self.sources[i].ok_or(Error::Stale)?)
+        // A source table can have holes after eviction. Remember the
+        // first vacant slot but keep searching for the existing IP.
+        let mut vacant = None;
+        let mut existing = None;
+        for (i, source) in self.sources.iter().copied().enumerate() {
+            match source {
+                Some(s) if s.ip == ip => {
+                    existing = Some((i, s));
+                    break;
+                }
+                None if vacant.is_none() => vacant = Some(i),
+                _ => {}
+            }
+        }
+        let (source_at, current) = if let Some(pair) = existing {
+            pair
         } else {
-            let i = self
-                .sources
-                .iter()
-                .position(Option::is_none)
+            let i = vacant
                 .or_else(|| {
                     self.sources
                         .iter()
@@ -478,6 +485,24 @@ impl Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wave4_source_lookup_does_not_replace_existing_ip_after_a_hole() {
+        let mut gate = Admission::new();
+        let first = gate.begin(1, 0, 4).unwrap();
+        gate.reject(first).unwrap();
+        let second = gate.begin(2, 0, 4).unwrap();
+        gate.evict_idle(1, 1).unwrap();
+        assert_eq!(gate.begin(2, 1, 4), Err(Error::Capacity));
+        assert_eq!(gate.pending_count(), 1);
+        gate.reject(second).unwrap();
+        let second = gate.begin(2, 1, 4).unwrap();
+        let third = gate.begin(3, 1, 4).unwrap();
+        assert_eq!(gate.pending_count(), 2);
+        gate.reject(second).unwrap();
+        gate.reject(third).unwrap();
+        assert_eq!(gate.pending_count(), 0);
+    }
+
     #[test]
     fn sec_n03_four_pending_slots_are_bounded_and_released_on_reject() {
         let mut admission = Admission::new();

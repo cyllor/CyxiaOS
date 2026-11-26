@@ -96,9 +96,9 @@ pub struct Owner {
     change_count: usize,
     poisoned: bool,
 }
-/// Exact ceil-to-grid with explicit slack and due checks; u128 avoids
-/// rounding overflow. The representable slack endpoint is saturated,
-/// not wrapped. Hard/lease/recovery requests must declare zero slack.
+/// Exact ceil-to-grid with explicit slack and due checks. Calculate the
+/// remaining grid distance without wide division or rounding overflow.
+/// Hard/lease/recovery requests must declare zero slack.
 pub fn programmed_ns(
     class: TimerClass,
     slack: u64,
@@ -118,9 +118,10 @@ pub fn programmed_ns(
     if deadline <= now || us == 0 {
         return Ok(deadline);
     }
-    let q = u128::from(us) * 1000;
-    let rounded = u128::from(deadline).div_ceil(q) * q;
-    Ok(rounded.min(u128::from(deadline.saturating_add(slack))) as u64)
+    let q = u64::from(us) * 1000;
+    let remainder = deadline % q;
+    let delta = if remainder == 0 { 0 } else { q - remainder };
+    Ok(deadline.saturating_add(delta.min(slack)))
 }
 impl Owner {
     pub const fn empty() -> Self {
@@ -200,27 +201,22 @@ impl Owner {
         if !id.valid() || class != TimerClass::Soft {
             return Err(Error::Denied);
         }
-        // Retain a bounded generation tombstone. Unrelated object IDs
-        // may not evict it and thereby resurrect stale timer tickets.
-        let old = self
+        // Slots form an occupied prefix: unregister keeps a generation
+        // tombstone, and a new ID always occupies the first empty slot.
+        // The first empty slot therefore also proves the ID is absent.
+        let i = self
             .entries
             .iter()
-            .position(|v| v.is_some_and(|e| e.timer.id == id.id));
-        let i = if let Some(i) = old {
-            let e = self.entries[i].unwrap();
+            .position(|v| v.is_none_or(|e| e.timer.id == id.id))
+            .ok_or(Error::Exhausted)?;
+        if let Some(e) = self.entries[i] {
             if e.live || e.active.is_some() || e.pending.is_some() {
                 return Err(Error::Busy);
             }
             if id.generation <= e.timer.generation {
                 return Err(Error::Stale);
             }
-            i
-        } else {
-            self.entries
-                .iter()
-                .position(Option::is_none)
-                .ok_or(Error::Exhausted)?
-        };
+        }
         verify()?;
         self.entries[i] = Some(Entry {
             timer: id,
@@ -262,10 +258,10 @@ impl Owner {
             .filter(|e| e.live && e.class == TimerClass::Soft)
         {
             n += 1;
-            let us = e.slack_ns / 1000;
-            slack = Some(slack.map_or(us, |old: u64| old.min(us)));
+            slack = Some(slack.map_or(e.slack_ns, |old: u64| old.min(e.slack_ns)));
         }
-        Ok([Some(n), None, slack, None])
+        // Integer division by a positive constant is monotone.
+        Ok([Some(n), None, slack.map(|ns| ns / 1000), None])
     }
     pub fn legal(&self, us: u16, now: u64) -> bool {
         if self.ready(now).is_err() || self.work.is_some() || !ActionV2::SoftCoalesce(us).valid() {
@@ -638,6 +634,58 @@ mod tests {
         }
     }
     #[test]
+    fn full_timer_registry_preserves_tombstones_and_minimum_slack() {
+        let mut o = owner();
+        for id in 1000..1000 + CAPACITY as u64 - 1 {
+            o.register(
+                Identity { id, generation: 1 },
+                TimerClass::Soft,
+                if id == 1000 { 1999 } else { 3001 },
+                || Ok(()),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            o.observe(1),
+            Ok([Some(CAPACITY as u64), None, Some(1), None])
+        );
+        o.unregister(SOFT, || Ok(())).unwrap();
+        assert_eq!(
+            o.register(SOFT, TimerClass::Soft, 0, || panic!()),
+            Err(Error::Stale)
+        );
+        assert_eq!(
+            o.register(
+                Identity {
+                    id: 9999,
+                    generation: 1,
+                },
+                TimerClass::Soft,
+                0,
+                || panic!()
+            ),
+            Err(Error::Exhausted)
+        );
+        let next = Identity {
+            generation: 2,
+            ..SOFT
+        };
+        assert_eq!(
+            o.register(next, TimerClass::Soft, 999, || Err(Error::NotReady)),
+            Err(Error::NotReady)
+        );
+        assert_eq!(
+            o.observe(1),
+            Ok([Some(CAPACITY as u64 - 1), None, Some(1), None])
+        );
+        o.register(next, TimerClass::Soft, 999, || Ok(())).unwrap();
+        assert_eq!(
+            o.observe(1),
+            Ok([Some(CAPACITY as u64), None, Some(0), None])
+        );
+    }
+
+    #[test]
     fn exact_grid_slack_and_hard_deadlines() {
         assert_eq!(
             programmed_ns(TimerClass::Soft, 80_000, 1_016_000, 1, 200),
@@ -659,6 +707,28 @@ mod tests {
             programmed_ns(TimerClass::Soft, u64::MAX, u64::MAX - 1, 1, 1000),
             Ok(u64::MAX)
         );
+    }
+    #[test]
+    fn soft_coalescing_matches_wide_reference_at_overflow_boundaries() {
+        for us in [0u16, 50, 200, 1000] {
+            for deadline in [1, 49_999, 50_000, 50_001, u64::MAX - 1, u64::MAX] {
+                for slack in [0, 1, 100_000, u64::MAX] {
+                    for now in [0, deadline] {
+                        let expected = if us == 0 || deadline <= now {
+                            deadline
+                        } else {
+                            let q = u128::from(us) * 1000;
+                            let rounded = u128::from(deadline).div_ceil(q) * q;
+                            rounded.min(u128::from(deadline.saturating_add(slack))) as u64
+                        };
+                        assert_eq!(
+                            programmed_ns(TimerClass::Soft, slack, deadline, now, us),
+                            Ok(expected)
+                        );
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn applied_requires_actual_soft_arm_and_exact_delivery() {

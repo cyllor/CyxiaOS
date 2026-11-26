@@ -11,8 +11,8 @@ import cosmic_applet_object_profile_v1 as subject
 
 class NativeHostContract(unittest.TestCase):
     def test_resource_or_host_drift_is_rejected(self):
-        with tempfile.TemporaryDirectory(dir='/private/tmp') as temporary:
-            root = Path(temporary); path = root / subject.CONTRACT; path.parent.mkdir(parents=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(); path = root / subject.CONTRACT; path.parent.mkdir(parents=True)
             inputs = {'cosmic-session.elf': '1' * 64, 'cosmic-panel.elf': '2' * 64}
             value = dict(subject.FIELDS, hosts=dict(inputs),
                 session_bus_sha256=hashlib.sha256(subject.BUS_SOURCE.read_bytes()).hexdigest(),

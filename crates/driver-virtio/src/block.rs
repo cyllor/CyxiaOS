@@ -90,15 +90,33 @@ impl Block {
     pub fn read_only(&self) -> bool {
         self.read_only
     }
+    // A reset or incomplete negotiation is not a live block device. Match
+    // the batched owner, and latch failure before touching the pinned pages.
+    fn require_live(&mut self, platform: &impl Platform) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::Device);
+        }
+        if self.transport.status() != 15 {
+            self.fail(platform);
+            return Err(Error::Device);
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, platform: &impl Platform) {
+        self.failed = true;
+        self.queue.poisoned = true;
+        self.transport.fail();
+        platform.barrier();
+    }
+
     pub fn begin(
         &mut self,
         operation: Operation,
         data: &[u8; SECTOR_BYTES],
         platform: &impl Platform,
     ) -> Result<(), Error> {
-        if self.failed {
-            return Err(Error::Device);
-        }
+        self.require_live(platform)?;
         if self.pending.is_some() {
             return Err(Error::Busy);
         }
@@ -126,12 +144,17 @@ impl Block {
         // Poison the status byte so a short or missing device response cannot
         // inherit a previous successful status from the reused pinned page.
         self.queue.memory.response.put8(response_len - 1, 0xff);
-        self.queue.submit(
+        if let Err(error) = self.queue.submit(
             &mut self.transport,
             &request[..request_len],
             response_len,
             platform,
-        )?;
+        ) {
+            // A submit error may follow avail publication. Never let the
+            // outer owner write another status byte into quarantined DMA.
+            self.fail(platform);
+            return Err(error);
+        }
         self.pending = Some((operation, platform.now_ms()));
         Ok(())
     }
@@ -141,9 +164,7 @@ impl Block {
         output: &mut [u8; SECTOR_BYTES],
         platform: &impl Platform,
     ) -> Result<Option<Operation>, Error> {
-        if self.failed {
-            return Err(Error::Device);
-        }
+        self.require_live(platform)?;
         let Some((operation, start)) = self.pending else {
             return Ok(None);
         };
@@ -157,6 +178,11 @@ impl Block {
             };
             if platform.now_ms().wrapping_sub(start) >= 250 {
                 return Err(Error::Timeout);
+            }
+            // Do not publish a completion if the device lost DRIVER_OK
+            // during queue acquisition, even with a valid used record.
+            if self.transport.status() != 15 {
+                return Err(Error::Device);
             }
             let expected = if matches!(operation, Operation::Read(_)) {
                 513
@@ -173,12 +199,7 @@ impl Block {
         })();
         match result {
             Ok(Some(_)) => self.pending = None,
-            Err(_) => {
-                self.failed = true;
-                self.queue.poisoned = true;
-                self.transport.fail();
-                platform.barrier();
-            }
+            Err(_) => self.fail(platform),
             _ => {}
         }
         result
@@ -283,6 +304,56 @@ mod tests {
             assert_eq!(out, [0xaa; 512]);
             assert_eq!(b.begin(Operation::Flush, &[0; 512], &h), Err(Error::Device));
         }
+    }
+    #[test]
+    fn reset_or_incomplete_status_before_submit_never_touches_dma() {
+        for status in [0, 3, 11, 79, 143] {
+            let (mut b, h) = fixture();
+            b.queue.memory.response.put8(0, 0x6a);
+            b.transport.set_status(status);
+            assert_eq!(b.begin(Operation::Flush, &[0; 512], &h), Err(Error::Device));
+            assert_eq!(b.queue.memory.response.get32(0) & 0xff, 0x6a);
+            assert_eq!(b.queue.available, 0);
+            assert!(b.queue.poisoned && b.failed);
+            b.transport.set_status(15);
+            assert_eq!(b.begin(Operation::Flush, &[0; 512], &h), Err(Error::Device));
+        }
+    }
+    #[test]
+    fn reset_with_used_record_never_publishes_read_write_or_flush() {
+        for operation in [Operation::Read(0), Operation::Write(0), Operation::Flush] {
+            let (mut b, h) = fixture();
+            b.begin(operation, &[0; 512], &h).unwrap();
+            let length = if matches!(operation, Operation::Read(_)) {
+                513
+            } else {
+                1
+            };
+            complete(&mut b, length, 0);
+            b.transport.set_status(0);
+            let mut out = [0xaa; 512];
+            assert_eq!(b.poll(&mut out, &h), Err(Error::Device));
+            assert_eq!(out, [0xaa; 512]);
+            assert_eq!(b.queue.used, 0);
+            assert!(b.pending.is_some() && b.queue.poisoned && b.failed);
+            b.transport.set_status(15);
+            assert_eq!(b.poll(&mut out, &h), Err(Error::Device));
+            assert_eq!(b.begin(Operation::Flush, &[0; 512], &h), Err(Error::Device));
+        }
+    }
+    #[test]
+    fn submit_failure_latches_outer_owner_before_later_dma_write() {
+        let (mut b, h) = fixture();
+        b.queue.memory.used.put16(2, 1);
+        assert_eq!(b.begin(Operation::Flush, &[0; 512], &h), Err(Error::Queue));
+        assert!(b.queue.poisoned && b.failed);
+        assert_eq!(b.queue.available, 0);
+        // Simulate device-visible storage after the rejection. The owner
+        // must not touch this byte even if status later appears healthy.
+        b.queue.memory.response.put8(0, 0x6a);
+        b.transport.set_status(15);
+        assert_eq!(b.begin(Operation::Flush, &[0; 512], &h), Err(Error::Device));
+        assert_eq!(b.queue.memory.response.get32(0) & 0xff, 0x6a);
     }
     #[test]
     fn out_of_range_and_readonly_requests_never_publish() {

@@ -509,7 +509,10 @@ impl FindingCustody {
             .flatten()
             .find(|r| r.finding.is_some_and(|f| f.finding_seq == finding_seq))
             .ok_or(Error::Stale)?;
-        if row.consumed {
+        // InvalidTarget can finalize an admitted finding before review. Its
+        // retained terminal evidence must never be turned back into work,
+        // including after the audit owner has acknowledged the disposition.
+        if row.consumed || row.terminal.is_some() {
             return Err(Error::Stale);
         }
         let f = row.finding.ok_or(Error::NotReady)?;
@@ -960,5 +963,58 @@ mod tests {
             Err(Error::Denied)
         );
         assert_eq!(q.occupied(), 1);
+    }
+
+    #[test]
+    fn invalid_target_disposition_cannot_reenter_review_before_or_after_audit_ack() {
+        for acknowledged in [false, true] {
+            let mut q = FindingCustody::new(ROLE7, ROLE11, 1, 2).unwrap();
+            let mut current = registered();
+            q.reserve(ROLE7, current, FindingMode::Assisted).unwrap();
+            q.submit(ROLE7, &wire(), 150).unwrap();
+            let terminal = q
+                .finalize(ROLE11, 3, FindingResolution::InvalidTarget, 151)
+                .unwrap();
+            let terminal_wire = terminal.encode().unwrap();
+            let digest = finding_sha256(&terminal_wire);
+            if acknowledged {
+                q.acknowledge_disposition(ROLE11, 3, digest, 152).unwrap();
+            }
+
+            // A delayed review attempt still has matching observation bytes
+            // and a live deadline, but the protected consumer has already
+            // invalidated this FindingKey. ACK cannot reopen it either.
+            current.scope.now_ns = 153;
+            assert_eq!(
+                q.consume(ROLE11, 3, current, FindingMode::Assisted, true),
+                Err(Error::Stale)
+            );
+            assert_eq!(
+                q.query_disposition(ROLE11, 3).unwrap().encode().unwrap(),
+                terminal_wire
+            );
+            assert_eq!(q.occupied(), 1);
+            assert_eq!(
+                q.finalize(ROLE11, 3, FindingResolution::IndependentRuleEntered, 154),
+                Err(Error::Denied)
+            );
+
+            // Keep the context tombstone until its evaluation lifetime ends;
+            // unacknowledged terminal evidence must retain its credit longer.
+            assert_eq!(q.reap_expired(ROLE11, 190), Ok(0));
+            let context_end = 100 + MAX_FINDING_AGE_NS;
+            assert_eq!(
+                q.reap_expired(ROLE11, context_end),
+                Ok(usize::from(acknowledged))
+            );
+            if !acknowledged {
+                assert_eq!(q.occupied(), 1);
+                assert_eq!(q.query_disposition(ROLE11, 3), Ok(terminal));
+                q.acknowledge_disposition(ROLE11, 3, digest, context_end)
+                    .unwrap();
+                assert_eq!(q.reap_expired(ROLE11, context_end), Ok(1));
+            }
+            assert_eq!(q.occupied(), 0);
+        }
     }
 }

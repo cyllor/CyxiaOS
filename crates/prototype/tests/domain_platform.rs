@@ -671,3 +671,66 @@ fn quotes_are_actual_remaining_capacity_and_have_no_positive_expired_baseline() 
     );
     assert_eq!(backend.sent.len(), 2);
 }
+
+#[test]
+fn wave5_network_sparse_ready_rotation_retains_failed_connection() {
+    struct Sparse {
+        seen: Vec<ObjectKey>,
+        fail: bool,
+    }
+    impl NetworkTx for Sparse {
+        fn reserved(&mut self) -> Result<TxStep, Error> {
+            Ok(TxStep::default())
+        }
+        fn send_ready(&mut self, key: ObjectKey) -> Result<TxStep, Error> {
+            self.seen.push(key);
+            if self.fail {
+                return Err(Error::Io);
+            }
+            Ok(TxStep {
+                sent: true,
+                still_ready: false,
+            })
+        }
+    }
+    let mut s = NetworkScheduler::new();
+    for id in 1..=16 {
+        s.register(key(id)).unwrap();
+    }
+    s.mark_ready(key(2)).unwrap();
+    s.mark_ready(key(15)).unwrap();
+    let mut backend = Sparse {
+        seen: vec![],
+        fail: true,
+    };
+    assert_eq!(s.service(1, &mut backend), Err(Error::Io));
+    assert_eq!(s.ready_connections(), 2);
+    backend.fail = false;
+    assert_eq!(s.service(2, &mut backend).unwrap().ordinary, 2);
+    assert_eq!(backend.seen, [key(2), key(15), key(2)]);
+    assert_eq!(s.ready_connections(), 0);
+    assert_eq!(s.service(3, &mut backend).unwrap().ordinary, 0);
+}
+
+#[test]
+fn wave5_irq_bucket_matches_wide_reference_at_product_overflow() {
+    for (ticks, frequency) in [
+        (0, 1),
+        (17, 1_000_000),
+        (4095, 1_000_000),
+        (4096, 1_000_000),
+        (u64::MAX / 1_000_000 + 1, u64::MAX),
+        (u64::MAX, u64::MAX),
+        (u64::MAX, 1),
+    ] {
+        let histogram = irq_metrics::Histogram::new();
+        histogram.record(ticks, frequency);
+        let mut snapshot = irq_metrics::Snapshot::new();
+        assert!(histogram.snapshot(&mut snapshot));
+        let delta = snapshot.since(&irq_metrics::Snapshot::new()).unwrap();
+        let us = (u128::from(ticks) * 1_000_000).div_ceil(u128::from(frequency));
+        assert_eq!(delta.count, 1);
+        assert_eq!(delta.ticks, ticks);
+        assert_eq!(delta.p99_us, (us < 4096).then_some(us as u64));
+    }
+}

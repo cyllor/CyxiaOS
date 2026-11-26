@@ -15,8 +15,8 @@ class WorkspaceAppletContract(unittest.TestCase):
     def test_additional_sdk_rejects_tampered_receipts_archives_and_wrong_isa(self):
         # Deliberately synthetic ELF headers/archive members; no executable or
         # native build proof is claimed by this isolated admission fixture.
-        with tempfile.TemporaryDirectory(prefix='cyxia-input-admission-', dir='/private/tmp') as temporary:
-            sdk = Path(temporary)
+        with tempfile.TemporaryDirectory(prefix='cyxia-input-admission-') as temporary:
+            sdk = Path(temporary).resolve()
             def elf_header(kind, machine=62):
                 raw = bytearray(64); raw[:7] = b'\x7fELF\x02\x01\x01'
                 struct.pack_into('<HH', raw, 16, kind, machine)
@@ -64,8 +64,8 @@ class WorkspaceAppletContract(unittest.TestCase):
                 subject.additional_link_inputs(sdk, recipe)
 
     def test_export_checks_real_modes_without_assuming_digest_records_have_modes(self):
-        with tempfile.TemporaryDirectory(prefix='cyxia-applets-source-', dir='/private/tmp') as temporary:
-            root = Path(temporary); stage = root / 'stage'; native = root / 'native'
+        with tempfile.TemporaryDirectory(prefix='cyxia-applets-source-') as temporary:
+            root = Path(temporary).resolve(); stage = root / 'stage'; native = root / 'native'
             stage.mkdir(); native.mkdir()
             (stage / 'Cargo.lock').write_text('locked\n')
             (native / 'lib.rs').write_text('genuine binding\n')

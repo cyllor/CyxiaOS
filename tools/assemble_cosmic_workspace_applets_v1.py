@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 
 import cosmic_workspace_applets_v1 as applets
@@ -112,7 +113,10 @@ def _assemble(build, base_build, output, probe=None, host_builds=(), applet_reli
     require(not output.exists() and all(not output.is_relative_to(p) and not p.is_relative_to(output)
         for p in (build, base_build, original, Path(report['sysroot']), applets.PORT)),
         'Applet catalog overlaps existing inputs')
-    subprocess.run(['/bin/cp', '-cRp', str(original), str(output)], check=True)
+    # Keep clonefile on Darwin without requiring its private cp option on
+    # other POSIX hosts. Catalog validation and publication stay unchanged.
+    copy_flags = '-cRp' if sys.platform == 'darwin' else '-Rp'
+    subprocess.run(['/bin/cp', copy_flags, str(original), str(output)], check=True)
     added = {}
     replaced = {}
     for kind, (directory, host_report) in host_reports.items():

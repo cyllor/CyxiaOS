@@ -1,0 +1,420 @@
+name: V0.20.1 kernel algorithm and native fixture regression
+on:
+  push:
+    branches: [V0.20.1]
+    paths:
+      - 'crates/kernel-core/**'
+      - 'crates/control-model/**'
+      - 'crates/prototype/**'
+      - 'crates/driver-virtio/**'
+      - 'crates/net-transport/**'
+      - 'kernel/**'
+      - 'tools/**'
+      - 'user/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/v0201-kernel-algorithms.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: v0201-kernel-algorithms-${{ github.sha }}
+  cancel-in-progress: true
+jobs:
+  modules:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: cyxia-kernel-core
+            seam: 'contig_frames::tests'
+          - package: cyxia-kernel-core
+            seam: 'console::tests'
+          - package: cyxia-kernel-core
+            seam: 'frames::tests'
+          - package: cyxia-kernel-core
+            seam: 'frame_meta_v0199::tests'
+          - package: cyxia-kernel-core
+            seam: 'd02_owner_v0199::tests'
+          - package: cyxia-kernel-core
+            seam: 'd07_owner_v0199::tests'
+          - package: cyxia-kernel-core
+            seam: 'ipc_receive_v3::tests'
+          - package: cyxia-kernel-core
+            seam: 'file_structure_v1::tests'
+          - package: cyxia-kernel-core
+            seam: 'd15_owner_v0199::tests'
+          - package: cyxia-control-model
+            seam: 'native_v0199'
+          - package: cyxia-prototype
+            seam: 'model::prefix_tests'
+          - package: cyxia-prototype
+            seam: 'wave4_scheduler_'
+          - package: cyxia-prototype
+            seam: 'wave4_vm_'
+          - package: cyxia-prototype
+            seam: 'wave4_io_'
+          - package: cyxia-driver-virtio
+            seam: 'queue::tests'
+          - package: cyxia-net-transport
+            seam: 'admission::tests'
+            features: tls
+          - package: cyxia-kernel-core
+            seam: 'snapshot_store_v3::tests'
+          - package: cyxia-kernel-core
+            seam: 'file_receipt_store_v0199::tests'
+          - package: cyxia-prototype
+            seam: 'wave5_capability_'
+          - package: cyxia-prototype
+            seam: 'wave5_network_'
+          - package: cyxia-prototype
+            seam: 'wave5_irq_'
+          - package: cyxia-prototype
+            seam: 'wave6_optional_'
+          - package: cyxia-prototype
+            seam: 'wave6_recovery_'
+          - package: cyxia-kernel-core
+            seam: 'cap_record_v3::tests'
+          - package: cyxia-kernel-core
+            seam: 'desired_plan_v0199::tests'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update
+      - name: Run module regression
+        env:
+          PACKAGE: ${{ matrix.package }}
+          SEAM: ${{ matrix.seam }}
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -n "$FEATURES" ]; then
+            args+=(--features "$FEATURES")
+          fi
+          cargo +1.95.0 test --locked -p "$PACKAGE" "${args[@]}" "$SEAM" 2>&1 | tee module.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed;' module.log
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update --component rustfmt
+      - name: Check format
+        run: cargo +1.95.0 fmt --all --check
+  integration:
+    needs: modules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.95.0 --profile minimal --no-self-update
+      - name: Kernel-core suite
+        run: cargo +1.95.0 test --locked -p cyxia-kernel-core
+      - name: Default workspace regression
+        run: cargo +1.95.0 test --locked
+  arm-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build AArch64 production skeleton (build evidence only)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat --target aarch64-unknown-none
+          rustup override set 1.95.0
+          cargo fetch --locked
+          mkdir -p artifacts/v0201-arm
+          git rev-parse HEAD > artifacts/v0201-arm/commit.txt
+          rustc -vV > artifacts/v0201-arm/toolchain.txt
+          python3 -B -c 'import sys; sys.path.insert(0, "tools"); import verify_v0199_sec_n as s; s.build_guest()' 2>&1 | tee artifacts/v0201-arm/build-guest.log
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production 2>&1 | tee artifacts/v0201-arm/build.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v0201-arm/kernel.elf
+          readelf -h artifacts/v0201-arm/kernel.elf > artifacts/v0201-arm/elf.txt
+          (cd artifacts/v0201-arm && sha256sum kernel.elf > elf.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-arm-build-${{ github.sha }}
+          path: artifacts/v0201-arm/
+          retention-days: 7
+  x86-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build x86-64 platform fixture (build evidence only)
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target x86_64-unknown-none
+          rustup override set 1.95.0
+          cargo fetch --locked
+          mkdir -p artifacts/v0201-x86
+          git rev-parse HEAD > artifacts/v0201-x86/commit.txt
+          rustc -vV > artifacts/v0201-x86/toolchain.txt
+          python3 -B tools/build.py --output artifacts/v0201-x86/image 2>&1 | tee artifacts/v0201-x86/build.log
+          test -s artifacts/v0201-x86/image/kernel.elf
+          readelf -h artifacts/v0201-x86/image/kernel.elf > artifacts/v0201-x86/elf.txt
+          sha256sum artifacts/v0201-x86/image/kernel.elf > artifacts/v0201-x86/kernel.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-x86-build-${{ github.sha }}
+          path: artifacts/v0201-x86/
+          retention-days: 7
+  qemu-pinned:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build exact QEMU 10.2.2 for both guest architectures
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev libslirp-dev python3-venv
+          mkdir -p artifacts/v0201-qemu
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu-source"
+          git -C "$RUNNER_TEMP/qemu-source" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          test "$(git -C "$RUNNER_TEMP/qemu-source" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          sha256sum tools/qemu/cyxia-per-vcpu-pmu.patch > artifacts/v0201-qemu/patch.sha256
+          git -C "$RUNNER_TEMP/qemu-source" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu-source" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu-source" diff --binary > artifacts/v0201-qemu/applied.patch
+          git -C "$RUNNER_TEMP/qemu-source" rev-parse HEAD > artifacts/v0201-qemu/upstream.txt
+          cd "$RUNNER_TEMP/qemu-source"
+          ./configure --target-list=aarch64-softmmu,x86_64-softmmu --enable-slirp --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/v0201-qemu/configure.log"
+          ninja -C build qemu-system-aarch64 qemu-system-x86_64 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/v0201-qemu/build.log"
+          mkdir -p "$RUNNER_TEMP/qemu-bin"
+          cp build/qemu-system-aarch64 build/qemu-system-x86_64 "$RUNNER_TEMP/qemu-bin/"
+          cp -a pc-bios "$RUNNER_TEMP/qemu-bin/pc-bios"
+          test -s "$RUNNER_TEMP/qemu-bin/pc-bios/bios-256k.bin"
+          "$RUNNER_TEMP/qemu-bin/qemu-system-aarch64" --version | tee "$GITHUB_WORKSPACE/artifacts/v0201-qemu/arm-version.txt"
+          "$RUNNER_TEMP/qemu-bin/qemu-system-x86_64" --version | tee "$GITHUB_WORKSPACE/artifacts/v0201-qemu/x86-version.txt"
+          tar -C "$RUNNER_TEMP" -czf "$GITHUB_WORKSPACE/artifacts/v0201-qemu/qemu-bin.tar.gz" qemu-bin
+          (cd "$GITHUB_WORKSPACE/artifacts/v0201-qemu" && sha256sum qemu-bin.tar.gz > archive.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-pinned-qemu-${{ github.sha }}
+          path: artifacts/v0201-qemu/
+          retention-days: 7
+  arm-native:
+    needs: [arm-build, qemu-pinned]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v0201-arm-build-${{ github.sha }}
+          path: artifacts/v0201-arm
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v0201-pinned-qemu-${{ github.sha }}
+          path: artifacts/v0201-qemu
+      - name: Verify production skeleton and fail-closed missing NIC
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
+          test "$(cat artifacts/v0201-arm/commit.txt)" = "$(git rev-parse HEAD)"
+          (cd artifacts/v0201-arm && sha256sum -c elf.sha256)
+          (cd artifacts/v0201-qemu && sha256sum -c archive.sha256)
+          sha256sum -c artifacts/v0201-qemu/patch.sha256
+          tar -xzf artifacts/v0201-qemu/qemu-bin.tar.gz -C "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/qemu-bin:$PATH"
+          mkdir -p artifacts/v0201-arm-native
+          printf '%s\n' 'PRODUCTION_SKELETON_ONLY; G4 NOT_RUN' > artifacts/v0201-arm-native/scope.txt
+          python3 -B tools/verify_v020_production.py --elf artifacts/v0201-arm/kernel.elf --output artifacts/v0201-arm-native/run --timeout 120
+          if python3 -B tools/verify_v020_production.py --elf artifacts/v0201-arm/kernel.elf --output artifacts/v0201-arm-native/run-no-nic --timeout 120 --no-nic; then
+            echo "no-NIC negative control unexpectedly PASSED" >&2
+            exit 1
+          fi
+          grep -q '"error": "ValueError: guest reported V020_W11_NET_ABSENT:' artifacts/v0201-arm-native/run-no-nic/summary.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-arm-native-${{ github.sha }}
+          path: artifacts/v0201-arm-native/
+          retention-days: 7
+  x86-native:
+    needs: [x86-build, qemu-pinned]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v0201-pinned-qemu-${{ github.sha }}
+          path: artifacts/v0201-qemu
+      - name: Build and run four-vCPU x86-64 mechanism fixture
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target x86_64-unknown-none
+          rustup override set 1.95.0
+          cargo fetch --locked
+          (cd artifacts/v0201-qemu && sha256sum -c archive.sha256)
+          tar -xzf artifacts/v0201-qemu/qemu-bin.tar.gz -C "$RUNNER_TEMP"
+          mkdir -p artifacts/v0201-x86-native
+          git rev-parse HEAD > artifacts/v0201-x86-native/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/v0201-x86-native/tree.txt
+          printf '%s\n' 'SMP_MECHANISM_FIXTURE_ONLY; G5 NOT_RUN' > artifacts/v0201-x86-native/scope.txt
+          python3 -B tools/x86_64.py build --output artifacts/v0201-x86-native/build --mechanism smp
+          CYXIA_PINNED_QEMU_FIRMWARE="$RUNNER_TEMP/qemu-bin/pc-bios" \
+            PATH="$RUNNER_TEMP/qemu-bin:$PATH" python3 -B tools/x86_64.py run \
+            --build artifacts/v0201-x86-native/build \
+            --output artifacts/v0201-x86-native/capture --timeout 35
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-x86-native-${{ github.sha }}
+          path: artifacts/v0201-x86-native/
+          retention-days: 7
+  host-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Measure full and shared-prefix MLP on the same runner
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          mkdir -p artifacts/v0201-bench
+          git rev-parse HEAD > artifacts/v0201-bench/commit.txt
+          rustc +1.95.0 -vV > artifacts/v0201-bench/toolchain.txt
+          lscpu > artifacts/v0201-bench/cpu.txt
+          cargo +1.95.0 run --locked --release -p cyxia-prototype --example v0201_mlp_bench 2>&1 | tee artifacts/v0201-bench/mlp.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-host-bench-${{ github.sha }}
+          path: artifacts/v0201-bench/
+          retention-days: 7
+  baseline-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Compile exact V0.20 baseline, wave 9 and current implementation
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          mkdir -p artifacts/v0201-baseline-bench
+          git rev-parse HEAD > artifacts/v0201-baseline-bench/commit.txt
+          rustc +1.95.0 -vV > artifacts/v0201-baseline-bench/toolchain.txt
+          lscpu > artifacts/v0201-baseline-bench/cpu.txt
+          base=4912423cf2bc26ddf5c38eeea0f64190ce07a085
+          prior=88d1fc966374396d67e5b3cd7cf8537fe4867ecb
+          test "$(git rev-parse "$base^{tree}")" = abf743f697c434c88b0a908a3fd0f93ea4d8bb74
+          test "$(git rev-parse "$prior^{tree}")" = d6f21750df448823f0fff3b31437d760b7a042d5
+          printf '%s\n' "$base" > artifacts/v0201-baseline-bench/baseline-commit.txt
+          printf '%s\n' "$prior" > artifacts/v0201-baseline-bench/previous-commit.txt
+          harness=crates/kernel-core/examples/v0201_kernel_bench.rs
+          sha256sum "$harness" > artifacts/v0201-baseline-bench/harness.sha256
+          for side in base prior; do
+            case "$side" in
+              base) revision="$base" ;;
+              prior) revision="$prior" ;;
+            esac
+            git worktree add --detach "$RUNNER_TEMP/v0201-bench-$side" "$revision"
+            install -D "$harness" "$RUNNER_TEMP/v0201-bench-$side/$harness"
+            cmp "$harness" "$RUNNER_TEMP/v0201-bench-$side/$harness"
+            (cd "$RUNNER_TEMP/v0201-bench-$side" && cargo +1.95.0 build --locked --release -p cyxia-kernel-core --example v0201_kernel_bench --target-dir "$RUNNER_TEMP/v0201-bench-$side-target")
+          done
+          cargo +1.95.0 build --locked --release -p cyxia-kernel-core --example v0201_kernel_bench --target-dir "$RUNNER_TEMP/v0201-bench-new-target"
+      - name: Compare exact outputs and three-way same-runner timing
+        run: |
+          set -euo pipefail
+          for label in base-1 prior-1 new-1 new-2 prior-2 base-2; do
+            side="${label%-*}"
+            "$RUNNER_TEMP/v0201-bench-$side-target/release/examples/v0201_kernel_bench" | tee "artifacts/v0201-baseline-bench/$label.log"
+          done
+          python3 -B - <<'PY' | tee artifacts/v0201-baseline-bench/summary.txt
+          from pathlib import Path
+          from statistics import median
+
+          root = Path("artifacts/v0201-baseline-bench")
+          checks = {}
+          samples = {"base": {}, "prior": {}, "new": {}}
+          capacities = (4, 8, 9, *range(16, 33), 64)
+          expected = {f"contig-{kind}-{n}" for kind in ("dense", "fragmented")
+                      for n in capacities}
+          expected |= {f"operations-d{domain:02}" for domain in range(1, 16)}
+          expected |= {f"security-kind{kind:02}" for kind in range(1, 6)}
+          expected |= {"frame-clean-64", "frame-clean-256",
+                       "ipc-roundtrip-8", "ipc-roundtrip-64",
+                       "console-wrap-64", "console-wrap-257", "timer-rounding-32"}
+          assert len(expected) == 69
+          for label in ("base-1", "prior-1", "new-1", "new-2", "prior-2", "base-2"):
+              side = label.split("-")[0]
+              observed = {}
+              counts = {}
+              for line in (root / (label + ".log")).read_text().splitlines():
+                  kind, name, value = line.split(",", 2)
+                  assert name in expected, (label, name)
+                  if kind == "check":
+                      assert name not in observed
+                      observed[name] = value
+                  elif kind == "sample":
+                      elapsed = int(value)
+                      assert elapsed > 0
+                      counts[name] = counts.get(name, 0) + 1
+                      samples[side].setdefault(name, []).append(elapsed)
+                  else:
+                      raise ValueError(line)
+              assert set(observed) == expected
+              assert counts == dict.fromkeys(expected, 7)
+              checks[label] = observed
+          assert all(value == checks["base-1"] for value in checks.values()), checks
+          print("scope=host_only; exact pinned baseline and wave9; checks=match; samples=14 per side; rounds=4096 (frame-clean/ipc-roundtrip=512); workloads=69")
+          for name in sorted(expected):
+              old = median(samples["base"][name])
+              prior = median(samples["prior"][name])
+              new = median(samples["new"][name])
+              print(f"{name},baseline_ns={old},previous_ns={prior},candidate_ns={new},speedup={old/new:.4f},previous_speedup={prior/new:.4f}")
+              current = samples["new"][name]
+              baseline = samples["base"][name]
+              print(f"spread,{name},baseline_min_ns={min(baseline)},baseline_max_ns={max(baseline)},candidate_min_ns={min(current)},candidate_max_ns={max(current)}")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-baseline-bench-${{ github.sha }}
+          path: artifacts/v0201-baseline-bench/
+          retention-days: 7

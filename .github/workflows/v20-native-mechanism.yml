@@ -3,27 +3,33 @@ name: V0.20 two-architecture native mechanism capture (WIP)
 
 on:
   push:
-    branches: [CyxiaOS-V0.20, work/v020-native-control-safety, fix/v020-v0199-contract-gaps, work/v020-gap-x86-native-firmware]
+    branches: [CyxiaOS-V0.20, V0.20.3, work/v0203-architecture-remediation, work/v020-native-control-safety, fix/v020-v0199-contract-gaps, work/v020-gap-x86-native-firmware]
     paths:
       - '.github/workflows/v20-native-mechanism.yml'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
       - 'kernel/**'
-      - 'crates/kernel-core/**'
-      - 'crates/prototype/**'
-      - 'crates/arch-aarch64/**'
-      - 'crates/arch-x86_64/**'
-      - 'crates/driver-gicv2/**'
-      - 'crates/driver-virtio/**'
-      - 'crates/platform-virt/**'
-      - 'tools/verify_smp.py'
-      - 'tools/verify_v0199_cpu0_roles.py'
-      - 'tools/x86_64.py'
-  # The workflow change itself receives a real PR run; after integration
-  # relevant main-branch pushes automatically run on the merged source tree.
-  # Avoid rebuilding QEMU on every independent component-review branch.
+      - 'crates/**'
+      - 'user/**'
+      - 'tests/**'
+      - 'tools/**'
+  # Check the same native build inputs on PRs and maintenance-branch pushes.
+  # The jobs remain mechanism fixtures, never full production acceptance.
   pull_request:
-    branches: [CyxiaOS-V0.20]
+    branches: [CyxiaOS-V0.20, V0.20.3]
     paths:
       - '.github/workflows/v20-native-mechanism.yml'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'kernel/**'
+      - 'crates/**'
+      - 'user/**'
+      - 'tests/**'
+      - 'tools/**'
   workflow_dispatch:
 
 permissions:

@@ -1,0 +1,614 @@
+{
+  "schema": "cyxia-v0203-architecture-remediation/v1",
+  "audit_id": "CYXAUDIT-V0203-20261126",
+  "created_at": "2026-11-26T20:52:01+04:00",
+  "repository": "cyllor/CyxiaOS",
+  "requested_ref": "V0.20.3",
+  "baseline_commit": "89f87ec7d480cd2cfc5851cecc079da5b3786459",
+  "same_as_ref_at_observation": "V0.20.2",
+  "working_branch": "work/v0203-architecture-remediation",
+  "authority": "用户要求拉取v0.20.3、架构审核并构建自动任务持续修复；不扩大为发布或改写架构约束。 用户追加授权：问题修复后自动同步V0.20；实际目标为CyxiaOS-V0.20。",
+  "finding_statuses": [
+    "open",
+    "in_progress",
+    "awaiting_verification",
+    "blocked",
+    "closed",
+    "reopened"
+  ],
+  "findings": [
+    {
+      "id": "A203-001",
+      "title": "批量块设备缺少本次 status 写入仍可报告成功",
+      "domain": "HAL / 设备 / 文件可靠性",
+      "kind": "implementation_defect",
+      "severity": "P1",
+      "status": "closed",
+      "conformity": "原版本不符合；当前组件范围符合",
+      "evidence_status": "已证实并复现",
+      "requirements": [
+        "SEC-D 完成证据",
+        "SEC-F WRITE/FLUSH 完成语义"
+      ],
+      "anchors": [
+        "crates/driver-virtio/src/block/batched.rs:158-166,215-231",
+        "crates/driver-virtio/src/queue.rs:323-325,573-585"
+      ],
+      "condition": "设备写入完整 used 长度，但没有写 status；新槽或复用槽原有的 0 被解释为成功。",
+      "impact": "READ/WRITE/FLUSH 可错误报告成功并推进完成版本。",
+      "remediation": "在槽仍由 CPU 私有持有时，将 status 尾字节置为 0xff，再同步并发布 DMA；其他队列调用保持原接口。",
+      "acceptance": [
+        "Read/Write/Flush × fresh/reused 缺失 status 均拒绝",
+        "输出及成功版本不变，错误 token 不能 ACK，DMA 不被释放"
+      ],
+      "evidence": [
+        "V03",
+        "V04",
+        "V08",
+        "REVIEW-01"
+      ],
+      "dependencies": [],
+      "references": [
+        "4c49f2380d44315f695edaf7b5330c407b7a7d01"
+      ],
+      "limitation": "关闭限源码及宿主故障注入组件；真实设备故障注入另列 VG03。"
+    },
+    {
+      "id": "A203-002",
+      "title": "复位与提交失败后块设备未完整锁存失败",
+      "domain": "HAL / DMA 所有权 / 可靠性",
+      "kind": "implementation_defect",
+      "severity": "P1",
+      "status": "closed",
+      "conformity": "原版本不符合；当前组件范围符合",
+      "evidence_status": "已证实并复现",
+      "requirements": [
+        "SEC-D 设备状态与可靠复位",
+        "SEC-M DMA 保管"
+      ],
+      "anchors": [
+        "crates/driver-virtio/src/block.rs:93-101,125-175",
+        "crates/driver-virtio/src/block/batched.rs:203-232",
+        "crates/driver-virtio/src/queue.rs:546-563"
+      ],
+      "condition": "提交前复位、队列提交失败，或队列取得 completion 到 IRQ ACK 期间失去 DRIVER_OK。",
+      "impact": "旧完成可能报告成功；外层 owner 仍可能触碰被隔离的 DMA。",
+      "remediation": "单请求进入前检查就绪状态，submit 错误粘性锁存，单/批量完成取得后再次核对状态；失败保留 DMA 保管。",
+      "acceptance": [
+        "复位前提交/复位带旧 used/ACK 窗口复位/submit 错误均拒绝",
+        "设备状态表面恢复不能解除失败锁存；不复制输出、不推进成功版本"
+      ],
+      "evidence": [
+        "V03",
+        "V04",
+        "V08",
+        "REVIEW-01"
+      ],
+      "dependencies": [],
+      "references": [
+        "687dbae3f77ad09a08875b44b8d5a6915e65b9f4",
+        "0d12dd53a04f07a00e278e558473ab8434b0dc22"
+      ],
+      "limitation": "关闭限本次实现与宿主反例；不声称真实 DMA 时序或硬件复位全部验收。"
+    },
+    {
+      "id": "A203-003",
+      "title": "已冻结终态的安全 Finding 仍可重新触发复核",
+      "domain": "AI 辅助安全 / 状态机 / 审计",
+      "kind": "implementation_defect",
+      "severity": "P2",
+      "status": "closed",
+      "conformity": "原版本不符合；当前组件范围符合",
+      "evidence_status": "已证实并复现",
+      "requirements": [
+        "V0.19.9 § 安全 Finding 有效目标及最终处置幂等"
+      ],
+      "anchors": [
+        "crates/kernel-core/src/control_plane/security_finding.rs:491-534,553-598",
+        "docs/design/baselines/v0.19.9-implementation-spec.txt:5570-5574,5602-5604"
+      ],
+      "condition": "reserve Assisted → submit → finalize InvalidTarget → 原有效期内 consume；此前仅检查 consumed。",
+      "impact": "终结建议重新进入待复核工作，破坏终态一致性；不直接授予动作权限。",
+      "remediation": "consume 同时拒绝 consumed 或存在 terminal 的记录。",
+      "acceptance": [
+        "ACK 前后 consume 均返回 Stale",
+        "终态字节不变，未 ACK 保留 credit，ACK 后也须 context 到期才回收"
+      ],
+      "evidence": [
+        "V05",
+        "V06",
+        "V08",
+        "REVIEW-02"
+      ],
+      "dependencies": [],
+      "references": [],
+      "limitation": "当前完整 FindingCustody 尚未接入生产入口；没有据此声称已发生原生攻击。"
+    },
+    {
+      "id": "A203-004",
+      "title": "x86 os-runtime 豁免不兼容的 ARM production 特性",
+      "domain": "HAL / 平台适配 / 构建契约",
+      "kind": "implementation_defect",
+      "severity": "P2",
+      "status": "closed",
+      "conformity": "原版本不符合；当前配置准入符合",
+      "evidence_status": "已证实并复现",
+      "requirements": [
+        "不支持的平台组合必须明确拒绝",
+        "平台证据独立"
+      ],
+      "anchors": [
+        "kernel/build/x86_64.rs:5-15",
+        "kernel/src/main.rs:19-26",
+        "kernel/src/arch/x86_64/mod.rs:77-80",
+        "kernel/src/runtime/os.rs:153-159"
+      ],
+      "condition": "x86 启用 os-runtime，并携带默认或任一 v020-production* 特性；单独默认 x86 原本已被拒绝。",
+      "impact": "构建接受 V0.20 生产标志但实际选择旧 PC runtime，证据及控制业务分工不相符。",
+      "remediation": "在 runtime 豁免之前拒绝所有 CARGO_FEATURE_V020_PRODUCTION*；保留显式 x86 profiles。",
+      "acceptance": [
+        "14 个 production profiles + runtime 及 default + runtime 均拒绝",
+        "6 个显式合法 x86 组合仍选择原 builder；共 22 组合"
+      ],
+      "evidence": [
+        "V07",
+        "V09",
+        "REVIEW-02"
+      ],
+      "dependencies": [],
+      "references": [],
+      "limitation": "测试执行真实 build adapter 的宿主 harness，不代表 x86 原生构建或启动。"
+    },
+    {
+      "id": "A203-005",
+      "title": "V0.20.3 未接入自动回归 CI",
+      "domain": "架构验证 / 演进",
+      "kind": "verification_wiring_defect",
+      "severity": "P2",
+      "status": "awaiting_verification",
+      "conformity": "原版本不符合；已改触发配置待远端验证",
+      "evidence_status": "已证实",
+      "requirements": [
+        "整改提交必须获得对应源码回归证据"
+      ],
+      "anchors": [
+        ".github/workflows/validate-current.yml:3-8",
+        ".github/workflows/v20-native-mechanism.yml:4-27",
+        ".github/workflows/v020-production.yml:38-57",
+        ".github/workflows/v0201-kernel-algorithms.yml:3-18"
+      ],
+      "condition": "V0.20.3 push 或以该分支为目标的 PR 均未匹配既有自动触发过滤。",
+      "impact": "自动修复没有自动 host/native 回归；旧分支绿色状态不能归属新版本。",
+      "remediation": "将 V0.20.3、专用整改分支及目标 PR 接入 validate-current 与两架构机制车道，覆盖源码、用户包、测试、工具、Cargo 和工具链输入。",
+      "acceptance": [
+        "静态检查 push/PR 分支和相关路径均匹配",
+        "保留准确修复 SHA 的真实 workflow run 和结果；失败须修复并复验"
+      ],
+      "evidence": [
+        "V14"
+      ],
+      "dependencies": [
+        "A203-011"
+      ],
+      "references": [],
+      "limitation": "静态 YAML 解析不等于 GitHub Actions 已运行或通过。"
+    },
+    {
+      "id": "A203-006",
+      "title": "默认启动在 CPU0 执行真实网络业务",
+      "domain": "控制业务隔离 / 网络 / 预算",
+      "kind": "architecture_nonconformance",
+      "severity": "P1",
+      "status": "open",
+      "conformity": "不符合",
+      "evidence_status": "已证实静态路径",
+      "requirements": [
+        "C={CPU0}；普通业务仅 B={CPU1,2,3}",
+        "业务热路径不等待 AI"
+      ],
+      "anchors": [
+        "kernel/src/arch/aarch64/production.rs:1369-1374,1892-1915",
+        "kernel/src/arch/aarch64/production/net.rs:4-18,147-151,187-207,250-283",
+        "docs/design/v0.20-native-local-system.md:15-19"
+      ],
+      "condition": "默认 v020-production 关闭业务核 gate 后，在 CPU0 调用 net::serve；authenticated 配置还执行 TLS。",
+      "impact": "网络轮询、TCP/EL0 Echo 占用唯一控制核，与现行职责及预算边界不一致。",
+      "remediation": "将真实网络和 Echo 调度接入业务核受保护执行路径，CPU0 保留控制与确定性发布；按现有契约保持网络设备与完成回收所有权。",
+      "acceptance": [
+        "ARM 联合原生负载证实 TCP/TLS/Echo 在业务核",
+        "CPU0 账本、无模型、网络阻塞和设备复位下进度及权限不变量通过"
+      ],
+      "evidence": [],
+      "dependencies": [
+        "A203-010"
+      ],
+      "references": [],
+      "shared_with": "既有性能自动任务 P13；只读复用其经过核验的成果，不并行改写其分支",
+      "limitation": "bounded skeleton 标记正确披露范围，但不能算目标隔离已满足。"
+    },
+    {
+      "id": "A203-007",
+      "title": "默认控制链仍为有限夹具，双脑及十五域生产闭环未完成",
+      "domain": "AI / 系统服务 / 总体架构",
+      "kind": "implementation_gap",
+      "severity": "P1",
+      "status": "open",
+      "conformity": "目标实现未闭合",
+      "evidence_status": "已证实源码范围",
+      "requirements": [
+        "独立双脑仅建议",
+        "D01–D15 同等地位接入",
+        "独立裁决、唯一发布、真实执行回执与反馈"
+      ],
+      "anchors": [
+        "kernel/src/arch/aarch64/production.rs:26-36,1032-1035,1485-1508,1564-1569,1622-1638,1830-1847,2055-2061",
+        "user/v0199-control/main.rs:20-61,137-167",
+        "docs/design/v0.20-native-local-system.md:17,37-43"
+      ],
+      "condition": "八角色只运行到固定 clock/yield 条件；EL1 预制规则/计划/决定，固定执行字；real_models=false 后 halt。",
+      "impact": "不能支持完整持续原生双脑和15域闭环交付声明；现有保护组件存在但不等于生产接线完成。",
+      "remediation": "为15域建立真实调用者、遥测、模型加载、建议/Finding、独立规则裁决、发布、执行、回执、反馈矩阵；接入统一预算与代际恢复。",
+      "acceptance": [
+        "15域均有真实原生路径与必要负向验证",
+        "相互隔离、仅建议、无模型确定性运行、70ms/100ms总账及子预算不被改变",
+        "真实模型/配置来源可验证，不用 probe seed 冒充交付"
+      ],
+      "evidence": [],
+      "dependencies": [
+        "A203-006",
+        "A203-008",
+        "A203-009",
+        "A203-010"
+      ],
+      "references": [],
+      "shared_with": "既有生产整改 G01–G11 和性能 P16；核验语义后择取成果",
+      "limitation": "涉及外部模型、签名授权和正式验证输入；缺失须登记阻塞，不能伪造。"
+    },
+    {
+      "id": "A203-008",
+      "title": "全局 FrameMeta 尚未进入通用原生分配与撤销保管链",
+      "domain": "内核 / 资源 / 内存安全",
+      "kind": "implementation_gap",
+      "severity": "P1",
+      "status": "open",
+      "conformity": "目标实现未闭合",
+      "evidence_status": "已证实源码范围",
+      "requirements": [
+        "SEC-M 页所有权、TLB、DMA pin、清零与全局计账"
+      ],
+      "anchors": [
+        "crates/kernel-core/src/frames.rs:1-12,80-94",
+        "kernel/src/arch/aarch64/production/frames/pool.rs:1-2,14,126-143"
+      ],
+      "condition": "一般 FramePool 可不附加 ledger；当前生产证明仅CPU0四页，未映射给实际EL0或DMA。",
+      "impact": "可选镜像及四页演示不能证明真实通用内存所有权守恒、撤销与复用安全闭环。",
+      "remediation": "真实分配器与EL0撤销/TLBI/DMA pin/epoch/清零/隔离统一进入权威FrameMeta，保持固定预算与资源容量。",
+      "acceptance": [
+        "实际所有者生命周期与全局守恒可追踪",
+        "撤销不完整、TLB/DMA失败、清零失败与代际边界均拒绝复用并保持在途义务"
+      ],
+      "evidence": [],
+      "dependencies": [
+        "A203-002",
+        "A203-010"
+      ],
+      "references": [],
+      "limitation": "实现缺口不等同于已发生内存破坏；原生故障证据必需。"
+    },
+    {
+      "id": "A203-009",
+      "title": "原生持久快照仍停留在空目录和空视图",
+      "domain": "数据 / 文件服务 / 可靠性 / 安全",
+      "kind": "implementation_gap",
+      "severity": "P1",
+      "status": "open",
+      "conformity": "目标实现未闭合",
+      "evidence_status": "已证实源码范围",
+      "requirements": [
+        "redo与不可变历史同时成立",
+        "权限/收据/保护水位不可回退",
+        "既定G1介质方向与资源证明"
+      ],
+      "anchors": [
+        "kernel/src/arch/aarch64/production/snapshot_catalog.rs:1-23,40-48",
+        "docs/design/v0.20-native-local-system.md:49-56,91,99,101",
+        "docs/design/v0.20-g1-media-freeze.md"
+      ],
+      "condition": "真实接线以 EmptyCatalog/EmptySnapshotView 为挂载视图；创建/恢复/GC的生产路径与字节冻结尚未闭合。",
+      "impact": "空信封与旧版本组件测试不能证明当前完整持久快照、恢复和防回退行为。",
+      "remediation": "遵循已有批准方向与待决边界，接通真实挂载写入、创建、只读历史、恢复、GC及保留期；补黄金向量和独立codec，不自行宣布G1冻结。",
+      "acceptance": [
+        "断电/部分FLUSH/恢复/GC故障与资源不足验证",
+        "恢复不回退BootEpoch、撤权、收据、保护水位；UNKNOWN不重做",
+        "真实生产介质及签名授权/冻结证据明确"
+      ],
+      "evidence": [],
+      "dependencies": [
+        "A203-001",
+        "A203-002",
+        "A203-010"
+      ],
+      "references": [],
+      "limitation": "若缺少待决格式批准或签名授权，保持blocked；不删库重建、放宽保留期或冒用测试身份。"
+    },
+    {
+      "id": "A203-010",
+      "title": "独立生产验证器没有绑定源码到所运行的 ELF",
+      "domain": "可观测性 / 证据 / 接口契约",
+      "kind": "verification_provenance_defect",
+      "severity": "P2",
+      "status": "open",
+      "conformity": "不符合",
+      "evidence_status": "已证实静态反例",
+      "requirements": [
+        "验证证据必须对应准确构建及依赖闭包"
+      ],
+      "anchors": [
+        "tools/verify_v020_production.py:71-150,588-622,698-699,736-737",
+        "kernel/src/arch/aarch64/production.rs:75-103"
+      ],
+      "condition": "传入旧 ELF，当前工作树为新源码；旧 ELF 本身仍通过验证器现有 QEMU/串口/证据页运行断言，两者各自 hash 在运行前后不变，但缺少构建时关联。",
+      "impact": "旧二进制结果可能被归入新修复；手工清单还未覆盖所有控制模块与Cargo.lock。",
+      "remediation": "构建时生成并校验 source/dependency/features/toolchain/ELF 关联清单；外部 --elf 必须匹配，运行前后复核；覆盖真实依赖闭包或受控完整源码树。",
+      "acceptance": [
+        "缺清单、旧ELF+新源码、feature或依赖不匹配均失败",
+        "正确关联产物仍执行，原有production_skeleton等scope不升级",
+        "不只增输出字段，要有行为负向测试与原生配对证据"
+      ],
+      "evidence": [],
+      "dependencies": [],
+      "references": [],
+      "limitation": "CI内commit.txt和ELF配对提供部分缓解；问题主要在独立CLI的契约，不是客体执行漏洞。"
+    },
+    {
+      "id": "A203-011",
+      "title": "完整宿主工具回归与当前源码、平台和历史输入脱节",
+      "domain": "验证接线 / 演进 / 证据可重现性",
+      "kind": "verification_wiring_defect",
+      "severity": "P2",
+      "status": "in_progress",
+      "conformity": "不符合；环境受阻项另列",
+      "evidence_status": "已运行并归因，部分子项待补证",
+      "requirements": [
+        "自动修复需有可执行且不伪造的验证基线",
+        "历史来源身份及现行单机范围保持"
+      ],
+      "anchors": [
+        "tools/cosmic_notifications_elf.py::_REVIEWED_LOADER_CONTRACT",
+        "tools/os_cosmic_services_runtime_v7.py::USER_STATUS_FIELDS",
+        "tools/test_discovery_capture.py:30",
+        "tools/v16_learning_archive.py::SCHEMAS",
+        "tools/prepare_host_tests.py::prepare"
+      ],
+      "condition": "完整tools discovery真实运行2180项，38 failures/171 errors/33 skipped；多个测试因同一上游合同门提前失败。",
+      "impact": "新版本全量验证门不能通过；不得把大量级联测试失败等同为同数量独立架构缺陷。",
+      "remediation": "按根因修复经过源码复审的pin、严格版本化字段解析、排除crate的独立测试调用和临时目录可移植性；保留冻结录制、D16默认隔离与所有安全门。AF_UNIX受限和缺失真实历史macOS输入如实分层；有语义变化的旧schema须独立版本化审核。",
+      "acceptance": [
+        "所修根因的行为回归通过，冻结capture字节/SHA不变",
+        "完整支持环境重跑，失败/受阻/skip分别记录；不得通过无依据跳过测试或刷新有语义变化的pin变绿",
+        "准确提交CI门通过后才能关闭A203-005；基线回归问题全部有对应闭合证据"
+      ],
+      "evidence": [
+        "V13",
+        "V15",
+        "V16",
+        "REVIEW-04"
+      ],
+      "dependencies": [],
+      "references": [],
+      "limitation": "本次全量运行未先执行prepare_host_tests；该工具仅准备固定上游来源，不能修复已确认的源码pin/字段/包调用漂移。缺失外部输入不是已证实产品运行漏洞。",
+      "subtasks": [
+        {
+          "id": "A203-011a",
+          "title": "经完整diff确认仅格式变化的loader源码审核pin",
+          "status": "closed",
+          "scope": "reviewed cause and targeted behavioral tests only; full tool suite not rerun"
+        },
+        {
+          "id": "A203-011b",
+          "title": "UserStatus现行/历史完整语法及遗留discovery独立crate调用",
+          "status": "closed",
+          "scope": "reviewed cause and targeted behavioral tests only; full tool suite not rerun"
+        },
+        {
+          "id": "A203-011c",
+          "title": "Mac专用临时目录路径导致Linux fixture不能创建",
+          "status": "closed",
+          "scope": "reviewed cause and targeted behavioral tests only; full tool suite not rerun"
+        },
+        {
+          "id": "A203-011d",
+          "title": "v16学习归档schema含legacy-d16-decode语义变化，需版本化审核",
+          "status": "open"
+        },
+        {
+          "id": "A203-011e",
+          "title": "AF_UNIX限制及缺失真实历史macOS构建/磁盘/host工具闭包输入",
+          "status": "blocked"
+        }
+      ]
+    }
+  ],
+  "risks": [
+    {
+      "id": "A203-R01",
+      "title": "PIE快照/审计入口实时身份复核不统一",
+      "status": "awaiting_verification",
+      "anchors": [
+        "kernel/src/arch/aarch64/production.rs:976-1028",
+        "kernel/src/arch/aarch64/production/observations/audit_rpc.rs:49"
+      ],
+      "condition": "未来重启/撤销/重放接线使索引与实际TTBR0、代际或cap不一致",
+      "why_not_confirmed": "当前上下文和VECTOR_CALLER由EL1串行管理，未证明恶意EL0能独自打破前置条件。",
+      "next": "参考f5272178bc9b30ab02e710ef6b796f89d220a33b，复核实时trap身份及admit_live，并运行错TTBR0/旧代际/撤权replay/ACK负向。"
+    },
+    {
+      "id": "A203-R02",
+      "title": "MountedReceiptQuery依赖上层已认证principal的前置条件",
+      "status": "awaiting_verification",
+      "anchors": [
+        "crates/kernel-core/src/security/file_receipt_query_v4.rs:85-114"
+      ],
+      "why_not_confirmed": "本版仅单测调用，构造器明确要求已认证mount；尚无生产调用者违反条件的证据。",
+      "next": "接线时绑定VerifiedOfflineConfig、已提交SecurityState与同一mount；伪principal且CRC一致的输入必须被拒绝。"
+    },
+    {
+      "id": "A203-R03",
+      "title": "退役页清零及角色恢复预算缺少准确版本运行测量",
+      "status": "awaiting_verification",
+      "anchors": [
+        "kernel/src/arch/aarch64/v0199_control_bringup.rs:1192-1196"
+      ],
+      "why_not_confirmed": "旧分支日志不能证明本版运行失败；整页清零/逐字节读回后才checkpoint只是需要实测的风险。",
+      "next": "在原预算下测量真实恢复和重启；可审阅acdf122的分段scrub，但不得将移植等同整窗验收。"
+    }
+  ],
+  "verification_gaps": [
+    {
+      "id": "VG01",
+      "title": "完整原生验收与实体平台证据",
+      "status": "not_run",
+      "inventory": {
+        "stable_ids": 127,
+        "g4_pairs": 262,
+        "g5_additional_pairs": 26
+      },
+      "note": "127个稳定ID的现有curated覆盖表为HOST71/FIXTURE44/GAP12，全部正式判定仍NOT_RUN；映射统计不是测试执行结果。"
+    },
+    {
+      "id": "VG02",
+      "title": "G1字节冻结/黄金向量/独立codec/签名授权与真实模型输入",
+      "status": "open",
+      "note": "仓库记录的方向批准不等于所有未决字节、实机或发布已批准。"
+    },
+    {
+      "id": "VG03",
+      "title": "首轮修复的原生设备故障和跨ISA验证",
+      "status": "not_run",
+      "note": "本地已做宿主反例和ARM构建；新增CI将提供机制证据，不能替代完整设备故障、预算或A53实机。"
+    }
+  ],
+  "coverage": [
+    {
+      "domain": "总体架构",
+      "status": "已检查（代表路径）",
+      "scope": "基线、默认composition与控制业务职责",
+      "findings": "A203-006,A203-007"
+    },
+    {
+      "domain": "内核",
+      "status": "已检查（代表路径）",
+      "scope": "页所有权、状态终态、syscall边界抽样",
+      "findings": "A203-003,A203-008"
+    },
+    {
+      "domain": "HAL",
+      "status": "已检查（代表路径）",
+      "scope": "VirtIO完成、reset、跨ISA profile",
+      "findings": "A203-001,A203-002,A203-004"
+    },
+    {
+      "domain": "资源",
+      "status": "已检查（代表路径）",
+      "scope": "DMA/FrameMeta、预算契约",
+      "findings": "A203-002,A203-008,A203-R03"
+    },
+    {
+      "domain": "系统服务",
+      "status": "已检查（代表路径）",
+      "scope": "控制角色、Echo、文件与快照",
+      "findings": "A203-006,A203-007,A203-009"
+    },
+    {
+      "domain": "分布式",
+      "status": "不适用（当前单机目标）",
+      "scope": "检查默认本地依赖隔离；历史集群功能未重新审核",
+      "findings": ""
+    },
+    {
+      "domain": "AI系统",
+      "status": "已检查（代表路径）",
+      "scope": "双脑权限、真实模型/建议/回执接线",
+      "findings": "A203-003,A203-007"
+    },
+    {
+      "domain": "安全",
+      "status": "已检查（代表路径）",
+      "scope": "建议终态、授权/身份与持久化边界",
+      "findings": "A203-003,A203-R01,A203-R02"
+    },
+    {
+      "domain": "通信",
+      "status": "已检查（代表路径）",
+      "scope": "网络CPU归属、角色RPC身份",
+      "findings": "A203-006,A203-R01"
+    },
+    {
+      "domain": "数据",
+      "status": "已检查（代表路径）",
+      "scope": "持久快照与receipt信任条件",
+      "findings": "A203-009,A203-R02"
+    },
+    {
+      "domain": "高可靠",
+      "status": "已检查（代表路径）",
+      "scope": "设备错误锁存、保管、恢复边界",
+      "findings": "A203-001,A203-002,A203-009"
+    },
+    {
+      "domain": "实时与性能",
+      "status": "已检查（契约/源码）",
+      "scope": "固定预算和checkpoint风险，未作时延实测",
+      "findings": "A203-006,A203-R03"
+    },
+    {
+      "domain": "接口与契约",
+      "status": "已检查（代表路径）",
+      "scope": "profile、终态、完成与验证器CLI",
+      "findings": "A203-003,A203-004,A203-010"
+    },
+    {
+      "domain": "可观测性",
+      "status": "已检查（代表路径）",
+      "scope": "source/ELF来源、scope诚实标记",
+      "findings": "A203-010"
+    },
+    {
+      "domain": "演进",
+      "status": "已检查",
+      "scope": "V0.20.3准确ref、旧附件覆盖与CI",
+      "findings": "A203-004,A203-005"
+    },
+    {
+      "domain": "决策与验证",
+      "status": "已检查（目录/证据层）",
+      "scope": "G1未决、稳定ID和证明清单，未执行全验收",
+      "findings": "A203-005,A203-010"
+    }
+  ],
+  "automation": {
+    "id": "Automation_2ffa41fbd9ac819196292e7655eee44c",
+    "cadence": "hourly",
+    "timezone": "Asia/Muscat",
+    "mode": "single controller, bounded work items, sequential integration",
+    "status": "enabled",
+    "next_run_time_at_creation": "2026-11-26T21:59:29+04:00"
+  },
+  "completion_policy": {
+    "must_close_all_findings": true,
+    "must_resolve_confirmed_risks": true,
+    "must_verify_required_native_evidence": true,
+    "forbid_closure_by_relabeling": true,
+    "forbid_promoting_fixture_to_production": true,
+    "stop_action": "全部审核缺陷按原判据闭合后，读取CyxiaOS-V0.20最新head，保留并整合并发更新、解决语义冲突、通过必要回归与真实保护/审核，再自动合入并核验目标SHA的CI；真实同步完成后发送最终证据总表并暂停本任务。",
+    "external_blockers": "缺失实体硬件、真实模型、签名配置或待决批准时明确blocked，保留未完成；仅在条件变化时继续，不伪造结果。",
+    "automatic_sync_authorized": true,
+    "integration_rules": [
+      "最终同步到CyxiaOS-V0.20已获用户明确授权，不重复请求一般确认",
+      "不强推，不绕过实际分支保护、必要审核或权限",
+      "整合目标最新代码并验证，保留其他任务及用户更新",
+      "合入后必须核验目标真实SHA与CI；失败则继续整改"
+    ]
+  },
+  "integration_target": "CyxiaOS-V0.20"
+}

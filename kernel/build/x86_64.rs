@@ -3,6 +3,13 @@ use std::env;
 pub fn build() {
     let runtime = env::var_os("CARGO_FEATURE_OS_RUNTIME").is_some();
     for (key, _) in env::vars() {
+        // These profiles are wired only by the AArch64 composition. The PC
+        // runtime must not silently accept their authority/fixture flags and
+        // select the legacy desktop path instead, including through defaults.
+        assert!(
+            !key.starts_with("CARGO_FEATURE_V020_PRODUCTION"),
+            "V0.20 production profiles require AArch64; use --no-default-features for an explicit x86 profile: {key}"
+        );
         assert!(
             runtime
                 || !key.starts_with("CARGO_FEATURE_")

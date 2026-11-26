@@ -190,24 +190,18 @@ impl BatchQueue {
     pub fn stats(&self) -> NotifyStats {
         let mut s = self.stats;
         s.pending = self.count as u8;
-        s.inflight = self
-            .slots
-            .iter()
-            .filter(|s| s.state == State::Published)
-            .count() as u8;
-        s.descriptors = self
-            .slots
-            .iter()
-            .filter(|v| v.state != State::Free)
-            .map(|v| v.descriptors)
-            .sum();
-        s.pending_version = self
-            .slots
-            .iter()
-            .filter(|v| v.state != State::Free)
-            .map(|v| v.version)
-            .max()
-            .unwrap_or(0);
+        s.inflight = 0;
+        s.descriptors = 0;
+        s.pending_version = 0;
+        for slot in &self.slots {
+            if slot.state == State::Published {
+                s.inflight += 1;
+            }
+            if slot.state != State::Free {
+                s.descriptors += slot.descriptors;
+                s.pending_version = s.pending_version.max(slot.version);
+            }
+        }
         s
     }
     pub fn current_batch(&self, now: u64) -> u8 {
@@ -302,6 +296,22 @@ impl BatchQueue {
         isolated: bool,
         p: &impl Platform,
     ) -> Result<Token, Error> {
+        self.enqueue_with_response_tail(t, request, (writable, None), synchronous, isolated, p)
+    }
+
+    /// Optionally initialize the final device-writable byte while the slot
+    /// is still private. Block status must not inherit a successful zero
+    /// from initial allocation or the preceding release.
+    pub(crate) fn enqueue_with_response_tail(
+        &mut self,
+        t: &mut Transport,
+        request: &[u8],
+        response: (usize, Option<u8>),
+        synchronous: bool,
+        isolated: bool,
+        p: &impl Platform,
+    ) -> Result<Token, Error> {
+        let (writable, tail) = response;
         if self.poisoned {
             return Err(Error::Device);
         }
@@ -309,7 +319,11 @@ impl BatchQueue {
             self.poison(t, p);
             return Err(Error::Device);
         }
-        if request.len() > 4096 || writable > 4096 || (request.is_empty() && writable == 0) {
+        if request.len() > 4096
+            || writable > 4096
+            || (request.is_empty() && writable == 0)
+            || (tail.is_some() && writable == 0)
+        {
             return Err(Error::Address);
         }
         // A stale used head must be rejected before its descriptor can become
@@ -329,6 +343,9 @@ impl BatchQueue {
         // A later wider descriptor exposes only the still-zero initial tail,
         // so rewriting the writable buffer here is redundant and would put a
         // second full DMA-range clear in the RX completion segment.
+        if let Some(value) = tail {
+            m.response[at].put8(writable - 1, value);
+        }
         let head = at * 2;
         let desc = head * 16;
         let descriptors = u16::from(!request.is_empty()) + u16::from(writable != 0);
@@ -677,6 +694,29 @@ mod tests {
         assert!(syncs.iter().any(|(_, len)| *len == 7), "{syncs:?}");
         assert!(syncs.iter().any(|(_, len)| *len == 8), "{syncs:?}");
     }
+    #[test]
+    fn wave4_queue_stats_retain_completed_descriptor_custody_until_release() {
+        let (mut q, mut t, p) = fixture(16);
+        q.install(4, 7, 1_000_000, 0).unwrap();
+        let token = q.enqueue(&mut t, &[1], 1, false, false, &p).unwrap();
+        let s = q.stats();
+        assert_eq!((s.pending, s.inflight, s.descriptors), (1, 0, 2));
+        assert_eq!(s.pending_version, 7);
+        q.drain(&mut t, &p).unwrap();
+        let s = q.stats();
+        assert_eq!((s.pending, s.inflight, s.descriptors), (0, 1, 2));
+        used(&mut q, 0, 1);
+        let c = q.poll(&mut t, &mut [0; 1], &p).unwrap().unwrap();
+        assert_eq!(c.token, token);
+        let s = q.stats();
+        assert_eq!((s.pending, s.inflight, s.descriptors), (0, 0, 2));
+        assert_eq!(s.pending_version, 7);
+        q.release(token).unwrap();
+        let s = q.stats();
+        assert_eq!((s.pending, s.inflight, s.descriptors), (0, 0, 0));
+        assert_eq!(s.pending_version, 0);
+    }
+
     #[test]
     fn four_chains_one_publish_and_out_of_order_custody() {
         let (mut q, mut t, p) = fixture(16);

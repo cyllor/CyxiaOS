@@ -27,7 +27,8 @@ class DiscoveryCaptureTests(unittest.TestCase):
         cargo=shutil.which('cargo') or str(pathlib.Path.home()/'.cargo/bin/cargo')
         with tempfile.TemporaryDirectory() as directory:
             output=pathlib.Path(directory)/'discovery.pcap'
-            result=subprocess.run([cargo,'test','--locked','--offline','-p','cyxia-cluster-transport','--test','discovery_network',
+            result=subprocess.run([cargo,'test','--manifest-path',str(root/'crates/cluster-transport/Cargo.toml'),
+                                   '--locked','--offline','--test','discovery_network',
                                    'delayed_arp_across_announcements_keeps_the_original_selected_attempt','--','--exact'],
                                   cwd=root,env=dict(os.environ,CYXIA_DISCOVERY_TEST_PCAP=str(output)),capture_output=True)
             self.assertEqual(result.returncode,0,result.stdout.decode()+result.stderr.decode())

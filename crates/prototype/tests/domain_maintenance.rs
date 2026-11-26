@@ -371,3 +371,51 @@ fn console_accepted_prefix_remains_accounted_when_clock_or_retry_fails() {
         assert_eq!(&audit, b"fault");
     }
 }
+
+#[test]
+fn wave6_optional_budget_keeps_partial_and_cross_group_debits() {
+    let mut b = BackgroundBudgets::new();
+    let other = ObjectKey {
+        id: 2,
+        generation: 1,
+    };
+    b.register(key(), 100, 0, 0).unwrap();
+    b.register(other, 100, 0, 0).unwrap();
+    let a = b.reserve(key(), 3_000_000, 0).unwrap();
+    let held = b.reserve(key(), 4_000_000, 1).unwrap();
+    let independent = b.reserve(other, 2_000_000, 1).unwrap();
+    b.complete(a, 0, 2).unwrap();
+    assert_eq!(b.status(key()).unwrap().reserved_ns, 4_000_000);
+    assert_eq!(b.peek_status(key(), WINDOW_NS), Err(Error::Busy));
+    assert_eq!(b.recover_stopped(key(), WINDOW_NS), Err(Error::Busy));
+    assert_eq!(b.reserve(key(), 1, WINDOW_NS), Err(Error::Busy));
+    b.complete(held, 1_000_000, WINDOW_NS + 1).unwrap();
+    assert_eq!(b.peek_status(key(), WINDOW_NS + 1).unwrap().reserved_ns, 0);
+    assert_eq!(
+        b.peek_status(key(), WINDOW_NS + 1).unwrap().spent_ns,
+        1_000_000
+    );
+    assert_eq!(b.peek_status(other, WINDOW_NS + 1), Err(Error::Busy));
+    assert_eq!(b.complete(held, 0, WINDOW_NS + 1), Err(Error::Stale));
+    b.complete(independent, 0, WINDOW_NS + 2).unwrap();
+    assert_eq!(b.current_status(other, WINDOW_NS + 2).unwrap().spent_ns, 0);
+}
+
+#[test]
+fn wave6_recovery_full_history_evicts_only_oldest_terminal_receipt() {
+    let mut s = RecoverySupervisor::new();
+    s.register(key(), 1).unwrap();
+    let pending = s.begin(apply(1), 1, 0).unwrap();
+    for seq in 2..=272 {
+        s.begin(apply(seq), 0, seq).unwrap();
+    }
+    assert_eq!(s.query(apply(1)), Ok(pending));
+    assert!(s.query(apply(2)).is_ok());
+    assert_eq!(s.begin(apply(273), 1, 2_000_000_000), Err(Error::Busy));
+    s.begin(apply(273), 0, 273).unwrap();
+    assert_eq!(s.query(apply(2)), Err(Error::Stale));
+    assert!(s.query(apply(3)).is_ok());
+    assert_eq!(s.query(apply(1)), Ok(pending));
+    assert_eq!(s.begin(apply(1), 1, 2_000_000_001), Ok(pending));
+    assert_eq!(s.recover_stopped(key()), Err(Error::Busy));
+}

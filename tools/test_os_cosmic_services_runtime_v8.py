@@ -1389,6 +1389,13 @@ CAPTURE3_LIST_BLOCK = b'posix list\r\nEL0 UserStatus { pid: 3, parent_pid: 0, ex
 CAPTURE3_LIST_BLOCK_SHA256 = '6d6a7d25888a09053507a1476380cd6cd74d4d8739fc05fa1f232bbc2dc26b23'
 
 
+def current_user_status_fixture_block():
+    """Synthetic current-format rows, independent of the producer grammar."""
+    block = re.sub(rb'(space_rebuilds: [0-9]+, )', rb'\g<1>space_reuses: 9, ',
+                   CAPTURE3_LIST_BLOCK)
+    return re.sub(rb'(space_retire_ns: [0-9]+, )', rb'\g<1>space_revoke_ns: 17, ', block)
+
+
 def retained_capture3_fixture():
     selected = [os.environ.get(CAPTURE3_RAW_ENV), os.environ.get(CAPTURE3_COMMANDS_ENV)]
     if selected == [None, None]:
@@ -1446,6 +1453,54 @@ class SettingsTransportBoundaries(unittest.TestCase):
         self.assertEqual(subject.USER_STATUS_FIELDS, actual)
         self.assertEqual(hashlib.sha256(CAPTURE3_LIST_BLOCK).hexdigest(), CAPTURE3_LIST_BLOCK_SHA256)
         self.assertEqual(len(CAPTURE3_LIST_BLOCK), 2497)
+
+    def test_current_complete_kernel_rows_keep_new_fields_bounded_and_receipted(self):
+        block = current_user_status_fixture_block()
+        for value in (0, 9, (1 << 64) - 1):
+            current = block.replace(b'space_reuses: 9,', f'space_reuses: {value},'.encode())
+            current = current.replace(b'space_revoke_ns: 17,', f'space_revoke_ns: {value},'.encode())
+            raw, commands, _, _ = self.fixture(block=current)
+            before = bytes(raw), copy.deepcopy(commands)
+            with self.subTest(value=value):
+                proof = self.observed(raw, commands)
+                view, receipts = subject.settings_transport_view(raw, commands, 0)
+                self.assertEqual(view, b'\n'.join(protocol_rows()[:2]) + b'\n')
+                self.assertEqual(receipts[0]['bytes'], len(current))
+                self.assertEqual(receipts[0]['sha256'], hashlib.sha256(current).hexdigest())
+                self.assertEqual(receipts[0]['status_pids'], [3, 5, 6])
+                self.assertEqual(proof['transport_command_spans'], receipts)
+                self.assertEqual(self.observed(raw, commands, expected_receipts=receipts), proof)
+                self.assertEqual((raw, commands), before)
+
+    def test_current_rows_reject_missing_reordered_duplicate_unknown_and_noncanonical_fields(self):
+        block = current_user_status_fixture_block()
+        changes = [
+            block.replace(b'space_reuses: 9, ', b'', 1),
+            block.replace(b'space_revoke_ns: 17, ', b'', 1),
+            block.replace(b'space_reuses: 9, ', b''),
+            block.replace(b'space_revoke_ns: 17, ', b''),
+            block.replace(b'space_reuses: 9, space_prepare_ns: 46590950, ',
+                          b'space_prepare_ns: 46590950, space_reuses: 9, ', 1),
+        ]
+        for field, value in ((b'space_reuses', b'9'), (b'space_revoke_ns', b'17')):
+            original = field + b': ' + value + b', '
+            changes.extend((block.replace(original, original * 2, 1),
+                            block.replace(original, b'unknown: ' + value + b', ', 1)))
+            for invalid in (b'-1', b'00', b'18446744073709551616'):
+                changes.append(block.replace(original, field + b': ' + invalid + b', ', 1))
+        for changed in changes:
+            raw, commands, _, _ = self.fixture(block=changed)
+            with self.subTest(block=changed[:500]), self.assertRaises((ValueError, AssertionError)):
+                self.observed(raw, commands)
+
+    def test_complete_current_and_legacy_row_grammars_cannot_mix_within_one_response(self):
+        current = current_user_status_fixture_block().split(b'\r\n')
+        legacy = CAPTURE3_LIST_BLOCK.split(b'\r\n')
+        for first, second in ((current, legacy), (legacy, current)):
+            mixed = b'\r\n'.join(first[:2] + second[2:])
+            raw, commands, _, _ = self.fixture(block=mixed)
+            with self.subTest(block=mixed[:500]), self.assertRaisesRegex(ValueError, 'exact kernel response'):
+                self.observed(raw, commands)
 
     def test_exact_authored_complete_block_recovers_only_unchanged_start_and_readiness(self):
         raw, commands, marker_start, split = self.fixture()
