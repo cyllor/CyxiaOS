@@ -385,6 +385,22 @@ class W11Validation(unittest.TestCase):
         self.assertFalse(obs["tls_echo_turn_verified"], "page evidence alone cannot prove TLS")
         self.rejects("unexpected authenticated RNG", words=words, lines=lines)
 
+    def test_authenticated_rng_rejects_unsealed_or_inconsistent_delivery(self):
+        modes = v.Modes(authenticated_net=True)
+        for count, serial_count, failed in ((0, 96, 0), (96, 0, 0),
+                                            (96, 104, 0), (96, 96, 1),
+                                            (31, 31, 0)):
+            with self.subTest(count=count, serial_count=serial_count, failed=failed):
+                words = w11_words()
+                words[160] = count
+                words[176] = 1
+                lines = w11_lines() + [
+                    f"V020_W12_NET_ENTROPY a=8 b={serial_count} c={failed}",
+                    f"V020_W13_NET_RETIRE a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
+                ]
+                self.rejects("matching VirtIO RNG evidence", words=words,
+                             lines=lines, modes=modes)
+
     def test_authenticated_eof_keeps_the_admission_credit(self):
         words = w11_words()
         words[160] = 96
