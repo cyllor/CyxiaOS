@@ -9,7 +9,7 @@ use cyxia_kernel_core::contig_frames::ContigFramePool;
 use std::{fmt::Debug, hint::black_box, time::Instant};
 
 const SAMPLES: usize = 7;
-const ROUNDS: usize = 256;
+const ROUNDS: usize = 4096;
 
 #[inline(never)]
 fn contig<const N: usize>(base: u64, fragmented: bool) -> u64 {
@@ -64,15 +64,20 @@ fn measure<T: Copy + Eq + Debug>(name: &str, mut work: impl FnMut() -> T) {
     }
 }
 
+fn measure_contig<const N: usize>() {
+    let dense = format!("contig-dense-{N}");
+    let fragmented = format!("contig-fragmented-{N}");
+    measure(&dense, || contig::<N>(black_box(0x1000), false));
+    measure(&fragmented, || contig::<N>(black_box(0x1000), true));
+}
+
 fn main() {
-    measure("contig-dense-8", || contig::<8>(black_box(0x1000), false));
-    measure("contig-fragmented-8", || {
-        contig::<8>(black_box(0x1000), true)
-    });
-    measure("contig-dense-64", || contig::<64>(black_box(0x1000), false));
-    measure("contig-fragmented-64", || {
-        contig::<64>(black_box(0x1000), true)
-    });
+    measure_contig::<4>();
+    measure_contig::<8>();
+    measure_contig::<9>();
+    measure_contig::<16>();
+    measure_contig::<32>();
+    measure_contig::<64>();
     let mut parameters = [0u8; integer_model::MODEL_BYTES];
     for (i, weight) in parameters[..2576].iter_mut().enumerate() {
         *weight = ((i * 73 % 17) as i8 - 8) as u8;

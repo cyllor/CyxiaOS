@@ -667,10 +667,7 @@ mod tests {
             assert_eq!(score_operations(&s, &[bad], &[]), Err(Error::Model));
             assert_eq!(score_operations(&s, &[], &[]), Err(Error::Candidate));
             s.domain = 16;
-            assert_eq!(
-                score_operations(&s, &[c], &parameters),
-                Err(Error::Format)
-            );
+            assert_eq!(score_operations(&s, &[c], &parameters), Err(Error::Format));
         }
     }
 

@@ -5,13 +5,18 @@
 //! supervisor resolves image pages against a single run base. Clearing and
 //! revocation must succeed before a run is released for reuse.
 //!
-//! The occupied prefix is kept sorted by physical base, followed by empty
-//! slots. First-fit allocation and release are bounded O(N) operations without
-//! an allocation-time sorting scratch array. Gaps coalesce implicitly; no
-//! separate free list can drift out of sync. A full live-run table and an
-//! exhausted address window remain distinct failures.
+//! Small tables retain the original sparse slots and sort a bounded local
+//! interval list for first-fit. Larger tables use an ordered occupied prefix
+//! and avoid sorting scratch. Both keep one authoritative ownership table;
+//! gaps coalesce implicitly. A full table and an exhausted address window
+//! remain distinct failures. The compile-time cutoff is provisional until
+//! same-runner measurements confirm the small-table regression correction.
 use super::frames::{FrameError, FrameSnapshot};
 use cyxia_contracts::TaskId;
+
+// Wave 7 measured a regression at N=8 and a gain at N=64. Do not
+// generalize the cutoff to other unmeasured sizes or change it at runtime.
+const SMALL_RUN_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 struct Run {
@@ -61,6 +66,37 @@ impl<const N: usize> ContigFramePool<N> {
         if pages == 0 || pages > self.capacity {
             return Err(FrameError::Invalid);
         }
+        if N <= SMALL_RUN_LIMIT {
+            let slot = self
+                .runs
+                .iter()
+                .position(|r| r.is_none())
+                .ok_or(FrameError::Capacity)?;
+            let mut occupied: [(u64, u64); N] = [(0, 0); N];
+            let mut count = 0;
+            for run in self.runs.iter().filter_map(|r| *r) {
+                occupied[count] = (run.base, run.base + run.pages as u64 * 4096);
+                count += 1;
+            }
+            occupied[..count].sort_unstable_by_key(|&(base, _)| base);
+            let need = pages as u64 * 4096;
+            let end = self.base + self.capacity as u64 * 4096;
+            let mut cursor = self.base;
+            let mut chosen = None;
+            for &(start, stop) in &occupied[..count] {
+                if start >= cursor.saturating_add(need) {
+                    chosen = Some(cursor);
+                    break;
+                }
+                cursor = cursor.max(stop);
+            }
+            if chosen.is_none() && end >= cursor.saturating_add(need) {
+                chosen = Some(cursor);
+            }
+            let base = chosen.ok_or(FrameError::Exhausted)?;
+            self.runs[slot] = Some(Run { base, pages, owner });
+            return Ok(base);
+        }
         let count = self.runs.partition_point(Option::is_some);
         if count == N {
             return Err(FrameError::Capacity);
@@ -94,6 +130,21 @@ impl<const N: usize> ContigFramePool<N> {
     /// were retired and its contents cleared. A mismatched owner is rejected
     /// without freeing anything; an unknown identity is stale.
     pub fn release(&mut self, base: u64, pages: usize, owner: TaskId) -> Result<(), FrameError> {
+        if N <= SMALL_RUN_LIMIT {
+            for run in self.runs.iter_mut() {
+                if let Some(r) = run
+                    && r.base == base
+                    && r.pages == pages
+                {
+                    if r.owner != owner {
+                        return Err(FrameError::Owner);
+                    }
+                    *run = None;
+                    return Ok(());
+                }
+            }
+            return Err(FrameError::Stale);
+        }
         // Nonempty runs have unique increasing bases; empty slots compare
         // after every valid base. The handle identity still includes pages
         // and owner, and a failed lookup never mutates the occupied prefix.
@@ -310,6 +361,44 @@ mod tests {
         }
         assert_eq!(pool.snapshot().used, 32);
         assert_eq!(pool.allocate(1, owner(99)), Err(FrameError::Capacity));
+    }
+
+    fn exercise_capacity<const N: usize>() {
+        let capacity = 3 * N;
+        let base = u64::MAX - 4095 - capacity as u64 * 4096;
+        let mut pool = ContigFramePool::<N>::new(base, capacity).unwrap();
+        let mut addresses = [0; N];
+        for (i, address) in addresses.iter_mut().enumerate() {
+            *address = pool.allocate(3, owner(i as u32 + 1)).unwrap();
+            assert_eq!(*address, base + i as u64 * 12288);
+        }
+        assert_eq!(pool.allocate(1, owner(99)), Err(FrameError::Capacity));
+        for i in (1..N).rev().filter(|i| i % 2 != 0) {
+            let address = addresses[i];
+            assert_eq!(pool.release(address, 2, owner(99)), Err(FrameError::Stale));
+            assert_eq!(pool.release(address, 3, owner(99)), Err(FrameError::Owner));
+            pool.release(address, 3, owner(i as u32 + 1)).unwrap();
+        }
+        assert_eq!(pool.allocate(4, owner(99)), Err(FrameError::Exhausted));
+        for &address in addresses.iter().skip(1).step_by(2) {
+            assert_eq!(pool.allocate(3, owner(99)), Ok(address));
+        }
+        assert_eq!(pool.snapshot().free, 0);
+        for (i, address) in addresses.into_iter().enumerate() {
+            let who = if i % 2 == 0 { i as u32 + 1 } else { 99 };
+            pool.release(address, 3, owner(who)).unwrap();
+        }
+        assert_eq!(pool.snapshot().used, 0);
+        assert_eq!(pool.allocate(capacity, owner(99)), Ok(base));
+    }
+
+    #[test]
+    fn wave8_small_large_boundary_preserves_first_fit_and_ownership() {
+        exercise_capacity::<4>();
+        exercise_capacity::<8>();
+        exercise_capacity::<9>();
+        exercise_capacity::<16>();
+        exercise_capacity::<64>();
     }
 
     #[test]
