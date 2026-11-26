@@ -54,11 +54,9 @@ impl SharedPrefix<'_> {
         }
         let mut hidden1 = [0; 32];
         for (row, activation) in hidden1.iter_mut().enumerate() {
-            let z = self.model.accumulate(
-                &input[40..],
-                row * INPUT_FEATURES + 40,
-                self.sums[row],
-            );
+            let z = self
+                .model
+                .accumulate(&input[40..], row * INPUT_FEATURES + 40, self.sums[row]);
             *activation = Model::quantize(z).max(0);
         }
         self.model.finish_trace(hidden1)
