@@ -435,8 +435,7 @@ mod tests {
         data[..RECEIPT_BYTES].copy_from_slice(&duplicate);
         assert_eq!(scan_receipts(&data, [1; 16]), Err(Error::Invalid));
         let seq = RECEIPTS as u64;
-        data[..RECEIPT_BYTES]
-            .copy_from_slice(&receipt(local_request_id(0, 0, seq).unwrap(), seq));
+        data[..RECEIPT_BYTES].copy_from_slice(&receipt(local_request_id(0, 0, seq).unwrap(), seq));
         assert_eq!(scan_receipts(&data, [1; 16]), Ok(expected));
         data[RECEIPT_STORE_BYTES - 1] ^= 1;
         assert_eq!(scan_receipts(&data, [1; 16]), Err(Error::Invalid));
