@@ -1123,5 +1123,25 @@ class MediaWorkflowPartition(unittest.TestCase):
                     self.assertIn("artifacts/v020-production/run-" + name + "/\n", job)
 
 
+    def test_qemu_host_evidence_is_retained_without_replacing_provenance(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github" /
+                    "workflows" / "v020-production.yml").read_text(encoding="utf-8")
+        build = workflow.split("\n  qemu-pinned:\n", 1)[1].split("\n  native-run:\n", 1)[0]
+        self.assertIn('bash "$GITHUB_WORKSPACE/tools/v020_qemu_host_evidence.sh" '
+                      'bin/qemu-system-aarch64 host-evidence', build)
+        self.assertLess(build.index("sha256sum bin/qemu-system-aarch64 > binary.sha256"),
+                        build.index("v020_qemu_host_evidence.sh"))
+        core, files = workflow.split("\n  media-staging-run:\n", 1)[1].split(
+            "\n  media-file-staging-run:\n", 1)
+        for job in (core, files):
+            capture = "bash tools/v020_qemu_host_evidence.sh "
+            self.assertEqual(job.count(capture), 1)
+            self.assertLess(job.index("sha256sum -c artifacts/v020-production-qemu/patch.sha256"),
+                            job.index(capture))
+            self.assertLess(job.index(capture), job.index("python3 -B tools/verify_v020_production.py"))
+            self.assertIn("artifacts/v020-production/host-media-evidence/\n", job)
+            self.assertIn("if: always()", job)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -258,6 +258,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/artifacts/v020-production-qemu"
           bin/qemu-system-aarch64 --version > version.txt
           sha256sum bin/qemu-system-aarch64 > binary.sha256
+          bash "$GITHUB_WORKSPACE/tools/v020_qemu_host_evidence.sh" bin/qemu-system-aarch64 host-evidence
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -370,6 +371,7 @@ jobs:
           (cd artifacts/v020-production-qemu; sha256sum -c binary.sha256)
           chmod +x artifacts/v020-production-qemu/bin/qemu-system-aarch64
           sha256sum -c artifacts/v020-production-qemu/patch.sha256
+          bash tools/v020_qemu_host_evidence.sh artifacts/v020-production-qemu/bin/qemu-system-aarch64 artifacts/v020-production/host-media-evidence
           # Staging lane: -m 1024M (prototype-memory) + fresh all-zero scratch
           # disk per run. Boot + fail-closed paths only; NOT persistence, NOT a
           # format golden vector, NOT signed config, NOT G4.
@@ -408,6 +410,7 @@ jobs:
         with:
           name: v020-production-media-core-staging-run-${{ github.sha }}
           path: |
+            artifacts/v020-production/host-media-evidence/
             artifacts/v020-production/run-media-staging/
             artifacts/v020-production/run-media-reopen/
             artifacts/v020-production/run-media-signed/
@@ -441,6 +444,7 @@ jobs:
           (cd artifacts/v020-production-qemu; sha256sum -c binary.sha256)
           chmod +x artifacts/v020-production-qemu/bin/qemu-system-aarch64
           sha256sum -c artifacts/v020-production-qemu/patch.sha256
+          bash tools/v020_qemu_host_evidence.sh artifacts/v020-production-qemu/bin/qemu-system-aarch64 artifacts/v020-production/host-media-evidence
           # Staging lane: -m 1024M (prototype-memory) + fresh all-zero scratch
           # disk per run. Boot + fail-closed paths only; NOT persistence, NOT a
           # format golden vector, NOT signed config, NOT G4.
@@ -481,6 +485,7 @@ jobs:
         with:
           name: v020-production-media-files-staging-run-${{ github.sha }}
           path: |
+            artifacts/v020-production/host-media-evidence/
             artifacts/v020-production/run-snapshot-catalog/
             artifacts/v020-production/run-file-read/
             artifacts/v020-production/run-snapshot-read/
