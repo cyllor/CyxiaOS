@@ -1085,5 +1085,43 @@ class Argv(unittest.TestCase):
                 self.assertEqual(unsigned, v.Modes(media_unified=True, live_control=True))
 
 
+
+class MediaWorkflowPartition(unittest.TestCase):
+    def test_independent_media_jobs_keep_all_ten_bounded_verifier_runs(self):
+        # Host wall-clock partition only: do not weaken guest timeouts,
+        # fail-closed checks, SHA provenance or the ten scratch scenarios.
+        workflow = (Path(__file__).resolve().parents[1] / ".github" /
+                    "workflows" / "v020-production.yml").read_text(encoding="utf-8")
+        core_marker = "\n  media-staging-run:\n"
+        files_marker = "\n  media-file-staging-run:\n"
+        self.assertEqual(workflow.count(core_marker), 1)
+        self.assertEqual(workflow.count(files_marker), 1)
+        core, files = workflow.split(core_marker, 1)[1].split(files_marker, 1)
+        groups = (
+            (core, "core", ("media-staging", "media-reopen", "media-signed",
+                            "media-envelopes", "media-unified")),
+            (files, "files", ("snapshot-catalog", "file-read", "snapshot-read",
+                              "file-sessions", "file-volatile-write")),
+        )
+        for job, suffix, names in groups:
+            with self.subTest(group=suffix):
+                self.assertIn("needs: [scope, arm-build, qemu-pinned]", job)
+                self.assertIn("if: needs.scope.outputs.verifier_present == 'true'", job)
+                self.assertIn("timeout-minutes: 20", job)
+                self.assertIn("set -euo pipefail", job)
+                self.assertIn('test "$(cat artifacts/v020-production/commit.txt)" = "$(git rev-parse HEAD)"', job)
+                for check in ("sha256sum -c image.sha256", "sha256sum -c binary.sha256",
+                              "sha256sum -c artifacts/v020-production-qemu/patch.sha256"):
+                    self.assertIn(check, job)
+                self.assertEqual(job.count("python3 -B tools/verify_v020_production.py"), 5)
+                self.assertEqual(job.count("--timeout 240"), 5)
+                self.assertNotIn("continue-on-error", job)
+                self.assertIn("if: always()", job)
+                self.assertIn("name: v020-production-media-" + suffix + "-staging-run-", job)
+                for name in names:
+                    self.assertEqual(job.count("--output artifacts/v020-production/run-" + name + " "), 1)
+                    self.assertIn("artifacts/v020-production/run-" + name + "/\n", job)
+
+
 if __name__ == "__main__":
     unittest.main()
