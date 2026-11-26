@@ -375,6 +375,94 @@ mod tests {
     }
 
     #[test]
+    fn public_query_requires_committed_signed_manifest() {
+        use crate::security::offline_config_v1::CatalogBindings;
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::{Digest, Sha256};
+
+        const LABEL: &[u8] = b"CYX/OFFLINE/v1";
+        let mut wire = [0u8; 577];
+        wire[..4].copy_from_slice(&0x4359_4f46u32.to_le_bytes());
+        wire[4..6].copy_from_slice(&1u16.to_le_bytes());
+        wire[6..8].copy_from_slice(&256u16.to_le_bytes());
+        wire[8..12].copy_from_slice(&577u32.to_le_bytes());
+        wire[12..16].copy_from_slice(&257u32.to_le_bytes());
+        wire[16..32].copy_from_slice(&UUID);
+        for (at, value) in [(32, 7u64), (40, 3), (48, 4), (56, 5)] {
+            wire[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        wire[64..96].fill(2);
+        wire[96..128].fill(3);
+        wire[128..160].fill(4);
+        for group in 0..GROUP_COUNT {
+            let at = 256 + group * 16;
+            wire[at..at + 8].copy_from_slice(&(100 + group as u64).to_le_bytes());
+            wire[at + 8..at + 16].copy_from_slice(&1u64.to_le_bytes());
+        }
+        wire[512] = 42;
+        let payload_hash = Sha256::digest(&wire[256..513]);
+        wire[160..192].copy_from_slice(&payload_hash);
+        // Host-only test key; never part of a boot trust catalog.
+        let signer = SigningKey::from_bytes(&[0x37; 32]);
+        let mut message = [0u8; LABEL.len() + 513];
+        message[..LABEL.len()].copy_from_slice(LABEL);
+        message[LABEL.len()..].copy_from_slice(&wire[..513]);
+        wire[513..].copy_from_slice(&signer.sign(&message).to_bytes());
+        let catalog = CatalogBindings {
+            rule_generation: 3,
+            security_generation: 4,
+            key_generation: 5,
+            rule_hash: [2; 32],
+            security_hash: [3; 32],
+            key_manifest_hash: [4; 32],
+        };
+        let mut scratch = [0u8; LABEL.len() + 513];
+        let config = VerifiedOfflineConfig::verify(
+            &wire,
+            &signer.verifying_key().to_bytes(),
+            catalog,
+            &mut scratch,
+            |_, _, payload| {
+                if payload == [42] {
+                    Ok(())
+                } else {
+                    Err(Error::Invalid)
+                }
+            },
+        )
+        .unwrap();
+        let mut security = SecurityStateStoreV2 {
+            fs_uuid: UUID,
+            state_generation: 1,
+            rule_min_generation: 3,
+            security_min_generation: 4,
+            key_generation: 5,
+            isolated_service_bitmap: 0,
+            last_boot_epoch: CALLER.boot_epoch,
+            offline_config_generation: 7,
+            offline_config_hash: config.digest(),
+            service_generations: [1; 16],
+        };
+        let (receipts, index) = mounted_image(4, -16);
+        let view = MountedReceiptQuery::new(&receipts, &index, &config, &security).unwrap();
+        let mut reply = [0; REPLY_HEADER];
+        assert_eq!(view.serve(CALLER, 0, &QUERY, &mut reply), Ok(REPLY_HEADER));
+        assert_eq!(reply, PARTIAL_REPLY);
+
+        security.offline_config_hash = [0x99; 32];
+        assert_eq!(
+            MountedReceiptQuery::new(&receipts, &index, &config, &security).err(),
+            Some(Error::Conflict)
+        );
+        security.offline_config_hash = config.digest();
+        security.last_boot_epoch = 0;
+        assert_eq!(
+            MountedReceiptQuery::new(&receipts, &index, &config, &security).err(),
+            Some(Error::Invalid)
+        );
+    }
+
+    #[test]
     fn literal_query_retains_prior_boot_and_group_generation() {
         let key = ReceiptKey::decode(&QUERY[REQUEST_HEADER..]).unwrap();
         assert_eq!(key, KEY);
@@ -496,8 +584,7 @@ mod tests {
     fn unknown_receipt_reply_preserves_proven_evidence() {
         for (stored, expected) in [(0, E_TIMEOUT), (-4, -4)] {
             let (receipts, index) = mounted_image(UNKNOWN, stored);
-            let view =
-                mounted_view(&receipts, &index, UUID, CALLER.boot_epoch).unwrap();
+            let view = mounted_view(&receipts, &index, UUID, CALLER.boot_epoch).unwrap();
             let mut reply = [0; REPLY_HEADER];
             view.serve(CALLER, 0, &QUERY, &mut reply).unwrap();
             let decoded = Reply::decode(&reply).unwrap();
