@@ -1,7 +1,7 @@
 name: V0.20.2 performance work regression
 on:
   push:
-    branches: [work/v0202-full-system-perf]
+    branches: [work/v0202-full-system-perf, CyxiaOS-V0.20]
   workflow_dispatch:
 permissions:
   contents: read
@@ -311,6 +311,75 @@ jobs:
         with:
           name: v0202-perf-host-bench-${{ github.sha }}
           path: artifacts/v0202-perf-bench/
+          retention-days: 7
+  timer-poll-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Measure original and indexed timer polling on one runner
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          out=artifacts/v0202-perf-timer
+          mkdir -p "$out"
+          git rev-parse HEAD > "$out/commit.txt"
+          rustc +1.95.0 -vV > "$out/toolchain.txt"
+          lscpu > "$out/cpu.txt"
+          prior=89f87ec7d480cd2cfc5851cecc079da5b3786459
+          test "$(git rev-parse "$prior^{tree}")" = 7728e3be29ddaf651a9fabdd69230644e9e55f63
+          printf '%s\n' "$prior" > "$out/prior.txt"
+          harness=crates/prototype/examples/v0202_timer_poll_bench.rs
+          sha256sum "$harness" > "$out/harness.sha256"
+          git worktree add --detach "$RUNNER_TEMP/timer-prior" "$prior"
+          install -D "$harness" "$RUNNER_TEMP/timer-prior/$harness"
+          cmp "$harness" "$RUNNER_TEMP/timer-prior/$harness"
+          (cd "$RUNNER_TEMP/timer-prior" && cargo +1.95.0 build --locked --release -p cyxia-prototype --example v0202_timer_poll_bench --target-dir "$RUNNER_TEMP/timer-prior-target")
+          cargo +1.95.0 build --locked --release -p cyxia-prototype --example v0202_timer_poll_bench --target-dir "$RUNNER_TEMP/timer-new-target"
+          for label in prior-1 new-1 new-2 prior-2; do
+            side="${label%-*}"
+            "$RUNNER_TEMP/timer-$side-target/release/examples/v0202_timer_poll_bench" | tee "$out/$label.log"
+          done
+          python3 -B - <<'PY' | tee "$out/summary.txt"
+          from pathlib import Path
+          from statistics import median
+
+          root = Path("artifacts/v0202-perf-timer")
+          cases = {(n, d) for n in (0, 1, 4, 16, 64, 256) for d in ("false", "true")}
+          data = {"prior": {}, "new": {}}
+          for label in ("prior-1", "new-1", "new-2", "prior-2"):
+              side = label.split("-")[0]
+              checks = {}
+              seen = set()
+              for line in (root / (label + ".log")).read_text().splitlines():
+                  kind, count, due, *rest = line.split(",")
+                  case = (int(count), due)
+                  assert case in cases, line
+                  if kind == "check":
+                      assert case not in checks and len(rest) == 1
+                      checks[case] = int(rest[0])
+                  else:
+                      assert kind == "sample" and len(rest) == 2
+                      i, elapsed = map(int, rest)
+                      assert 0 <= i < 7 and elapsed > 0 and (case, i) not in seen
+                      seen.add((case, i))
+                      data[side].setdefault(case, []).append(elapsed / 4096)
+              assert seen == {(case, i) for case in cases for i in range(7)}
+              assert checks == {case: case[0] * 4096 * 7 if case[1] == "true" else 0 for case in cases}
+          print("scope=host_only; exact V0.20.2 comparison; attempts=match; samples=14 per side")
+          for count, due in sorted(cases):
+              old = data["prior"][(count, due)]
+              new = data["new"][(count, due)]
+              print(f"timer-poll,count={count},busy={due},prior_ns={median(old):.3f},candidate_ns={median(new):.3f},speedup={median(old)/median(new):.4f},prior_min={min(old):.3f},prior_max={max(old):.3f},new_min={min(new):.3f},new_max={max(new):.3f}")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0202-perf-timer-poll-${{ github.sha }}
+          path: artifacts/v0202-perf-timer/
           retention-days: 7
   baseline-benchmark:
     runs-on: ubuntu-24.04
