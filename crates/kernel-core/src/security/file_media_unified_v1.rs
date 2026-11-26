@@ -26,6 +26,9 @@ use super::Error;
 use super::file_media_v0199::{SnapshotMediaKind, crc32c_zeroed, probe_snapshot_media_pair};
 use super::file_structure_v1::{INODE_BYTES, INODES, SystemKind, SystemObject};
 
+#[path = "snapshot_protection_candidate.rs"]
+pub mod protection_candidate;
+
 // Baseline-frozen layout constants, re-exported as the unified contract's
 // single source (never re-derived here).
 pub use super::file_media_v0199::{
@@ -353,13 +356,20 @@ pub fn decode_object_envelope(
     kind: UnifiedSystemKind,
     bytes: &[u8],
 ) -> Result<ObjectEnvelope, Error> {
+    let envelope = decode_envelope_header(kind, bytes)?;
+    if bytes[ENVELOPE_BYTES..].iter().any(|v| *v != 0) {
+        return Err(Error::Invalid);
+    }
+    Ok(envelope)
+}
+
+fn decode_envelope_header(kind: UnifiedSystemKind, bytes: &[u8]) -> Result<ObjectEnvelope, Error> {
     let magic = kind.envelope_magic().ok_or(Error::Invalid)?;
     if bytes.len() != SUPER_BYTES
         || le32(bytes, 0)? != magic
         || le16(bytes, 4)? != ENVELOPE_VERSION
         || le16(bytes, 6)? != ENVELOPE_BYTES as u16
         || le32(bytes, 36)? != 0
-        || bytes[ENVELOPE_BYTES..].iter().any(|v| *v != 0)
         || le32(bytes, 32)? != crc32c_zeroed(bytes, 32)?
     {
         return Err(Error::Invalid);
