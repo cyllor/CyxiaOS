@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 import cosmic_applet_object_profile_v1 as objects
@@ -33,7 +34,10 @@ def assemble(parent, output):
     producers = os_x86.producer_sources(__file__)
     with tempfile.TemporaryDirectory(prefix='.optional-workspaces-', dir=output.parent) as temporary:
         stage = Path(temporary) / 'catalog'
-        subprocess.run(['/bin/cp', '-cRp', str(parent), str(stage)], check=True, timeout=60)
+        # Darwin's clonefile optimization is optional; retain the same
+        # recursive metadata-preserving copy on other POSIX hosts.
+        copy_flags = '-cRp' if sys.platform == 'darwin' else '-Rp'
+        subprocess.run(['/bin/cp', copy_flags, str(parent), str(stage)], check=True, timeout=60)
         target = stage / USER; target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content); target.chmod(0o644)
         current = os_x86.catalog_inputs(stage)

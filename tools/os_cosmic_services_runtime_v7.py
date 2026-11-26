@@ -315,13 +315,13 @@ def preparation_evidence(raw, pid, required_pages):
     return {'pid': pid, 'argv': ['/bin/settings-probe', 'prepare'], 'prepared': True}
 
 
-# Exact Debug field order/types of crates/posix/src/lib.rs::UserStatus. Only
-# this complete kernel response may interrupt a settings line in the view.
+# Exact current Debug field order/types of crates/posix/src/lib.rs::UserStatus.
 USER_STATUS_FIELDS = (
     ('pid', 32), ('parent_pid', 32), ('exit_signal', 32), ('state', None),
     ('code', 32), ('syscalls', 64), ('observed_tid', 32), ('observed_pc', 64),
     ('observed_sp', 64), ('observed_syscall', 64), ('space_rebuilds', 64),
-    ('space_prepare_ns', 64), ('space_retire_ns', 64), ('preemptions', 64),
+    ('space_reuses', 64), ('space_prepare_ns', 64), ('space_retire_ns', 64),
+    ('space_revoke_ns', 64), ('preemptions', 64),
     ('ai_slices', 64), ('cpu_model', 64), ('last_slice_ms', 64), ('esr', 64),
     ('far', 64), ('free_pages', 32), ('rank_model', 64), ('ai_selections', 64),
     ('guard_selections', 64), ('thread_count', 32), ('thread_peak', 32),
@@ -332,6 +332,11 @@ USER_STATUS_FIELDS = (
     ('heap_allocations', 32), ('heap_peak_allocations', 32), ('heap_largest_free', 32),
     ('image_pages', 32), ('image_free', 32),
 )
+# Retained capture3 predates these two counters. Recognize its complete ordered
+# layout separately; neither optional fields nor mixed-generation rows authorize
+# removal of a response. Original capture bytes and receipts stay unchanged.
+LEGACY_USER_STATUS_FIELDS = tuple(field for field in USER_STATUS_FIELDS
+                                  if field[0] not in ('space_reuses', 'space_revoke_ns'))
 
 
 def settings_transport_view(raw, commands, start, *, expected_receipts=None):
@@ -357,10 +362,13 @@ def settings_transport_view(raw, commands, start, *, expected_receipts=None):
         previous = command['serial_offset']
     number = rb'(?:0|[1-9][0-9]*)'
     state = rb'(?:Idle|Running|Waiting|Exited|Fault|Timeout|Killed)'
-    fields = b', '.join(name.encode() + b': ' + (state if bits is None else number)
-                        for name, bits in USER_STATUS_FIELDS)
-    row_pattern = rb'EL0 UserStatus \{ ' + fields + rb' \}\r\n'
-    block_pattern = rb'posix list\r\n(?:' + row_pattern + rb'){1,8}' + re.escape(b'cyxia:/> ')
+    block_patterns = []
+    for status_fields in (USER_STATUS_FIELDS, LEGACY_USER_STATUS_FIELDS):
+        fields = b', '.join(name.encode() + b': ' + (state if bits is None else number)
+                            for name, bits in status_fields)
+        row_pattern = rb'EL0 UserStatus \{ ' + fields + rb' \}\r\n'
+        block_pattern = rb'posix list\r\n(?:' + row_pattern + rb'){1,8}' + re.escape(b'cyxia:/> ')
+        block_patterns.append((status_fields, block_pattern))
     pieces, receipts, cursor = [], [], start
     for index, command in enumerate(commands):
         issued = command['serial_offset']
@@ -376,7 +384,10 @@ def settings_transport_view(raw, commands, start, *, expected_receipts=None):
             continue
         require(raw.find(b'posix list\r\n', echo + 1, limit) < 0,
                 'Ambiguous command echo inside settings evidence')
-        block = re.match(block_pattern, raw[echo:limit])
+        for status_fields, block_pattern in block_patterns:
+            block = re.match(block_pattern, raw[echo:limit])
+            if block is not None:
+                break
         require(block is not None, 'Interleaved list lacks its complete exact kernel response and prompt')
         end = echo + block.end()
         require(cursor <= echo < end <= limit and b'SETTINGS_PROBE' not in block[0],
@@ -384,7 +395,7 @@ def settings_transport_view(raw, commands, start, *, expected_receipts=None):
         rows = base.parse_processes(block[0])
         global_arena(rows)
         require(all(0 <= row[name] < 1 << bits for row in rows.values()
-                    for name, bits in USER_STATUS_FIELDS if bits is not None),
+                    for name, bits in status_fields if bits is not None),
                 'Interleaved kernel response exceeds its actual unsigned field types')
         continued_end = raw.find(b'\n', end)
         continued_end = None if continued_end < 0 else continued_end + 1

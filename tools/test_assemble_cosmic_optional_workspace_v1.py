@@ -9,8 +9,8 @@ import assemble_cosmic_optional_workspace_v1 as subject
 
 class OptionalConfiguration(unittest.TestCase):
     def test_only_appends_user_entry_and_preserves_every_original_byte(self):
-        with tempfile.TemporaryDirectory(dir='/private/tmp') as directory:
-            root = Path(directory); parent = root / 'parent'; parent.mkdir()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(); parent = root / 'parent'; parent.mkdir()
             path = parent / subject.DEFAULT; path.parent.mkdir(parents=True)
             path.write_text('Some((["com.system76.CosmicPanelWorkspacesButton", "com.system76.CosmicPanelAppButton"],["com.system76.CosmicAppletTiling"]))\n')
             (parent / 'probe.elf').write_bytes(b'nonexecutable fixture')

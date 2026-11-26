@@ -14,8 +14,8 @@ class PartialCapture(unittest.TestCase):
         def fail(*args, _result, **options):
             _result['completed_step'] = dict(matched=True, elapsed_seconds=3.1)
             raise RuntimeError('later fixture failure')
-        with tempfile.TemporaryDirectory(dir='/private/tmp') as directory:
-            output = Path(directory)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory).resolve()
             with patch.object(subject, '_interaction', side_effect=fail), self.assertRaises(RuntimeError):
                 subject.interaction(None, Qmp(), output)
             value = json.loads((output / 'workspace-result.json').read_text())

@@ -1,0 +1,417 @@
+{
+  "schema": "cyxia-v0203-audit-verification/v1",
+  "recorded_at": "2026-11-26T21:04:34+04:00",
+  "baseline_commit": "89f87ec7d480cd2cfc5851cecc079da5b3786459",
+  "environment": {
+    "host": "Linux x86_64",
+    "RUSTUP_TOOLCHAIN": "1.95.0",
+    "cargo_mode": "locked/offline where stated",
+    "native_qemu": "not run in local environment",
+    "physical_A53": "not available / not run"
+  },
+  "checks": [
+    {
+      "id": "V01",
+      "command": "cargo test --locked --offline --workspace --exclude cyxia-kernel",
+      "revision": "89f87ec7d480cd2cfc5851cecc079da5b3786459",
+      "exit_code": 0,
+      "scope": "host unit/integration/doc tests",
+      "passed": 2213,
+      "failed": 0,
+      "ignored": 0,
+      "log": "v0203-baseline-workspace.log"
+    },
+    {
+      "id": "V02",
+      "command": "python -B -m unittest tools.test_v19_native_security_source tools.test_v0199_local_link_graph -v",
+      "revision": "baseline",
+      "exit_code": 0,
+      "scope": "source/feature-closure guards",
+      "tests": 50,
+      "log": "v0203-baseline-source-guards.log"
+    },
+    {
+      "id": "V03",
+      "command": "cargo test -p cyxia-driver-virtio --offline -- block::",
+      "revision": "baseline implementation + five regression tests only",
+      "exit_code": 101,
+      "scope": "host behavior fault injection, expected red",
+      "passed": 11,
+      "failed": 5,
+      "log": "v0203-virtio-regressions-red.log"
+    },
+    {
+      "id": "V04",
+      "command": "cargo test -p cyxia-driver-virtio --offline",
+      "revision": "remediated driver",
+      "exit_code": 0,
+      "scope": "host unit and PCI integration",
+      "passed": 110,
+      "failed": 0,
+      "log": "v0203-virtio-regressions-green.log"
+    },
+    {
+      "id": "V05",
+      "command": "cargo test --offline -p cyxia-kernel-core --lib control_plane::security_finding::tests::invalid_target_disposition_cannot_reenter_review_before_or_after_audit_ack -- --exact --nocapture",
+      "revision": "baseline consume implementation + new test",
+      "exit_code": 101,
+      "scope": "one actual host behavior counterexample",
+      "tests": 1,
+      "failed": 1,
+      "source": "agent execution tool output; chunk 22eb29/session 56347; no retained raw file",
+      "observation": "Ok(ReviewTarget request_review=true) instead of Err(Stale)",
+      "excluded_run": "Earlier short filter with --exact ran 0 tests and is not counted."
+    },
+    {
+      "id": "V06",
+      "command": "cargo test --offline -p cyxia-kernel-core --lib control_plane::security_finding::tests",
+      "revision": "remediated consume",
+      "exit_code": 0,
+      "scope": "host component",
+      "passed": 9,
+      "failed": 0,
+      "source": "agent execution tool output chunk81af11; included again in V08"
+    },
+    {
+      "id": "V07",
+      "command": "python -B -m unittest discover -s tools -p test_x86_profile_guard.py -v",
+      "revision": "baseline then remediated real build adapter",
+      "scope": "host build-adapter behavior, not x86 native build",
+      "red_exit_code": 1,
+      "red_failing_subcases": 15,
+      "green_exit_code": 0,
+      "green_tests": 3,
+      "green_profile_combinations": 22,
+      "source": "agent execution tool output, no original raw log; remediated rerun included in V09"
+    },
+    {
+      "id": "V08",
+      "command": "cargo test --locked --offline --workspace --exclude cyxia-kernel",
+      "revision": "all four Rust/config fixes",
+      "exit_code": 0,
+      "scope": "host unit/integration/doc tests",
+      "passed": 2219,
+      "failed": 0,
+      "ignored": 0,
+      "log": "v0203-remediation-workspace.log"
+    },
+    {
+      "id": "V09",
+      "command": "python -B -m unittest tools.test_v19_native_security_source tools.test_v0199_local_link_graph tools.test_x86_profile_guard tools.test_verify_v020_production -v",
+      "exit_code": 0,
+      "scope": "targeted host guards/config/verifier tests",
+      "tests": 123,
+      "log": "v0203-remediation-python.log"
+    },
+    {
+      "id": "V10",
+      "command": "cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features smp-selftest",
+      "exit_code": 0,
+      "scope": "AArch64 mechanism ELF compile/link only, NOT QEMU",
+      "log": "v0203-arm-mechanism-build.log"
+    },
+    {
+      "id": "V11",
+      "command": "cargo clippy --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features smp-selftest -- -D warnings",
+      "exit_code": 0,
+      "scope": "AArch64 static compiler/lint",
+      "log": "v0203-remediation-arm-clippy.log"
+    },
+    {
+      "id": "V12",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "scope": "format",
+      "log": "v0203-remediation-fmt.log"
+    },
+    {
+      "id": "V13",
+      "command": "python -B -m unittest discover -s tools -p 'test_*.py' -v",
+      "exit_code": 1,
+      "scope": "expanded host tool suite BEFORE A203-011 repairs; no prepare_host_tests executed",
+      "tests": 2180,
+      "failures": 38,
+      "errors": 171,
+      "skipped": 33,
+      "log": "v0203-remediation-tools-all.log",
+      "limitation": "Diagnostics include subtests/setup failures; do not count these as independent architecture defects. Full suite not yet rerun after A203-011 repairs."
+    },
+    {
+      "id": "V14",
+      "command": "parse workflow YAML with BaseLoader and match branch/path fixtures",
+      "exit_code": 0,
+      "scope": "static only; actual GitHub Actions pending",
+      "branches": [
+        "V0.20.3",
+        "work/v0203-architecture-remediation",
+        "CyxiaOS-V0.20"
+      ],
+      "workflows": [
+        "validate-current.yml",
+        "v20-native-mechanism.yml"
+      ]
+    },
+    {
+      "id": "V15",
+      "command": "41 targeted loader/ELF/source-contract/portable-copy/settings-publication tests; exact command in docs/implementation/v0203-loader-contract-recheck.md",
+      "exit_code": 0,
+      "scope": "host behavioral regressions",
+      "tests": 41,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "log": "v0203-loader-portable-final.log",
+      "earlier_failure_log": "v0203-loader-portable-green.log"
+    },
+    {
+      "id": "V16",
+      "command": "python -m unittest -v tools.test_os_cosmic_services_runtime_v7 tools.test_os_cosmic_services_runtime_v8 tools.test_discovery_capture",
+      "exit_code": 0,
+      "scope": "host parser/receipt regressions plus independent legacy-crate PCAP test",
+      "tests": 183,
+      "passed": 177,
+      "skipped": 6,
+      "failures": 0,
+      "errors": 0,
+      "log": "v0203-a203-011-green.log",
+      "red_log": "v0203-a203-011-red.log",
+      "limitation": "Six pre-existing opt-in full UART fixture skips remain unexecuted; no native desktop claim."
+    }
+  ],
+  "logs": [
+    {
+      "original_log": "v0203-baseline-workspace.log",
+      "path": "evidence/v0203-baseline-workspace.log.gz",
+      "bytes": 248459,
+      "sha256": "ebbde9c442e6015d4e75f894236b77ffb699fcdf9b638ab4c1861fb68e4a2e03",
+      "gzip_sha256": "753e446e4de029df8bdbaf320d3ef9f87b19d7f0c97df94b4058c0f6fab459d7"
+    },
+    {
+      "original_log": "v0203-baseline-source-guards.log",
+      "path": "evidence/v0203-baseline-source-guards.log.gz",
+      "bytes": 8993,
+      "sha256": "e42972281428007cbdd8cb2fc6f28470469bd546d2c95fc06ef1e6d97c88ee85",
+      "gzip_sha256": "290815d6ef93442ea06d997a6a784ba56918f4752e28821409c085086a62574d"
+    },
+    {
+      "original_log": "v0203-virtio-regressions-red.log",
+      "path": "evidence/v0203-virtio-regressions-red.log.gz",
+      "bytes": 4191,
+      "sha256": "a01da97b349fe7567018ed8e0234b6fbf604f609d9dbeba0e832ae27165b60d1",
+      "gzip_sha256": "b4c07d3875a8e88d37c70329e82e420bb3eaac50575317fe2c637e44398add0e"
+    },
+    {
+      "original_log": "v0203-virtio-regressions-green.log",
+      "path": "evidence/v0203-virtio-regressions-green.log.gz",
+      "bytes": 9854,
+      "sha256": "6b0fee0d9c942518e8cd7b910673187bf97e700d1427d4da6c92d792491be951",
+      "gzip_sha256": "fb2f02c5dffa01cabba1237ce411969f21c97026775f25a25cf7e22654e700a8"
+    },
+    {
+      "original_log": "v0203-remediation-workspace.log",
+      "path": "evidence/v0203-remediation-workspace.log.gz",
+      "bytes": 246483,
+      "sha256": "f3b5cfa7e9efb212cc8bb1e7d07f1aea7500ae8eab9740dc3f14d546dca9d362",
+      "gzip_sha256": "7df055a5bfcc98cd1f45aedf55b9f6e325f154b2ea7cef03f5e9ed8d7a99329c"
+    },
+    {
+      "original_log": "v0203-remediation-python.log",
+      "path": "evidence/v0203-remediation-python.log.gz",
+      "bytes": 20056,
+      "sha256": "c7b3603861e942e31208be58b6a328d9ce2a2302070d76822c9a8d6a54ec6d7a",
+      "gzip_sha256": "5e60ee1568191940cec0c980f2901a3280687e30a20cbadd27ebf7a61b59a67e"
+    },
+    {
+      "original_log": "v0203-arm-mechanism-build.log",
+      "path": "evidence/v0203-arm-mechanism-build.log.gz",
+      "bytes": 2084,
+      "sha256": "64497761c909931b4254ad4754dd96b5b36d1a075db57e13e0f781448d470d16",
+      "gzip_sha256": "e3ed55cc03248af940c6838d1831fb8961b67d5863f21ce8a179d268ceba77e1"
+    },
+    {
+      "original_log": "v0203-remediation-arm-clippy.log",
+      "path": "evidence/v0203-remediation-arm-clippy.log.gz",
+      "bytes": 1988,
+      "sha256": "27ac32d4632eaefe86a79d75ba2159ef549520cfc08000b04bb4a2a48c895abd",
+      "gzip_sha256": "3bd599d992d7f98decee215ca18b6e91eee350d548c30e432ac8e848a402a95a"
+    },
+    {
+      "original_log": "v0203-remediation-fmt.log",
+      "path": "evidence/v0203-remediation-fmt.log.gz",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gzip_sha256": "f61f27bd17de546264aa58f40f3aafaac7021e0ef69c17f6b1b4cd7664a037ec"
+    },
+    {
+      "original_log": "v0203-remediation-tools-all.log",
+      "path": "evidence/v0203-remediation-tools-all.log.gz",
+      "bytes": 756238,
+      "sha256": "8604f7a4926656e33adc86f424af7d1b52a9df9970e84f6f1bb0361cfc042432",
+      "gzip_sha256": "d78637bda581a282497727e1419ced4d24de5e803a3b3520f9dcb33854e9cea5"
+    },
+    {
+      "original_log": "v0203-loader-portable-green.log",
+      "path": "evidence/v0203-loader-portable-green.log.gz",
+      "bytes": 14447,
+      "sha256": "6ff009b0cbf60eafc8a150328fda4465cd6495de4a7581d3103ec604f870f42a",
+      "gzip_sha256": "1c6114da86ea610237941c235dbcd2b21ecf1dc6c0e3ff0541bafac936a7c628"
+    },
+    {
+      "original_log": "v0203-loader-portable-final.log",
+      "path": "evidence/v0203-loader-portable-final.log.gz",
+      "bytes": 7675,
+      "sha256": "fc6003b88d33ab9989fcb8f45f7dc5e853d30afad0bcb78b2c9aff0fe9301f64",
+      "gzip_sha256": "a851430594689b5fbb4bdb2a59244927a12f20e0e1800eabfe1bed234a4d8cdf"
+    },
+    {
+      "original_log": "v0203-python-grammar-targeted.log",
+      "path": "evidence/v0203-python-grammar-targeted.log.gz",
+      "bytes": 3112,
+      "sha256": "62a0a504b47273885d55b8cb57bfffaefdb2ecfe20694ea2997eb5489af4f4c6",
+      "gzip_sha256": "d70f1410fcc9abc364b97d742fbe539275971c9905a86aa976c58cd7d323f888"
+    },
+    {
+      "original_log": "v0203-a203-011-red.log",
+      "path": "evidence/v0203-a203-011-red.log.gz",
+      "bytes": 18710,
+      "sha256": "e9fedc600691f4b30c893a55755c15ee853d20e5cb45e46967c80ebb1b5ada4f",
+      "gzip_sha256": "0e22bacde2cf9d1e0bcd15ea98eee7d7d356ee5310b6b03fa803d0887c9b2c24"
+    },
+    {
+      "original_log": "v0203-a203-011-green.log",
+      "path": "evidence/v0203-a203-011-green.log.gz",
+      "bytes": 39311,
+      "sha256": "126acfcafa66146afec15e40eca69789d6d1c47c39551500f7032406e0e6569d",
+      "gzip_sha256": "4e89f913237a3b4bd2aa3376659b20d5f2217585e227ce51c9f742821d24c62b"
+    },
+    {
+      "original_log": "v0203-python-discovery-manifest-check.log",
+      "path": "evidence/v0203-python-discovery-manifest-check.log.gz",
+      "bytes": 1240,
+      "sha256": "a613c5be2da7a768f9001edabbc07ce1a98ac840aee991ee05b8f9af08e26459",
+      "gzip_sha256": "333c36df87176a20901d9fced62f430b72801225e5a041b0bc4a937e20f27cd9"
+    }
+  ],
+  "remediated_source_sha256": {
+    ".github/workflows/v20-native-mechanism.yml": "abd1d8f933d774e1e656a956baf04ec06be28432ecc1b48816ac7913a46913fa",
+    ".github/workflows/validate-current.yml": "7a41676689c80b3ad391d8c6c76ac23e7cb8bd870b895aee4dd68973575d7ef3",
+    "crates/driver-virtio/src/block.rs": "fdcd0951714ef29b8ca01738ceb8099b5c52ecbf9f150fefc1e0c5e8174ab92c",
+    "crates/driver-virtio/src/block/batched.rs": "11e74d118197859536c7fcb9be03f70c26173557da997aeacbbb167b1485d93d",
+    "crates/driver-virtio/src/queue.rs": "c1f2af58f0028e3b9c96a7de8a2683758b540869805c44b987f1a2022b2efb12",
+    "crates/kernel-core/src/control_plane/security_finding.rs": "85c53bf1c1538f4851ad4a346cdbf35018b0b73b459946dd4967c30cd64c08a1",
+    "kernel/build/x86_64.rs": "059f04772337e7cc701628234317987b4eb2dffb71c72bbdf274cd827124712c",
+    "tools/assemble_cosmic_optional_workspace_v1.py": "05f8d74bc369725d154cbaae7717b027e33321c0eec104699b7338c13461ab95",
+    "tools/assemble_cosmic_workspace_applets_v1.py": "515669bed045228f889240e0b6c61ccaeb3b4dea44f0787b769ce6b26161ed25",
+    "tools/cosmic_notifications_elf.py": "ca5922ba2405f9fb301323ec2dcb7b333149a723a54cc53f7e577cc1eab13b50",
+    "tools/os_cosmic_services_runtime_v6.py": "9f017ba5c82567b7944c302967089d5f43d45addf6bcf65a284c4e1a7a9de0a7",
+    "tools/os_cosmic_services_runtime_v7.py": "8e418ce1db3e5e0a43079ee844484a5fe4b6981753b17d318f7f2e29ec248a6c",
+    "tools/test_assemble_cosmic_optional_workspace_v1.py": "20b6aa27cefeacc5cbd8b887969e11c05df4d3631d2ca902aba58e1e73e08cad",
+    "tools/test_assemble_cosmic_workspace_applets_v1.py": "1b6fa6c0384695a07d0492e14d1b01314d789f202b90188d12461d3275388eba",
+    "tools/test_cosmic_applet_object_profile_v1.py": "545dd646fbee467b4acdf141770449e470c005201be8c03db0eb0033d09934a9",
+    "tools/test_cosmic_workspace_applets_v1.py": "7a66e7039c384d2f50ce7041cbc8a30b205c8c3da473ad57323ae4fa7e33864c",
+    "tools/test_cosmic_workspace_result_v1.py": "1c572ca851166089e4b60b824df3eef0af71b2328d464a4cbd44c8af751fe13a",
+    "tools/test_discovery_capture.py": "0bd8860835b481251a958d9f4eaade4762bdf6776177aa6dcfc74558513f7a3e",
+    "tools/test_os_cosmic_services_runtime_v7.py": "d0d788d25accd50ff991dd5ccf8abc26f50152250a9905be51372373ccf41be5",
+    "tools/test_os_cosmic_services_runtime_v8.py": "2ea47bf98c5c06c72db98e98b687f279c8281572d9d5109199db3e4aa18822a0",
+    "tools/test_x86_profile_guard.py": "4d084d68fe42d6eb1851269e43d46edb7959443d037f9efaf586f2a17d31adec"
+  },
+  "workflow_static_checks": [
+    {
+      "workflow": "validate-current",
+      "event": "push",
+      "branch": "V0.20.3",
+      "inputs_match": true
+    },
+    {
+      "workflow": "validate-current",
+      "event": "push",
+      "branch": "work/v0203-architecture-remediation",
+      "inputs_match": true
+    },
+    {
+      "workflow": "validate-current",
+      "event": "push",
+      "branch": "CyxiaOS-V0.20",
+      "inputs_match": true
+    },
+    {
+      "workflow": "validate-current",
+      "event": "pull_request",
+      "branch": "V0.20.3",
+      "inputs_match": true
+    },
+    {
+      "workflow": "validate-current",
+      "event": "pull_request",
+      "branch": "CyxiaOS-V0.20",
+      "inputs_match": true
+    },
+    {
+      "workflow": "v20-native-mechanism",
+      "event": "push",
+      "branch": "V0.20.3",
+      "inputs_match": true
+    },
+    {
+      "workflow": "v20-native-mechanism",
+      "event": "push",
+      "branch": "work/v0203-architecture-remediation",
+      "inputs_match": true
+    },
+    {
+      "workflow": "v20-native-mechanism",
+      "event": "push",
+      "branch": "CyxiaOS-V0.20",
+      "inputs_match": true
+    },
+    {
+      "workflow": "v20-native-mechanism",
+      "event": "pull_request",
+      "branch": "V0.20.3",
+      "inputs_match": true
+    },
+    {
+      "workflow": "v20-native-mechanism",
+      "event": "pull_request",
+      "branch": "CyxiaOS-V0.20",
+      "inputs_match": true
+    }
+  ],
+  "reviews": [
+    {
+      "id": "REVIEW-01",
+      "scope": "VirtIO three-file diff and adjacent ownership/completion paths",
+      "reviewer": "AI/security reviewer separate from patch author",
+      "result": "no blocking finding in reviewed diff",
+      "limitation": "not external certification or hardware test"
+    },
+    {
+      "id": "REVIEW-02",
+      "scope": "Finding terminal/ACK/credit and x86 profile guard/harness",
+      "reviewer": "resource reviewer separate from patch author",
+      "result": "no blocking finding in reviewed diff"
+    },
+    {
+      "id": "REVIEW-03",
+      "scope": "audit scope/versions and CI inputs",
+      "reviewer": "overall reviewer separate from author",
+      "result": "corrected ELF counterexample precondition and added .cargo/** to native trigger"
+    },
+    {
+      "id": "REVIEW-04",
+      "scope": "loader pins full historical diff; parser strict current/legacy grammar; portable copy",
+      "reviewer": "primary reviewer after specialist implementation",
+      "result": "no blocking finding; captures and integrity boundaries retained"
+    }
+  ],
+  "remote_ci": {
+    "status": "pending publication and execution",
+    "must_check_exact_head": true
+  },
+  "formal_acceptance": {
+    "status": "NOT_RUN",
+    "stable_ids": 127,
+    "g4_required_pairs": 262,
+    "g5_additional_pairs": 26
+  }
+}

@@ -45,15 +45,21 @@ U64_MAX = (1 << 64) - 1
 # initialization changed since e43b8e3: load_accounted, virtual bounds, stack
 # budget, page counting and W^X admission are byte-identical. The other three
 # pinned sources remain unchanged; this does not establish runtime readiness.
+# 2026-11-26 reviewed V0.20.3 89f87ec against e5d8306: user_layout.rs changed
+# only test formatting, image.rs only match formatting, and exec_memory.rs
+# only import order and expression formatting. executable.rs is unchanged.
+# The complete comparison and exact source identities are recorded in
+# docs/implementation/v0203-loader-contract-recheck.md. Keep this byte-level
+# gate: no new layout, admission, allocation or native-runtime claim is made.
 _REVIEWED_LOADER_CONTRACT = (
     ('crates/contracts/src/user_layout.rs',
-     '10edd3b77ee0896563fef4f19662d2b366b729198f35adb2982eb8fb812365f3'),
+     '8c97945de3ce0f7f517354cfb7455d0c7affb39fe7a3c17d6691468400d244e7'),
     ('crates/contracts/src/image.rs',
-     'c6440043f43d5fea3a676adf30d37b2750936ef5782bbcdcd6b87d1907fce639'),
+     '8344a288a3af4a68105688d938d91269d1e8002623763ab2702d2d9d6ae9706a'),
     ('crates/posix/src/executable.rs',
      '0a2310be332d66a2c1e06ededc28c06fe41c4949db686b35f53e7ccd53e2b5e7'),
     ('kernel/src/desktop/memory/exec_memory.rs',
-     '824b5132ea3f215e8ace9aacf848ca74e0d9603cb71569a0afcb4dde6fab91bc'),
+     '23c613788a9978ab07aaa124f763fc6353b19e3413268f6ff08ab19b5db3c3a4'),
 )
 
 

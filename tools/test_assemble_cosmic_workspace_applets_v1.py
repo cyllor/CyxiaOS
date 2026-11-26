@@ -10,9 +10,9 @@ import assemble_cosmic_workspace_applets_v1 as subject
 
 class CatalogInstallation(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix='cyxia-applet-install-', dir='/private/tmp')
+        self.temporary = tempfile.TemporaryDirectory(prefix='cyxia-applet-install-')
         self.addCleanup(self.temporary.cleanup)
-        root = self.root = Path(self.temporary.name)
+        root = self.root = Path(self.temporary.name).resolve()
         self.build = root / 'build'; self.build.mkdir(); (self.build / 'source').mkdir()
         self.parent = root / 'parent'; self.parent.mkdir()
         self.prefix = root / 'prefix'; self.prefix.mkdir()

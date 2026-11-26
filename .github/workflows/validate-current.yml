@@ -5,6 +5,11 @@ on:
     branches:
       - fix/first-level-subsystems-20261024
       - CyxiaOS-V0.1
+      - CyxiaOS-V0.20
+      - V0.20.3
+      - work/v0203-architecture-remediation
+  pull_request:
+    branches: [V0.20.3, CyxiaOS-V0.20]
   workflow_dispatch:
 
 permissions:
