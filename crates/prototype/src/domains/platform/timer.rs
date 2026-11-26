@@ -348,10 +348,9 @@ mod tests {
                         let mut actual = Backend::default();
                         let mut expected = Backend::default();
                         for i in 0..TIMER_CAPACITY {
-                            for (t, b) in [
-                                (&mut indexed, &mut actual),
-                                (&mut reference, &mut expected),
-                            ] {
+                            for (t, b) in
+                                [(&mut indexed, &mut actual), (&mut reference, &mut expected)]
+                            {
                                 t.register(key(i), TimerClass::Soft, 2).unwrap();
                                 if dense || [0, 63, 64, 127, 128, 255].contains(&i) {
                                     let deadline = if i == 64 { 20 } else { 5 };
@@ -408,10 +407,7 @@ mod tests {
         backend.cancel_error = None;
         timers.cancel(k, &mut backend).unwrap();
         timers.unregister(k).unwrap();
-        let next = ObjectKey {
-            generation: 2,
-            ..k
-        };
+        let next = ObjectKey { generation: 2, ..k };
         timers.register(next, TimerClass::HardDeadline, 0).unwrap();
         assert_eq!(timers.cancel(k, &mut backend), Err(Error::Stale));
         assert_eq!(timers.poll(10, 1, &mut backend), Ok(0));
