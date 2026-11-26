@@ -173,6 +173,9 @@ pub fn build() {
     }
     println!("cargo:rerun-if-changed=build/v0199_roles.rs");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let model_operator_probe = env::var_os("CARGO_FEATURE_V020_PRODUCTION").is_none()
+        && (env::var_os("CARGO_FEATURE_V0199_CONTROL_BRINGUP").is_some()
+            || env::var_os("CARGO_FEATURE_V0199_EPOCH_DISK_SELFTEST").is_some());
     let snapshot_catalog = env::var_os("CARGO_FEATURE_V020_PRODUCTION_SNAPSHOT_CATALOG").is_some();
     let file_read = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_READ").is_some();
     let file_sessions = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_SESSIONS").is_some();
@@ -185,6 +188,9 @@ pub fn build() {
         let name = format!("v0199-role-{role}.elf");
         let target = out.join(&name);
         let mut compiler = Command::new(env::var("RUSTC").unwrap());
+        if model_operator_probe && matches!(role, 6 | 7) {
+            compiler.args(["--cfg", "model_operator_probe"]);
+        }
         if snapshot_catalog && matches!(role, 6 | 11) {
             compiler.args(["--cfg", "snapshot_catalog_probe"]);
         }
@@ -205,6 +211,7 @@ pub fn build() {
             .args([
                 "--edition=2024",
                 "--check-cfg=cfg(control_role, values(\"2\", \"3\", \"6\", \"7\", \"8\", \"9\", \"10\", \"11\"))",
+                "--check-cfg=cfg(model_operator_probe)",
                 "--check-cfg=cfg(snapshot_catalog_probe)",
                 "--check-cfg=cfg(file_read_probe)",
                 "--check-cfg=cfg(file_sessions_probe)",

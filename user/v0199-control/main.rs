@@ -11,25 +11,25 @@ mod audit;
 mod catalog;
 #[cfg(all(file_read_probe, any(control_role = "6", control_role = "11")))]
 mod file_read;
-#[cfg(any(control_role="6",control_role="7"))]
+#[cfg(model_operator_probe)]
 #[path="../../crates/control-model/src/native_v0199.rs"]
 mod brain;
-#[cfg(any(control_role="6",control_role="7"))]
+#[cfg(model_operator_probe)]
 #[path="../../crates/prototype/src/learning/seed.rs"]
 mod probe_seed;
 
 // Only this explicitly diagnostic package build contains test seed bytes.
 // They are never admitted as a verified/trained Active model.
-#[cfg(control_role="6")]
+#[cfg(all(model_operator_probe,control_role="6"))]
 static PROBE_PARAMETERS:[u8;2772]=probe_seed::UNTRAINED_SEED0_BYTES;
-#[cfg(control_role="7")]
+#[cfg(all(model_operator_probe,control_role="7"))]
 static PROBE_PARAMETERS:[u8;2772]=probe_seed::untrained_seed_bytes(1);
-#[cfg(any(control_role="6",control_role="7"))]
+#[cfg(model_operator_probe)]
 #[used]
 #[unsafe(link_section=".role_probe")]
 static mut PROBE_RESULT:[u64;4]=[0;4];
 
-#[cfg(any(control_role="6",control_role="7"))]
+#[cfg(model_operator_probe)]
 fn model_probe(generation:u64){
     // Internal operator/codec test vector, NOT a live snapshot or durable
     // boot identity. Never submit it through Advice/Finding/Plan endpoints.
@@ -176,7 +176,7 @@ extern "C" fn _start(arg_va:u64,args_len:u64)->!{
     let target=u64::from_le(unsafe{p.add(1).read_volatile()});
     let generation=u64::from_le(unsafe{p.add(2).read_volatile()});
     if generation==0{reject_startup();}
-    #[cfg(any(control_role="6",control_role="7"))]
+    #[cfg(model_operator_probe)]
     model_probe(generation);
     #[cfg(all(control_role = "6", file_read_probe))]
     file_read::probe_operations(cap, target);
