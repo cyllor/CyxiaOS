@@ -1,0 +1,15 @@
+# V0.20.1 kernel algorithms — wave 2
+
+Baseline for this wave: ad8d412eda9b3f5fd00bbcfa238dacfe610d9f2c. Wave 1 at fd08e10: 9 contiguous-frame and 6 console tests passed (GitHub Actions run 45806499098). Integration stopped at rustfmt; exact formatting correction committed separately (ad8d412). No test failure was reported by either module.
+
+## Scope and review ledger
+- T10: FramePool clean-first-fit and full FrameMeta reserve lower-bound cursors. Only successful clean/reclaim can lower the corresponding cursor. Recorder failure must leave the candidate eligible for retry. Preserve authoritative row checks, first-fit, generation retirement, zeroing, quarantine and static/pool mode rejection. No FrameMeta row layout change; one usize per owner. Worst-case O(N), avoids repeated prefix scans in monotonic sequences. Hierarchical bitmap and incremental inventory deferred pending native ownership integration and measured justification.
+- T11: D02 counts in a single scan of the 128 receipt slots rather than three scans; UNKNOWN is counted independently, Created requires occupied. No admission decision, queue order, token rule or authority change. Full scheduler changes deferred; no topology or ABI change.
+- T12: D07 soft timer grid distance computed using one u64 remainder, clamped to slack then saturating addition. Existing validation, hard deadline, due and zero-grid rules unchanged. Existing IPC queue retained; no new heap without evidence of an actual scheduler hot path.
+- T13: operations inference reuses 40 common features' first-layer unrounded accumulators; per-candidate suffix, final rounding, ReLU and stable selection unchanged. Cache is bound to immutable model bytes and exact prefix; mismatch falls back. Single candidate bypasses preparation. Security inference unchanged. No Schema or authority change.
+- T14: matrix CI jobs verify kernel and model seams; integration format and full workspace regression remain mandatory. No merge to V0.20, no release acceptance or native performance claim.
+
+## Evidence and limits
+Reference-level checks executed in the orchestration runtime: 1,024 MLP trace comparisons (including changed prefix fallback), 40,000 soft timer arithmetic comparisons including u64 upper bound, 128,000 simplified clean cursor state transitions; PASS. These are independent arithmetic/state models, not compiled Rust tests, and do not verify recorder failures or the full FrameMeta implementation. Public behavior regression tests added for reclaim, task counts, soft rounding, exact layer traces and operational candidate scores. Rust RED/GREEN not executed locally; the branch CI is the pending compilation and test gate. Prior wave formatting fix awaits CI confirmation. Static spec and standards review performed by the same agent, not independent reviewers.
+
+Ruling: do not change native scheduler, IPC topology, protected resource/authority interfaces or bitmap layouts without target validation. Maintain V0.20 fixed CPU0, isolated advisory brains and fifteen equally situated domains. Actual runtime gains and native ARM/x86 acceptance remain NOT_RUN.

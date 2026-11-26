@@ -230,8 +230,15 @@ impl Features {
     fn set(&mut self, i: usize, value: Option<u64>, h: u64) {
         if let Some(v) = value {
             assert!(h > 0);
-            self.values[i] =
-                ((512u128 * u128::from(v.min(h)) + u128::from(h)) / (2 * u128::from(h))) as i16;
+            // All current schema scales are small enough for exact u64
+            // arithmetic. Preserve the wide fallback for future scales.
+            self.values[i] = if v >= h {
+                256
+            } else if h <= u64::MAX / 513 {
+                ((512 * v + h) / (2 * h)) as i16
+            } else {
+                ((512u128 * u128::from(v) + u128::from(h)) / (2 * u128::from(h))) as i16
+            };
             if v > h {
                 self.clipped |= 1u64 << i;
             }
@@ -289,6 +296,10 @@ fn action_limits(domain: u16, c: Candidate) -> Result<(u64, u64), Error> {
     Ok(limits)
 }
 pub fn operations_features(s: &SnapshotReplyV3, c: Candidate) -> Result<Features, Error> {
+    operations_candidate(operations_base(s)?, s.domain, c)
+}
+
+fn operations_base(s: &SnapshotReplyV3) -> Result<Features, Error> {
     if !s.valid() {
         return Err(Error::Format);
     }
@@ -297,7 +308,6 @@ pub fn operations_features(s: &SnapshotReplyV3, c: Candidate) -> Result<Features
     if s.present_mask() & 0xf00 != 0xf00 {
         return Err(Error::Missing);
     }
-    let (h1, h2) = action_limits(s.domain, c)?;
     let mut f = Features::new();
     f.values[usize::from(s.domain - 1)] = 256;
     for (i, &h) in COMMON_H.iter().enumerate() {
@@ -307,6 +317,11 @@ pub fn operations_features(s: &SnapshotReplyV3, c: Candidate) -> Result<Features
         f.set(24 + i, s.fields[8 + i], h);
         f.values[32 + i] = 256;
     }
+    Ok(f)
+}
+
+fn operations_candidate(mut f: Features, domain: u16, c: Candidate) -> Result<Features, Error> {
+    let (h1, h2) = action_limits(domain, c)?;
     f.set(40, Some(1), 255);
     f.set(41, Some(c.a1), h1);
     f.set(42, c.a2, h2);
@@ -376,11 +391,15 @@ pub fn score_operations(
         return Err(Error::Candidate);
     }
     let model = integer_model::Model::parse(parameters).map_err(|_| Error::Model)?;
+    // All candidates refer to this same immutable snapshot. Preserve model
+    // and snapshot error precedence, then validate every candidate as before.
+    let base = operations_base(s)?;
     let mut out = Scores {
         count: candidates.len() as u8,
         recommended_index: 0,
         scores: [0; 32],
     };
+    let mut shared = None;
     for (i, &c) in candidates.iter().enumerate() {
         if candidates[..i]
             .iter()
@@ -388,8 +407,14 @@ pub fn score_operations(
         {
             return Err(Error::Candidate);
         }
-        let features = operations_features(s, c)?;
-        out.scores[i] = model.score(&features.values);
+        let features = operations_candidate(base, s.domain, c)?;
+        out.scores[i] = if candidates.len() == 1 {
+            model.score(&features.values)
+        } else {
+            shared
+                .get_or_insert_with(|| model.prepare_prefix(&features.values))
+                .score(&features.values)
+        };
         if out.scores[i] > out.scores[usize::from(out.recommended_index)] {
             out.recommended_index = i as u16;
         }
@@ -444,6 +469,61 @@ mod tests {
             ],
         }
     }
+    #[test]
+    fn wave10_normalization_matches_wide_reference_and_clipping() {
+        let mut seed = 0x7c50_189d_2468_1357u64;
+        let scales = [
+            1,
+            2,
+            3,
+            8,
+            16,
+            50,
+            64,
+            100,
+            128,
+            255,
+            256,
+            400,
+            512,
+            750,
+            900,
+            1000,
+            4096,
+            5000,
+            10000,
+            100000,
+            262144,
+            1000000,
+            u64::MAX / 513,
+            u64::MAX / 513 + 1,
+            u64::MAX,
+        ];
+        for h in scales {
+            for v in [0, 1, h / 2, h - 1, h, h.saturating_add(1), u64::MAX] {
+                let mut f = Features::new();
+                f.set(63, Some(v), h);
+                let expected =
+                    ((512u128 * u128::from(v.min(h)) + u128::from(h)) / (2 * u128::from(h))) as i16;
+                assert_eq!(f.values[63], expected);
+                assert_eq!(f.clipped, if v > h { 1 << 63 } else { 0 });
+            }
+            for _ in 0..256 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let v = if seed & 1 == 0 { seed % h } else { seed };
+                let mut f = Features::new();
+                f.set(17, Some(v), h);
+                let expected =
+                    ((512u128 * u128::from(v.min(h)) + u128::from(h)) / (2 * u128::from(h))) as i16;
+                assert_eq!(f.values[17], expected);
+                assert_eq!(f.clipped, if v > h { 1 << 17 } else { 0 });
+            }
+        }
+        let mut f = Features::new();
+        f.set(23, None, 0);
+        assert_eq!(f, Features::new());
+    }
+
     #[test]
     fn exact_snapshot_shape_presence_width_and_age() {
         let s = sample(1);
@@ -533,6 +613,126 @@ mod tests {
         s.domain = 16;
         assert_eq!(operations_features(&s, c), Err(Error::Format));
     }
+    #[test]
+    fn operations_scores_match_full_inference_for_every_weight_candidate() {
+        let s = sample(1);
+        let candidates = [1, 2, 4, 8].map(|a1| Candidate {
+            a1,
+            a2: None,
+            cpu: [None; 4],
+        });
+        let mut p = [0u8; integer_model::MODEL_BYTES];
+        p[0] = 64;
+        p[41] = 64;
+        p[2048] = 64;
+        p[2560] = 64;
+        let result = score_operations(&s, &candidates, &p).unwrap();
+        let model = integer_model::Model::parse(&p).unwrap();
+        for (i, &candidate) in candidates.iter().enumerate() {
+            let f = operations_features(&s, candidate).unwrap();
+            assert_eq!(result.scores[i], model.score(&f.values));
+        }
+        assert_eq!(result.count, 4);
+        assert_eq!(result.recommended_index, 3);
+        assert_eq!(result.scores[3], 512);
+    }
+
+    #[test]
+    fn wave7_snapshot_reuse_preserves_all_domain_scores_and_error_order() {
+        let mut parameters = [0u8; integer_model::MODEL_BYTES];
+        for (i, w) in parameters[..2576].iter_mut().enumerate() {
+            *w = ((i * 73 % 31) as i8 - 15) as u8;
+        }
+        let model = integer_model::Model::parse(&parameters).unwrap();
+        for domain in 1..=15 {
+            let mut s = sample(domain);
+            s.fields[0] = Some(u64::MAX);
+            let actions: &[(u64, Option<u64>)] = match domain {
+                1 | 2 | 8 | 11 => &[(1, None), (2, None), (4, None), (8, None)],
+                3 => &[
+                    (64, Some(4)),
+                    (256, Some(16)),
+                    (1024, Some(32)),
+                    (4096, Some(64)),
+                ],
+                4 => &[(0, Some(4)), (2, Some(8)), (8, Some(16)), (16, Some(32))],
+                5 => &[(8, Some(1)), (32, Some(4)), (64, Some(8)), (128, Some(16))],
+                6 => &[(1, None), (2, None), (3, None)],
+                7 => &[(0, None), (50, None), (200, None), (1000, None)],
+                9 => &[(100, None), (250, None), (500, None), (750, None)],
+                10 => &[(1, None), (4, None), (8, None), (16, None)],
+                12 => &[(4, None), (8, None), (16, None), (32, None)],
+                13 => &[(50, None), (100, None), (200, None), (400, None)],
+                14 => &[(0, None), (1, None), (2, None)],
+                15 => &[(1, None), (8, None), (32, None), (64, None)],
+                _ => unreachable!(),
+            };
+            let mut candidates = [Candidate {
+                a1: 0,
+                a2: None,
+                cpu: [None; 4],
+            }; 4];
+            for mask in 1usize..1usize << actions.len() {
+                let mut count = 0;
+                for (i, &(a1, a2)) in actions.iter().enumerate() {
+                    if mask & (1 << i) != 0 {
+                        candidates[count] = Candidate {
+                            a1,
+                            a2,
+                            cpu: if domain == 6 {
+                                [Some(a1 * 100), Some(262145), None, Some(1)]
+                            } else {
+                                [None; 4]
+                            },
+                        };
+                        count += 1;
+                    }
+                }
+                for reverse in [false, true] {
+                    let batch = &mut candidates[..count];
+                    if reverse {
+                        batch.reverse();
+                    }
+                    let mut expected = Scores {
+                        count: count as u8,
+                        recommended_index: 0,
+                        scores: [0; 32],
+                    };
+                    for (i, &candidate) in batch.iter().enumerate() {
+                        let f = operations_features(&s, candidate).unwrap();
+                        assert_ne!(f.clipped & (1 << 16), 0);
+                        expected.scores[i] = model.score(&f.values);
+                        if expected.scores[i]
+                            > expected.scores[usize::from(expected.recommended_index)]
+                        {
+                            expected.recommended_index = i as u16;
+                        }
+                    }
+                    assert_eq!(score_operations(&s, batch, &parameters), Ok(expected));
+                }
+            }
+            let c = candidates[0];
+            assert_eq!(
+                score_operations(&s, &[c, c], &parameters),
+                Err(Error::Candidate)
+            );
+            let bad = Candidate { a1: u64::MAX, ..c };
+            assert_eq!(
+                score_operations(&s, &[c, bad], &parameters),
+                Err(Error::Candidate)
+            );
+            s.fields[8] = None;
+            assert_eq!(
+                score_operations(&s, &[bad], &parameters),
+                Err(Error::Missing)
+            );
+            assert_eq!(score_operations(&s, &[bad], &[]), Err(Error::Model));
+            assert_eq!(score_operations(&s, &[], &[]), Err(Error::Candidate));
+            s.domain = 16;
+            assert_eq!(score_operations(&s, &[c], &parameters), Err(Error::Format));
+        }
+    }
+
     #[test]
     fn security_redaction_and_integer_inference_are_advisory_only() {
         let mut s = sample(12);

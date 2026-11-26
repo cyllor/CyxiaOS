@@ -1,6 +1,7 @@
 use crate::domains::{Action, Error, ObjectKey, PolicyStamp};
 
 pub const CONNECTION_CAPACITY: usize = 16;
+const _: () = assert!(CONNECTION_CAPACITY == u16::BITS as usize);
 pub const RESERVED_TX_PER_TURN: usize = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -150,24 +151,28 @@ impl NetworkScheduler {
                 break;
             }
         }
-        // At most batch * 16 inspections. A productive connection can be
-        // revisited, but equal ready connections rotate fairly across turns.
-        for _ in 0..batch {
-            let mut found = None;
-            for _ in 0..CONNECTION_CAPACITY {
-                let slot = self.cursor;
-                self.cursor = (self.cursor + 1) % CONNECTION_CAPACITY;
-                if self.connections[slot].is_some_and(|c| c.ready) {
-                    found = Some(slot);
-                    break;
-                }
+        // Build a turn-local ready mask from the authoritative rows. Each
+        // next selection is a rotated bit scan, preserving cyclic order.
+        // An error advances the cursor exactly as before and keeps custody.
+        let mut ready = 0u16;
+        for (slot, connection) in self.connections.iter().enumerate() {
+            if connection.is_some_and(|c| c.ready) {
+                ready |= 1u16 << slot;
             }
-            let Some(slot) = found else {
+        }
+        for _ in 0..batch {
+            if ready == 0 {
                 break;
-            };
+            }
+            let offset = ready.rotate_right(self.cursor as u32).trailing_zeros() as usize;
+            let slot = (self.cursor + offset) % CONNECTION_CAPACITY;
+            self.cursor = (slot + 1) % CONNECTION_CAPACITY;
             let key = self.connections[slot].unwrap().key;
             let step = transport.send_ready(key)?;
             self.connections[slot].as_mut().unwrap().ready = step.still_ready;
+            if !step.still_ready {
+                ready &= !(1u16 << slot);
+            }
             if step.sent {
                 round.ordinary += 1;
                 self.sent = self.sent.saturating_add(1);

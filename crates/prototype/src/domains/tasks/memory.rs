@@ -271,20 +271,22 @@ impl<const P: usize, const R: usize> Memory<P, R> {
             .filter(|f| {
                 f.kind == Kind::Free && f.progress == owner.progress && f.generation != u64::MAX
             })
+            .take(owner.quota)
             .count()
             < owner.quota
         {
             return Err(Error::Capacity);
         }
+        // Complete preflight before mutation, then stop after the exact
+        // number of first-fit frames. No partial commitment on shortage.
         let mut left = owner.quota;
         for f in &mut self.frames {
-            if left != 0
-                && f.kind == Kind::Free
-                && f.progress == owner.progress
-                && f.generation != u64::MAX
-            {
+            if f.kind == Kind::Free && f.progress == owner.progress && f.generation != u64::MAX {
                 f.kind = Kind::Committed(key);
                 left -= 1;
+                if left == 0 {
+                    break;
+                }
             }
         }
         self.owners[oi].as_mut().ok_or(Error::Stale)?.committed = true;

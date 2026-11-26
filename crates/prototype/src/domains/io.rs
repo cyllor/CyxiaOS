@@ -533,20 +533,16 @@ impl Scheduler {
             return Err(Error::Format);
         }
         let recovery = r.class == Class::Recovery;
-        let normal_pages: u32 = self
-            .slots
-            .iter()
-            .flatten()
-            .filter(|s| s.request.class != Class::Recovery)
-            .map(|s| s.request.pages)
-            .sum();
-        let normal_descriptors: u32 = self
-            .slots
-            .iter()
-            .flatten()
-            .filter(|s| s.request.class != Class::Recovery)
-            .map(|s| u32::from(s.request.descriptors))
-            .sum();
+        let mut normal_pages = 0u32;
+        let mut normal_descriptors = 0u32;
+        // Count both ordinary resource dimensions in one pass. Retained
+        // completion and UNKNOWN slots still own their DMA resources.
+        for slot in self.slots.iter().flatten() {
+            if slot.request.class != Class::Recovery {
+                normal_pages += slot.request.pages;
+                normal_descriptors += u32::from(slot.request.descriptors);
+            }
+        }
         if (!recovery && self.usage.submit_credits == COMPLETION_CREDITS)
             || (if recovery {
                 self.usage.recovery_credits

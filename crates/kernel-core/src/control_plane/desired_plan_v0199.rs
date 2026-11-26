@@ -15,6 +15,7 @@ use super::{
     registered_gate_v3::TrustedRegistrationScope,
 };
 use sha2::{Digest, Sha256};
+const _: () = assert!(MAX_BINDINGS <= u128::BITS as usize);
 fn report_digest(r: &ApplyReportV1<'_>) -> Result<[u8; 32], Error> {
     let mut wire = [0; super::apply_report_v1::MAX_APPLY_REPORT_BYTES];
     let n = r.encode(&mut wire)?;
@@ -183,26 +184,25 @@ impl DesiredBank {
         if !binding.permits(origin(binding)) {
             return Err(Error::Denied);
         }
-        let previous = self.slots.iter().position(|s| {
-            s.is_some_and(|s| {
-                s.binding.domain == binding.domain && s.binding.target.id == binding.target.id
+        // Retirement retains a tombstone; new IDs fill the first empty
+        // slot, so the occupied prefix includes every older generation.
+        let i = self
+            .slots
+            .iter()
+            .position(|s| {
+                s.is_none_or(|s| {
+                    s.binding.domain == binding.domain && s.binding.target.id == binding.target.id
+                })
             })
-        });
-        let i = if let Some(i) = previous {
-            let old = self.slots[i].unwrap();
+            .ok_or(Error::Exhausted)?;
+        if let Some(old) = self.slots[i] {
             if old.binding.active || old.pending.is_some() {
                 return Err(Error::Busy);
             }
             if binding.target.generation <= old.binding.target.generation {
                 return Err(Error::Stale);
             }
-            i
-        } else {
-            self.slots
-                .iter()
-                .position(Option::is_none)
-                .ok_or(Error::Exhausted)?
-        };
+        }
         verify_live(binding)?;
         self.slots[i] = Some(TargetSlot {
             binding,
@@ -269,6 +269,7 @@ impl DesiredBank {
         let count = usize::from(plan.header.action_count);
         let plan_digest = Sha256::digest(wire).into();
         let mut slots = [0usize; MAX_ACTIONS];
+        let mut seen = 0u128;
         let mut stage = [None; MAX_ACTIONS];
         for i in 0..count {
             let a = plan.action(i)?;
@@ -306,9 +307,11 @@ impl DesiredBank {
             if row.pending.is_some() || row.no_effect.is_some() {
                 return Err(Error::Busy);
             }
-            if slots[..i].contains(&slot) {
+            let bit = 1u128 << slot;
+            if seen & bit != 0 {
                 return Err(Error::Denied);
             }
+            seen |= bit;
             slots[i] = slot;
             stage[i] = Some(PublishedAction {
                 key: PlanKey {
@@ -702,6 +705,45 @@ mod tests {
         );
         assert_eq!(b.version(), 2);
     }
+    #[test]
+    fn full_registry_preflights_high_slot_targets_atomically() {
+        let mut b = DesiredBank::empty();
+        b.bind_boot(1, 1, PUB, || Ok(())).unwrap();
+        for id in 1..=MAX_BINDINGS as u64 {
+            b.register_target(binding(id), |_| Ok(())).unwrap();
+        }
+        assert_eq!(
+            b.register_target(binding(1), |_| panic!()),
+            Err(Error::Busy)
+        );
+        assert_eq!(
+            b.register_target(binding(1000), |_| panic!()),
+            Err(Error::Exhausted)
+        );
+        let first = binding(MAX_BINDINGS as u64 - 1);
+        let last = binding(MAX_BINDINGS as u64);
+        let (mut wire, n) = plan(1, 0, true);
+        wire[104..112].copy_from_slice(&first.target.id.to_le_bytes());
+        wire[252..260].copy_from_slice(&last.target.id.to_le_bytes());
+        assert_eq!(
+            b.publish_registered(PUB, 0, &wire[..n], scope(0), |_| Err(Error::Busy)),
+            Err(Error::Busy)
+        );
+        assert_eq!(b.pending(15, first.target), Ok(None));
+        assert_eq!(b.pending(15, last.target), Ok(None));
+        assert_eq!(b.version(), 0);
+        assert_eq!(
+            b.publish_registered(PUB, 0, &wire[..n], scope(0), |stage| {
+                assert_eq!(stage[0].unwrap().binding, first);
+                assert_eq!(stage[1].unwrap().binding, last);
+                Ok(())
+            }),
+            Ok(1)
+        );
+        assert_eq!(b.pending(15, first.target).unwrap().unwrap().version, 1);
+        assert_eq!(b.pending(15, last.target).unwrap().unwrap().version, 1);
+    }
+
     #[test]
     fn publication_atomic_global_version_and_exact_per_target_custody() {
         let mut b = DesiredBank::empty();

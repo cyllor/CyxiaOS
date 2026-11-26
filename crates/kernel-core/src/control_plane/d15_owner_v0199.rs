@@ -258,11 +258,15 @@ impl Owner {
         if bytes.len() > QUEUE - self.len {
             return Err(Error::Busy);
         }
-        for (i, &b) in bytes.iter().enumerate() {
-            let p = (self.head + self.len + i) % QUEUE;
-            self.bytes[p] = b;
-            self.ages[p] = now;
-        }
+        // Admission has already succeeded. Copy at most two contiguous
+        // spans, with matching arrival timestamps for each accepted byte.
+        let tail = (self.head + self.len) % QUEUE;
+        let first = bytes.len().min(QUEUE - tail);
+        let second = bytes.len() - first;
+        self.bytes[tail..tail + first].copy_from_slice(&bytes[..first]);
+        self.ages[tail..tail + first].fill(now);
+        self.bytes[..second].copy_from_slice(&bytes[first..]);
+        self.ages[..second].fill(now);
         self.len += bytes.len();
         self.last_clock = now;
         Ok(())
@@ -654,6 +658,35 @@ mod tests {
         assert_eq!(u.bytes, b"abcdefghijklmnopqrstuvwxyz0123456789");
         assert_eq!(o.observe(c.wall).unwrap()[0], Some(0));
     }
+    #[test]
+    fn wrapped_batch_enqueue_preserves_bytes_and_original_wait_times() {
+        let mut o = owner();
+        let mut c = C { wall: 100, cpu: 0 };
+        let mut u = U {
+            full: false,
+            fail: false,
+            bytes: std::vec::Vec::new(),
+        };
+        o.enqueue(&[b'a'; QUEUE - 4], 100).unwrap();
+        for _ in 0..(QUEUE - 8) / usize::from(BASELINE) {
+            assert_eq!(o.pump(&mut u, &mut c).unwrap().unwrap().chars, BASELINE);
+        }
+        assert_eq!(o.pending(), 4);
+        u.bytes.clear();
+        let stamp = c.wall + 100;
+        assert_eq!(o.enqueue(&[0; QUEUE], stamp + 1), Err(Error::Busy));
+        o.enqueue(b"BCDEFGHI", stamp).unwrap();
+        c.wall = stamp;
+        let first = o.pump(&mut u, &mut c).unwrap().unwrap();
+        assert_eq!(first.wait_ns, first.start_ns - 100);
+        assert_eq!(first.chars, BASELINE);
+        let second = o.pump(&mut u, &mut c).unwrap().unwrap();
+        assert_eq!(second.wait_ns, second.start_ns - stamp);
+        assert_eq!(second.chars, 4);
+        assert_eq!(u.bytes, b"aaaaBCDEFGHI");
+        assert_eq!(o.pending(), 0);
+    }
+
     #[test]
     fn expiry_report_advances_clock_and_cannot_reopen_old_policy() {
         let mut o = owner();

@@ -10,6 +10,7 @@ use super::{
 use cyxia_control_model::native_v0199::{MAX_AGE_NS, SNAPSHOT_BYTES, SnapshotReplyV3};
 pub const TARGETS: usize = 96;
 pub const VIEWS: usize = 96;
+const _: () = assert!(TARGETS <= u8::MAX as usize + 1);
 const FIELD_MASK: u16 = 0x0f7f;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Target {
@@ -237,29 +238,32 @@ impl SnapshotStore {
                 fields,
             }
         };
+        // Record exact, already verified registry positions. A duplicate
+        // slot denotes the same full live target, including owner/generation.
+        let mut slots = [0u8; TARGETS];
+        let mut seen = [false; TARGETS];
         for (i, o) in observations.iter().enumerate() {
-            if observations[..i].iter().any(|v| v.target == o.target)
-                || !self
-                    .targets
-                    .iter()
-                    .flatten()
-                    .any(|r| r.active && r.target == o.target)
-            {
+            let at = self
+                .targets
+                .iter()
+                .position(|r| r.is_some_and(|r| r.active && r.target == o.target))
+                .ok_or(Error::Denied)?;
+            if seen[at] {
                 return Err(Error::Denied);
             }
             make(o).encode().map_err(|_| Error::Invalid)?;
             verify_source(o)?;
+            slots[i] = at as u8;
+            seen[at] = true;
         }
         // The old batch becomes stale as a whole, including objects not
         // selected in this round. Never mix snapshots across sequences.
         for r in self.targets.iter_mut().flatten() {
             r.snapshot = None;
         }
-        for o in observations {
-            self.targets
-                .iter_mut()
-                .flatten()
-                .find(|r| r.active && r.target == o.target)
+        for (o, &at) in observations.iter().zip(&slots) {
+            self.targets[usize::from(at)]
+                .as_mut()
                 .expect("immutable capture preflight")
                 .snapshot = Some(make(o));
         }
@@ -419,6 +423,71 @@ mod tests {
             }),
         }
     }
+    #[test]
+    fn wave4_capture_resolves_slots_once_without_partial_publication() {
+        let mut store = SnapshotStore::new(7).unwrap();
+        let observations: [DomainObservation; TARGETS] = core::array::from_fn(|i| {
+            let target = Target {
+                domain: 2,
+                object: Identity {
+                    id: i as u64 + 1,
+                    generation: 1,
+                },
+                owner: Identity {
+                    id: 100,
+                    generation: 1,
+                },
+            };
+            DomainObservation {
+                target,
+                fields: [None, Some(1), None, Some(i as u64)],
+            }
+        });
+        for o in observations {
+            store.register_target(o.target, |_| Ok(())).unwrap();
+        }
+        let first = observations[0];
+        let last = observations[TARGETS - 1];
+        assert_eq!(
+            store.capture(2, 3, 100, [None; 8], &[last, first], |_| Ok(())),
+            Ok(1)
+        );
+        let mut verified = 0;
+        assert_eq!(
+            store.capture(2, 3, 101, [None; 8], &[first, first], |_| {
+                verified += 1;
+                Ok(())
+            }),
+            Err(Error::Denied)
+        );
+        assert_eq!(verified, 1);
+        assert_eq!(
+            store.capture(2, 3, 101, [None; 8], &[first, last], |o| {
+                if o.target == last.target {
+                    Err(Error::Denied)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(Error::Denied)
+        );
+        for o in [first, last] {
+            let retained = store
+                .frozen_for_owner(o.target, 2, 3, 101, |_| Ok(()))
+                .unwrap();
+            assert_eq!(retained.snapshot_seq, 1);
+            assert_eq!(&retained.fields[8..], &o.fields);
+        }
+        assert_eq!(
+            store.capture(2, 3, 102, [None; 8], &[first], |_| Ok(())),
+            Ok(2)
+        );
+        assert!(matches!(
+            store.frozen_for_owner(last.target, 2, 3, 103, |_| panic!()),
+            Err(Error::NotReady)
+        ));
+    }
+
     #[test]
     fn resource_generation_regression_does_not_replace_current_batch() {
         let mut s = SnapshotStore::new(7).unwrap();

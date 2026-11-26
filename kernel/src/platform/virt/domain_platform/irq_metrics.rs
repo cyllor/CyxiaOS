@@ -57,7 +57,12 @@ impl Histogram {
             self.invalid.store(true, Ordering::Release);
             return;
         }
-        let us = (u128::from(ticks) * 1_000_000).div_ceil(u128::from(frequency));
+        // Normal handler durations fit the scaled u64 numerator. Keep
+        // exact wide arithmetic for large ticks, never truncate on overflow.
+        let us = match ticks.checked_mul(1_000_000) {
+            Some(product) => u128::from(product.div_ceil(frequency)),
+            None => (u128::from(ticks) * 1_000_000).div_ceil(u128::from(frequency)),
+        };
         let bucket = us.min(MICROSECOND_BINS as u128) as usize;
         let next = self
             .count
@@ -115,16 +120,17 @@ impl Snapshot {
     pub fn since(&self, previous: &Self) -> Option<Delta> {
         let count = self.count.checked_sub(previous.count)?;
         let ticks = self.ticks.checked_sub(previous.ticks)?;
-        let rank = (u128::from(count) * 99).div_ceil(100);
-        let mut cumulative = 0u128;
+        // ceil(99 * count / 100) = count - floor(count / 100).
+        let rank = count - count / 100;
+        let mut cumulative = 0u64;
         let mut p99_us = None;
         for (i, (current, old)) in self.bins.iter().zip(&previous.bins).enumerate() {
-            cumulative += u128::from(current.checked_sub(*old)?);
+            cumulative = cumulative.checked_add(current.checked_sub(*old)?)?;
             if count != 0 && cumulative >= rank && p99_us.is_none() && i < MICROSECOND_BINS {
                 p99_us = Some(i as u64);
             }
         }
-        (cumulative == u128::from(count)).then_some(Delta {
+        (cumulative == count).then_some(Delta {
             count,
             ticks,
             p99_us,
