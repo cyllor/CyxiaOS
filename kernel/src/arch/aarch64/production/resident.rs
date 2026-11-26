@@ -12,11 +12,53 @@ use super::{
 use crate::{ExceptionFrame, UART, machine::enqueue_resident_frame};
 use cyxia_contracts::{PhysAddr, UartResource};
 use cyxia_driver_pl011::Pl011;
-use cyxia_kernel_core::console::OutputQueue;
+use cyxia_kernel_core::{
+    console::OutputQueue,
+    control_plane::{
+        Error,
+        role_budget_v0199::{Class, Cpu0BudgetLedger, Settlement},
+    },
+};
 
 const STATUS: &[u8] = b"status";
 const DISCARD_LINE: usize = STATUS.len() + 1;
 const RX_BYTES_PER_TURN: usize = 16;
+const TX_BYTES_PER_TURN: usize = 64;
+const CONSOLE_TURN_NS: u64 = 1_000_000;
+
+struct ConsoleBudget {
+    ledger: Cpu0BudgetLedger,
+    frequency: u64,
+}
+
+impl ConsoleBudget {
+    fn now_ns(&self) -> Result<u64, Error> {
+        u64::try_from(u128::from(timer::ticks()) * 1_000_000_000 / u128::from(self.frequency))
+            .map_err(|_| Error::Clock)
+    }
+
+    fn turn(&mut self, class: Class, work: impl FnOnce()) -> Result<Option<Settlement>, Error> {
+        let cpu = cpu::slot();
+        let start = self.now_ns()?;
+        let grant = match self
+            .ledger
+            .reserve_kernel(cpu, class, CONSOLE_TURN_NS, start)
+        {
+            Err(Error::Exhausted) => return Ok(None),
+            result => result?,
+        };
+        work();
+        let end = self.now_ns()?;
+        // The generic counter provides a conservative elapsed-time debit
+        // for a foreground console turn, with one tick of rounding margin.
+        // Timer IRQ handling and WFI outside the turn are outside this scope.
+        let bound = end
+            .checked_sub(start)
+            .and_then(|delta| delta.checked_add(1_000_000_000u64.div_ceil(self.frequency)))
+            .ok_or(Error::Clock)?;
+        self.ledger.settle(cpu, grant, bound, end).map(Some)
+    }
+}
 
 pub(super) fn timer_deadline() -> u64 {
     timer::ticks().saturating_add((timer::frequency() / 1_000).max(1))
@@ -34,7 +76,9 @@ fn poll_console(
     command: &mut usize,
     interrupts: u64,
 ) {
-    pending.drain(uart, 128).expect("bounded PL011 transmit");
+    pending
+        .drain(uart, TX_BYTES_PER_TURN)
+        .expect("bounded PL011 transmit");
     if pending.pending() != 0 {
         return;
     }
@@ -88,6 +132,12 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         b"V020_STARTUP state=SECURE_DEGRADED reason=missing_startup_authority command=status\n",
     )
     .expect("resident startup frame");
+    let frequency = timer::frequency();
+    assert_ne!(frequency, 0);
+    let mut budget = ConsoleBudget {
+        ledger: Cpu0BudgetLedger::new(),
+        frequency,
+    };
     gic()
         .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
         .expect("CPU0 timer PPI");
@@ -99,11 +149,48 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     }
     let mut command = 0;
     let mut last_interrupt = 0;
+    let mut overrun = None;
+    let mut notice_queued = false;
+    let mut stopped = false;
     loop {
         let interrupts = IRQS[0].load(Ordering::Acquire);
-        if interrupts != last_interrupt {
+        if !stopped && interrupts != last_interrupt {
             last_interrupt = interrupts;
-            poll_console(&mut uart, &mut pending, &mut command, interrupts);
+            if let Some(bound) = overrun {
+                let result = budget.turn(Class::Recovery, || {
+                    if !notice_queued && pending.pending() == 0 {
+                        let mut text = [0; 96];
+                        let payload = report_payload(
+                            &mut text,
+                            "V020_RESIDENT_BUDGET_OVERRUN",
+                            bound,
+                            CONSOLE_TURN_NS,
+                            interrupts,
+                        );
+                        enqueue_resident_frame(&mut pending, payload)
+                            .expect("budget failure frame");
+                        notice_queued = true;
+                    }
+                    pending
+                        .drain(&mut uart, TX_BYTES_PER_TURN)
+                        .expect("bounded failure transmit");
+                });
+                stopped = match result {
+                    Ok(Some(receipt)) => {
+                        receipt.overrun || (notice_queued && pending.pending() == 0)
+                    }
+                    Ok(None) => false,
+                    Err(_) => true,
+                };
+            } else {
+                match budget.turn(Class::Coordination, || {
+                    poll_console(&mut uart, &mut pending, &mut command, interrupts);
+                }) {
+                    Ok(Some(receipt)) if receipt.overrun => overrun = Some(receipt.actual_ns),
+                    Ok(_) => {}
+                    Err(_) => stopped = true,
+                }
+            }
         }
         timer::idle();
     }
