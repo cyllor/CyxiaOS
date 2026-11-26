@@ -20,6 +20,19 @@ NAMES={v:k for k,v in CLASSES.items()}
 STATUS={0:"NOT_RUN",1:"PASS",2:"FAIL"}
 REASONS={0:{1,2,7,8,9},1:{0},2:{3,4,5,6}}
 INVENTORY=Path(__file__).resolve().parent/"v0199-required-proof-inventory.json"
+
+# Verdict v4 identity allocation and the ranges in baseline 安§7.4.
+_CASE_RANGES = (
+    range(1, 14), range(1, 14), range(1, 16), range(1, 17),
+    range(1, 15), range(1, 14), range(1, 14),
+    (*range(1, 12), 15, 16), (*range(1, 9), 13, 14, 15), range(1, 7),
+)
+STABLE_CASES = {
+    (domain << 16) | number: f"{family}{number:02d}"
+    for domain, (family, numbers) in enumerate(zip("PFMNDSJAEH", _CASE_RANGES), 1)
+    for number in numbers
+}
+
 def require(ok,msg):
     if not ok: raise ValueError(msg)
 def digest(data):return hashlib.sha256(data).hexdigest()
@@ -64,15 +77,33 @@ def inventory():
     raw=INVENTORY.read_bytes()
     j=strict_json(raw)
     cases=j["cases"]
-    require(j["required_ids"]==len(cases)==127 and len({x["test_id"] for x in cases})==127,"inventory invalid")
-    g4={(c["test_id"],CLASSES[p]) for c in cases for p in c["g4_required"]}
-    g5=g4|{(c["test_id"],CLASSES[p]) for c in cases for p in c["g5_additional"]}
+    require(j["required_ids"] == len(cases) == len(STABLE_CASES) == 127, "inventory invalid")
+    ids = {}
+    g4, physical = set(), set()
+    for case in cases:
+        test = case["test_id"]
+        name = case["id"]
+        require(type(test) is int and isinstance(name, str)
+                and STABLE_CASES.get(test) == name and test not in ids,
+                "unknown or duplicate stable test ID")
+        required, additional = case["g4_required"], case["g5_additional"]
+        require(isinstance(required, list) and required.count("RUNTIME_QEMU") == 1,
+                "missing mandatory runtime proof")
+        require(all(
+            proof in ("RUNTIME_QEMU", "STATIC_EL1", "MODEL_CHECK") for proof in required
+        ) and len(required) == len(set(required)), "invalid required proof classes")
+        require(additional in ([], ["ARCH_A53"]), "invalid mandatory physical proof")
+        ids[test] = name
+        g4.update((test, CLASSES[proof]) for proof in required)
+        physical.update((test, CLASSES[proof]) for proof in additional)
+    g5 = g4 | physical
     require(len(g4)==262 and len(g5-g4)==26,"inventory proof count mismatch")
-    return g4,g5,{c["test_id"]:c["id"] for c in cases},digest(raw)
+    return g4,g5,ids,digest(raw)
 def parse(raw):
     require(len(raw)==320,"wrong Verdict v4 size")
     magic,ver,size,run,test,status,proof,checker,checker_version,reason,count=struct.unpack_from("<IHHQIHHIIII",raw)
     require((magic,ver,size)==(0x43595632,4,320),"wrong Verdict v4 header")
+    require(test in STABLE_CASES, "unknown stable test ID")
     require(status in STATUS and proof in NAMES and reason in REASONS[status],"invalid status/reason/class")
     require(run>0 and checker_version>0 and checker>>16==test>>16 and checker&0xffff,"invalid checker identity")
     epochs=struct.unpack_from("<7Q",raw,40)
@@ -103,6 +134,9 @@ def aggregate(manifest_raw,locked_digest,root):
         key=(item["test_id"],CLASSES[item["proof_class"]])
         require(key in g5 and key not in expected,"duplicate/unknown expected proof")
         require(all(k in item for k in FIELDS),"incomplete frozen expected input")
+        if "evidence_count" in item:
+            count = item["evidence_count"]
+            require(type(count) is int and 0 <= count < 2**32, "invalid frozen evidence count")
         for k in FIELDS:
             if k.endswith("_hash"):
                 require(hash_value(item[k])!="0"*64,"zero expected hash")
@@ -130,16 +164,21 @@ def aggregate(manifest_raw,locked_digest,root):
             require((v["run_id"],v["test_id"],v["proof_class"])==(run,*key),"wrong run/proof key")
             require(all(v[k]==item[k] for k in FIELDS),"frozen input mismatch")
             if v["evidence_count"]:
+                require(v["evidence_count"] == item.get("evidence_count"),
+                        "evidence count differs from frozen input")
                 # Digest of the exact external manifest bytes; each member's
                 # SHA256/size is then independently read from the archive.
                 m=safe_file(root,f'evidence/{stem}.json').read_bytes()
                 require(digest(m)==v["evidence_digest"],"evidence manifest digest mismatch")
                 members=strict_json(m)["files"]
                 require(isinstance(members,list) and len(members)==v["evidence_count"],"evidence count mismatch")
-                require(len({e["path"] for e in members})==len(members),"duplicate evidence member")
                 identities=set()
+                previous_path = b""
                 for e in members:
                     p=safe_file(root,e["path"])
+                    utf8_path = e["path"].encode("utf-8")
+                    require(previous_path < utf8_path, "evidence paths must be unique and UTF-8 sorted")
+                    previous_path = utf8_path
                     st=p.stat()
                     identity=(st.st_dev,st.st_ino)
                     require(identity not in identities,"aliased physical evidence member")
