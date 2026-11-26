@@ -23,6 +23,7 @@ pub mod file;
 pub mod file_admission_flow_v1;
 pub mod file_auth_context_v1;
 pub mod file_auth_v3;
+pub mod file_fsync_v1;
 pub mod file_index_v0199;
 pub mod file_media_v0199;
 pub mod file_receipt_query_v4;
