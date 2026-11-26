@@ -257,7 +257,8 @@ mod tests {
                         .ok_or(FrameError::Exhausted)
                 };
                 assert_eq!(pool.allocate(pages, owner(99)), expected);
-                let used = used_mask.count_ones() as usize + if expected.is_ok() { pages } else { 0 };
+                let used =
+                    used_mask.count_ones() as usize + if expected.is_ok() { pages } else { 0 };
                 assert_eq!(
                     pool.snapshot(),
                     FrameSnapshot {
