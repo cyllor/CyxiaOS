@@ -110,7 +110,44 @@ pub struct DirectionalEndpoint<const N: usize> {
     send_hi: u64,
 }
 impl<const N: usize> DirectionalEndpoint<N> {
+    pub(crate) const fn unbound() -> Self {
+        let none = Identity {
+            id: 0,
+            generation: 0,
+        };
+        Self {
+            identity: Endpoint {
+                id: 0,
+                generation: 0,
+                receiver: none,
+            },
+            sender: none,
+            closed: true,
+            queue: [None; N],
+            head: 0,
+            len: 0,
+            hi: 0,
+            retired: 0,
+            reservation: None,
+            last_send: None,
+            send_hi: 0,
+        }
+    }
     pub fn new(identity: Endpoint, sender: Identity) -> Result<Self, Error> {
+        let mut queue = Self::unbound();
+        queue.bind_unbound(identity, sender)?;
+        Ok(queue)
+    }
+    /// Initialize a preallocated, never-bound arena without moving N slots
+    /// through the native kernel stack. Fencing does not unbind the arena.
+    pub(crate) fn bind_unbound(
+        &mut self,
+        identity: Endpoint,
+        sender: Identity,
+    ) -> Result<(), Error> {
+        if self.identity.id != 0 {
+            return Err(Error::Busy);
+        }
         if N == 0
             || N > 128
             || identity.id == 0
@@ -121,19 +158,10 @@ impl<const N: usize> DirectionalEndpoint<N> {
         {
             return Err(Error::Format);
         }
-        Ok(Self {
-            identity,
-            sender,
-            closed: false,
-            queue: [None; N],
-            head: 0,
-            len: 0,
-            hi: 0,
-            retired: 0,
-            reservation: None,
-            last_send: None,
-            send_hi: 0,
-        })
+        self.identity = identity;
+        self.sender = sender;
+        self.closed = false;
+        Ok(())
     }
     fn auth_receive(&self, actor: Identity, generation: u64) -> Result<(), Error> {
         if actor.id != self.identity.receiver.id {

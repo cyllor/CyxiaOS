@@ -611,4 +611,5 @@ pub(super) fn run(boot: u64, confirmed_boot: Option<u64>) {
         tasks,
         spawn_proof,
     );
+    super::v0199_d05_fixture::run(boot, &mut gate, snapshots, inbox, desired);
 }

@@ -185,6 +185,10 @@ class EpochFixture:
                 matches.append(elf[seg['offset']+delta:seg['offset']+delta+end-start])
         verify_smp.require(len(matches)==1,'D02 code not uniquely backed by ELF')
         self.d02_code=(start,end-start,hashlib.sha256(matches[0]).digest())
+        d05_proof=verify_smp.symbol(elf,'V0199_D05_EVIDENCE')
+        verify_smp.require(d05_proof['pa']%BLOCK==0 and d05_proof['size']==BLOCK,
+                           'invalid D05 evidence extent')
+        self.d05_proof_pa=d05_proof['pa']
         return verify_smp.profile(elf)
     @staticmethod
     def metadata():
@@ -401,6 +405,7 @@ class EpochFixture:
                 and 0<w[396]<=BLOCK and (w[395],w[396])==self.d02_code[:2],
                 'invalid D02 diagnostic package extent or ELF mismatch')
         require(serial.count(b'V0199_D02_EFFECT a=2 b=4 c=3\n')==1,'missing actual D02 UART evidence')
+        require(serial.count(b'V0199_D05_EFFECT a=4 b=1 c=4\n')==1,'missing actual D05 UART evidence')
         require(all(v==0 for v in w[397:]),'nonzero reserved evidence')
         expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c={flushes}\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
@@ -430,6 +435,69 @@ class EpochFixture:
                     native_diagnostic_restart_verified=True,role7_abi3_package_verified=True,
                     role7_package_sha256=self.role7_hash.hex(),private_stack_bytes=stack_bytes,
                     role7_operator_results=[old_score,new_score],production_service_restart_verified=False)
+
+    def capture_d05(self,qmp,out,custody):
+        require=verify_smp.require
+        path=out/'d05-effect.bin'
+        qmp.execute('pmemsave',{'val':self.d05_proof_pa,'size':BLOCK,'filename':str(path)})
+        proof=path.read_bytes()
+        require(len(proof)==BLOCK,'incomplete native D05 evidence')
+        rows=struct.unpack('<512Q',proof)
+        magic,boot,sample,accept,cpu,depth,occ,applied_batch,total,version,applied,retained,base=rows[:13]
+        require((magic,boot,cpu,depth,occ,base,applied_batch,total,version,retained)
+                    ==(0x4359443035465831,self.epoch,1,9,70,4,1,10,4,4)
+                and 0<sample<=accept<sample+100_000_000 and accept<=applied,
+                'native D05 observation, version or delivery counts differ')
+        require(rows[13:16]==(0,0,0) and not any(proof[1051:144*8])
+                and not any(proof[(144+6*14)*8:]),'noncanonical native D05 proof padding')
+        snap,rules,plan,decision,report=(proof[a:b] for a,b in
+                                      ((128,392),(392,480),(480,693),(696,952),(952,1051)))
+        require(proof[693:696]==bytes(3) and struct.unpack_from('<IHH',snap)==(0x4359534e,3,72)
+                and struct.unpack_from('<7Q',snap,8)==(4,self.epoch,1,1,5,1,sample)
+                and struct.unpack_from('<HHI',snap,64)==(5,12,0),'D05 exact observation scope mismatch')
+        for i,value in enumerate([None]*8+[depth,None,None,occ]):
+            at=72+i*16
+            require(struct.unpack_from('<HB5xQ',snap,at)==(16+i,int(value is not None),value or 0)
+                    and snap[at+3:at+8]==bytes(5),'D05 snapshot observation format')
+        expected=bytearray(88)
+        put(expected,0,'IHHQIIQ',0x43595255,2,32,4,1,88,0)
+        put(expected,32,'IHHQHHHHII',1,5,1,5,0,1,1,0,56,0)
+        put(expected,64,'HB5xQ',1,3,8)
+        require(rules==bytes(expected),'D05 exact rule fixture mismatch')
+        h=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
+        h.update(hashlib.sha256(b'CYX/D05-FIXTURE/0=8,1/1=32,4/2=64,8/3=128,16').digest())
+        h.update(snap);h.update(bytes(1))
+        for value in [depth,None,None,occ,1,depth,1]:
+            h.update(struct.pack('<BQ',value is not None,value or 0))
+        h.update(struct.pack('<H',4))
+        for ordinal,(budget,batch) in enumerate(((8,1),(32,4),(64,8),(128,16))):
+            h.update(struct.pack('<HBHB',ordinal,3,budget,batch))
+        digest=h.digest()
+        require(struct.unpack_from('<IHHIHH6Q',plan)==(0x43594c31,2,64,213,1,0,4,3,0,1,4,sample+10_000_000_000)
+                and struct.unpack_from('<IHHHHI8Q',plan,64)==(0x43595031,2,144,5,1,5,1,4,4,5,1,1,1,sample+100_000_000)
+                and plan[144:176]==bytes(32) and plan[176:208]==digest and plan[208:]==bytes([0,0,8,0,1]),
+                'D05 publication differs from independently fixed rule and observation')
+        require(struct.unpack_from('<10Q',decision,8)==(self.epoch,1,4,4,4,5,1,1,1,4)
+                and struct.unpack_from('<IHHH',decision,88)==(1,0,5,1)
+                and decision[98:102]==bytes(4) and struct.unpack_from('<HH',decision,102)==(0,65535)
+                and struct.unpack_from('<IHH',decision,152)==(1,0,0)
+                and decision[160:192]==hashlib.sha256(rules).digest()
+                and decision[192:224]==hashlib.sha256(plan).digest() and decision[224:256]==digest,
+                'D05 exact decision binding mismatch')
+        require(struct.unpack_from('<QQQHHHHQQQQiIQ',report)==(self.epoch,1,4,0,5,1,0,5,1,1,4,0,3,applied)
+                and report[80:96]==bytes(16) and report[96:]==bytes([8,0,1])
+                and custody.count(decision)==custody.count(report)==1,'D05 retained native receipt mismatch')
+        previous=0
+        for i in range(1,15):
+            n,seq,payload,copied,acked,worker=rows[144+6*(i-1):144+6*i]
+            require((n,seq,payload,worker)==(48,i,0xc50000+i,1) and 0<copied<=acked and previous<=copied,
+                    'D05 native EL0 actual FIFO/copy/ACK proof mismatch')
+            require((acked<=sample if i<=4 else accept<=applied<=copied)
+                    and acked<sample+10_000_000_000,'D05 delivery originated outside its policy interval')
+            previous=acked
+        return dict(native_d05_effect_fixture_verified=True,d05_real_el0_messages=14,
+                    d05_baseline_batch=base,d05_approved_batch=applied_batch,
+                    d05_evidence_sha256=hashlib.sha256(proof).hexdigest())
 
     def capture_extra(self,qmp,out,page):
         # This hook runs after validate(), with all four CPUs stopped.
@@ -573,7 +641,7 @@ class EpochFixture:
                     effect_owner_pool_sha256=hashlib.sha256(owner_raw).hexdigest(),
                     native_d02_effect_fixture_verified=True,d02_retired_pages_verified=True,
                     d02_actual_cpu1_creations=6,d02_async_ticket_acknowledgements_verified=6,
-                    d02_diagnostic_package_sha256=package.hex())
+                    d02_diagnostic_package_sha256=package.hex(),**self.capture_d05(qmp,out,custody))
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -611,7 +679,11 @@ def main():
         result['cross_process_formatted_mount_checkpoint_verified']=True
         result['native_d15_actual_effect_fixture_verified']=True
         result['native_d07_actual_effect_fixture_verified']=True
+        verify_smp.require(all(
+            b.get('observations',{}).get('native_d05_effect_fixture_verified') is True
+            for b in result['boots']),'missing D05 real IPC copy and feedback proof')
         result['native_d02_actual_effect_fixture_verified']=True
+        result['native_d05_actual_effect_fixture_verified']=True
         result['status']='PASS'
     except (OSError,ValueError,RuntimeError) as e:
         result['status']='FAIL'

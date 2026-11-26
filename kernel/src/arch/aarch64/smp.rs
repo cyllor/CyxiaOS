@@ -111,6 +111,9 @@ mod v0199_control_bringup;
 #[path = "v0199_d02_fixture.rs"]
 mod v0199_d02_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_d05_fixture.rs"]
+mod v0199_d05_fixture;
+#[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_d07_fixture.rs"]
 mod v0199_d07_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
@@ -947,7 +950,10 @@ fn secondary_work(slot: usize) -> ! {
         // ordinary fixed business gate. It exclusively reuses the dormant
         // private slot 3 after actual architectural stop/TLBI/scrub.
         #[cfg(feature = "v0199-epoch-disk-selftest")]
-        if slot == 1 && token.plane == Plane::Business && v0199_d02_fixture::worker_step() {
+        if slot == 1
+            && token.plane == Plane::Business
+            && (v0199_d02_fixture::worker_step() || v0199_d05_fixture::worker_step())
+        {
             drop(permit);
             continue;
         }
