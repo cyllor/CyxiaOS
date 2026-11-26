@@ -46,6 +46,8 @@ on:
       - '.github/workflows/v020-production.yml'
       - 'tools/verify_v020_production.py'
       - 'tools/test_verify_v020_production.py'
+      - 'tools/qmp_stdio.py'
+      - 'tools/test_qmp_stdio.py'
       - 'tools/v020_production_*.py'
       - 'tools/v020_tls_peer.py'
       - 'tools/test_v020_tls_peer.py'
@@ -64,6 +66,8 @@ on:
       - '.github/workflows/v020-production.yml'
       - 'tools/verify_v020_production.py'
       - 'tools/test_verify_v020_production.py'
+      - 'tools/qmp_stdio.py'
+      - 'tools/test_qmp_stdio.py'
       - 'tools/v020_production_*.py'
       - 'tools/v020_tls_peer.py'
       - 'tools/test_v020_tls_peer.py'
@@ -129,7 +133,7 @@ jobs:
         run: |
           set -euo pipefail
           openssl version
-          python3 -m unittest -v tools/test_verify_v020_production.py tools/test_v020_tls_peer.py tools/test_v020_signed_scratch_vector.py tools/test_v020_snapshot_envelopes.py 2>&1 | tee artifacts/v020-production/unit-tests.log
+          python3 -m unittest -v tools/test_verify_v020_production.py tools/test_v020_tls_peer.py tools/test_v020_signed_scratch_vector.py tools/test_v020_snapshot_envelopes.py tools/test_qmp_stdio.py 2>&1 | tee artifacts/v020-production/unit-tests.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

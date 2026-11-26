@@ -232,8 +232,9 @@ def main():
     p.add_argument('--ram-mib',type=int,choices=(256,1024),default=256)
     p.add_argument('--qemu-sha256',required=True)
     p.add_argument('--patch-sha256',required=True)
+    p.add_argument('--qmp-stdio',action='store_true',help='use owned pipes instead of a Unix socket')
     a=p.parse_args()
-    result=verify_smp.run(a.elf,a.output,45,4,acceptance=Bringup(a.packages,a.qemu_sha256,a.patch_sha256),ram_mib=a.ram_mib)
+    result=verify_smp.run(a.elf,a.output,45,4,acceptance=Bringup(a.packages,a.qemu_sha256,a.patch_sha256),ram_mib=a.ram_mib,qmp_stdio=a.qmp_stdio)
     print(json.dumps(result,indent=2))
     return 0 if result['status']=='PASS' else 1
 if __name__=='__main__':

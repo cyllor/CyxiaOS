@@ -36,7 +36,8 @@ def free_port() -> int:
 
 
 def qemu_args(binary: str, qmp_path: str, elf: Path, port: int,
-              scratch: Path | None = None, nic: bool = True, rng: bool = False) -> list:
+              scratch: Path | None = None, nic: bool = True, rng: bool = False,
+              qmp_stdio: bool = False) -> list:
     """Pinned G-A argv; `scratch` selects the media-staging lane (-m 1024M + blk)."""
     ram = STAGING_RAM if scratch is not None else GA_RAM
     args = [binary, "-machine", "virt-10.2,gic-version=2,secure=off,virtualization=off",
@@ -58,7 +59,8 @@ def qemu_args(binary: str, qmp_path: str, elf: Path, port: int,
         args += ["-drive", f"file={scratch},if=none,id=scratch,format=raw,cache=none",
                  "-device", "virtio-blk-device,drive=scratch"]
     return args + ["-chardev", "ringbuf,id=cyxlog,size=1048576", "-serial", "chardev:cyxlog",
-                   "-qmp", f"unix:{qmp_path},server=on,wait=off", "-kernel", str(elf),
+                   "-qmp", "stdio" if qmp_stdio else f"unix:{qmp_path},server=on,wait=off",
+                   "-kernel", str(elf),
                    "-no-reboot"]
 
 

@@ -14,8 +14,12 @@ on:
       - 'crates/kernel-core/src/control_plane/role_budget_v0199.rs'
       - 'tools/verify_v0199_eight_packages.py'
       - 'tools/verify_smp.py'
+      - 'tools/qmp_stdio.py'
+      - 'tools/test_qmp_stdio.py'
       - 'kernel/Cargo.toml'
       - 'crates/arch-aarch64/src/user.rs'
+      - 'crates/arch-aarch64/src/memory.rs'
+      - 'crates/arch-aarch64/src/lib.rs'
       - 'crates/control-model/src/native_v0199.rs'
       - 'crates/kernel-core/src/security/epoch_redo_v0199.rs'
       - 'kernel/src/arch/aarch64/v0199_epoch_disk.rs'
@@ -171,6 +175,8 @@ jobs:
           rustup override set 1.95.0
           cargo fetch --locked
           mkdir -p artifacts/epoch-components
+          python3 -B -m unittest -v tools.test_qmp_stdio 2>&1 | tee artifacts/epoch-components/qmp-stdio.log
+          cargo test --locked --offline -p cyxia-arch-aarch64 2>&1 | tee artifacts/epoch-components/arch-memory.log
           cargo test --locked --offline -p cyxia-control-model native_v0199 2>&1 | tee artifacts/epoch-components/model.log
           cargo test --locked --offline -p cyxia-kernel-core epoch_redo_v0199 2>&1 | tee artifacts/epoch-components/redo.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
