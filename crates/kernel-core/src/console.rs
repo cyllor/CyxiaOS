@@ -52,10 +52,13 @@ impl<const N: usize> OutputQueue<N> {
         if bytes.len() > N - self.len {
             return Err(PlatformError::Again);
         }
-        for &byte in bytes {
-            self.bytes[(self.head + self.len) % N] = byte;
-            self.len += 1;
-        }
+        // One wrap calculation and at most two contiguous copies. Capacity
+        // is checked before either copy, so rejected admission has no effect.
+        let tail = (self.head + self.len) % N;
+        let first = bytes.len().min(N - tail);
+        self.bytes[tail..tail + first].copy_from_slice(&bytes[..first]);
+        self.bytes[..bytes.len() - first].copy_from_slice(&bytes[first..]);
+        self.len += bytes.len();
         Ok(())
     }
     pub fn drain(
@@ -154,6 +157,57 @@ mod tests {
         assert_eq!(queue.pending(), 4);
         assert_eq!(queue.enqueue(b"x"), Err(PlatformError::Again));
     }
+    #[test]
+    fn enqueue_matches_fifo_for_all_small_non_power_of_two_wrap_states() {
+        const N: usize = 5;
+        for head in 0..N {
+            for len in 0..=N {
+                for extra in 0..=N + 1 {
+                    let mut queue = OutputQueue::<N>::new();
+                    let mut c = Console {
+                        calls: 0,
+                        mode: 3,
+                        bytes: std::vec::Vec::new(),
+                    };
+                    queue.enqueue(&[0; N][..head]).unwrap();
+                    assert_eq!(queue.drain(&mut c, head), Ok(head));
+                    c.bytes.clear();
+                    let prefix = &b"abcde"[..len];
+                    let incoming = &b"UVWXYZ"[..extra];
+                    queue.enqueue(prefix).unwrap();
+                    let mut expected = std::vec::Vec::from(prefix);
+                    if extra <= N - len {
+                        assert_eq!(queue.enqueue(incoming), Ok(()));
+                        expected.extend_from_slice(incoming);
+                    } else {
+                        assert_eq!(queue.enqueue(incoming), Err(PlatformError::Again));
+                    }
+                    assert_eq!(queue.pending(), expected.len());
+                    assert_eq!(queue.drain(&mut c, N), Ok(expected.len()));
+                    assert_eq!(c.bytes, expected);
+                    assert_eq!(queue.pending(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_byte_ring_keeps_empty_and_full_admission_distinct() {
+        let mut queue = OutputQueue::<1>::new();
+        let mut c = Console {
+            calls: 0,
+            mode: 3,
+            bytes: std::vec::Vec::new(),
+        };
+        queue.enqueue(b"a").unwrap();
+        assert_eq!(queue.enqueue(b""), Ok(()));
+        assert_eq!(queue.enqueue(b"b"), Err(PlatformError::Again));
+        assert_eq!(queue.drain(&mut c, 1), Ok(1));
+        queue.enqueue(b"b").unwrap();
+        assert_eq!(queue.drain(&mut c, 1), Ok(1));
+        assert_eq!(c.bytes, b"ab");
+    }
+
     #[test]
     fn zero_progress_can_retry_same_sequence_without_corrupting_frame() {
         let mut c = Console {

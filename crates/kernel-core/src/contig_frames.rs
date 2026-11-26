@@ -5,10 +5,11 @@
 //! supervisor resolves image pages against a single run base. Clearing and
 //! revocation must succeed before a run is released for reuse.
 //!
-//! Free space is recomputed from the occupied set on every allocation, so gaps
-//! coalesce implicitly and no separate free list can drift out of sync. The
-//! live-run table is bounded by `N`; both a full table and an exhausted address
-//! window are distinct, reported failures rather than silent overcommit.
+//! The occupied prefix is kept sorted by physical base, followed by empty
+//! slots. First-fit allocation and release are bounded O(N) operations without
+//! an allocation-time sorting scratch array. Gaps coalesce implicitly; no
+//! separate free list can drift out of sync. A full live-run table and an
+//! exhausted address window remain distinct failures.
 use super::frames::{FrameError, FrameSnapshot};
 use cyxia_contracts::TaskId;
 
@@ -60,50 +61,51 @@ impl<const N: usize> ContigFramePool<N> {
         if pages == 0 || pages > self.capacity {
             return Err(FrameError::Invalid);
         }
-        let slot = self
+        let count = self
             .runs
             .iter()
-            .position(|r| r.is_none())
+            .position(Option::is_none)
             .ok_or(FrameError::Capacity)?;
-        let mut occupied: [(u64, u64); N] = [(0, 0); N];
-        let mut count = 0;
-        for run in self.runs.iter().filter_map(|r| *r) {
-            occupied[count] = (run.base, run.base + run.pages as u64 * 4096);
-            count += 1;
-        }
-        occupied[..count].sort_unstable_by_key(|&(base, _)| base);
         let need = pages as u64 * 4096;
         let end = self.base + self.capacity as u64 * 4096;
         let mut cursor = self.base;
-        let mut chosen = None;
-        for &(start, stop) in &occupied[..count] {
-            if start >= cursor.saturating_add(need) {
-                chosen = Some(cursor);
+        let mut insertion = 0;
+        for run in self.runs[..count].iter().flatten() {
+            if run.base.saturating_sub(cursor) >= need {
                 break;
             }
-            cursor = cursor.max(stop);
+            cursor = run.base + run.pages as u64 * 4096;
+            insertion += 1;
         }
-        if chosen.is_none() && end >= cursor.saturating_add(need) {
-            chosen = Some(cursor);
+        if end.saturating_sub(cursor) < need {
+            return Err(FrameError::Exhausted);
         }
-        let base = chosen.ok_or(FrameError::Exhausted)?;
-        self.runs[slot] = Some(Run { base, pages, owner });
-        Ok(base)
+        // Publish only after a complete gap has been found. Preserve the sorted
+        // occupied prefix and the empty tail; ownership and first-fit stay exact.
+        self.runs.copy_within(insertion..count, insertion + 1);
+        self.runs[insertion] = Some(Run {
+            base: cursor,
+            pages,
+            owner,
+        });
+        Ok(cursor)
     }
 
     /// Release exactly the run identified by `base`/`pages` after its mappings
     /// were retired and its contents cleared. A mismatched owner is rejected
     /// without freeing anything; an unknown identity is stale.
     pub fn release(&mut self, base: u64, pages: usize, owner: TaskId) -> Result<(), FrameError> {
-        for run in self.runs.iter_mut() {
-            if let Some(r) = run
+        let count = self.runs.iter().position(Option::is_none).unwrap_or(N);
+        for index in 0..count {
+            if let Some(r) = self.runs[index]
                 && r.base == base
                 && r.pages == pages
             {
                 if r.owner != owner {
                     return Err(FrameError::Owner);
                 }
-                *run = None;
+                self.runs.copy_within(index + 1..count, index);
+                self.runs[count - 1] = None;
                 return Ok(());
             }
         }
@@ -226,6 +228,61 @@ mod tests {
                 used: 8
             }
         );
+    }
+
+    #[test]
+    fn first_fit_matches_page_bitmap_for_every_eight_page_fragmentation() {
+        for used_mask in 0u16..=255 {
+            for pages in 1usize..=8 {
+                let mut pool = ContigFramePool::<8>::new(0x1000, 8).unwrap();
+                for page in 0..8 {
+                    assert_eq!(
+                        pool.allocate(1, owner(page as u32 + 1)).unwrap(),
+                        0x1000 + page as u64 * 4096
+                    );
+                }
+                for page in 0..8 {
+                    if used_mask & (1 << page) == 0 {
+                        pool.release(0x1000 + page as u64 * 4096, 1, owner(page as u32 + 1))
+                            .unwrap();
+                    }
+                }
+                let bits = (1u16 << pages) - 1;
+                let expected = if used_mask == 255 {
+                    Err(FrameError::Capacity)
+                } else {
+                    (0..=8 - pages)
+                        .find(|&start| used_mask & (bits << start) == 0)
+                        .map(|start| 0x1000 + start as u64 * 4096)
+                        .ok_or(FrameError::Exhausted)
+                };
+                assert_eq!(pool.allocate(pages, owner(99)), expected);
+                let used = used_mask.count_ones() as usize + if expected.is_ok() { pages } else { 0 };
+                assert_eq!(
+                    pool.snapshot(),
+                    FrameSnapshot {
+                        capacity: 8,
+                        free: 8 - used,
+                        used,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_fit_near_address_limit_preserves_exhaustion_and_ownership() {
+        let base = u64::MAX - 0x4fff;
+        let mut pool = ContigFramePool::<4>::new(base, 4).unwrap();
+        let a = pool.allocate(3, owner(1)).unwrap();
+        let b = pool.allocate(1, owner(2)).unwrap();
+        assert_eq!((a, b), (base, base + 3 * 4096));
+        assert_eq!(pool.allocate(1, owner(3)), Err(FrameError::Exhausted));
+        assert_eq!(pool.release(a, 3, owner(2)), Err(FrameError::Owner));
+        assert_eq!(pool.snapshot().used, 4);
+        pool.release(a, 3, owner(1)).unwrap();
+        assert_eq!(pool.allocate(3, owner(3)), Ok(base));
+        assert_eq!(pool.snapshot().free, 0);
     }
 
     #[test]
