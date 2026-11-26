@@ -246,6 +246,8 @@ impl Timers {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     #[derive(Default)]
