@@ -61,11 +61,10 @@ impl<const N: usize> ContigFramePool<N> {
         if pages == 0 || pages > self.capacity {
             return Err(FrameError::Invalid);
         }
-        let count = self
-            .runs
-            .iter()
-            .position(Option::is_none)
-            .ok_or(FrameError::Capacity)?;
+        let count = self.runs.partition_point(Option::is_some);
+        if count == N {
+            return Err(FrameError::Capacity);
+        }
         let need = pages as u64 * 4096;
         let end = self.base + self.capacity as u64 * 4096;
         let mut cursor = self.base;
@@ -95,21 +94,24 @@ impl<const N: usize> ContigFramePool<N> {
     /// were retired and its contents cleared. A mismatched owner is rejected
     /// without freeing anything; an unknown identity is stale.
     pub fn release(&mut self, base: u64, pages: usize, owner: TaskId) -> Result<(), FrameError> {
-        let count = self.runs.iter().position(Option::is_none).unwrap_or(N);
-        for index in 0..count {
-            if let Some(r) = self.runs[index]
-                && r.base == base
-                && r.pages == pages
-            {
-                if r.owner != owner {
-                    return Err(FrameError::Owner);
-                }
-                self.runs.copy_within(index + 1..count, index);
-                self.runs[count - 1] = None;
-                return Ok(());
-            }
+        // Nonempty runs have unique increasing bases; empty slots compare
+        // after every valid base. The handle identity still includes pages
+        // and owner, and a failed lookup never mutates the occupied prefix.
+        let index = self
+            .runs
+            .binary_search_by(|r| r.map_or(core::cmp::Ordering::Greater, |r| r.base.cmp(&base)))
+            .map_err(|_| FrameError::Stale)?;
+        let run = self.runs[index].ok_or(FrameError::Stale)?;
+        if run.pages != pages {
+            return Err(FrameError::Stale);
         }
-        Err(FrameError::Stale)
+        if run.owner != owner {
+            return Err(FrameError::Owner);
+        }
+        let count = self.runs.partition_point(Option::is_some);
+        self.runs.copy_within(index + 1..count, index);
+        self.runs[count - 1] = None;
+        Ok(())
     }
 }
 
@@ -284,6 +286,30 @@ mod tests {
         pool.release(a, 3, owner(1)).unwrap();
         assert_eq!(pool.allocate(3, owner(3)), Ok(base));
         assert_eq!(pool.snapshot().free, 0);
+    }
+
+    #[test]
+    fn wave7_exact_release_lookup_preserves_error_order_and_sorted_reuse() {
+        let mut pool = ContigFramePool::<16>::new(0x1000, 32).unwrap();
+        let mut bases = [0u64; 16];
+        for (i, base) in bases.iter_mut().enumerate() {
+            *base = pool.allocate(2, owner(i as u32 + 1)).unwrap();
+        }
+        assert_eq!(pool.allocate(1, owner(99)), Err(FrameError::Capacity));
+        for i in (0..16).rev().step_by(2) {
+            assert_eq!(pool.release(bases[i], 1, owner(99)), Err(FrameError::Stale));
+            assert_eq!(pool.release(bases[i], 2, owner(99)), Err(FrameError::Owner));
+            pool.release(bases[i], 2, owner(i as u32 + 1)).unwrap();
+            assert_eq!(
+                pool.release(bases[i], 2, owner(i as u32 + 1)),
+                Err(FrameError::Stale)
+            );
+        }
+        for &base in bases.iter().skip(1).step_by(2) {
+            assert_eq!(pool.allocate(2, owner(99)), Ok(base));
+        }
+        assert_eq!(pool.snapshot().used, 32);
+        assert_eq!(pool.allocate(1, owner(99)), Err(FrameError::Capacity));
     }
 
     #[test]

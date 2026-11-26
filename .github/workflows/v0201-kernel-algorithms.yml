@@ -323,3 +323,81 @@ jobs:
           name: v0201-host-bench-${{ github.sha }}
           path: artifacts/v0201-bench/
           retention-days: 7
+  baseline-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Compile the immutable V0.20 baseline and current implementation
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          mkdir -p artifacts/v0201-baseline-bench
+          git rev-parse HEAD > artifacts/v0201-baseline-bench/commit.txt
+          rustc +1.95.0 -vV > artifacts/v0201-baseline-bench/toolchain.txt
+          lscpu > artifacts/v0201-baseline-bench/cpu.txt
+          base=4912423cf2bc26ddf5c38eeea0f64190ce07a085
+          test "$(git rev-parse "$base^{tree}")" = abf743f697c434c88b0a908a3fd0f93ea4d8bb74
+          printf '%s\n' "$base" > artifacts/v0201-baseline-bench/baseline-commit.txt
+          git worktree add --detach "$RUNNER_TEMP/v0201-baseline" "$base"
+          install -D crates/kernel-core/examples/v0201_kernel_bench.rs "$RUNNER_TEMP/v0201-baseline/crates/kernel-core/examples/v0201_kernel_bench.rs"
+          sha256sum crates/kernel-core/examples/v0201_kernel_bench.rs > artifacts/v0201-baseline-bench/harness.sha256
+          cmp crates/kernel-core/examples/v0201_kernel_bench.rs "$RUNNER_TEMP/v0201-baseline/crates/kernel-core/examples/v0201_kernel_bench.rs"
+          (cd "$RUNNER_TEMP/v0201-baseline" && cargo +1.95.0 build --locked --release -p cyxia-kernel-core --example v0201_kernel_bench --target-dir "$RUNNER_TEMP/v0201-bench-base-target")
+          cargo +1.95.0 build --locked --release -p cyxia-kernel-core --example v0201_kernel_bench --target-dir "$RUNNER_TEMP/v0201-bench-new-target"
+      - name: Compare exact outputs and alternating same-runner timing samples
+        run: |
+          set -euo pipefail
+          for label in base-1 new-1 new-2 base-2; do
+            case "$label" in
+              base-*) tree=base ;;
+              new-*) tree=new ;;
+            esac
+            "$RUNNER_TEMP/v0201-bench-$tree-target/release/examples/v0201_kernel_bench" | tee "artifacts/v0201-baseline-bench/$label.log"
+          done
+          python3 -B - <<'PY' | tee artifacts/v0201-baseline-bench/summary.txt
+          from pathlib import Path
+          from statistics import median
+
+          root = Path("artifacts/v0201-baseline-bench")
+          checks = {}
+          samples = {"base": {}, "new": {}}
+          expected = {"contig-dense-8", "contig-fragmented-8",
+                      "contig-dense-64", "contig-fragmented-64",
+                      "operations-d01", "operations-d06"}
+          for label in ("base-1", "new-1", "new-2", "base-2"):
+              side = label.split("-")[0]
+              observed = {}
+              counts = {}
+              for line in (root / (label + ".log")).read_text().splitlines():
+                  kind, name, value = line.split(",", 2)
+                  assert name in expected, (label, name)
+                  if kind == "check":
+                      assert name not in observed
+                      observed[name] = value
+                  elif kind == "sample":
+                      elapsed = int(value)
+                      assert elapsed > 0
+                      counts[name] = counts.get(name, 0) + 1
+                      samples[side].setdefault(name, []).append(elapsed)
+                  else:
+                      raise ValueError(line)
+              assert set(observed) == expected
+              assert counts == dict.fromkeys(expected, 7)
+              checks[label] = observed
+          assert all(value == checks["base-1"] for value in checks.values()), checks
+          print("scope=host_only; exact pinned baseline; checks=match; samples=14 per side")
+          for name in sorted(expected):
+              old = median(samples["base"][name])
+              new = median(samples["new"][name])
+              print(f"{name},baseline_ns={old},candidate_ns={new},speedup={old/new:.4f}")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-baseline-bench-${{ github.sha }}
+          path: artifacts/v0201-baseline-bench/
+          retention-days: 7
