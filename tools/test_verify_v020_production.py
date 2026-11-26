@@ -423,8 +423,9 @@ class W11Validation(unittest.TestCase):
 
     def test_signed_scratch_needs_the_selected_epoch_and_scope(self):
         words = w11_words(staging=True)
-        words[181:183] = [1, 1]
+        words[181:188] = [1, 1, 1, 2, 3, 4, 5]
         lines = w11_lines(staging=True) + [
+            "V020_W23_RECEIPT_VIEW a=1 b=7 c=2",
             "V020_W13_SIGNED_SCRATCH a=1 b=1 c=0",
             "V020_W13_MEDIA_SCOPE test_key=true format_golden=false signed_config=true",
         ]
@@ -432,6 +433,14 @@ class W11Validation(unittest.TestCase):
         obs = self.check(words=words, lines=lines, staging=True, modes=modes)
         self.assertTrue(obs["signed_test_config_verified"])
         self.assertEqual(obs["signed_config_bound_boot_epoch"], 1)
+        self.assertEqual(obs["signed_receipt_view_sha256"],
+                         b"".join(word.to_bytes(8, "little") for word in (2, 3, 4, 5)).hex())
+        self.rejects("signed receipt view", words=words,
+                     lines=[line for line in lines if not line.startswith("V020_W23_RECEIPT_VIEW")],
+                     staging=True, modes=modes)
+        words[183] = 2
+        self.rejects("signed receipt view", words=words, lines=lines, staging=True, modes=modes)
+        words[183] = 1
         self.rejects("unexpected signed scratch", words=words, lines=lines, staging=True)
         self.rejects("signed scratch test scope", words=words, lines=lines[:-1], staging=True, modes=modes)
         words[182] = 2

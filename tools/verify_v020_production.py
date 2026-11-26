@@ -51,7 +51,9 @@ import time
 import verify_smp
 from run_qemu import Qmp
 from transport import FrameDecoder
-from v020_production_media import run_media_reopen, verify_signed_disk
+from v020_production_media import (
+    run_media_reopen, verify_signed_disk, verify_signed_receipt_view,
+)
 from v020_production_modes import (
     Modes, QEMU_GATEWAY_IPV4, W21_END, authenticated_echo, file_read_evidence, file_sessions_evidence,
     file_volatile_write_evidence, rows as w11_rows, signed_media_authority, snapshot_catalog_evidence,
@@ -700,6 +702,8 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                     if modes.signed_media:
                         epoch = report["observations"]["signed_config_bound_boot_epoch"]
                         report["signed_scratch_policy_sha256"] = verify_signed_disk(scratch, epoch)
+                        report["signed_receipt_view_disk_sha256"] = verify_signed_receipt_view(
+                            scratch, report["observations"]["signed_receipt_view_sha256"])
                         report["signed_config"] = True
                     if modes.snapshot_envelopes:
                         disk_evidence = verify_envelopes(

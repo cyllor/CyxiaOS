@@ -18,6 +18,7 @@ use super::{
     file_structure_v1::{self, BLOCK, INODES, Inode, StructureEvidence, SystemKind, SystemObject},
     offline_config_v1::{Principal, VerifiedOfflineConfig},
 };
+use sha2::{Digest, Sha256};
 const ACL_BYTES: usize = 64;
 const ACL_STORE: usize = INODES * ACL_BYTES;
 const FILE_RIGHTS: u32 = (1 << 8) | (1 << 9) | (1 << 13);
@@ -104,6 +105,56 @@ impl Workspace {
             receipts: [0; RECEIPT_STORE_BYTES],
             acl: [0; ACL_STORE],
         }
+    }
+
+    /// Check the receipt/query view captured by a successful exclusive mount
+    /// after the owner independently verifies the single paired BootEpoch redo.
+    /// That transaction changes only the boot and security homes, so the
+    /// receipt and index images from the same mount remain valid. This is
+    /// read-only custody evidence, not a FILE_RECEIPT_QUERY role qualification.
+    pub fn confirmed_receipt_query_digest(
+        &self,
+        prior: &MountEvidence,
+        committed: &SecurityStateStoreV2,
+        config: &VerifiedOfflineConfig<'_>,
+    ) -> Result<[u8; 32], Error> {
+        let old_boot = BootEpochStoreV1::decode(&self.boot)?;
+        let old_security = SecurityStateStoreV2::decode(&self.security)?;
+        if old_boot != prior.boot
+            || old_security != prior.security
+            || !old_boot.matches(&old_security)
+            || file_receipt_store_v0199::scan_receipts_with_index(
+                &self.receipts,
+                &self.index,
+                old_boot.fs_uuid,
+            )? != prior.receipts
+        {
+            return Err(Error::Conflict);
+        }
+        let expected = SecurityStateStoreV2 {
+            state_generation: old_security
+                .state_generation
+                .checked_add(1)
+                .ok_or(Error::Exhausted)?,
+            last_boot_epoch: old_security
+                .last_boot_epoch
+                .checked_add(1)
+                .ok_or(Error::Exhausted)?,
+            ..old_security
+        };
+        if committed != &expected {
+            return Err(Error::Conflict);
+        }
+        let _view = super::file_receipt_query_v4::MountedReceiptQuery::new(
+            &self.receipts,
+            &self.index,
+            config,
+            committed,
+        )?;
+        let mut digest = Sha256::new();
+        digest.update(self.receipts.as_slice());
+        digest.update(self.index.as_slice());
+        Ok(digest.finalize().into())
     }
 }
 impl Default for Workspace {

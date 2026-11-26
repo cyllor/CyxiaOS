@@ -740,6 +740,16 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("trapped_pie_cap(index, m)", audit)
         self.assertNotIn("table.admit(", audit)
 
+    def test_v020_combined_mount_gates_both_native_services(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        prod = source(arm / "production.rs")
+        self.assertIn("staging_outcome.services_ready()\n        && let Some(view) = staging_outcome.file_read", prod)
+        self.assertIn("staging_outcome.services_ready()\n        && let Some(view) = staging_outcome.snapshot_catalog", prod)
+        staging = source(arm / "production/media_staging.rs")
+        self.assertIn("out.chain_complete = run_chain(&mut disk, &mut out).is_some()", staging)
+        self.assertIn("authority::verified_pair_state(disk, checkpoint, config)", staging)
+        self.assertIn("volume::confirmed_receipt_query_digest(&mounted, &committed, &verified)", staging)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)

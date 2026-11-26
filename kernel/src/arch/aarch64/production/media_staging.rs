@@ -87,6 +87,9 @@ pub(super) struct StagingOutcome {
     /// `BootEpochAuthority::confirmed_epoch`, 0 = not confirmed.
     pub(super) confirmed_epoch: u64,
     pub(super) admission_flow_ok: bool,
+    chain_complete: bool,
+    #[cfg(feature = "v020-production-media-signed")]
+    receipt_query_digest: Option<[u8; 32]>,
     #[cfg(feature = "v020-production-media-unified")]
     unified_mount_counts: [u64; 3],
     #[cfg(feature = "v020-production-snapshot-catalog")]
@@ -98,7 +101,7 @@ pub(super) struct StagingOutcome {
 impl StagingOutcome {
     /// First missing staging result, including the independent in-vector probe.
     fn first_incomplete_step(&self, snapshot_refused: bool) -> Option<u8> {
-        [
+        let missing = [
             self.formatted || self.identified,
             self.mount_validated,
             self.unified_map_validated,
@@ -112,7 +115,19 @@ impl StagingOutcome {
         ]
         .iter()
         .position(|passed| !passed)
-        .map(|i| i as u8 + 1)
+        .map(|i| i as u8 + 1);
+        missing.or(if self.chain_complete { None } else { Some(9) })
+    }
+
+    /// A prepared individual view never authorizes an incomplete combined
+    /// mount. Check the full chain before either EL0 service is started.
+    #[cfg(any(
+        feature = "v020-production-file-read",
+        feature = "v020-production-snapshot-catalog"
+    ))]
+    pub(super) fn services_ready(&self) -> bool {
+        self.first_incomplete_step(SNAPSHOT_FAIL_CLOSED.load(Ordering::Relaxed) > 0)
+            .is_none()
     }
 }
 
@@ -237,6 +252,15 @@ fn run_chain(disk: &mut Disk, out: &mut StagingOutcome) -> Option<()> {
         4,
         authority::boot_epoch(disk, checkpoint, &mounted.security, config),
     )?;
+    #[cfg(feature = "v020-production-media-signed")]
+    {
+        let committed = authority::verified_pair_state(disk, checkpoint, config).ok()?;
+        if committed.last_boot_epoch != out.confirmed_epoch {
+            return None;
+        }
+        out.receipt_query_digest =
+            Some(volume::confirmed_receipt_query_digest(&mounted, &committed, &verified).ok()?);
+    }
     step(
         5,
         authority::admission_flow(out.confirmed_epoch).map(|()| 1),
@@ -317,7 +341,7 @@ pub(super) fn stage(info: &BootInfo) -> StagingOutcome {
         writes: 0,
         flushes: 0,
     };
-    let _ = run_chain(&mut disk, &mut out);
+    out.chain_complete = run_chain(&mut disk, &mut out).is_some();
     report("V020_W11_MEDIA_IO", disk.reads, disk.writes, disk.flushes);
     let (read_us, write_us, flush_us) = scratch_blk::max_latency_us();
     report(
@@ -414,6 +438,21 @@ pub(super) fn publish(outcome: &StagingOutcome) {
         let verified = u64::from(outcome.mount_validated);
         evidence::put(evidence::W13_SIGNED_CONFIG_VERIFIED, verified);
         evidence::put(evidence::W13_SIGNED_BOOT_EPOCH, outcome.confirmed_epoch);
+        if let Some(digest) = outcome.receipt_query_digest {
+            evidence::put(evidence::W23_RECEIPT_VIEW_BOOT, outcome.confirmed_epoch);
+            for (i, bytes) in digest.chunks_exact(8).enumerate() {
+                evidence::put(
+                    evidence::W23_RECEIPT_VIEW_DIGEST + i,
+                    u64::from_le_bytes(bytes.try_into().unwrap()),
+                );
+            }
+            report(
+                "V020_W23_RECEIPT_VIEW",
+                outcome.confirmed_epoch,
+                7,
+                u64::from_le_bytes(digest[..8].try_into().unwrap()),
+            );
+        }
         report(
             "V020_W13_SIGNED_SCRATCH",
             verified,

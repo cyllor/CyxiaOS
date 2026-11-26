@@ -53,6 +53,16 @@ pub(super) fn verify_previous_pair(
     sb: SuperblockV1,
     config: volume::Config<'_>,
 ) -> Result<u64, SecurityError> {
+    Ok(verified_pair_state(disk, sb, config)?.last_boot_epoch)
+}
+
+/// Re-read the exact paired transaction from the actual device. Return its
+/// verified state image, not a synthetic next epoch or an unflushed home.
+pub(super) fn verified_pair_state(
+    disk: &mut Disk,
+    sb: SuperblockV1,
+    config: volume::Config<'_>,
+) -> Result<SecurityStateStoreV2, SecurityError> {
     // SAFETY: synchronous, non-overlapping use of this CPU0-owned workspace.
     let pair = unsafe { &mut *core::ptr::addr_of_mut!(PAIR) };
     pair.read(disk, FIRST_LOG_BLOCK)?;
@@ -72,7 +82,7 @@ pub(super) fn verify_previous_pair(
     if state != volume::expected_state(sb.generation, config)? {
         return Err(SecurityError::Conflict);
     }
-    Ok(state.last_boot_epoch)
+    Ok(state)
 }
 
 /// Allocate and durably confirm the next epoch on the scratch volume. Returns

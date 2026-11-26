@@ -541,6 +541,21 @@ pub(super) fn validate_homes(
     Ok(e)
 }
 
+/// The exclusive mount workspace retains the seven receipt/index blocks
+/// read by validate_homes. Only the known paired boot transaction has run
+/// since that mount; its independently verified state is required here.
+#[cfg(feature = "v020-production-media-signed")]
+pub(super) fn confirmed_receipt_query_digest(
+    mounted: &MountEvidence,
+    committed: &SecurityStateStoreV2,
+    config: &VerifiedOfflineConfig<'_>,
+) -> Result<[u8; 32], SecurityError> {
+    // SAFETY: same one-shot CPU0 owner as validate_homes; all mutable
+    // workspace borrows have ended, and no other CPU can access MOUNT.
+    let workspace = unsafe { &*core::ptr::addr_of!(MOUNT) };
+    workspace.confirmed_receipt_query_digest(mounted, committed, config)
+}
+
 fn checked_map() -> Result<[UnifiedSystemObject; unified::UNIFIED_SYSTEM_OBJECTS], SecurityError> {
     let map = unified::unified_map_from_baseline(&SYSTEM, &SNAPSHOTS)?;
     if map.iter().any(|object| {
