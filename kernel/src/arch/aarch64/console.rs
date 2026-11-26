@@ -77,6 +77,26 @@ pub(crate) fn try_log(s: &[u8]) -> Result<(), PlatformError> {
         }
     }
 }
+
+/// Admit a complete frame to the sole CPU0 writer. The resident console
+/// drains the retained suffix after a short write before admitting another.
+#[cfg(all(
+    feature = "v020-production",
+    not(feature = "v020-production-diagnostic")
+))]
+pub(crate) fn enqueue_resident_frame(
+    pending: &mut cyxia_kernel_core::console::OutputQueue<128>,
+    payload: &[u8],
+) -> Result<(), PlatformError> {
+    let sequence = LOG_SEQUENCE.load(Ordering::Relaxed);
+    let next = sequence.checked_add(1).ok_or(PlatformError::Invalid)?;
+    let mut frame = [0; 128];
+    let size = cyxia_contracts::transport::encode(1, sequence, payload, &mut frame)
+        .map_err(|_| PlatformError::Invalid)?;
+    pending.enqueue(&frame[..size])?;
+    LOG_SEQUENCE.store(next, Ordering::Relaxed);
+    Ok(())
+}
 /// The current ordinary HAL owner accepts a complete transport frame
 /// before advancing the sole writer's sequence. Emergency log() stays
 /// independent. Call only from the serialized native console owner;

@@ -1,9 +1,9 @@
-//! V0.20 PRODUCTION boot + in-vector SVC dispatch SKELETON (wave 10 T1).
+//! V0.20 native diagnostics for the boot and in-vector SVC mechanism.
 //!
 //! This elevates the proven advice-e2e SvcV3Bridge dispatch OUT of the fixture
-//! turn loop and INTO the production exception-vector path. Under the opt-in
-//! `v020-production` feature, boot.rs routes here instead of smp::run's fixture
-//! dispatch; exceptions.rs routes EL0 sync ABI-v3 SVCs (0x40/0x41/0x50) to
+//! turn loop and INTO the production exception-vector path. The opt-in
+//! `v020-production-diagnostic` feature selects this entry. The exception
+//! vector routes its EL0 sync ABI-v3 SVCs (0x40/0x41/0x50) to
 //! [`exception`], which dispatches them in-vector and returns straight to EL0.
 //!
 //! What is genuinely production-wired here:
@@ -127,27 +127,6 @@ pub(crate) mod recovery;
 #[cfg(feature = "v020-production-snapshot-catalog")]
 #[path = "production/snapshot_catalog.rs"]
 mod snapshot_catalog;
-
-// The production skeleton owns the CPU0 EL0 turn loop and the in-vector dispatch
-// path; it must not be combined with another profile that also hijacks CPU0 or
-// rewrites dispatch/execute.
-#[cfg(any(
-    feature = "v0199-cpu0-role-selftest",
-    feature = "v0199-advice-e2e-selftest",
-    feature = "v0199-control-bringup",
-    feature = "v0199-epoch-disk-selftest",
-    feature = "v0199-format-selftest",
-    feature = "v0199-sec-n-selftest",
-    feature = "ai-control-selftest",
-    feature = "legacy-coreset",
-    feature = "prototype-runtime",
-    feature = "unified-runtime",
-    feature = "net-selftest",
-    feature = "model-v13-selftest",
-    feature = "storage-v13-selftest",
-    feature = "tcp-v13-selftest",
-))]
-compile_error!("v020-production requires the plain smp-selftest profile");
 
 // The advice EL0 advisor/carrier program is the SAME proven bounded program the
 // advice-e2e fixture uses (constructs the envelope at EL0, records the x0 return,
@@ -1382,55 +1361,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     #[cfg(feature = "v020-production-frame-pool")]
     let info = &reserved_info;
     recovery::init_or_fatal();
-    // ---- SMP bring-up: mirrors smp::run's proven secondary-start path ----
-    if info.cpu_count != REQUIRED {
-        report(
-            "SMP_REJECT_CPU_COUNT",
-            info.cpu_count as u64,
-            REQUIRED as u64,
-            0,
-        );
-        panic!("unsupported CPU count for the production skeleton");
-    }
-    let topo = cyxia_platform_virt::cpu_topology(info, cpu::affinity()).expect("PSCI topology");
-    assert_eq!(topo.count, REQUIRED);
-    let mut resource = info.gic.unwrap();
-    resource.distributor.0 += super::super::HIGH;
-    resource.cpu.0 += super::super::HIGH;
-    let irq = info.timer_irq.unwrap();
-    assert!((16..32).contains(&irq));
-    TIMER_IRQ.store(irq as u64, Ordering::Relaxed);
-    unsafe {
-        *core::ptr::addr_of_mut!(RESOURCE) = Some(resource);
-        *core::ptr::addr_of_mut!(GICS).cast::<Option<Gic>>() = Some(Gic::new(resource).unwrap());
-        init_memory();
-    }
-    for (slot, affinity) in AFFINITIES.iter().enumerate().take(topo.count) {
-        affinity.store(topo.affinity[slot], Ordering::Release);
-    }
-    BOOT_READY.store(true, Ordering::Release);
-    unsafe {
-        core::arch::asm!("dsb sy", options(nostack));
-    }
-    let entry = core::ptr::addr_of!(cyxia_secondary_start) as u64;
-    assert!((cyxia_platform_virt::ENTRY..cyxia_platform_virt::ENTRY + 4096).contains(&entry));
-    for slot in 1..topo.count {
-        let result = unsafe { cpu::start(topo.conduit, topo.affinity[slot], entry, slot as u64) };
-        report(
-            "SMP_CPU_ON",
-            slot as u64,
-            topo.affinity[slot],
-            result as u64,
-        );
-        assert_eq!(result, 0, "CPU_ON must report success");
-    }
-    wait(|| ONLINE.load(Ordering::Acquire) == 15);
-    report(
-        "SMP_BOOT_OK",
-        topo.count as u64,
-        ONLINE.load(Ordering::Acquire),
-        0,
-    );
+    bring_up_production(info);
     for gate in GATES.iter().take(REQUIRED).skip(1) {
         gate.open(Token {
             generation: 1,

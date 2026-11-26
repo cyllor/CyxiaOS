@@ -49,13 +49,37 @@ pub(crate) mod prototype_runtime;
 #[cfg(feature = "v0199-advice-e2e-selftest")]
 #[path = "v0199_advice_e2e.rs"]
 mod v0199_advice_e2e;
-// V0.20 production boot + in-vector SVC dispatch skeleton (wave 10 T1). It is a
-// child of smp so it can reuse the proven secondary-start path, private spaces
-// and execute()/context() mechanism. boot.rs routes v020-production directly to
-// production::run(info); smp::run's fixture dispatch is never reached under it.
-#[cfg(feature = "v020-production")]
+// V0.20 shares fixed-core PSCI and GIC setup. The explicit diagnostic
+// build adds the EL0 fixture, test network identity and scratch media.
+#[cfg(feature = "v020-production-diagnostic")]
 #[path = "production.rs"]
 pub(crate) mod production;
+#[cfg(all(
+    feature = "v020-production",
+    not(feature = "v020-production-diagnostic")
+))]
+#[path = "production/resident.rs"]
+pub(crate) mod production;
+#[cfg(all(
+    feature = "v020-production",
+    any(
+        feature = "v0199-cpu0-role-selftest",
+        feature = "v0199-advice-e2e-selftest",
+        feature = "v0199-control-bringup",
+        feature = "v0199-epoch-disk-selftest",
+        feature = "v0199-format-selftest",
+        feature = "v0199-sec-n-selftest",
+        feature = "ai-control-selftest",
+        feature = "legacy-coreset",
+        feature = "prototype-runtime",
+        feature = "unified-runtime",
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "storage-v13-selftest",
+        feature = "tcp-v13-selftest",
+    )
+))]
+compile_error!("v020-production requires the plain smp-selftest profile");
 #[cfg(feature = "v0199-cpu0-role-selftest")]
 #[path = "v0199_role_selftest.rs"]
 mod v0199_role_selftest;
@@ -107,8 +131,11 @@ mod v0199_format_fixture;
 #[path = "scratch_blk.rs"]
 mod scratch_blk;
 // SEC-N local-echo guest loader + SVC 0x43 broker, shared by the SEC-N fixture
-// and the v020-production boot (production/net.rs).
-#[cfg(any(feature = "v0199-sec-n-selftest", feature = "v020-production"))]
+// and the V0.20 diagnostic boot (production/net.rs).
+#[cfg(any(
+    feature = "v0199-sec-n-selftest",
+    feature = "v020-production-diagnostic"
+))]
 #[path = "sec_n_broker.rs"]
 mod sec_n_broker;
 #[cfg(feature = "v0199-sec-n-selftest")]
@@ -169,7 +196,7 @@ const PRIVATE_SPACES: usize = C * 2
     } else {
         0
     }
-    + if cfg!(feature = "v020-production") {
+    + if cfg!(feature = "v020-production-diagnostic") {
         8
     } else {
         0
@@ -337,13 +364,13 @@ pub(crate) fn gic() -> &'static Gic {
             .unwrap()
     }
 }
-fn report(label: &str, a: u64, b: u64, c: u64) {
+fn report_payload<'a>(data: &'a mut [u8], label: &str, a: u64, b: u64, c: u64) -> &'a [u8] {
     use core::fmt::Write;
-    struct Text {
-        data: [u8; 192],
+    struct Text<'a> {
+        data: &'a mut [u8],
         n: usize,
     }
-    impl Write for Text {
+    impl Write for Text<'_> {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
             let end = self.n + s.len();
             let out = self.data.get_mut(self.n..end).ok_or(core::fmt::Error)?;
@@ -352,13 +379,14 @@ fn report(label: &str, a: u64, b: u64, c: u64) {
             Ok(())
         }
     }
-    // CPU0 alone owns the framed UART writer; secondary CPUs publish atomics.
-    let mut text = Text {
-        data: [0; 192],
-        n: 0,
-    };
+    let mut text = Text { data, n: 0 };
     writeln!(&mut text, "{label} a={a} b={b} c={c}").unwrap();
-    super::log(&text.data[..text.n]);
+    &text.data[..text.n]
+}
+fn report(label: &str, a: u64, b: u64, c: u64) {
+    // CPU0 alone owns the framed UART writer; secondary CPUs publish atomics.
+    let mut data = [0; 192];
+    super::log(report_payload(&mut data, label, a, b, c));
 }
 pub(super) fn check_failures() {
     for i in 1..REQUIRED {
@@ -462,6 +490,13 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
                     }
                     #[cfg(not(feature = "unified-runtime"))]
                     cpu::disable_timer();
+                    #[cfg(all(
+                        feature = "v020-production",
+                        not(feature = "v020-production-diagnostic")
+                    ))]
+                    if slot == 0 {
+                        timer::arm(production::timer_deadline());
+                    }
                 }
                 #[cfg(feature = "unified-runtime")]
                 if slot < 4 {
@@ -510,10 +545,21 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
             IrqAck::Spurious => {
                 prototype_runtime::irq_exit(slot);
             }
+            #[cfg(all(
+                feature = "v020-production",
+                not(feature = "v020-production-diagnostic")
+            ))]
+            IrqAck::Spurious if kind == 5 => {}
             #[cfg(not(feature = "unified-runtime"))]
             _ => fatal(10 + kind),
         }
-        #[cfg(feature = "unified-runtime")]
+        #[cfg(any(
+            feature = "unified-runtime",
+            all(
+                feature = "v020-production",
+                not(feature = "v020-production-diagnostic")
+            )
+        ))]
         if kind == 5 {
             return;
         }
@@ -559,6 +605,13 @@ unsafe fn init_memory() {
                 mmu::encode_user_leaf(PhysAddr(phys(stack as u64)), true, false).unwrap();
             (*data).0[0] = cookie(i);
         }
+        init_secondary_stacks();
+    }
+}
+
+/// Install guard pages and stack tops before permitting any PSCI CPU_ON.
+unsafe fn init_secondary_stacks() {
+    unsafe {
         let base = core::ptr::addr_of_mut!(STACKS) as u64;
         let boot_leaves = (core::ptr::addr_of!(ram_l3) as u64 + super::HIGH) as *mut u64;
         for slot in 0..C {
@@ -575,6 +628,62 @@ unsafe fn init_memory() {
             options(nostack)
         );
     }
+}
+
+#[cfg(feature = "v020-production")]
+fn bring_up_production(info: &BootInfo) {
+    assert_eq!(cpu::slot(), 0);
+    if info.cpu_count != REQUIRED {
+        report(
+            "SMP_REJECT_CPU_COUNT",
+            info.cpu_count as u64,
+            REQUIRED as u64,
+            0,
+        );
+        panic!("unsupported CPU count for V0.20");
+    }
+    let topo = cyxia_platform_virt::cpu_topology(info, cpu::affinity()).expect("PSCI topology");
+    assert_eq!(topo.count, REQUIRED);
+    let mut resource = info.gic.unwrap();
+    resource.distributor.0 += super::HIGH;
+    resource.cpu.0 += super::HIGH;
+    let irq = info.timer_irq.unwrap();
+    assert!((16..32).contains(&irq));
+    TIMER_IRQ.store(irq as u64, Ordering::Relaxed);
+    // SAFETY: CPU0 owns these pre-SMP writes. The DTB-validated resources use
+    // the mapped high Device alias. BOOT_READY releases all state to workers.
+    unsafe {
+        *core::ptr::addr_of_mut!(RESOURCE) = Some(resource);
+        *core::ptr::addr_of_mut!(GICS).cast::<Option<Gic>>() = Some(Gic::new(resource).unwrap());
+        #[cfg(feature = "v020-production-diagnostic")]
+        init_memory();
+        #[cfg(not(feature = "v020-production-diagnostic"))]
+        init_secondary_stacks();
+    }
+    for (slot, affinity) in AFFINITIES.iter().enumerate().take(topo.count) {
+        affinity.store(topo.affinity[slot], Ordering::Release);
+    }
+    BOOT_READY.store(true, Ordering::Release);
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+    let entry = core::ptr::addr_of!(cyxia_secondary_start) as u64;
+    assert!((cyxia_platform_virt::ENTRY..cyxia_platform_virt::ENTRY + 4096).contains(&entry));
+    for slot in 1..topo.count {
+        // SAFETY: affinity and conduit came from DTB topology. The assembly
+        // entry verifies the slot and enters with its prepared stack.
+        let result = unsafe { cpu::start(topo.conduit, topo.affinity[slot], entry, slot as u64) };
+        report(
+            "SMP_CPU_ON",
+            slot as u64,
+            topo.affinity[slot],
+            result as u64,
+        );
+        assert_eq!(result, 0, "CPU_ON must report success");
+    }
+    let online = (1 << REQUIRED) - 1;
+    wait(|| ONLINE.load(Ordering::Acquire) == online);
+    report("SMP_BOOT_OK", topo.count as u64, online, 0);
 }
 fn context(i: usize) -> user::Context {
     let mut ctx = user::Context::empty();
@@ -781,6 +890,30 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
     ONLINE.fetch_or(1 << slot, Ordering::Release);
     #[cfg(feature = "register-v15-selftest")]
     register_evidence::worker(slot);
+    #[cfg(all(
+        feature = "v020-production",
+        not(feature = "v020-production-diagnostic")
+    ))]
+    {
+        // Startup has yet to authorize any business EL0. The parked CPUs stay
+        // online with their exception vectors and interrupt interfaces active.
+        unsafe { timer::enable_irqs() };
+        loop {
+            timer::idle();
+        }
+    }
+    #[cfg(any(
+        not(feature = "v020-production"),
+        feature = "v020-production-diagnostic"
+    ))]
+    secondary_work(slot)
+}
+
+#[cfg(any(
+    not(feature = "v020-production"),
+    feature = "v020-production-diagnostic"
+))]
+fn secondary_work(slot: usize) -> ! {
     let mut contexts = [context(slot * 2), context(slot * 2 + 1)];
     let mut tested = [false; 2];
     #[cfg(feature = "prototype-runtime")]

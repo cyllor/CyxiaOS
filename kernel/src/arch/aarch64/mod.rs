@@ -20,6 +20,11 @@ use cyxia_contracts::*;
 mod boot;
 mod console;
 mod exceptions;
+#[cfg(all(
+    feature = "v020-production",
+    not(feature = "v020-production-diagnostic")
+))]
+pub(crate) use console::enqueue_resident_frame;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 pub(crate) use console::enqueue_v0199;
 pub(crate) use console::{UART, halt, log, try_log};

@@ -45,6 +45,7 @@ on:
       - 'tests/fixtures/v020-signed-scratch/**'
       - '.github/workflows/v020-production.yml'
       - 'tools/verify_v020_production.py'
+      - 'tools/verify_v020_resident.py'
       - 'tools/test_verify_v020_production.py'
       - 'tools/qmp_stdio.py'
       - 'tools/test_qmp_stdio.py'
@@ -65,6 +66,7 @@ on:
       - 'tests/fixtures/v020-signed-scratch/**'
       - '.github/workflows/v020-production.yml'
       - 'tools/verify_v020_production.py'
+      - 'tools/verify_v020_resident.py'
       - 'tools/test_verify_v020_production.py'
       - 'tools/qmp_stdio.py'
       - 'tools/test_qmp_stdio.py'
@@ -164,11 +166,13 @@ jobs:
           cargo fetch --locked
           rustc -vV > artifacts/v020-production/toolchain.txt
           cargo test --locked --offline -p cyxia-driver-virtio --lib 2>&1 | tee artifacts/v020-production/driver-virtio-tests.log
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat 2>&1 | tee artifacts/v020-production/build-resident.log
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-resident.elf
           # The kernel include_bytes!-embeds the fixture-identity local-echo guest:
           # build it first with the exact helper verify_v0199_sec_n.py uses.
           python3 -B -c 'import sys; sys.path.insert(0, "tools"); import verify_v0199_sec_n as s; s.build_guest()' 2>&1 | tee artifacts/v020-production/build-guest.log
           sha256sum target/aarch64-unknown-none/release/cyxia-local-echo > artifacts/v020-production/guest.sha256
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production 2>&1 | tee artifacts/v020-production/build.log
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v020-production-diagnostic 2>&1 | tee artifacts/v020-production/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel.elf
           # Opt-in staging profile (prototype-memory, RAM_MIB 1024).
           cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production-media-staging 2>&1 | tee artifacts/v020-production/build-staging.log
@@ -304,6 +308,9 @@ jobs:
           # NOT G4 acceptance; the verifier exits non-zero on any FAIL so set -e
           # preserves honesty — a skeleton-lane green is never production acceptance.
           export PATH="$PWD/artifacts/v020-production-qemu/bin:$PATH"
+          python3 -B tools/verify_v020_resident.py \
+            --elf artifacts/v020-production/kernel-resident.elf \
+            --output artifacts/v020-production/run-resident
           python3 -B tools/verify_v020_production.py \
             --elf artifacts/v020-production/kernel.elf \
             --output artifacts/v020-production/run \

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Independent pinned-QEMU check of the V0.20 production boot + in-vector SVC
-dispatch SKELETON (wave 10 T1, feature v020-production).
+dispatch SKELETON (feature v020-production-diagnostic).
 
-This verifies that, in the production profile, the eight ABI3 PIE role packages
+This verifies that, in the diagnostic profile, the eight ABI3 PIE role packages
 load through the build catalog and execute, and that the advice causal chain
 (AdviceEnvelope v1 -> 0x50 intake -> RuleProfile review -> 0x50 register ->
 0x41 publish -> ApplyReport -> supervisor terminal) is serviced by REAL EL0

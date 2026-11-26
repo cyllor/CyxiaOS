@@ -145,7 +145,7 @@ jobs:
           git rev-parse HEAD > artifacts/v0201-arm/commit.txt
           rustc -vV > artifacts/v0201-arm/toolchain.txt
           python3 -B -c 'import sys; sys.path.insert(0, "tools"); import verify_v0199_sec_n as s; s.build_guest()' 2>&1 | tee artifacts/v0201-arm/build-guest.log
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest,v020-production 2>&1 | tee artifacts/v0201-arm/build.log
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v020-production-diagnostic 2>&1 | tee artifacts/v0201-arm/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v0201-arm/kernel.elf
           readelf -h artifacts/v0201-arm/kernel.elf > artifacts/v0201-arm/elf.txt
           (cd artifacts/v0201-arm && sha256sum kernel.elf > elf.sha256)

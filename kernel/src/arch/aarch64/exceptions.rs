@@ -18,17 +18,11 @@ pub struct ExceptionFrame {
 }
 #[unsafe(no_mangle)]
 extern "C" fn exception_dispatch(f: &mut ExceptionFrame, kind: u64) {
-    // V0.20 canonical dispatcher: ONE SMP/production entry for every
-    // smp-selftest profile. Under the default v020-production profile the
-    // production dispatcher services EL0 sync ABI-v3 SVCs (0x40/0x41/0x50)
-    // IN-VECTOR and returns straight to EL0; all other exceptions fall through
-    // to the proven smp capture path. production::run initializes the control
-    // plane before the first EL0 turn, and svc_dispatch additionally
-    // fail-closes (returns None -> smp path) whenever no registered caller is
-    // present, so an uninitialized state can never dispatch a production SVC.
+    // The diagnostic build adds the ABI3 trap path and per-CPU EL0 fault
+    // evidence. The resident startup profile services its architectural IRQs.
     #[cfg(feature = "smp-selftest")]
     {
-        #[cfg(feature = "v020-production")]
+        #[cfg(feature = "v020-production-diagnostic")]
         {
             // A lower-EL AArch64 synchronous fault, including a permission abort,
             // enters its CPU's summary. SVCs are requests; ESR and FAR come from
@@ -46,8 +40,9 @@ extern "C" fn exception_dispatch(f: &mut ExceptionFrame, kind: u64) {
                     far,
                 );
             }
-            smp::production::exception(f, kind);
         }
+        #[cfg(feature = "v020-production")]
+        smp::production::exception(f, kind);
         // Isolated --no-default-features smp-selftest fixture: no production
         // control plane is compiled there, so the proven smp capture path (the
         // production dispatcher's own fall-through target) is the whole entry.
