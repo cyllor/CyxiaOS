@@ -1,4 +1,4 @@
-name: V0.20.1 kernel algorithm host regression
+name: V0.20.1 kernel algorithm and native fixture regression
 on:
   push:
     branches: [V0.20.1]
@@ -72,6 +72,14 @@ jobs:
             seam: 'wave5_network_'
           - package: cyxia-prototype
             seam: 'wave5_irq_'
+          - package: cyxia-prototype
+            seam: 'wave6_optional_'
+          - package: cyxia-prototype
+            seam: 'wave6_recovery_'
+          - package: cyxia-kernel-core
+            seam: 'cap_record_v3::tests'
+          - package: cyxia-kernel-core
+            seam: 'desired_plan_v0199::tests'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -174,4 +182,144 @@ jobs:
         with:
           name: v0201-x86-build-${{ github.sha }}
           path: artifacts/v0201-x86/
+          retention-days: 7
+  qemu-pinned:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build exact QEMU 10.2.2 for both guest architectures
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev libslirp-dev python3-venv
+          mkdir -p artifacts/v0201-qemu
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$RUNNER_TEMP/qemu-source"
+          git -C "$RUNNER_TEMP/qemu-source" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          test "$(git -C "$RUNNER_TEMP/qemu-source" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          sha256sum tools/qemu/cyxia-per-vcpu-pmu.patch > artifacts/v0201-qemu/patch.sha256
+          git -C "$RUNNER_TEMP/qemu-source" apply --check "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu-source" apply "$GITHUB_WORKSPACE/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$RUNNER_TEMP/qemu-source" diff --binary > artifacts/v0201-qemu/applied.patch
+          git -C "$RUNNER_TEMP/qemu-source" rev-parse HEAD > artifacts/v0201-qemu/upstream.txt
+          cd "$RUNNER_TEMP/qemu-source"
+          ./configure --target-list=aarch64-softmmu,x86_64-softmmu --enable-slirp --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/v0201-qemu/configure.log"
+          ninja -C build qemu-system-aarch64 qemu-system-x86_64 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/v0201-qemu/build.log"
+          mkdir -p "$RUNNER_TEMP/qemu-bin"
+          cp build/qemu-system-aarch64 build/qemu-system-x86_64 "$RUNNER_TEMP/qemu-bin/"
+          cp -a pc-bios "$RUNNER_TEMP/qemu-bin/pc-bios"
+          test -s "$RUNNER_TEMP/qemu-bin/pc-bios/bios-256k.bin"
+          "$RUNNER_TEMP/qemu-bin/qemu-system-aarch64" --version | tee "$GITHUB_WORKSPACE/artifacts/v0201-qemu/arm-version.txt"
+          "$RUNNER_TEMP/qemu-bin/qemu-system-x86_64" --version | tee "$GITHUB_WORKSPACE/artifacts/v0201-qemu/x86-version.txt"
+          tar -C "$RUNNER_TEMP" -czf "$GITHUB_WORKSPACE/artifacts/v0201-qemu/qemu-bin.tar.gz" qemu-bin
+          (cd "$GITHUB_WORKSPACE/artifacts/v0201-qemu" && sha256sum qemu-bin.tar.gz > archive.sha256)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-pinned-qemu-${{ github.sha }}
+          path: artifacts/v0201-qemu/
+          retention-days: 7
+  arm-native:
+    needs: [arm-build, qemu-pinned]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v0201-arm-build-${{ github.sha }}
+          path: artifacts/v0201-arm
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v0201-pinned-qemu-${{ github.sha }}
+          path: artifacts/v0201-qemu
+      - name: Verify production skeleton and fail-closed missing NIC
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
+          test "$(cat artifacts/v0201-arm/commit.txt)" = "$(git rev-parse HEAD)"
+          (cd artifacts/v0201-arm && sha256sum -c elf.sha256)
+          (cd artifacts/v0201-qemu && sha256sum -c archive.sha256)
+          sha256sum -c artifacts/v0201-qemu/patch.sha256
+          tar -xzf artifacts/v0201-qemu/qemu-bin.tar.gz -C "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/qemu-bin:$PATH"
+          mkdir -p artifacts/v0201-arm-native
+          printf '%s\n' 'PRODUCTION_SKELETON_ONLY; G4 NOT_RUN' > artifacts/v0201-arm-native/scope.txt
+          python3 -B tools/verify_v020_production.py --elf artifacts/v0201-arm/kernel.elf --output artifacts/v0201-arm-native/run --timeout 120
+          if python3 -B tools/verify_v020_production.py --elf artifacts/v0201-arm/kernel.elf --output artifacts/v0201-arm-native/run-no-nic --timeout 120 --no-nic; then
+            echo "no-NIC negative control unexpectedly PASSED" >&2
+            exit 1
+          fi
+          grep -q '"error": "ValueError: guest reported V020_W11_NET_ABSENT:' artifacts/v0201-arm-native/run-no-nic/summary.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-arm-native-${{ github.sha }}
+          path: artifacts/v0201-arm-native/
+          retention-days: 7
+  x86-native:
+    needs: [x86-build, qemu-pinned]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v0201-pinned-qemu-${{ github.sha }}
+          path: artifacts/v0201-qemu
+      - name: Build and run four-vCPU x86-64 mechanism fixture
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libfdt1 libglib2.0-0 libpixman-1-0 libslirp0
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target x86_64-unknown-none
+          rustup override set 1.95.0
+          cargo fetch --locked
+          (cd artifacts/v0201-qemu && sha256sum -c archive.sha256)
+          tar -xzf artifacts/v0201-qemu/qemu-bin.tar.gz -C "$RUNNER_TEMP"
+          mkdir -p artifacts/v0201-x86-native
+          git rev-parse HEAD > artifacts/v0201-x86-native/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/v0201-x86-native/tree.txt
+          printf '%s\n' 'SMP_MECHANISM_FIXTURE_ONLY; G5 NOT_RUN' > artifacts/v0201-x86-native/scope.txt
+          python3 -B tools/x86_64.py build --output artifacts/v0201-x86-native/build --mechanism smp
+          CYXIA_PINNED_QEMU_FIRMWARE="$RUNNER_TEMP/qemu-bin/pc-bios" \
+            PATH="$RUNNER_TEMP/qemu-bin:$PATH" python3 -B tools/x86_64.py run \
+            --build artifacts/v0201-x86-native/build \
+            --output artifacts/v0201-x86-native/capture --timeout 35
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-x86-native-${{ github.sha }}
+          path: artifacts/v0201-x86-native/
+          retention-days: 7
+  host-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Measure full and shared-prefix MLP on the same runner
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          mkdir -p artifacts/v0201-bench
+          git rev-parse HEAD > artifacts/v0201-bench/commit.txt
+          rustc +1.95.0 -vV > artifacts/v0201-bench/toolchain.txt
+          lscpu > artifacts/v0201-bench/cpu.txt
+          cargo +1.95.0 run --locked --release -p cyxia-prototype --example v0201_mlp_bench 2>&1 | tee artifacts/v0201-bench/mlp.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v0201-host-bench-${{ github.sha }}
+          path: artifacts/v0201-bench/
           retention-days: 7

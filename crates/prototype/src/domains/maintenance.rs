@@ -98,7 +98,9 @@ impl BackgroundBudgets {
         }
         group.last_ns = now;
         if window > group.window {
-            if self.debits.iter().flatten().any(|d| d.key == group.key) {
+            // Every live debit reserves a strictly positive amount. The
+            // exact sum is changed only at issue and exact receipt settlement.
+            if group.status.reserved_ns != 0 {
                 group.status.freeze_admission = true;
                 return Err(Error::Busy);
             }
@@ -289,7 +291,7 @@ impl BackgroundBudgets {
         }
         let mut status = group.status;
         if window > group.window {
-            if self.debits.iter().flatten().any(|debit| debit.key == key) {
+            if status.reserved_ns != 0 {
                 return Err(Error::Busy);
             }
             status.spent_ns = if group.carry_window == Some(window) {
@@ -318,7 +320,7 @@ impl BackgroundBudgets {
     }
     pub fn recover_stopped(&mut self, key: ObjectKey, now: u64) -> Result<(), Error> {
         let i = self.index(key)?;
-        if self.debits.iter().flatten().any(|d| d.key == key) {
+        if self.groups[i].ok_or(Error::Stale)?.status.reserved_ns != 0 {
             return Err(Error::Busy);
         }
         self.refresh(i, now)?;
@@ -513,15 +515,26 @@ impl RecoverySupervisor {
         if recipe != 0 && recipe != service.recipe {
             return Err(Error::Auth);
         }
-        if recipe != 0
-            && (service.isolated
-                || self
-                    .records
-                    .iter()
-                    .flatten()
-                    .any(|r| r.receipt.apply.target == apply.target && !r.receipt.state.terminal()))
-        {
+        if recipe != 0 && service.isolated {
             return Err(Error::Busy);
+        }
+        // Records form an occupied prefix: terminal replacement never
+        // creates a hole. Find a vacancy or the oldest terminal record
+        // while retaining the independent unresolved-target fence.
+        let mut vacant = None;
+        let mut oldest = None;
+        for (at, record) in self.records.iter().enumerate() {
+            let Some(record) = record else {
+                vacant = Some(at);
+                break;
+            };
+            if record.receipt.state.terminal() {
+                if oldest.is_none_or(|(_, order)| record.order < order) {
+                    oldest = Some((at, record.order));
+                }
+            } else if recipe != 0 && record.receipt.apply.target == apply.target {
+                return Err(Error::Busy);
+            }
         }
         if recipe != 0
             && service
@@ -530,21 +543,8 @@ impl RecoverySupervisor {
         {
             return Err(Error::Again);
         }
-        let slot = self
-            .records
-            .iter()
-            .position(Option::is_none)
-            .or_else(|| {
-                self.records
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, r)| {
-                        r.filter(|r| r.receipt.state.terminal())
-                            .map(|r| (i, r.order))
-                    })
-                    .min_by_key(|(_, n)| *n)
-                    .map(|(i, _)| i)
-            })
+        let slot = vacant
+            .or(oldest.map(|(at, _)| at))
             .ok_or(Error::Capacity)?;
         self.sequence = self.sequence.checked_add(1).ok_or(Error::Overflow)?;
         let generation = if recipe == 0 {

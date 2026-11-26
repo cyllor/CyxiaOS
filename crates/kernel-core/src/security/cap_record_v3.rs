@@ -267,6 +267,8 @@ impl<const N: usize> StaticControlCaps<N> {
         verify_catalog_and_object: impl FnOnce(Label, &CapRecordV3) -> Result<(), Error>,
     ) -> Result<u64, Error> {
         let (role, authority, kind, rights) = label.requirement(r.source_role)?;
+        // Issued slots, including retired tombstones, are never removed.
+        let at = self.rows.partition_point(Option::is_some);
         if !r.valid()
             || !r.target.valid()
             || r.state != 1
@@ -281,7 +283,7 @@ impl<const N: usize> StaticControlCaps<N> {
                 .iter()
                 .flatten()
                 .any(|a| a.id == r.holder.id && a.generation >= r.holder.generation)
-            || self.rows.iter().flatten().any(|e| {
+            || self.rows[..at].iter().flatten().any(|e| {
                 e.record.cap_id==r.cap_id
                 // A fenced or retired holder generation may never gain
                 // a new root, even under a previously unused cap_id.
@@ -297,11 +299,9 @@ impl<const N: usize> StaticControlCaps<N> {
         manifest
             .can_act(role, r.holder, authority, 0)
             .map_err(|_| Error::Unauthorized)?;
-        let at = self
-            .rows
-            .iter()
-            .position(Option::is_none)
-            .ok_or(Error::Capacity)?;
+        if at == N {
+            return Err(Error::Capacity);
+        }
         let index = u32::try_from(at).map_err(|_| Error::Capacity)?;
         verify_catalog_and_object(label, &r)?;
         self.rows[at] = Some(Entry { label, record: r });
@@ -565,6 +565,59 @@ mod tests {
             Err(Error::Unauthorized)
         );
     }
+    #[test]
+    fn full_static_table_keeps_exact_handles_and_duplicate_rejection() {
+        let m = manifest();
+        let r = publisher();
+        let mut table = StaticControlCaps::<3> {
+            boot: 1,
+            rows: [None; 3],
+            fenced: [None; rm::ROLE_COUNT],
+        };
+        for i in 0..3u64 {
+            let record = CapRecordV3 {
+                cap_id: r.cap_id + i,
+                ..r
+            };
+            assert_eq!(
+                table.issue_checked(&m, Label::Publish, record, |_, _| Ok(())),
+                Ok((1u64 << 32) | i)
+            );
+        }
+        assert_eq!(
+            table.issue_checked(&m, Label::Publish, r, |_, _| panic!()),
+            Err(Error::Unauthorized)
+        );
+        let extra = CapRecordV3 {
+            cap_id: 100,
+            ..r
+        };
+        assert_eq!(
+            table.issue_checked(&m, Label::Publish, extra, |_, _| panic!()),
+            Err(Error::Capacity)
+        );
+        table.fence_holder(r.holder).unwrap();
+        table.retire_holder(r.holder, |_| Ok(())).unwrap();
+        assert_eq!(
+            table.issue_checked(&m, Label::Publish, extra, |_, _| panic!()),
+            Err(Error::Unauthorized)
+        );
+        for i in 0..3u64 {
+            assert_eq!(
+                table.lookup(
+                    1,
+                    r.holder,
+                    0,
+                    (1u64 << 32) | i,
+                    Label::Publish,
+                    r.target,
+                    |_| panic!()
+                ),
+                Err(Error::Stale)
+            );
+        }
+    }
+
     #[test]
     fn record_type_rights_and_exact_holder_cap_lookup() {
         let m = manifest();
