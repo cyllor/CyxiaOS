@@ -210,6 +210,13 @@ impl BatchedBlock {
             }
         };
         if let Some(c) = completion {
+            // The queue acquires DMA and acknowledges the interrupt after its
+            // initial status check. A reset in that interval cannot certify a
+            // block result or authorize releasing its pinned buffers.
+            if self.transport.status() != 15 {
+                self.fail(p);
+                return Err(Error::Device);
+            }
             let Some((token, operation, _)) = self.pending[usize::from(c.token.slot)] else {
                 self.fail(p);
                 return Err(Error::Queue);
@@ -273,9 +280,18 @@ mod tests {
         clock: Cell<u64>,
         idle_completion: Cell<Option<(usize, u8, bool)>>,
         idle_clock: Cell<Option<u64>>,
+        mmio: usize,
+        reset_on_completion_ack: Cell<bool>,
     }
     unsafe impl Platform for Host {
         fn diagnostic_stage(&self, stage: u64) {
+            if stage == crate::DiagnosticStage::QueueCompletionAck as u64
+                && self.reset_on_completion_ack.replace(false)
+            {
+                // The initial queue status check and DMA acquisition already
+                // succeeded. Model device reset immediately before IRQ ACK.
+                unsafe { write_volatile((self.mmio + 0x70) as *mut u32, 0) };
+            }
             if stage == crate::DiagnosticStage::QueueIdleAck as u64 {
                 // The device completes after the poll sampled an empty used
                 // ring. Model descheduling across the deadline during IRQ ACK.
@@ -300,12 +316,14 @@ mod tests {
         }
     }
     fn fixture() -> (BatchedBlock, Host, usize) {
+        let mmio = Box::leak(Box::new(Page::zeroed()));
         let p = Host {
             clock: Cell::new(0),
             idle_completion: Cell::new(None),
             idle_clock: Cell::new(None),
+            mmio: mmio.address(),
+            reset_on_completion_ack: Cell::new(false),
         };
-        let mmio = Box::leak(Box::new(Page::zeroed()));
         mmio.put32(0, 0x74726976);
         mmio.put32(4, 2);
         mmio.put32(8, 2);
@@ -554,6 +572,30 @@ mod tests {
                     Err(Error::Device)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn reset_during_completion_ack_never_certifies_block_result() {
+        for operation in [Operation::Read(1), Operation::Write(1), Operation::Flush] {
+            let (mut b, p, m) = fixture();
+            b.set_notify_policy(1, 2, 1_000_000, 0).unwrap();
+            let token = b.begin(operation, &[0; 512], true, true, &p).unwrap();
+            unsafe { complete(m, token.slot, matches!(operation, Operation::Read(_)), 0) };
+            p.reset_on_completion_ack.set(true);
+            let mut out = [0xaa; 512];
+            assert_eq!(b.poll(&mut out, &p), Err(Error::Device));
+            assert!(!p.reset_on_completion_ack.get());
+            assert_eq!(out, [0xaa; 512]);
+            assert_eq!(b.notify_stats().last_completed_version, 0);
+            assert_eq!(b.acknowledge(token), Err(Error::Response));
+            assert_eq!(b.free(), b.capacity() - 1);
+            assert!(!b.is_quiescent());
+            b.transport.set_status(15);
+            assert_eq!(
+                b.begin(Operation::Flush, &[0; 512], true, true, &p),
+                Err(Error::Device)
+            );
         }
     }
 
