@@ -1745,3 +1745,56 @@ fn control_window_headroom_defers_without_reserving_cpu_time() {
         .unwrap();
     assert_eq!(s.cpu_window_usage(1, WINDOW_NS + 900_000), Ok((900_000, 0)));
 }
+
+#[test]
+fn wave4_scheduler_later_minimum_precedes_overdue_and_weighted_threads() {
+    let mut s = Scheduler::new();
+    for group in 1..=3 {
+        s.register_group(key(group)).unwrap();
+    }
+    s.install_weight(key(2), 8, stamp(1, 0, 0), 0).unwrap();
+    s.admit(spec(10, 1, 1, 0, 10_000_000), layout(1), 0)
+        .unwrap();
+    s.admit(spec(11, 2, 1, 0, 10_000_000), layout(1), 0)
+        .unwrap();
+    let mut now = WINDOW_NS;
+    s.admit(spec(30, 3, 1, 1_000_000, 10_000_000), layout(1), now)
+        .unwrap();
+    for (id, reason, state) in [
+        (30, DispatchReason::Minimum, RunState::Runnable),
+        (10, DispatchReason::FairRecovery, RunState::Blocked),
+        (11, DispatchReason::FairRecovery, RunState::Blocked),
+        (30, DispatchReason::Weighted, RunState::Runnable),
+    ] {
+        let d = s.dispatch(1, layout(1), now, 1_000_000).unwrap().unwrap();
+        assert_eq!((d.thread, d.reason), (key(id), reason));
+        assert_eq!(d.reserved_ns, 1_000_000);
+        now += d.reserved_ns;
+        s.complete(d, d.reserved_ns, state, now).unwrap();
+    }
+    assert_eq!(s.stats().fair_recoveries, 2);
+    assert_eq!(s.stats().actual_ns, 4_000_000);
+}
+
+#[test]
+fn wave4_vm_commit_is_all_or_nothing_and_keeps_progress_partition() {
+    let mut m = Memory::<8>::new();
+    let mut b = Backing::new(8);
+    m.reserve_frames(0, 1).unwrap();
+    m.reserve_progress_frames(6, 2).unwrap();
+    m.register_owner(key(1), 6).unwrap();
+    let before = m.stats();
+    assert_eq!(m.commit_pages(key(1)), Err(Error::Capacity));
+    assert_eq!(m.stats(), before);
+    m.unregister_owner(key(1)).unwrap();
+    m.register_owner(key(2), 2).unwrap();
+    m.register_progress_owner(key(3), 2).unwrap();
+    m.commit_pages(key(2)).unwrap();
+    m.commit_pages(key(3)).unwrap();
+    m.reserve(key(2), 0x10000, 2, true).unwrap();
+    m.reserve(key(3), 0x20000, 2, true).unwrap();
+    assert_eq!(m.fault(key(2), 0x10000, true, &mut b), Ok(1));
+    assert_eq!(m.fault(key(2), 0x11000, true, &mut b), Ok(2));
+    assert_eq!(m.fault(key(3), 0x20000, true, &mut b), Ok(6));
+    assert_eq!(m.fault(key(3), 0x21000, true, &mut b), Ok(7));
+}

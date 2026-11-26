@@ -5,7 +5,9 @@ on:
     paths:
       - 'crates/kernel-core/**'
       - 'crates/control-model/**'
-      - 'crates/prototype/src/model.rs'
+      - 'crates/prototype/**'
+      - 'crates/driver-virtio/**'
+      - 'crates/net-transport/**'
       - '.github/workflows/v0201-kernel-algorithms.yml'
   workflow_dispatch:
 permissions:
@@ -43,6 +45,19 @@ jobs:
             seam: 'native_v0199'
           - package: cyxia-prototype
             seam: 'model::prefix_tests'
+          - package: cyxia-prototype
+            seam: 'wave4_scheduler_'
+          - package: cyxia-prototype
+            seam: 'wave4_vm_'
+          - package: cyxia-prototype
+            seam: 'wave4_io_'
+          - package: cyxia-driver-virtio
+            seam: 'queue::tests'
+          - package: cyxia-net-transport
+            seam: 'admission::tests'
+            features: tls
+          - package: cyxia-kernel-core
+            seam: 'snapshot_store_v3::tests'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -53,7 +68,15 @@ jobs:
         env:
           PACKAGE: ${{ matrix.package }}
           SEAM: ${{ matrix.seam }}
-        run: cargo +1.95.0 test --locked -p "$PACKAGE" "$SEAM"
+          FEATURES: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -n "$FEATURES" ]; then
+            args+=(--features "$FEATURES")
+          fi
+          cargo +1.95.0 test --locked -p "$PACKAGE" "${args[@]}" "$SEAM" 2>&1 | tee module.log
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed;' module.log
   format:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
