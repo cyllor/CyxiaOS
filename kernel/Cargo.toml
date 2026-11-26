@@ -10,13 +10,26 @@ test = false
 bench = false
 
 [features]
+# V0.20 canonical default (wave 11 integration): the production boot +
+# in-vector SVC dispatch skeleton is the default aarch64 profile. v020-production
+# implies the proven smp-selftest bring-up, so the default boot runs
+# production::run and the default exception path is the production dispatcher.
+# The isolated fixed-CPU0 fixture stays reachable via
+# --no-default-features --features smp-selftest; the retired CPU0 desktop path
+# requires the explicit legacy-desktop feature.
+default = ["v0199-local-native", "v020-production"]
 # The native single-node V0.19.9 release profile must never silently
-# activate historical D16/peer-billing or cluster transport paths.
-default = ["v0199-local-native"]
-v0199-local-native = []
-selftest = []
+# activate historical D16/peer-billing or cluster transport paths. Without
+# smp-selftest it denotes the retired legacy-desktop reference profile.
+v0199-local-native = ["legacy-desktop"]
+selftest = ["legacy-desktop"]
+# Retired CPU0 desktop exception/boot path (exception_dispatch_primary +
+# primary_services), preserved for offline reference and carried by the x86
+# platform selftest feature chain. Never part of the default V0.20 aarch64
+# production path: every smp-selftest profile excludes it at compile time.
+legacy-desktop = []
 # Long-running OS composition. Independent of bounded acceptance profiles.
-os-runtime = ["cyxia-arch-x86_64/runtime"]
+os-runtime = ["legacy-desktop", "cyxia-arch-x86_64/runtime"]
 # Explicit x86 production image layout; preserves legacy runtime profiles.
 full-os = ["os-runtime", "ported", "large-memory", "cyxia-posix/full-os"]
 cosmic-desktop = ["full-os", "graphics"]
@@ -60,7 +73,9 @@ v0199-cpu0-svc-selftest = ["v0199-advice-e2e-selftest"]
 # the proven advice-e2e SvcV3Bridge dispatch (0x50 intake/register, 0x41 publish)
 # out of the fixture turn loop and into the production exception-vector path, and
 # loads the eight ABI3 PIE role packages through the existing build catalog.
-# Opt-in only: the default build and every existing fixture profile are unchanged.
+# Wave 11 integration: this is the DEFAULT aarch64 profile (see `default` above).
+# The bounded acceptance fixtures remain isolated opt-in profiles; build them
+# with --no-default-features so the production control plane does not unify in.
 # HONEST SCOPE: this is a skeleton, NOT full production authority. The boot epoch
 # is staged (volatile), the executor is a bounded fixture target, no real model is
 # active, and the snapshot backend stays fail-closed (EAGAIN). See production.rs
@@ -129,7 +144,9 @@ prototype-runtime = ["smp-selftest", "prototype-memory"]
 unified-runtime = ["prototype-runtime", "dep:cyxia-cluster-transport", "dep:sha2", "dep:cyxia-peer-billing", "cyxia-prototype/legacy-cluster"]
 prototype-memory = ["cyxia-platform-virt/prototype-memory"]
 graphics = []
-ported = []
+# The historical desktop/ported reference profiles keep the retired CPU0
+# desktop boot/exception path available (aarch64 smithay probes, x86 full-os).
+ported = ["legacy-desktop"]
 openbox = ["ported"]
 gtk = ["openbox"]
 pcmanfm = ["openbox"]

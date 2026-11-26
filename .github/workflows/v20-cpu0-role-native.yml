@@ -81,7 +81,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/v020-cpu0-native
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v0199-cpu0-role-selftest \
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features v0199-cpu0-role-selftest \
             2>&1 | tee artifacts/v020-cpu0-native/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-cpu0-native/kernel.elf
           sha256sum artifacts/v020-cpu0-native/kernel.elf > artifacts/v020-cpu0-native/kernel.sha256

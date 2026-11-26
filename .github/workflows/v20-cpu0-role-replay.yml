@@ -45,7 +45,7 @@ jobs:
           rustup override set 1.95.0
           cargo fetch --locked
           mkdir -p artifacts/v020-role-replay
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v0199-cpu0-role-selftest \
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features v0199-cpu0-role-selftest \
             2>&1 | tee artifacts/v020-role-replay/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-role-replay/kernel.elf
           sha256sum artifacts/v020-role-replay/kernel.elf > artifacts/v020-role-replay/kernel.sha256

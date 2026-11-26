@@ -103,7 +103,7 @@ jobs:
           (cd qemu-evidence && sha256sum -c archive.sha256)
           tar -xzf qemu-evidence/qemu-bin.tar.gz -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/qemu-bin" >> "$GITHUB_PATH"
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features smp-selftest
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features smp-selftest
           mkdir -p artifacts/v020-arm-native
           git rev-parse HEAD > artifacts/v020-arm-native/commit.txt
           git rev-parse HEAD^{tree} > artifacts/v020-arm-native/tree.txt
@@ -194,7 +194,7 @@ jobs:
           git rev-parse HEAD > artifacts/v020-cpu0-native/commit.txt
           git rev-parse HEAD^{tree} > artifacts/v020-cpu0-native/tree.txt
           printf '%s\n' 'MECHANISM_FIXTURE_ONLY; G0 BLOCKED; G4 NOT_RUN' > artifacts/v020-cpu0-native/scope.txt
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v0199-cpu0-role-selftest \
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features v0199-cpu0-role-selftest \
             2>&1 | tee artifacts/v020-cpu0-native/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-cpu0-native/kernel.elf
           sha256sum artifacts/v020-cpu0-native/kernel.elf > artifacts/v020-cpu0-native/kernel.sha256
