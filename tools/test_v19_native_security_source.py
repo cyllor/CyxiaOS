@@ -743,8 +743,11 @@ class NativeSecurityWiring(unittest.TestCase):
     def test_v020_combined_mount_gates_both_native_services(self):
         arm = ROOT / "kernel/src/arch/aarch64"
         prod = source(arm / "production.rs")
-        self.assertIn("staging_outcome.services_ready()\n        && let Some(view) = staging_outcome.file_read", prod)
-        self.assertIn("staging_outcome.services_ready()\n        && let Some(view) = staging_outcome.snapshot_catalog", prod)
+        normalized = " ".join(prod.split())
+        self.assertIn("staging_outcome.services_ready() && let Some(view) = staging_outcome.file_read",
+                      normalized)
+        self.assertIn("staging_outcome.services_ready() && let Some(view) = staging_outcome.snapshot_catalog",
+                      normalized)
         staging = source(arm / "production/media_staging.rs")
         self.assertIn("out.chain_complete = run_chain(&mut disk, &mut out).is_some()", staging)
         self.assertIn("authority::verified_pair_state(disk, checkpoint, config)", staging)

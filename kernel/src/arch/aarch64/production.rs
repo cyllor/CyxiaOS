@@ -2040,15 +2040,11 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     #[cfg(feature = "v020-production-live-control")]
     observations::drive(&mut pie_ctx, &pie_manifest);
     #[cfg(feature = "v020-production-file-read")]
-    if staging_outcome.services_ready()
-        && let Some(view) = staging_outcome.file_read
-    {
+    if staging_outcome.services_ready() && let Some(view) = staging_outcome.file_read {
         file_read::drive(&mut pie_ctx, &pie_manifest, view);
     }
     #[cfg(feature = "v020-production-snapshot-catalog")]
-    if staging_outcome.services_ready()
-        && let Some(view) = staging_outcome.snapshot_catalog
-    {
+    if staging_outcome.services_ready() && let Some(view) = staging_outcome.snapshot_catalog {
         snapshot_catalog::drive(&mut pie_ctx, &pie_manifest, view);
     }
     words.words[2].store(1, Ordering::Release);

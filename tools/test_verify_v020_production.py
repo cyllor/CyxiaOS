@@ -4,6 +4,7 @@ Every page and serial stream here is SYNTHETIC (built in-test); these tests
 check the verifier's acceptance logic only and are not runtime evidence.
 """
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import io
 from pathlib import Path
 import struct
@@ -445,6 +446,27 @@ class W11Validation(unittest.TestCase):
         self.rejects("signed scratch test scope", words=words, lines=lines[:-1], staging=True, modes=modes)
         words[182] = 2
         self.rejects("signed scratch verdict and BootEpoch", words=words, lines=lines, staging=True, modes=modes)
+
+    def test_signed_receipt_view_host_disk_hash_rejects_modified_or_short_image(self):
+        # Synthetic sparse file, not evidence of a native device run.
+        with tempfile.TemporaryDirectory() as tmp:
+            disk = Path(tmp) / "receipt-view.raw"
+            offset = (media.DATA_START + 1) * media.BLOCK_BYTES
+            image = bytes([0x5a]) * (7 * media.BLOCK_BYTES)
+            expected = hashlib.sha256(image).hexdigest()
+            with disk.open("wb") as stream:
+                stream.seek(offset)
+                stream.write(image)
+            self.assertEqual(media.verify_signed_receipt_view(disk, expected), expected)
+            with disk.open("r+b") as stream:
+                stream.seek(offset + 6 * media.BLOCK_BYTES)
+                stream.write(b"\\x01")
+            with self.assertRaisesRegex(ValueError, "differs from actual scratch media"):
+                media.verify_signed_receipt_view(disk, expected)
+            with disk.open("r+b") as stream:
+                stream.truncate(offset + len(image) - 1)
+            with self.assertRaisesRegex(ValueError, "short signed receipt/index image"):
+                media.verify_signed_receipt_view(disk, expected)
 
     def test_frame_pool_requires_conservation_and_matching_uart(self):
         modes = v.Modes(frame_pool=True)

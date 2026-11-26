@@ -120,14 +120,15 @@ impl Workspace {
     ) -> Result<[u8; 32], Error> {
         let old_boot = BootEpochStoreV1::decode(&self.boot)?;
         let old_security = SecurityStateStoreV2::decode(&self.security)?;
+        let receipts = file_receipt_store_v0199::scan_receipts_with_index(
+            &self.receipts,
+            &self.index,
+            old_boot.fs_uuid,
+        )?;
         if old_boot != prior.boot
             || old_security != prior.security
             || !old_boot.matches(&old_security)
-            || file_receipt_store_v0199::scan_receipts_with_index(
-                &self.receipts,
-                &self.index,
-                old_boot.fs_uuid,
-            )? != prior.receipts
+            || receipts != prior.receipts
         {
             return Err(Error::Conflict);
         }
