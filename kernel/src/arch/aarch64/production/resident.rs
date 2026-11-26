@@ -25,6 +25,7 @@ const DISCARD_LINE: usize = STATUS.len() + 1;
 const RX_BYTES_PER_TURN: usize = 16;
 const TX_BYTES_PER_TURN: usize = 64;
 const CONSOLE_TURN_NS: u64 = 1_000_000;
+const DEGRADED_POLL_INTERVAL: u64 = 4;
 
 struct ConsoleBudget {
     ledger: Cpu0BudgetLedger,
@@ -37,13 +38,17 @@ impl ConsoleBudget {
             .map_err(|_| Error::Clock)
     }
 
-    fn turn(&mut self, class: Class, work: impl FnOnce()) -> Result<Option<Settlement>, Error> {
+    fn turn(&mut self, degraded: bool, work: impl FnOnce()) -> Result<Option<Settlement>, Error> {
         let cpu = cpu::slot();
         let start = self.now_ns()?;
-        let grant = match self
-            .ledger
-            .reserve_kernel(cpu, class, CONSOLE_TURN_NS, start)
-        {
+        let reservation = if degraded {
+            self.ledger
+                .reserve_readonly_diagnostic(cpu, CONSOLE_TURN_NS, start)
+        } else {
+            self.ledger
+                .reserve_kernel(cpu, Class::Coordination, CONSOLE_TURN_NS, start)
+        };
+        let grant = match reservation {
             Err(Error::Exhausted) => return Ok(None),
             result => result?,
         };
@@ -149,47 +154,37 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     }
     let mut command = 0;
     let mut last_interrupt = 0;
-    let mut overrun = None;
-    let mut notice_queued = false;
-    let mut stopped = false;
+    let mut degraded = false;
+    let mut notice = None;
+    let mut accounting_fault = false;
     loop {
         let interrupts = IRQS[0].load(Ordering::Acquire);
-        if !stopped && interrupts != last_interrupt {
+        let interval = if degraded { DEGRADED_POLL_INTERVAL } else { 1 };
+        if !accounting_fault && interrupts.wrapping_sub(last_interrupt) >= interval {
             last_interrupt = interrupts;
-            if let Some(bound) = overrun {
-                let result = budget.turn(Class::Recovery, || {
-                    if !notice_queued && pending.pending() == 0 {
-                        let mut text = [0; 96];
-                        let payload = report_payload(
-                            &mut text,
-                            "V020_RESIDENT_BUDGET_OVERRUN",
-                            bound,
-                            CONSOLE_TURN_NS,
-                            interrupts,
-                        );
-                        enqueue_resident_frame(&mut pending, payload)
-                            .expect("budget failure frame");
-                        notice_queued = true;
-                    }
-                    pending
-                        .drain(&mut uart, TX_BYTES_PER_TURN)
-                        .expect("bounded failure transmit");
-                });
-                stopped = match result {
-                    Ok(Some(receipt)) => {
-                        receipt.overrun || (notice_queued && pending.pending() == 0)
-                    }
-                    Ok(None) => false,
-                    Err(_) => true,
-                };
-            } else {
-                match budget.turn(Class::Coordination, || {
-                    poll_console(&mut uart, &mut pending, &mut command, interrupts);
-                }) {
-                    Ok(Some(receipt)) if receipt.overrun => overrun = Some(receipt.actual_ns),
-                    Ok(_) => {}
-                    Err(_) => stopped = true,
+            let result = budget.turn(degraded, || {
+                if pending.pending() == 0
+                    && let Some(bound) = notice.take()
+                {
+                    let mut text = [0; 96];
+                    let payload = report_payload(
+                        &mut text,
+                        "V020_RESIDENT_BUDGET_OVERRUN",
+                        bound,
+                        CONSOLE_TURN_NS,
+                        interrupts,
+                    );
+                    enqueue_resident_frame(&mut pending, payload).expect("budget failure frame");
                 }
+                poll_console(&mut uart, &mut pending, &mut command, interrupts);
+            });
+            match result {
+                Ok(Some(receipt)) if !degraded && receipt.overrun => {
+                    degraded = true;
+                    notice = Some(receipt.actual_ns);
+                }
+                Ok(_) => {}
+                Err(_) => accounting_fault = true,
             }
         }
         timer::idle();

@@ -485,6 +485,7 @@ impl Cpu0BudgetLedger {
             requested,
             wall_ns,
             now,
+            false,
         )
     }
     /// Separate trusted EL1 recovery/coordination entry. There is no user
@@ -512,7 +513,31 @@ impl Cpu0BudgetLedger {
         if wall_ns == 0 || wall_ns > 50_000_000 {
             return Err(Error::Invalid);
         }
-        self.reserve(None, None, class, 0, requested, wall_ns, now)
+        self.reserve(None, None, class, 0, requested, wall_ns, now, false)
+    }
+
+    /// Prepay a trusted, read-only EL1 health diagnostic during containment.
+    /// This uses the existing coordination limit and leaves the ordinary
+    /// admission latch set. The caller must expose no ordinary control work.
+    pub fn reserve_readonly_diagnostic(
+        &mut self,
+        cpu: usize,
+        requested: u64,
+        now: u64,
+    ) -> Result<Turn, Error> {
+        if cpu != CONTROL_CPU {
+            return Err(Error::Denied);
+        }
+        self.reserve(
+            None,
+            None,
+            Class::Coordination,
+            0,
+            requested,
+            requested,
+            now,
+            true,
+        )
     }
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -525,6 +550,7 @@ impl Cpu0BudgetLedger {
         requested: u64,
         wall_ns: u64,
         now: u64,
+        readonly_diagnostic: bool,
     ) -> Result<Turn, Error> {
         if self.active.is_some() {
             return Err(Error::Busy);
@@ -534,7 +560,7 @@ impl Cpu0BudgetLedger {
             return Err(Error::Clock);
         }
         self.time(now)?;
-        if self.ordinary_closed && class != Class::Recovery {
+        if self.ordinary_closed && class != Class::Recovery && !readonly_diagnostic {
             return Err(Error::Denied);
         }
         let end = self.enter_window(now)?;
@@ -1367,6 +1393,32 @@ mod tests {
             ),
             Err(Error::Exhausted)
         );
+    }
+    #[test]
+    fn overrun_keeps_diagnostics_in_coordination_and_ordinary_admission_closed() {
+        let mut q = Cpu0BudgetLedger::new();
+        let turn = q
+            .reserve_kernel(0, Class::Coordination, 1_000_000, 0)
+            .unwrap();
+        let late = KERNEL_COORDINATION_LIMIT_NS + 1;
+        assert!(q.settle(0, turn, late, late).unwrap().overrun);
+        assert_eq!(
+            q.reserve_readonly_diagnostic(0, 100, late),
+            Err(Error::Exhausted)
+        );
+        assert_eq!(
+            q.reserve_readonly_diagnostic(1, 100, WINDOW_NS),
+            Err(Error::Denied)
+        );
+        let diagnostic = q.reserve_readonly_diagnostic(0, 100, WINDOW_NS).unwrap();
+        q.settle(0, diagnostic, 100, WINDOW_NS + 100).unwrap();
+        assert_eq!(q.kernel_coordination_spent(), 100);
+        assert!(q.ordinary_closed());
+        assert_eq!(
+            q.reserve_kernel(0, Class::Coordination, 1, WINDOW_NS + 100),
+            Err(Error::Denied)
+        );
+        assert_eq!(q.spent(Class::Recovery), 0);
     }
     #[test]
     fn actual_overrun_and_late_copy_never_refill_ordinary_budget() {
