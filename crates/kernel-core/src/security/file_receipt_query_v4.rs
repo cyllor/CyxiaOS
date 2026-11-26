@@ -4,10 +4,11 @@
 
 use super::{
     Error,
-    file_index_v0199::{FileStreamIndexV4, GROUP_COUNT},
+    file_index_v0199::{FileStreamIndexV4, GROUP_COUNT, SecurityStateStoreV2},
     file_media_v0199::{FileReceiptV4, RECEIPT_BYTES, local_request_id},
     file_receipt_store_v0199::scan_receipts_with_index,
     file_service_v4::{REPLY_HEADER, REPLY_MAGIC, REPLY_VERSION, Request},
+    offline_config_v1::VerifiedOfflineConfig,
 };
 
 pub const FILE_QUERY_RESULT: u16 = 11;
@@ -77,17 +78,33 @@ pub struct MountedReceiptQuery<'a> {
 }
 
 impl<'a> MountedReceiptQuery<'a> {
-    /// The authenticated native mount owner must supply a stable copy of the
-    /// complete committed receipt and index images from the same mounted state,
-    /// with the index's permanent principals verified against its manifest.
-    /// The UUID and confirmed boot epoch come from that mount. The scanner
-    /// checks layout and consistency, so the caller must establish commit
-    /// and recovery evidence independently before constructing the view.
+    /// The native mount owner must supply the complete committed receipt,
+    /// index and security images from one stable mounted state, together
+    /// with the independently authenticated, already committed config.
+    /// CRCs cannot establish principal identity or substitute for actual
+    /// redo, FLUSH and recovery evidence.
     pub fn new(
+        receipts: &'a [u8],
+        index_block: &[u8],
+        config: &VerifiedOfflineConfig<'_>,
+        security: &SecurityStateStoreV2,
+    ) -> Result<Self, Error> {
+        config.check_committed(security)?;
+        Self::from_principals(
+            receipts,
+            index_block,
+            security.fs_uuid,
+            security.last_boot_epoch,
+            config.principals().map(|principal| principal.id),
+        )
+    }
+
+    fn from_principals(
         receipts: &'a [u8],
         index_block: &[u8],
         fs_uuid: [u8; 16],
         boot_epoch: u64,
+        principals: [u64; GROUP_COUNT],
     ) -> Result<Self, Error> {
         if boot_epoch == 0 {
             return Err(Error::Invalid);
@@ -101,11 +118,14 @@ impl<'a> MountedReceiptQuery<'a> {
         {
             return Err(Error::Invalid);
         }
+        if index.groups.map(|group| group.manifest_principal_id) != principals {
+            return Err(Error::Unauthorized);
+        }
         Ok(Self {
             receipts,
             fs_uuid,
             boot_epoch,
-            principals: index.groups.map(|group| group.manifest_principal_id),
+            principals,
         })
     }
 
@@ -318,13 +338,49 @@ mod tests {
         (receipts, block)
     }
 
+    fn mounted_view<'a>(
+        receipts: &'a [u8],
+        index: &[u8],
+        fs_uuid: [u8; 16],
+        boot_epoch: u64,
+    ) -> Result<MountedReceiptQuery<'a>, Error> {
+        MountedReceiptQuery::from_principals(
+            receipts,
+            index,
+            fs_uuid,
+            boot_epoch,
+            core::array::from_fn(|group| 100 + group as u64),
+        )
+    }
+
+    #[test]
+    fn query_rejects_consistent_but_unauthenticated_principal_rebinding() {
+        let (mut receipts, index) = mounted_image(4, -16);
+        let mut changed = FileStreamIndexV4::decode(&index).unwrap();
+        changed.groups[KEY.group_id as usize].manifest_principal_id = 999;
+        let at = RECEIPT_SLOT * RECEIPT_BYTES;
+        let mut receipt = FileReceiptV4::decode(&receipts[at..at + RECEIPT_BYTES]).unwrap();
+        receipt.owner_principal_id = 999;
+        receipts[at..at + RECEIPT_BYTES].copy_from_slice(&receipt.encode().unwrap());
+        let mut block = [0; BLOCK_BYTES];
+        changed.encode_into(&mut block).unwrap();
+
+        // Both media records have valid CRCs and agree with one another.
+        // They still cannot replace a principal from the authenticated config.
+        assert!(scan_receipts_with_index(&receipts, &block, UUID).is_ok());
+        assert_eq!(
+            mounted_view(&receipts, &block, UUID, CALLER.boot_epoch).err(),
+            Some(Error::Unauthorized)
+        );
+    }
+
     #[test]
     fn literal_query_retains_prior_boot_and_group_generation() {
         let key = ReceiptKey::decode(&QUERY[REQUEST_HEADER..]).unwrap();
         assert_eq!(key, KEY);
         assert_eq!(key.request_id(), Some(REQUEST_ID));
         let (receipts, index) = mounted_image(4, -16);
-        let view = MountedReceiptQuery::new(&receipts, &index, UUID, CALLER.boot_epoch).unwrap();
+        let view = mounted_view(&receipts, &index, UUID, CALLER.boot_epoch).unwrap();
         let mut reply = [0xa5; REPLY_HEADER + 2];
         assert_eq!(view.serve(CALLER, 0, &QUERY, &mut reply), Ok(REPLY_HEADER));
         assert_eq!(&reply[..REPLY_HEADER], &PARTIAL_REPLY);
@@ -355,7 +411,7 @@ mod tests {
     #[test]
     fn query_rejects_foreign_missing_and_changed_keys_without_copyout() {
         let (receipts, index) = mounted_image(4, -16);
-        let view = MountedReceiptQuery::new(&receipts, &index, UUID, CALLER.boot_epoch).unwrap();
+        let view = mounted_view(&receipts, &index, UUID, CALLER.boot_epoch).unwrap();
         let mut reply = [0xa5; REPLY_HEADER];
         let mut refused = |caller, selector, request: &[u8], capacity, error| {
             assert_eq!(
@@ -425,13 +481,13 @@ mod tests {
             (&receipts[..], &index[..], UUID, CALLER.boot_epoch - 1),
         ] {
             assert_eq!(
-                MountedReceiptQuery::new(data, index_block, fs_uuid, boot_epoch).err(),
+                mounted_view(data, index_block, fs_uuid, boot_epoch).err(),
                 Some(Error::Invalid)
             );
         }
         receipts[BLOCK_BYTES..2 * BLOCK_BYTES].fill(0);
         assert_eq!(
-            MountedReceiptQuery::new(&receipts, &index, UUID, CALLER.boot_epoch).err(),
+            mounted_view(&receipts, &index, UUID, CALLER.boot_epoch).err(),
             Some(Error::Invalid)
         );
     }
@@ -441,7 +497,7 @@ mod tests {
         for (stored, expected) in [(0, E_TIMEOUT), (-4, -4)] {
             let (receipts, index) = mounted_image(UNKNOWN, stored);
             let view =
-                MountedReceiptQuery::new(&receipts, &index, UUID, CALLER.boot_epoch).unwrap();
+                mounted_view(&receipts, &index, UUID, CALLER.boot_epoch).unwrap();
             let mut reply = [0; REPLY_HEADER];
             view.serve(CALLER, 0, &QUERY, &mut reply).unwrap();
             let decoded = Reply::decode(&reply).unwrap();

@@ -4,7 +4,10 @@ use super::*;
 
 pub(super) fn dispatch(index: usize, m: NativeRole, args: [u64; 6]) -> Result<(), RpcError> {
     let c = caller(index, m)?;
-    if cpu::slot() != 0 || args[0] != c.cap || args[3] != 0 {
+    if trapped_pie_cap(index, m).map_err(|_| RpcError::Auth)? != c.cap
+        || args[0] != c.cap
+        || args[3] != 0
+    {
         return Err(RpcError::Auth);
     }
     let len = match args[2] {
@@ -46,13 +49,19 @@ pub(super) fn dispatch(index: usize, m: NativeRole, args: [u64; 6]) -> Result<()
     let now = now_ns();
     let table = unsafe { &mut *addr_of_mut!(RPC) };
     let custody = unsafe { &mut *addr_of_mut!(CUSTODY) };
-    let op = table.admit(
+    let op = table.admit_live(
         c,
         request,
         n,
         now,
         now.saturating_add(cyxia_kernel_core::control_plane::control_rpc_v1::MAX_WAIT_NS),
         c.holder.generation,
+        |live| {
+            if live != c || trapped_pie_cap(index, m).map_err(|_| RpcError::Auth)? != live.cap {
+                return Err(RpcError::Auth);
+            }
+            Ok(())
+        },
         |_| {
             if req.op == Op::AuditAck {
                 custody.check_ack(c, audit_seq, digest)?;

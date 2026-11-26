@@ -145,7 +145,11 @@ fn copy_reply(address: u64, wire: &[u8]) -> bool {
 }
 
 pub(super) fn snapshot(index: usize, m: NativeRole, args: [u64; 6]) -> Option<u64> {
-    if args[2] != selector(m.role) {
+    let cap = match trapped_pie_cap(index, m) {
+        Ok(cap) => cap,
+        Err(error) => return Some(error as u64),
+    };
+    if args[0] != cap || args[2] != selector(m.role) {
         return Some(E_AUTH as u64);
     }
     let Some(manifest) = manifest() else {
@@ -165,7 +169,7 @@ pub(super) fn snapshot(index: usize, m: NativeRole, args: [u64; 6]) -> Option<u6
         identity: m.actor,
         cpu: cpu::slot(),
         package_abi: 3,
-        endpoint_cap: PIE_CAP[index].load(Ordering::Acquire),
+        endpoint_cap: cap,
     };
     let sampled = read_snapshot_rpc(
         unsafe { &*addr_of!(STORE) },

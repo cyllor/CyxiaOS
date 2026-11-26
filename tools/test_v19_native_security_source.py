@@ -723,6 +723,23 @@ class NativeSecurityWiring(unittest.TestCase):
         verifier = source(ROOT / "tools/verify_v020_production.py")
         self.assertIn('"kernel/src/arch/aarch64/console.rs",', verifier)
 
+    def test_v020_live_pie_dispatch_checks_trapped_identity(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        prod = source(arm / "production.rs")
+        dispatch = prod.split("fn pie_dispatch(", 1)[1].split("fn advice_dispatch(", 1)[0]
+        self.assertIn("trapped_pie_cap(index, member)", dispatch)
+        self.assertLess(dispatch.index("trapped_pie_cap("), dispatch.index("match x8"))
+        observations = source(arm / "production/observations.rs")
+        snap = observations.split("pub(super) fn snapshot(", 1)[1].split(
+            "pub(super) fn audit(", 1
+        )[0]
+        self.assertIn("trapped_pie_cap(index, m)", snap)
+        self.assertIn("endpoint_cap: cap", snap)
+        audit = source(arm / "production/observations/audit_rpc.rs")
+        self.assertIn("table.admit_live(", audit)
+        self.assertIn("trapped_pie_cap(index, m)", audit)
+        self.assertNotIn("table.admit(", audit)
+
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")
         self.assertIn("pub fn authorize_business_core(", src)
