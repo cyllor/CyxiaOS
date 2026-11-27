@@ -1483,6 +1483,68 @@ mod tests {
         }
     }
     #[test]
+    fn indexed_pool_bridge_preserves_zero_and_owner_custody() {
+        struct BufferZero {
+            bytes: std::vec::Vec<u8>,
+            calls: usize,
+        }
+        impl PageZeroer for BufferZero {
+            fn zero(&mut self, address: PhysAddr) -> Result<(), FrameError> {
+                let offset = address
+                    .0
+                    .checked_sub(0x40000000)
+                    .ok_or(FrameError::Invalid)?;
+                let offset = usize::try_from(offset).map_err(|_| FrameError::Invalid)?;
+                let end = offset.checked_add(4096).ok_or(FrameError::Invalid)?;
+                let page = self.bytes.get_mut(offset..end).ok_or(FrameError::Invalid)?;
+                page.fill(0);
+                self.calls += 1;
+                Ok(())
+            }
+        }
+        let ram = [pool_ram(0x40000000, 2)];
+        let mut metadata = std::vec![crate::frames::FrameMeta::EMPTY; 2];
+        let mut storage = crate::frames::FreeFrameIndex::EMPTY;
+        let mut pool = FramePool::from_memory(&ram, &[], &mut metadata).unwrap();
+        pool.attach_free_index(&mut storage).unwrap();
+        let mut rows = std::vec![FrameMeta::ZERO; 2];
+        let bridge =
+            PoolBridge::new(Ledger::initialize_pool(&mut rows, 0x40000000, &ram, &[]).unwrap())
+                .unwrap();
+        pool.attach_recorder(&bridge);
+        let first = TaskId::new(7).unwrap();
+        let second = TaskId::new(8).unwrap();
+        let mut zero = BufferZero {
+            bytes: std::vec![0xa5; 8192],
+            calls: 0,
+        };
+        let a = pool.alloc_zeroed(first, &mut zero).unwrap();
+        let b = pool.alloc_zeroed(first, &mut zero).unwrap();
+        assert_eq!((a.index(), b.index()), (0, 1));
+        assert!(zero.bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(zero.calls, 2);
+        zero.bytes[4096..8192].fill(0x5a);
+        pool.begin_revoke(b, first).unwrap();
+        assert_eq!(pool.alloc_zeroed(second, &mut zero), Err(FrameError::Again));
+        assert_eq!(zero.calls, 2);
+        assert!(zero.bytes[4096..8192].iter().all(|byte| *byte == 0x5a));
+        pool.finish_revoke(b, unsafe { RevokeComplete::after_unmap(b) })
+            .unwrap();
+        let reused = pool.alloc_zeroed(second, &mut zero).unwrap();
+        assert_eq!(reused.address(), b.address());
+        assert_ne!(reused, b);
+        assert_eq!(zero.calls, 3);
+        assert!(zero.bytes[4096..8192].iter().all(|byte| *byte == 0));
+        pool.check_owned(reused, second).unwrap();
+        assert_eq!(pool.check_owned(b, first), Err(FrameError::Stale));
+        bridge.conservation(pool.snapshot()).unwrap();
+        let row = bridge.ledger.borrow().rows[1];
+        assert_eq!(row.flags, ALLOCATED);
+        assert_eq!(row.owner_slot, 8);
+        assert_eq!(row.frame_generation, 2);
+    }
+
+    #[test]
     fn pool_bridge_alloc_records_allocated_with_owner_and_generation() {
         let ram = [pool_ram(0x40000000, 4)];
         let mut metadata = std::vec![crate::frames::FrameMeta::EMPTY; 4];
