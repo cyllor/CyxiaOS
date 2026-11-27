@@ -13,6 +13,10 @@ tls = ["dep:rustls", "dep:ring", "dep:getrandom", "smoltcp"]
 # in the excluded cluster-transport crate, so this stack needs no UDP socket.
 smoltcp = ["dep:smoltcp", "dep:cyxia-driver-virtio"]
 
+[[test]]
+name = "virtio_custody"
+required-features = ["smoltcp"]
+
 [dependencies]
 cyxia-driver-virtio = { path = "../driver-virtio", optional = true }
 smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp"], optional = true }
