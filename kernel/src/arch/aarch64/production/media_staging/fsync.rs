@@ -53,7 +53,7 @@ const LEGACY_LOG_END: u32 = 32;
 const BOOT_COMMIT_LSN: u64 = 4;
 const ISSUE_COMMIT_LSN: u64 = 9;
 pub(super) const FINAL_LSN: u64 = 21;
-pub(super) const LEGACY_FINAL_LSN: u64 = 19;
+const LEGACY_FINAL_LSN: u64 = 19;
 const KEY: ReceiptKey = ReceiptKey {
     fs_uuid: volume::UUID,
     issued_boot_epoch: 1,
@@ -64,6 +64,14 @@ const KEY: ReceiptKey = ReceiptKey {
     request_seq: 1,
 };
 const REQUEST_ID: u64 = 0x0100_0000_0000_0001;
+
+/// The first post-FSYNC checkpoint is generation 2. Each subsequent
+/// generation checkpoints one two-home BootEpoch transaction (four LSNs).
+pub(super) fn receipt_lsn(checkpoint: SuperblockV1) -> Option<u64> {
+    let boot_lsns = checkpoint.generation.checked_sub(2)?.checked_mul(4)?;
+    let original = checkpoint.checkpoint_lsn.checked_sub(boot_lsns)?;
+    matches!(original, FINAL_LSN | LEGACY_FINAL_LSN).then_some(original)
+}
 
 #[cfg_attr(target_os = "none", unsafe(link_section = ".bss.sec_n"))]
 static mut WORK: FsyncWorkspace = FsyncWorkspace::new();
@@ -443,10 +451,22 @@ pub(super) fn recover(
     checkpoint: SuperblockV1,
     config: &VerifiedOfflineConfig<'_>,
 ) -> Result<(SuperblockV1, MountEvidence), Error> {
-    if checkpoint.generation != 1 {
-        return Err(Error::Stale);
-    }
     let mode = SnapshotLayout::BaselineFsyncFile;
+    if checkpoint.generation > 1 {
+        let origin = receipt_lsn(checkpoint).ok_or(Error::Stale)?;
+        // SAFETY: this private preflight ends before any view is published.
+        let receipts = unsafe { &mut *core::ptr::addr_of_mut!(RECEIPTS) };
+        let expected = read_retained_receipt(disk, origin, receipts)?;
+        return reopen::recover_boot_pair(disk, checkpoint, Some(config), mode, |disk, epoch| {
+            volume::validate_fsync_homes(
+                disk,
+                checkpoint,
+                config,
+                epoch,
+                expected.completed_prefix as usize,
+            )
+        });
+    }
     volume::unified_map(disk, checkpoint, mode)?;
     volume::validate_homes(disk, checkpoint, 0, Some(config), mode)?;
     volume::require_zero_blocks(disk, LOG_END..BITMAP_START)?;
@@ -535,7 +555,9 @@ pub(super) fn recover(
         if selected != checkpoint {
             return Err(Error::Conflict);
         }
-        mounted = Some(volume::validate_fsync_homes(disk, selected, config, size)?);
+        mounted = Some(volume::validate_fsync_homes(
+            disk, selected, config, 1, size,
+        )?);
         Ok(())
     })?;
     if chain.transactions != 4 || next.checkpoint_lsn != final_lsn {
@@ -545,26 +567,39 @@ pub(super) fn recover(
     Ok((next, mounted.ok_or(Error::Conflict)?))
 }
 
+fn read_retained_receipt(
+    disk: &mut Disk,
+    commit_lsn: u64,
+    receipts: &mut [u8; RECEIPT_STORE_BYTES],
+) -> Result<FileReceiptV4, Error> {
+    let mut raw = [0; BLOCK];
+    disk.read(INODE_START, &mut raw)?;
+    let (size, write_seq) = recovered_version(&raw, commit_lsn)?;
+    let mut snapshot = [0; FROZEN_BYTES];
+    disk.read(
+        SCRATCH_FILE_BLOCK,
+        (&mut snapshot[SIZE_BYTES..]).try_into().unwrap(),
+    )?;
+    let expected = final_receipt(&mut snapshot, size, write_seq, commit_lsn)?;
+    for (block, output) in receipts.chunks_exact_mut(BLOCK).enumerate() {
+        disk.read(RECEIPTS_HOME + block as u32, output.try_into().unwrap())?;
+    }
+    if FileReceiptV4::decode(&receipts[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES])? != expected {
+        return Err(Error::Conflict);
+    }
+    Ok(expected)
+}
+
 pub(super) fn readback(
     disk: &mut Disk,
     checkpoint: SuperblockV1,
     config: &VerifiedOfflineConfig<'_>,
     state: &SecurityStateStoreV2,
 ) -> Result<StagedReceiptQuery, Error> {
-    if state.last_boot_epoch != 2
-        || !matches!(checkpoint.checkpoint_lsn, FINAL_LSN | LEGACY_FINAL_LSN)
-    {
+    let origin = receipt_lsn(checkpoint).ok_or(Error::Stale)?;
+    if state.last_boot_epoch != checkpoint.generation {
         return Err(Error::Stale);
     }
-    let mut raw = [0; BLOCK];
-    disk.read(INODE_START, &mut raw)?;
-    let (size, write_seq) = recovered_version(&raw, checkpoint.checkpoint_lsn)?;
-    let mut snapshot = [0; FROZEN_BYTES];
-    disk.read(
-        SCRATCH_FILE_BLOCK,
-        (&mut snapshot[SIZE_BYTES..]).try_into().unwrap(),
-    )?;
-    let expected = final_receipt(&mut snapshot, size, write_seq, checkpoint.checkpoint_lsn)?;
     // Derive the static query qualification separately from the signed media
     // policy. Both are pinned to the identical persistent principal.
     // SAFETY: only the CPU0 staging owner borrows the role load scratch,
@@ -577,13 +612,9 @@ pub(super) fn readback(
     // has finished measuring and modifying the journal before this borrow.
     // No reachable operation mutates RECEIPTS after the view is published.
     let receipts = unsafe { &mut *core::ptr::addr_of_mut!(RECEIPTS) };
-    for (block, output) in receipts.chunks_exact_mut(BLOCK).enumerate() {
-        disk.read(RECEIPTS_HOME + block as u32, output.try_into().unwrap())?;
-    }
+    let expected = read_retained_receipt(disk, origin, receipts)?;
+    let mut raw = [0; BLOCK];
     disk.read(RECEIPTS_HOME + 6, &mut raw)?;
-    if FileReceiptV4::decode(&receipts[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES])? != expected {
-        return Err(Error::Conflict);
-    }
     let view = MountedReceiptQuery::new(receipts, &raw, config, state)?;
     Ok(StagedReceiptQuery {
         view,

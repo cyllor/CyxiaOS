@@ -305,7 +305,8 @@ class Production:
         }
 
     def validate(self, serial: bytes, page: bytes, cpu_count: int, *,
-                 pending_fsync_blocks: int | None = None) -> dict:
+                 pending_fsync_blocks: int | None = None,
+                 expected_fsync_epoch: int | None = None) -> dict:
         require = verify_smp.require
         require(cpu_count == 4, "QMP did not prove four real guest CPUs")
         require(len(page) == 4096, "short native-owned evidence page")
@@ -421,7 +422,8 @@ class Production:
             raise ValueError("guest reported V020_W11_MEDIA_STAGING_INCOMPLETE: a staging step failed")
         extensions = validate_extensions(words, lines, self.modes)
         wave11 = validate_w11(words, lines, serial, self.staging, snapshot_calls, self.modes,
-                              pending_fsync_blocks=pending_fsync_blocks)
+                              pending_fsync_blocks=pending_fsync_blocks,
+                              expected_fsync_epoch=expected_fsync_epoch)
         signed = signed_media_authority(words, lines, self.modes)
         return {
             **wave11,
@@ -558,7 +560,8 @@ def check_w11_net(words: tuple, lines: list, serial: bytes) -> None:
 
 def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
                       snapshot_calls: int, modes: Modes, *,
-                      pending_fsync_blocks: int | None = None) -> dict:
+                      pending_fsync_blocks: int | None = None,
+                      expected_fsync_epoch: int | None = None) -> dict:
     require = verify_smp.require
     if not staging:
         require(all(v == 0 for v in words[144:152]),
@@ -571,6 +574,10 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     reopen = modes.media_reopen
     require(words[144] == 1, "media_staging_enabled not set (word 144)")
     epoch = 2 if reopen else 1
+    if expected_fsync_epoch is not None:
+        require(reopen and modes.fsync_scratch and expected_fsync_epoch >= 2,
+                "expected FSYNC epoch requires a scratch reopen")
+        epoch = expected_fsync_epoch
     require(words[145:151] == (int(not reopen), 1, 1, epoch, 1, 1),
             "media staging steps or confirmed epoch disagree with the selected mode")
     require(words[162:164] == (int(reopen), epoch - 1)
@@ -582,7 +589,8 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     steps = w11_rows(lines, "V020_W11_MEDIA_STEP")
     live_inodes = (9 if modes.media_unified else 5) + int(modes.file_read or modes.fsync_scratch)
     require([step[:2] for step in steps] == [(index, 1) for index in range(1, 6)]
-            and steps[0][2] == 1 and steps[1][2] == live_inodes and steps[2][2] == 151 and steps[4][2] == 1,
+            and steps[0][2] == epoch - int(reopen) and steps[1][2] == live_inodes
+            and steps[2][2] == 151 and steps[4][2] == 1,
             "media staging serial steps must show format, mount, map, epoch and admission success")
     require(steps[3][2] == words[148], "media staging BootEpoch disagrees with word 148")
     io = w11_rows(lines, "V020_W11_MEDIA_IO")
@@ -593,13 +601,18 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     if modes.fsync_scratch:
         event = "V020_FSYNC_RECOVERED" if reopen else "V020_FSYNC_COMMITTED"
         terminal = w11_rows(lines, event)
-        legacy = [(2, 19, 7)] if reopen else [(19, 7, 29)]
+        legacy = [(epoch, 19, 7)] if reopen else [(19, 7, 29)]
         current = len(terminal) == 1 and (
-            terminal[0][:2] == (2, 21) and terminal[0][2] > 0 if reopen else
+            terminal[0][:2] == (epoch, 21) and terminal[0][2] > 0 if reopen else
             terminal[0][0] == 21 and terminal[0][1] > 0 and 29 <= terminal[0][2] <= 4096
         )
         require(terminal == legacy or current, "media staging FSYNC terminal differs")
-        if reopen:
+        if reopen and epoch > 2:
+            # Only the earlier BootEpoch pair remains. The two data tails
+            # are zero, and the boot-only recovery clears all six log blocks.
+            require(pending_fsync_blocks in (None, 4),
+                    "pre-replay BootEpoch pair block count differs")
+        elif reopen:
             # The data REDO's continuation only needs clearing if the final
             # 64 bytes are nonzero. Archived 29-byte runs have no such block.
             allowed = (28, 29) if current else (24,)
@@ -623,7 +636,7 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
         }
     receipt = w11_rows(lines, "V020_FSYNC_RECEIPT_ABI")
     if receipt:
-        require(modes.fsync_scratch and reopen and receipt == [(2, 11, 1)],
+        require(modes.fsync_scratch and reopen and receipt == [(epoch, 11, 1)],
                 "unexpected native file receipt-query identity")
         evidence["native_file_receipt_query"] = {
             "boot_epoch": receipt[0][0],
@@ -648,14 +661,16 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
 
 def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
                  snapshot_calls: int, modes: Modes, *,
-                 pending_fsync_blocks: int | None = None) -> dict:
+                 pending_fsync_blocks: int | None = None,
+                 expected_fsync_epoch: int | None = None) -> dict:
     """Words 128..160 and the wave-11 serial contract (words 0..127 are checked by the caller)."""
     require = verify_smp.require
     check_w11_baseline(words)
     measured_rows = check_w11_rows(words, lines)
     check_w11_net(words, lines, serial)
     media_rows = check_w11_staging(words, lines, serial, staging, snapshot_calls, modes,
-                                   pending_fsync_blocks=pending_fsync_blocks)
+                                   pending_fsync_blocks=pending_fsync_blocks,
+                                   expected_fsync_epoch=expected_fsync_epoch)
     net_boot_epoch = words[148] if modes.signed_media else 1
     if modes.signed_media:
         listen = "V020_W11_NET_LISTEN a=7 b=0 c=0"
@@ -718,7 +733,7 @@ def source_manifest() -> dict:
 def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
         nic: bool = True, connect_peer: bool = True, *, modes: Modes = Modes(),
         rng_present: bool = True, boot_disk: Path | None = None,
-        qmp_stdio: bool = False) -> dict:
+        qmp_stdio: bool = False, expected_fsync_epoch: int | None = None) -> dict:
     require = verify_smp.require
     require(1 <= timeout <= 300, "invalid execution budget")
     require(not staging or (nic and connect_peer), "network negative controls are G-A only")
@@ -836,7 +851,8 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                             "incomplete/corrupt framed UART transport")
                     page = (output / "native-page.bin").read_bytes()
                     report["observations"] = acceptance.validate(
-                        bytes(decoded), page, len(actual_cpus), pending_fsync_blocks=pending_fsync_blocks)
+                        bytes(decoded), page, len(actual_cpus), pending_fsync_blocks=pending_fsync_blocks,
+                        expected_fsync_epoch=expected_fsync_epoch)
                     relay_bytes = report["observations"]["echo_bytes_relayed"]
                     if modes.authenticated_net:
                         require(peer is not None, "missing authenticated host peer")

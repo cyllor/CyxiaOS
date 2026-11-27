@@ -159,23 +159,32 @@ def read(disk, block, size=BLOCK):
     return raw
 
 
-def verify_disk(path, reopened, final_lsn=FINAL_LSN, *, contents=FINAL, size=29, write_seq=7):
+def checkpoint_lsn(epoch, final_lsn):
+    return 0 if epoch == 1 else final_lsn + 4 * (epoch - 2)
+
+
+def verify_disk(path, reopened, final_lsn=FINAL_LSN, *, contents=FINAL, size=29, write_seq=7,
+                boot_epoch=None):
     require(final_lsn in (FINAL_LSN, LEGACY_FINAL_LSN), "unrecognized FSYNC redo closure")
     require(29 <= size <= BLOCK and len(contents) == BLOCK and not any(contents[size:])
             and write_seq > 0 and (final_lsn != LEGACY_FINAL_LSN or (size, write_seq) == (29, 7)),
             "expected caller content must fit one allocated file block")
-    expected = (boot_tx(2, final_lsn + 1) if reopened else
+    epoch = boot_epoch if boot_epoch is not None else 1 + reopened
+    require(epoch >= 1 and reopened == (epoch > 1), "invalid FSYNC checkpoint epoch")
+    expected = (boot_tx(epoch, checkpoint_lsn(epoch, final_lsn) + 1) if reopened else
                 boot_one_log(final_lsn, contents, size, write_seq))
     done = reopened
+    prior_checkpoint = max(1, epoch - 1)
+    first, second = (prior_checkpoint, epoch) if epoch % 2 == 0 else (epoch, prior_checkpoint)
     with path.open("rb") as disk:
-        require(read(disk, 0) == checkpoint(1, 0)
-                and read(disk, 1) == (checkpoint(2, final_lsn) if done else checkpoint(1, 0)),
+        require(read(disk, 0) == checkpoint(first, checkpoint_lsn(first, final_lsn))
+                and read(disk, 1) == checkpoint(second, checkpoint_lsn(second, final_lsn)),
                 "FSYNC checkpoint pair differs from the independently expected state")
         log = read(disk, FIRST, (LOG_END - FIRST) * BLOCK)
         require(log.startswith(expected) and not any(log[len(expected):]),
                 "FSYNC BEGIN/REDO/COMMIT sequence or log tail differs")
-        require(read(disk, BOOT) == boot_home(int(done))
-                and read(disk, SECURITY) == security_home(int(done)),
+        require(read(disk, BOOT) == boot_home(epoch - 1)
+                and read(disk, SECURITY) == security_home(epoch - 1),
                 "FSYNC BootEpoch or signed policy homes differ")
         require(read(disk, INODE) == inode_page(done, size, write_seq)
                 and read(disk, DATA) == (contents if done else INITIAL),
@@ -189,6 +198,64 @@ def verify_disk(path, reopened, final_lsn=FINAL_LSN, *, contents=FINAL, size=29,
                 and struct.unpack_from('<I', acl, 60)[0] == crc(acl[:60] + bytes(4)),
                 "FSYNC diagnostic owner ACL differs")
     return sha256(expected).hexdigest()
+
+
+def run_healthy_boots(fresh, reopen, output, timeout, qmp_stdio, boot_count, content=FINAL[:29]):
+    """Run repeated independent QEMU boots on the same healthy signed volume."""
+    require(boot_count >= 2 and 29 <= len(content) <= BLOCK, "invalid FSYNC healthy boot fixture")
+    output.mkdir(parents=True, exist_ok=False)
+    fresh_modes = Modes(authenticated_net=True, fsync_scratch=True)
+    reopen_modes = replace(fresh_modes, media_reopen=True)
+    size = len(content)
+    padded = content.ljust(BLOCK, b"\0")
+    write_seq = max(7, (size + 83) // 84)
+    retained_digest = sha256(receipts(3, FINAL_LSN, padded, size, write_seq)
+                             + index_page(True)).hexdigest()
+    boots = []
+    with tempfile.TemporaryDirectory(prefix="cyx-fsync-healthy-") as tmp:
+        disk = Path(tmp) / "scratch.raw"
+        create_scratch(disk)
+        for epoch in range(1, boot_count + 1):
+            reopened = epoch > 1
+            case = output / f"boot-{epoch}"
+            result = run(reopen if reopened else fresh, case, timeout, staging=True,
+                         modes=reopen_modes if reopened else fresh_modes, boot_disk=disk,
+                         qmp_stdio=qmp_stdio, expected_fsync_epoch=epoch if reopened else None)
+            require(result["status"] == "PASS", f"healthy FSYNC boot {epoch}: {result.get('error')}")
+            if reopened:
+                require(result["scratch_before_sha256"] == boots[-1]["disk_sha256"],
+                        "healthy FSYNC reboot must use the same verified disk")
+            observations = result["observations"]
+            endpoint = "native_file_receipt_query" if reopened else "native_file_fsync"
+            require(observations.get(endpoint) == {
+                        "boot_epoch": epoch, "actor": 11, "service_generation": 1,
+                    }, "missing epoch-bound native file client")
+            lines = (case / "serial.txt").read_text().splitlines()
+            if reopened:
+                require(rows(lines, "V020_FSYNC_RECOVERED") == [(epoch, FINAL_LSN, write_seq)]
+                        and observations["signed_receipt_view_sha256"] == retained_digest,
+                        "reboot changed the retained receipt or stream index")
+            else:
+                require(rows(lines, "V020_FSYNC_COMMITTED") == [(FINAL_LSN, write_seq, size)],
+                        "initial FSYNC receipt differs from the caller's write")
+            _, writes, flushes = rows(lines, "V020_W11_MEDIA_IO")[0]
+            boots.append({
+                "boot_epoch": epoch,
+                "checkpoint_lsn": checkpoint_lsn(epoch, FINAL_LSN),
+                "journal_sha256": verify_disk(disk, reopened, contents=padded, size=size,
+                                               write_seq=write_seq, boot_epoch=epoch),
+                "disk_sha256": result["scratch_disk"]["scratch_after_sha256"],
+                "receipt_view_sha256": observations["signed_receipt_view_sha256"],
+                "writes": writes,
+                "flushes": flushes,
+                "elf_sha256": result["elf_sha256"],
+                "qemu_sha256": result["qemu_sha256"],
+            })
+    report = {"status": "PASS", "scope": "signed-baseline-v1-native-fsync-diagnostic",
+              "file_bytes": size, "file_write_seq": write_seq, "file_commit_lsn": FINAL_LSN,
+              "file_sha256": sha256(content).hexdigest(), "boots": boots}
+    (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
+    return report
 
 
 def run_pair(fresh, reopen, output, timeout, qmp_stdio):
@@ -262,9 +329,17 @@ def main():
     parser.add_argument("--reopen-elf", type=Path)
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--qmp-stdio", action="store_true")
+    parser.add_argument("--healthy-boots", type=int, metavar="COUNT",
+                        help="boot and repeatedly reopen one healthy volume")
+    parser.add_argument("--contents", type=Path,
+                        help="expected file payload of the prebuilt fresh ELF in a healthy run")
     args = parser.parse_args()
     if bool(args.fresh_elf) != bool(args.reopen_elf):
         parser.error("pass both kernel ELFs, or let the verifier build both")
+    if args.healthy_boots is not None and args.healthy_boots < 2:
+        parser.error("--healthy-boots requires at least 2")
+    if args.contents is not None and (args.healthy_boots is None or args.fresh_elf is None):
+        parser.error("--contents requires --healthy-boots and prebuilt ELFs")
     with tempfile.TemporaryDirectory(prefix="cyx-fsync-elf-") as scratch:
         fresh, reopen = args.fresh_elf, args.reopen_elf
         if fresh is None:
@@ -272,7 +347,12 @@ def main():
             fresh = Path(scratch) / "fresh.elf"
             shutil.copy2(build(True, modes), fresh)
             reopen = build(True, replace(modes, media_reopen=True))
-        report = run_pair(fresh, reopen, args.output, args.timeout, args.qmp_stdio)
+        if args.healthy_boots is None:
+            report = run_pair(fresh, reopen, args.output, args.timeout, args.qmp_stdio)
+        else:
+            content = args.contents.read_bytes() if args.contents else FINAL[:29]
+            report = run_healthy_boots(fresh, reopen, args.output, args.timeout, args.qmp_stdio,
+                                       args.healthy_boots, content)
     print(json.dumps(report, indent=2))
 
 

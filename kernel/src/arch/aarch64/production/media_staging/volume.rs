@@ -567,13 +567,13 @@ pub(super) fn validate_homes(
     Ok(e)
 }
 
-/// Validate only the signed diagnostic's post-replay view, after the exact
-/// expected journal homes were verified and replayed by the scratch owner.
+/// Validate the signed FSYNC diagnostic's persisted file and paired epoch.
 #[cfg(feature = "v020-production-fsync-scratch")]
 pub(super) fn validate_fsync_homes(
     disk: &mut Disk,
     checkpoint: SuperblockV1,
     config: &VerifiedOfflineConfig<'_>,
+    epoch: u64,
     file_size: usize,
 ) -> Result<MountEvidence, SecurityError> {
     // SAFETY: the one-shot CPU0 mount excludes all other MOUNT borrows.
@@ -589,8 +589,8 @@ pub(super) fn validate_fsync_homes(
                 file_size,
             )
         })?;
-    if e.security != expected_state(1, Some(config))?
-        || e.boot.boot_epoch != 1
+    if e.security != expected_state(epoch, Some(config))?
+        || e.boot.boot_epoch != epoch
         || e.structure.live_inodes != 6
         || e.structure.directory_entries != 1
         || e.system_blocks != 13
@@ -600,6 +600,8 @@ pub(super) fn validate_fsync_homes(
     {
         return Err(SecurityError::Conflict);
     }
+    let expected = file_format_v1::scratch_file_dirent()?;
+    read_root(disk, &mut [0; BLOCK_BYTES], Some(&expected))?;
     Ok(e)
 }
 
@@ -664,6 +666,10 @@ pub(super) fn read_checkpoint(
     if sb.generation > 1 && (a == b || (sb == a) != (sb.generation % 2 == 1)) {
         return Err(SecurityError::Conflict);
     }
+    #[cfg(feature = "v020-production-fsync-scratch")]
+    if sb.generation > 2 && super::fsync::receipt_lsn(a) != super::fsync::receipt_lsn(b) {
+        return Err(SecurityError::Conflict);
+    }
     if sb != a {
         *raw = other;
     }
@@ -672,13 +678,10 @@ pub(super) fn read_checkpoint(
 
 fn checkpoint_lsn_valid(copy: SuperblockV1) -> bool {
     #[cfg(feature = "v020-production-fsync-scratch")]
-    return match copy.generation {
-        1 => copy.checkpoint_lsn == 0,
-        2 => matches!(
-            copy.checkpoint_lsn,
-            super::fsync::FINAL_LSN | super::fsync::LEGACY_FINAL_LSN
-        ),
-        _ => false,
+    return if copy.generation == 1 {
+        copy.checkpoint_lsn == 0
+    } else {
+        super::fsync::receipt_lsn(copy).is_some()
     };
     #[cfg(not(feature = "v020-production-fsync-scratch"))]
     {
