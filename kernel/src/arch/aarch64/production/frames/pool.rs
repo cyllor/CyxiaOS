@@ -1,7 +1,7 @@
 //! Bounded CPU0 frame lifecycle proof. The board reservation stays in BootInfo
 //! for later boot consumers. Only the fixture admits those pages to its pool.
 
-use super::super::high_leaf;
+use super::super::role_loader::high_leaf;
 use super::{evidence, report};
 use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_contracts::{BootInfo, MemoryRegion, PhysAddr, RegionKind, TaskId};

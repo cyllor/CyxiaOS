@@ -143,8 +143,6 @@ use meter::ExecTarget;
 mod net;
 #[path = "production/role_loader.rs"]
 mod role_loader;
-#[cfg(feature = "v020-production-frame-pool")]
-use role_loader::high_leaf;
 #[cfg(cyxia_signed_resident)]
 use role_loader::ns_from_ticks;
 use role_loader::{

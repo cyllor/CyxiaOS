@@ -49,7 +49,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 ))]
 use core::{cell::RefCell, mem::MaybeUninit};
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind};
-#[cfg(not(all(cyxia_startup_catalog, feature = "prototype-memory")))]
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 use cyxia_kernel_core::frame_meta_v0199::Inventory;
 use cyxia_kernel_core::frame_meta_v0199::{
     COUNT, FrameMeta, Ledger, PAGE, StaticClass, StaticRegion,
@@ -75,13 +78,19 @@ mod pool;
 /// The authenticated profile also pins a separate 95-page signer address
 /// space. Reserve 128 additional rows for it and surrounding linker gaps.
 /// The largest backing (165 KiB) fits within the FrameMeta reservation.
-#[cfg(not(all(cyxia_startup_catalog, feature = "prototype-memory")))]
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 const ROWS: usize = if cfg!(feature = "v020-production-authenticated-net") {
     4096 + 128
 } else {
     4096
 };
-#[cfg(not(all(cyxia_startup_catalog, feature = "prototype-memory")))]
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 const _: () = assert!(ROWS <= COUNT);
 const STATICS: usize = if cfg!(feature = "v020-production-diagnostic") {
     12
@@ -95,7 +104,10 @@ const STATICS: usize = if cfg!(feature = "v020-production-diagnostic") {
 ))]
 const FATAL_FRAME_META: u64 = 0x5731_1290;
 
-#[cfg(not(all(cyxia_startup_catalog, feature = "prototype-memory")))]
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 static mut ROWS_BACKING: [FrameMeta; ROWS] = [FrameMeta::ZERO; ROWS];
 #[cfg(any(
     feature = "v020-production-live-control",
@@ -196,7 +208,10 @@ fn statics(service: StaticRegion) -> Result<[StaticRegion; STATICS], Error> {
 }
 
 /// `[lowest start, highest end)` over the registered regions.
-#[cfg(not(all(cyxia_startup_catalog, feature = "prototype-memory")))]
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 fn window(regions: &[StaticRegion]) -> Result<(u64, u64), Error> {
     let mut base = u64::MAX;
     let mut end = 0u64;
@@ -224,7 +239,10 @@ fn service_arena() -> Result<StaticRegion, Error> {
 }
 
 /// Register the production statics once, before any EL0 entry.
-#[cfg(not(all(cyxia_startup_catalog, feature = "prototype-memory")))]
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 fn register_production_statics() -> Result<(Inventory, u64), Error> {
     if REGISTERED.swap(true, Ordering::AcqRel) {
         return Err(Error::Once);
@@ -309,7 +327,10 @@ fn statically_pinned_span(span: core::ops::Range<u64>, class: StaticClass) -> bo
 }
 
 /// Registered static pages: the class tallies, never the unregistered gaps.
-#[cfg(not(all(cyxia_startup_catalog, feature = "prototype-memory")))]
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 fn registered_pages(inv: &Inventory) -> u64 {
     u64::from(inv.arena)
         + u64::from(inv.firmware_extra)
@@ -319,7 +340,10 @@ fn registered_pages(inv: &Inventory) -> u64 {
 }
 
 /// run() entry hook: register or stop the boot (word 129 = 0, fatal).
-#[cfg(not(all(cyxia_startup_catalog, feature = "prototype-memory")))]
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 pub(super) fn register_or_fatal() {
     match register_production_statics() {
         Ok((inv, service_pages)) if service_pages > 0 => {
