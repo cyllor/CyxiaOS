@@ -187,6 +187,17 @@ pub(super) fn security(config: Config<'_>) -> SecurityStateStoreV2 {
     }
 }
 
+pub(super) fn format_manifest(config: Config<'_>) -> FormatManifest {
+    let security = security(config);
+    FormatManifest {
+        fs_uuid: security.fs_uuid,
+        root_block: ROOT,
+        system: SYSTEM,
+        principals: principals(config),
+        security,
+    }
+}
+
 /// Include the D1.5 heads in the formatter's first metadata flush. The full
 /// zero scan has passed and the baseline superblocks are still unpublished.
 struct EnvelopeFormatDisk<'a, D> {
@@ -233,17 +244,10 @@ pub(super) fn format(
     if snapshots.has_file() && config.is_none() {
         return Err(SecurityError::Unauthorized);
     }
-    let security = security(config);
+    let manifest = format_manifest(config);
     if let Some(config) = config {
-        config.check_committed(&security)?;
+        config.check_committed(&manifest.security)?;
     }
-    let manifest = FormatManifest {
-        fs_uuid: security.fs_uuid,
-        root_block: ROOT,
-        system: SYSTEM,
-        principals: principals(config),
-        security,
-    };
     // SAFETY: one-shot CPU0 call (module header); this is the only borrow of
     // FORMAT and it ends on return. The value is initialised at runtime here.
     let slot = unsafe { &mut *core::ptr::addr_of_mut!(FORMAT) };

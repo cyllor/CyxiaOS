@@ -359,9 +359,9 @@ impl Transport {
         self.set_status(self.status() | 128);
     }
 
-    /// Poll a terminal reset after the serialized owner has fenced every old
-    /// queue. Use one deadline for status and readiness across all queues,
-    /// including time spent renewing a grant between MMIO observations.
+    /// Confirm a reset with all named queues disabled. The serialized owner
+    /// must hold every old queue fenced or have published none in this boot.
+    /// One deadline covers status, readiness, and grant renewal.
     pub(crate) fn observe_mmio_reset(
         &mut self,
         device_id: u32,

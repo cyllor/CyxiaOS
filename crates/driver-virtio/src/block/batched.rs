@@ -55,7 +55,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         memory: &'static mut BatchMemory,
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        Self::attach_inner(t, memory, None, None, p)
+        Self::attach_inner(t, memory, None, None, p, None)
     }
 
     /// Attach a writable device using only VERSION_1 and FLUSH. A read-only
@@ -65,7 +65,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         memory: &'static mut BatchMemory,
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        Self::attach_inner(t, memory, Some(false), None, p)
+        Self::attach_inner(t, memory, Some(false), None, p, None)
     }
 
     /// Require a writable device with the admitted geometry before publishing
@@ -76,7 +76,20 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         sectors: u64,
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        Self::attach_inner(t, memory, Some(false), Some(sectors), p)
+        Self::attach_inner(t, memory, Some(false), Some(sectors), p, None)
+    }
+
+    /// Admit the signed writable MMIO boot device under the caller's
+    /// Recovery grants. Checkpoints must neither access the device nor
+    /// reenter this owner. An interrupted attach publishes no DMA queue.
+    pub fn attach_writable_exact_with_checkpoint(
+        t: Transport,
+        memory: &'static mut BatchMemory,
+        sectors: u64,
+        p: &impl Platform,
+        checkpoint: &mut dyn FnMut() -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        Self::attach_inner(t, memory, Some(false), Some(sectors), p, Some(checkpoint))
     }
 
     /// Require a read-only device with the admitted geometry before publishing
@@ -87,7 +100,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         sectors: u64,
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        Self::attach_inner(t, memory, Some(true), Some(sectors), p)
+        Self::attach_inner(t, memory, Some(true), Some(sectors), p, None)
     }
 
     fn attach_inner(
@@ -96,19 +109,25 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         expected_read_only: Option<bool>,
         expected_sectors: Option<u64>,
         p: &impl Platform,
+        mut checkpoint: Option<&mut dyn FnMut() -> Result<(), Error>>,
     ) -> Result<Self, Error> {
         if BYTES == 0 || BYTES > 4096 - 16 || !BYTES.is_multiple_of(SECTOR_BYTES) {
             return Err(Error::Address);
         }
-        if t.device_id() != 2 {
-            return Err(Error::Device);
-        }
-        t.set_status(0);
-        p.barrier();
-        let start = p.now_ms();
-        while t.status() != 0 {
-            if p.now_ms().wrapping_sub(start) >= 100 {
-                return Err(Error::Timeout);
+        if let Some(checkpoint) = checkpoint.as_deref_mut() {
+            t.observe_mmio_reset(2, &[0], p, &mut *checkpoint)?;
+            checkpoint()?;
+        } else {
+            if t.device_id() != 2 {
+                return Err(Error::Device);
+            }
+            t.set_status(0);
+            p.barrier();
+            let start = p.now_ms();
+            while t.status() != 0 {
+                if p.now_ms().wrapping_sub(start) >= 100 {
+                    return Err(Error::Timeout);
+                }
             }
         }
         t.set_status(3);
@@ -148,6 +167,9 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
             t.fail();
             p.barrier();
             return Err(Error::Response);
+        }
+        if let Some(checkpoint) = checkpoint {
+            checkpoint()?;
         }
         let queue = BatchQueue::configure(&mut t, memory, 0, p)?;
         t.start(p)?;
@@ -673,6 +695,78 @@ mod tests {
                 .unwrap();
         assert_eq!(driver.sectors(), SCRATCH_SECTORS);
         assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (15, 1));
+    }
+
+    #[test]
+    fn signed_attach_refusal_prevents_queue_publication_at_each_reset_boundary() {
+        for (refuse_at, status, ready) in [(1, 15, 1), (2, 0, 0), (3, 0, 0), (4, 11, 0)] {
+            let (mmio, mut platform, memory) = attach_fixture(FLUSH, false);
+            let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+            mmio.put32(0x70, 15);
+            mmio.put32(0x44, 1);
+            platform.complete_mmio_reset = true;
+            let mut checkpoints = 0;
+
+            let result = BatchedBlock::attach_writable_exact_with_checkpoint(
+                transport,
+                memory,
+                4096,
+                &platform,
+                &mut || {
+                    checkpoints += 1;
+                    if checkpoints == refuse_at {
+                        Err(Error::Busy)
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(result.err(), Some(Error::Busy));
+            assert_eq!(checkpoints, refuse_at);
+            assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (status, ready));
+            for register in [0x80, 0x84, 0x90, 0x94, 0xa0, 0xa4] {
+                assert_eq!(mmio.get32(register), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn signed_attach_waits_for_queue_readback_with_one_reset_deadline() {
+        use crate::reset::RESET_DEADLINE_NS;
+        for ready_at in [RESET_DEADLINE_NS - 1, RESET_DEADLINE_NS] {
+            let (mmio, platform, memory) = attach_fixture(FLUSH, false);
+            let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+            mmio.put32(0x70, 15);
+            mmio.put32(0x44, 1);
+            let mut checkpoints = 0;
+
+            let result = BatchedBlock::attach_writable_exact_with_checkpoint(
+                transport,
+                memory,
+                4096,
+                &platform,
+                &mut || {
+                    checkpoints += 1;
+                    if checkpoints == 3 {
+                        assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (0, 1));
+                        assert_eq!(mmio.get32(0x80), 0);
+                        mmio.put32(0x44, 0);
+                        platform.clock.set(ready_at);
+                    }
+                    Ok(())
+                },
+            );
+            if ready_at == RESET_DEADLINE_NS {
+                assert_eq!(result.err(), Some(Error::Timeout));
+                assert_eq!(checkpoints, 3);
+                assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (0, 0));
+                assert_eq!(mmio.get32(0x80), 0);
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(checkpoints, 5);
+                assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (15, 1));
+            }
+        }
     }
 
     #[test]

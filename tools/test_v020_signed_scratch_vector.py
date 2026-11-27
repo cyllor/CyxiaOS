@@ -51,17 +51,20 @@ def unsigned_bytes(uuid=UUID, lists=bytes(12)):
     return header + payload
 
 
-def signed_vector(path, uuid=UUID, lists=bytes(12)):
+def sign_scratch_fixture(path, contents):
     # PKCS#8 Ed25519 private key, RFC 8410. No production key material.
     key = path / "test-key.der"
     key.write_bytes(bytes.fromhex("302e020100300506032b657004220420") + SEED)
     message = path / "message"
+    message.write_bytes(contents)
+    return subprocess.check_output(["openssl", "pkeyutl", "-sign", "-rawin",
+                                    "-inkey", str(key), "-keyform", "DER",
+                                    "-in", str(message)])
+
+
+def signed_vector(path, uuid=UUID, lists=bytes(12)):
     unsigned = unsigned_bytes(uuid, lists)
-    message.write_bytes(LABEL + unsigned)
-    signature = subprocess.check_output(["openssl", "pkeyutl", "-sign", "-rawin",
-                                          "-inkey", str(key), "-keyform", "DER",
-                                          "-in", str(message)])
-    return unsigned + signature
+    return unsigned + sign_scratch_fixture(path, LABEL + unsigned)
 
 
 class SignedScratchVector(unittest.TestCase):

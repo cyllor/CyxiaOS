@@ -9,7 +9,7 @@
 //! one continuous CPU0 cursor from early boot through the durable media
 //! handoff and the resident roles.
 
-use super::role_loader::RoleLaunch;
+use super::role_loader::{RoleLaunch, pie_syscall_abi};
 use super::{
     BootInfo, E_AUTH, Error, ExceptionFrame, IRQS, Identity, NativeRole, NativeRoleManifest,
     Ordering, ROLE_COUNT, ROLES, Role, TIMER_IRQ, bring_up_production, cpu, frames, gic,
@@ -28,7 +28,7 @@ use cyxia_kernel_core::{
         Error as SvcError,
         durable_role_epoch_v0199::ConfirmedBootPolicy,
         syscall::Syscall,
-        syscall_v3::{ABI_VERSION, decode_aarch64_lifecycle_svc_v3, preflight_errno},
+        syscall_v3::{decode_aarch64_lifecycle_svc_v3, preflight_errno},
     },
 };
 
@@ -51,14 +51,22 @@ const NO_MEDIA: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=signed_media_unavailable command=status\n";
 const FENCED: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=signed_roles_fenced command=status\n";
-// CPU0 publishes the expected root/ASID for the exclusive running turn.
-// The vector verifies the live EL0 context before handing control back.
+#[cfg(cyxia_lifecycle_package_signature)]
+const UNQUALIFIED_PACKAGES: &[u8] =
+    b"V020_STARTUP state=SECURE_DEGRADED reason=lifecycle_packages_unqualified command=status\n";
+// CPU0 publishes the expected root/ASID for each EL0 entry. The
+// vector consumes it once, before the common native capture returns.
 static ACTIVE_ROLE_TTBR0: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn verify_captured_role(frame: &ExceptionFrame, kind: u64) {
     if cpu::slot() == 0 && matches!(kind, 8 | 9) {
-        let expected = ACTIVE_ROLE_TTBR0.load(Ordering::Acquire);
-        if expected == 0 || frame.spsr & 0x1f != 0 || trapped_ttbr0() != expected {
+        let captured = trapped_ttbr0();
+        if captured == 0
+            || frame.spsr & 0x1f != 0
+            || ACTIVE_ROLE_TTBR0
+                .compare_exchange(captured, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
             super::fatal(FATAL_ROLE_CONTEXT);
         }
     }
@@ -418,7 +426,7 @@ fn register_frames(info: &mut BootInfo, budget: &mut Budget) -> Result<(), Fault
 }
 
 impl Task {
-    fn trap(&mut self) -> Result<TaskAction, Error> {
+    fn trap(&mut self, syscall_abi: u16) -> Result<TaskAction, Error> {
         let ctx = &mut self.context;
         if ctx.kind == 9 {
             return Ok(TaskAction::EndTurn);
@@ -426,7 +434,7 @@ impl Task {
         if ctx.kind != 8 || ctx.esr >> 26 != 0x15 {
             return Err(Error::Denied);
         }
-        let call = match decode_aarch64_lifecycle_svc_v3(ABI_VERSION, ctx.esr, &ctx.regs) {
+        let call = match decode_aarch64_lifecycle_svc_v3(syscall_abi, ctx.esr, &ctx.regs) {
             Ok(call) => call,
             Err(error) => {
                 if error == SvcError::Unauthorized {
@@ -488,7 +496,7 @@ fn load_signed_roles(
     actors: &[Identity; ROLE_COUNT],
 ) -> Result<[NativeRole; ROLE_COUNT], Fault> {
     startup_work(budget, 2, || {
-        #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+        #[cfg(cyxia_startup_catalog)]
         if !frames::role_storage_registered() {
             return Err(Error::Denied);
         }
@@ -501,7 +509,7 @@ fn load_signed_roles(
     for (index, slot) in members.iter_mut().enumerate() {
         *slot = Some(startup_work(budget, 3 + index as u64, || {
             load_role_with_identity(index, actors[index].generation, RoleLaunch::Lifecycle)
-        })?);
+        })??);
     }
     Ok(members.map(|entry| entry.expect("complete signed launch inventory")))
 }
@@ -570,6 +578,7 @@ fn run_quantum(
     let trap_limit = if decision { 1 } else { 8 };
     let asid = role_asid(index);
     let ttbr0 = member.ttbr0_root | (u64::from(asid) << 48);
+    let syscall_abi = pie_syscall_abi(index, member.ttbr0_root).ok_or(Error::Denied)?;
     for _ in 0..trap_limit {
         let wall_ticks = timer::ticks();
         let wall_left = grant
@@ -586,7 +595,10 @@ fn run_quantum(
             break;
         }
         let deadline = wall_ticks.checked_add(ticks).ok_or(Error::Clock)?;
-        ACTIVE_ROLE_TTBR0.store(ttbr0, Ordering::Release);
+        task.context.kind = 0;
+        ACTIVE_ROLE_TTBR0
+            .compare_exchange(0, ttbr0, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::Denied)?;
         // SAFETY: CPU0 is the sole owner of each verified, pinned root and
         // context. Its ASID is private and its mappings are retained for boot.
         unsafe {
@@ -594,9 +606,13 @@ fn run_quantum(
             user::enter_pinned_until_retired(&mut task.context, member.ttbr0_root, asid);
             cpu::disable_timer();
         }
-        ACTIVE_ROLE_TTBR0.store(0, Ordering::Release);
+        // Every dispatch needs a newly captured lower-EL trap from the
+        // root registered for this entry. No stale trap reaches recovery.
+        if ACTIVE_ROLE_TTBR0.swap(0, Ordering::AcqRel) != 0 || task.context.kind == 0 {
+            return Err(Error::Denied);
+        }
         *returned += 1;
-        match task.trap() {
+        match task.trap(syscall_abi) {
             Ok(TaskAction::Resume) => {}
             Ok(TaskAction::EndTurn) => break,
             Ok(TaskAction::Exit(status)) => return Ok(Some(status)),
@@ -628,17 +644,26 @@ fn run_tasks(
     let mut console_window = next_window;
     let mut command = 0;
     let mut budget_frame = false;
+    // Finish publishing the authenticated cohort before entering any EL0
+    // role. Each console grant prepares at most one frame and drains a
+    // bounded number of bytes, including when the UART is busy.
+    let mut ready_record = Some(0);
     loop {
         let now = now_ns();
         let window = now / WINDOW_NS;
-        if window >= next_window {
+        let ready_at_start = ready_record.is_none();
+        if ready_at_start && window >= next_window {
             next_window = window + 1;
             for (index, task) in tasks.iter_mut().enumerate() {
                 turn(policy, manifest, index, task, budget)?;
             }
         }
         let mut wake = next_boundary(now)?;
-        if window >= console_window || pending.pending() != 0 || budget_frame {
+        if window >= console_window
+            || ready_record.is_some()
+            || pending.pending() != 0
+            || budget_frame
+        {
             let start = budget.sample_gap()?;
             match budget.ledger.reserve_kernel_with_wall(
                 0,
@@ -649,25 +674,38 @@ fn run_tasks(
             ) {
                 Ok(grant) => {
                     console_window = window + 1;
-                    let result = queue_activity(
-                        &mut tasks,
-                        window,
-                        &mut proof_window,
-                        &mut budget_frame,
-                        budget,
-                        pending,
-                    );
-                    if result.is_ok() {
-                        resident::poll_console(
-                            &mut uart,
+                    let result = if let Some(index) = ready_record {
+                        queue_ready(policy.boot_epoch(), manifest, index, pending).map(|()| {
+                            resident::drain_console(&mut uart, pending);
+                            if pending.pending() == 0 {
+                                ready_record = (index < ROLE_COUNT).then_some(index + 1);
+                            }
+                        })
+                    } else {
+                        queue_activity(
+                            &mut tasks,
+                            window,
+                            &mut proof_window,
+                            &mut budget_frame,
+                            budget,
                             pending,
-                            &mut command,
-                            IRQS[0].load(Ordering::Acquire),
-                        );
-                    }
+                        )
+                        .map(|()| {
+                            resident::poll_console(
+                                &mut uart,
+                                pending,
+                                &mut command,
+                                IRQS[0].load(Ordering::Acquire),
+                            );
+                        })
+                    };
                     budget.settle(grant, start, 0)?;
                     result?;
-                    if pending.pending() != 0 || budget_frame {
+                    if !ready_at_start && ready_record.is_none() {
+                        proof_window = window + EVIDENCE_WINDOWS;
+                        continue;
+                    }
+                    if ready_record.is_some() || pending.pending() != 0 || budget_frame {
                         wake =
                             wake.min(now_ns().checked_add(CONSOLE_RETRY_NS).ok_or(Error::Clock)?);
                     }
@@ -680,6 +718,29 @@ fn run_tasks(
         // Recheck sooner only to finish a queued frame with remaining credit.
         budget.idle_until(wake)?;
     }
+}
+
+fn queue_ready(
+    epoch: u64,
+    manifest: &ValidatedLifecycleManifest<'_>,
+    index: usize,
+    pending: &mut OutputQueue<128>,
+) -> Result<(), Error> {
+    if pending.pending() != 0 {
+        return Ok(());
+    }
+    let (label, [a, b, c]) = if index == 0 {
+        ("V020_SIGNED_RESIDENT_BOOT", [epoch, ROLE_COUNT as u64, 0])
+    } else {
+        let actor = manifest.manifest().members[index - 1].actor;
+        (
+            "V020_SIGNED_RESIDENT_ROLE",
+            [(index - 1) as u64, actor.id, actor.generation],
+        )
+    };
+    let mut text = [0; 96];
+    let payload = report_payload(&mut text, label, a, b, c);
+    enqueue_resident_frame(pending, payload).map_err(|_| Error::Denied)
 }
 
 fn queue_activity(
@@ -857,14 +918,22 @@ pub(super) fn run(info: &BootInfo) -> ! {
     };
     #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
     let info = &reserved;
-    let config = match startup_work(&mut budget, 1, media_staging::verify_scratch_config) {
+    let config = match startup_work(&mut budget, 1, || {
+        // An authenticated catalog with unsupported lists can still be
+        // inspected by the default read-only diagnostics.
+        let fallback = if cfg!(cyxia_startup_catalog) {
+            None
+        } else {
+            Some(FENCED)
+        };
+        let config = media_staging::verify_scratch_config().map_err(|_| fallback)?;
+        #[cfg(cyxia_lifecycle_package_signature)]
+        super::startup_catalog::verify_lifecycle_packages(&config)
+            .map_err(|_| Some(UNQUALIFIED_PACKAGES))?;
+        Ok(config)
+    }) {
         Ok(Ok(config)) => config,
-        // A valid catalog for a different policy can still be inspected by
-        // the read-only diagnostics. It cannot reach the SIM mount or EL0.
-        #[cfg(cyxia_startup_catalog)]
-        Ok(Err(_)) => degraded(info, budget, None),
-        #[cfg(not(cyxia_startup_catalog))]
-        Ok(Err(_)) => degraded(info, budget, Some(FENCED)),
+        Ok(Err(reason)) => degraded(info, budget, reason),
         Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     };
     #[cfg(cyxia_startup_catalog)]
@@ -934,20 +1003,6 @@ pub(super) fn run(info: &BootInfo) -> ! {
         Ok(manifest) => manifest,
         Err(error) => fence(info, budget, OutputQueue::new(), error.into()),
     };
-    report(
-        "V020_SIGNED_RESIDENT_BOOT",
-        policy.boot_epoch(),
-        ROLE_COUNT as u64,
-        0,
-    );
-    for (index, actor) in actors.iter().enumerate() {
-        report(
-            "V020_SIGNED_RESIDENT_ROLE",
-            index as u64,
-            actor.id,
-            actor.generation,
-        );
-    }
     let mut pending = OutputQueue::new();
     let Err(fault) = run_tasks(info, &policy, &manifest, &mut budget, &mut pending);
     fence(info, budget, pending, fault)

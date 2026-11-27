@@ -614,7 +614,7 @@ class NativeSecurityWiring(unittest.TestCase):
         arm = ROOT / "kernel/src/arch/aarch64"
         net = source(arm / "production/net.rs")
         self.assertIn("net_device::with_device(", net)
-        self.assertIn("net_device::terminal_custody(identity.boot_epoch)", net)
+        self.assertIn("net_device::terminal_custody(identity.boot_epoch())", net)
         self.assertNotIn("LoopbackPort", net)
         self.assertNotIn("RateLimiter", net)
         self.assertIn("evidence::W11_TLS_ECHO_TURN_VERIFIED, 0", net)
@@ -780,7 +780,7 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertEqual(scope.count("f()"), 1)
         self.assertTrue(scope.rstrip().endswith("\n    out"))
         net = source(arm / "production/net.rs")
-        self.assertIn("pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity) -> NetOutcome", net)
+        self.assertIn("pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity<'_>) -> NetOutcome", net)
 
     def test_v020_wave11_production_parks_halted_cpus_with_wfi(self):
         # Final fix wave I1: under TCG a WFE park spins a host core per halted
@@ -793,6 +793,18 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertNotIn("wfe", prod)
         verifier = source(ROOT / "tools/verify_v020_production.py")
         self.assertIn('"kernel/src/arch/aarch64/console.rs",', verifier)
+
+    def test_signed_lifecycle_dispatch_consumes_the_verified_package_abi_and_return(self):
+        arm = ROOT / "kernel/src/arch/aarch64/production"
+        signed = source(arm / "signed_resident.rs")
+        loader = source(arm / "role_loader.rs")
+        self.assertIn("let syscall_abi = verified.syscall_abi();", loader)
+        self.assertIn("PIE_SYSCALL_ABI[index].store(syscall_abi, Ordering::Release);", loader)
+        self.assertIn("decode_aarch64_lifecycle_svc_v3(syscall_abi, ctx.esr, &ctx.regs)", signed)
+        self.assertIn("compare_exchange(captured, 0, Ordering::AcqRel, Ordering::Acquire)", signed)
+        quantum = signed.split("fn run_quantum(", 1)[1].split("fn run_tasks(", 1)[0]
+        self.assertLess(quantum.index("ACTIVE_ROLE_TTBR0.swap(0, Ordering::AcqRel)"),
+                        quantum.index("task.trap(syscall_abi)"))
 
     def test_v020_live_pie_dispatch_checks_trapped_identity(self):
         arm = ROOT / "kernel/src/arch/aarch64"

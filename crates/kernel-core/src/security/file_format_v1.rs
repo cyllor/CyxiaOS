@@ -251,27 +251,36 @@ fn write_bitmap(
     w: &mut FormatWorkspace,
 ) -> Result<(), Error> {
     for page in 0..BITMAP_BLOCKS {
-        w.block.fill(0);
-        let base = page * (BLOCK as u32 * 8);
-        for (byte, slot) in w.block.iter_mut().enumerate() {
-            let mut bits = 0u8;
-            for bit in 0..8u32 {
-                if allocated(
-                    base + byte as u32 * 8 + bit,
-                    root_block,
-                    system,
-                    scratch_file,
-                ) {
-                    bits |= 1 << bit;
-                }
-            }
-            *slot = bits;
-        }
+        bitmap_page(&mut w.block, page, root_block, system, scratch_file);
         io.write(BITMAP_START + page, &w.block)
             .map_err(|_| Error::Unknown)?;
     }
     record(w, FormatOp::Bitmap, BITMAP_START, BITMAP_BLOCKS);
     Ok(())
+}
+
+fn bitmap_page(
+    out: &mut [u8; BLOCK],
+    page: u32,
+    root_block: u32,
+    system: &[UnifiedSystemObject],
+    scratch_file: bool,
+) {
+    let base = page * (BLOCK as u32 * 8);
+    for (byte, slot) in out.iter_mut().enumerate() {
+        let mut bits = 0u8;
+        for bit in 0..8u32 {
+            if allocated(
+                base + byte as u32 * 8 + bit,
+                root_block,
+                system,
+                scratch_file,
+            ) {
+                bits |= 1 << bit;
+            }
+        }
+        *slot = bits;
+    }
 }
 fn seal_inode(
     slot: &mut [u8],
@@ -307,41 +316,75 @@ fn write_inodes(
     w: &mut FormatWorkspace,
 ) -> Result<(), Error> {
     for page in 0..INODE_BLOCKS {
-        w.block.fill(0);
-        for slot in 0..(BLOCK / INODE_BYTES) {
-            let id = page as usize * (BLOCK / INODE_BYTES) + slot;
-            let b = &mut w.block[slot * INODE_BYTES..(slot + 1) * INODE_BYTES];
-            if id == 0 {
-                seal_inode(b, 2, 1, ROOT_SIZE, root_block, 1)?;
-            } else if scratch_file && id == SCRATCH_FILE_INODE as usize {
-                seal_inode(
-                    b,
-                    1,
-                    SCRATCH_FILE_GENERATION,
-                    SCRATCH_FILE_DATA.len() as u64,
-                    SCRATCH_FILE_BLOCK,
-                    1,
-                )?;
-            } else if let Some(s) = system.iter().find(|s| usize::from(s.inode) == id) {
-                let count = s.kind.blocks();
-                seal_inode(
-                    b,
-                    1,
-                    s.generation,
-                    u64::from(count) * BLOCK as u64,
-                    s.first_block,
-                    count,
-                )?;
-            } else {
-                // Fresh free slot: magic + generation 0 + valid CRC only.
-                seal_inode(b, 0, 0, 0, 0, 0)?;
-            }
-        }
+        inode_page(&mut w.block, page, root_block, system, scratch_file)?;
         io.write(INODE_START + page, &w.block)
             .map_err(|_| Error::Unknown)?;
     }
     record(w, FormatOp::InodeTable, INODE_START, INODE_BLOCKS);
     Ok(())
+}
+
+fn inode_page(
+    out: &mut [u8; BLOCK],
+    page: u32,
+    root_block: u32,
+    system: &[UnifiedSystemObject],
+    scratch_file: bool,
+) -> Result<(), Error> {
+    out.fill(0);
+    for (slot, entry) in out.chunks_exact_mut(INODE_BYTES).enumerate() {
+        let id = page as usize * (BLOCK / INODE_BYTES) + slot;
+        if id == 0 {
+            seal_inode(entry, 2, 1, ROOT_SIZE, root_block, 1)?;
+        } else if scratch_file && id == SCRATCH_FILE_INODE as usize {
+            seal_inode(
+                entry,
+                1,
+                SCRATCH_FILE_GENERATION,
+                SCRATCH_FILE_DATA.len() as u64,
+                SCRATCH_FILE_BLOCK,
+                1,
+            )?;
+        } else if let Some(s) = system.iter().find(|s| usize::from(s.inode) == id) {
+            let count = s.kind.blocks();
+            seal_inode(
+                entry,
+                1,
+                s.generation,
+                u64::from(count) * BLOCK as u64,
+                s.first_block,
+                count,
+            )?;
+        } else {
+            // Fresh free slot: magic + generation 0 + valid CRC only.
+            seal_inode(entry, 0, 0, 0, 0, 0)?;
+        }
+    }
+    Ok(())
+}
+
+fn baseline_system(m: &FormatManifest) -> [UnifiedSystemObject; 4] {
+    m.system.map(|s| UnifiedSystemObject {
+        kind: UnifiedSystemKind::from_baseline(s.kind),
+        inode: s.inode,
+        generation: s.generation,
+        first_block: s.first_block,
+    })
+}
+
+/// Pure encoding of the three nontrivial genesis metadata homes that the
+/// signed baseline FSYNC fixture can change. Shares the actual formatter's
+/// encoders so recovery can authenticate homes even after partial replay.
+pub fn baseline_fsync_genesis_metadata(
+    m: &FormatManifest,
+    first_bitmap: &mut [u8; BLOCK],
+    first_inode: &mut [u8; BLOCK],
+    stream_index: &mut [u8; BLOCK],
+) -> Result<(), Error> {
+    let system = baseline_system(m);
+    bitmap_page(first_bitmap, 0, m.root_block, &system, true);
+    inode_page(first_inode, 0, m.root_block, &system, true)?;
+    encode_index(m, stream_index)
 }
 
 /// The canonical populated v1 root slot for the signed scratch file.
@@ -620,7 +663,7 @@ fn format_layout(
         return Err(Error::Capacity);
     }
     validate_manifest(m)?;
-    let baseline_system;
+    let baseline;
     let unified_system;
     let system: &[UnifiedSystemObject] = match snapshots {
         Some(snapshots) => {
@@ -637,13 +680,8 @@ fn format_layout(
             &unified_system
         }
         None => {
-            baseline_system = m.system.map(|s| UnifiedSystemObject {
-                kind: UnifiedSystemKind::from_baseline(s.kind),
-                inode: s.inode,
-                generation: s.generation,
-                first_block: s.first_block,
-            });
-            &baseline_system
+            baseline = baseline_system(m);
+            &baseline
         }
     };
     let scratch_file = scratch_owner_rights.is_some();

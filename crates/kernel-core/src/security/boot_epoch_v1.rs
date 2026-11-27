@@ -1062,6 +1062,131 @@ mod tests {
     }
 
     #[test]
+    fn tls_boot_borrows_the_confirmed_signed_pair_and_exact_installation() {
+        use super::super::{
+            network::TlsInstallation,
+            offline_config_v1::{CatalogBindings, VerifiedOfflineConfig},
+        };
+
+        const UUID: [u8; 16] = *b"CYX-W11-STAGING!";
+        const WIRE: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/v020-signed-scratch/config.bin"
+        ));
+        const BOOT_KEY: [u8; 32] = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+        let catalogue = CatalogBindings {
+            rule_generation: 1,
+            security_generation: 1,
+            key_generation: 1,
+            rule_hash: hash(b"scratch/test/rules/1"),
+            security_hash: hash(b"scratch/test/security/1"),
+            key_manifest_hash: hash(b"scratch/test/keys/1"),
+        };
+        let config = VerifiedOfflineConfig::verify(
+            WIRE,
+            &BOOT_KEY,
+            catalogue,
+            &mut [0; 1024],
+            |_, _, lists| {
+                if lists == [0; 12] {
+                    Ok(())
+                } else {
+                    Err(Error::Unauthorized)
+                }
+            },
+        )
+        .unwrap();
+        let mut state = SecurityStateStoreV2::decode(&prod_state(UUID, 7, 5)).unwrap();
+        state.offline_config_hash = config.digest();
+        let boot = prod_boot(UUID, 5);
+        let sb = prod_sb_raw(UUID);
+        let installation = TlsInstallation {
+            verifier_generation: 1,
+            signer_generation: 1,
+            key_generation: 1,
+            key_manifest_hash: catalogue.key_manifest_hash,
+        };
+        let authorize =
+            |state: SecurityStateStoreV2, slots, installation: TlsInstallation, fail| {
+                let mut owner = BootEpochAuthority::open_for_startup(
+                    &state.encode()?,
+                    &boot,
+                    slots,
+                    &config,
+                    |mounted| {
+                        assert_eq!(mounted, &state);
+                        Ok(())
+                    },
+                )?;
+                assert!(owner.confirmed_boot_policy(&config).is_err());
+                let mut pair = BootPairRedo::new();
+                let result = owner.allocate_for_startup(
+                    &mut prod_disk(fail),
+                    &mut pair,
+                    prod_tx(&sb, 2, 1, 4),
+                    &config,
+                );
+                if result.is_err() {
+                    assert!(owner.confirmed_boot_policy(&config).is_err());
+                }
+                result?;
+                let authority = installation.authorize(owner.confirmed_boot_policy(&config)?)?;
+                Ok(authority.boot_epoch())
+            };
+        assert_eq!(authorize(state, prod_slots(), installation, false), Ok(6));
+        assert_eq!(
+            authorize(state, prod_slots(), installation, true),
+            Err(Error::Unknown)
+        );
+        let mut overlapping = prod_slots();
+        overlapping[0].slot = 12;
+        assert_eq!(
+            authorize(state, overlapping, installation, false),
+            Err(Error::Conflict)
+        );
+        for slot in [12, 13] {
+            let mut isolated = state;
+            isolated.isolated_service_bitmap = 1 << slot;
+            assert_eq!(
+                authorize(isolated, prod_slots(), installation, false),
+                Err(Error::Unauthorized)
+            );
+            let mut advanced = state;
+            advanced.service_generations[slot] += 1;
+            assert_eq!(
+                authorize(advanced, prod_slots(), installation, false),
+                Err(Error::Stale)
+            );
+        }
+        let wrong_key = TlsInstallation {
+            key_generation: 2,
+            ..installation
+        };
+        assert_eq!(
+            authorize(state, prod_slots(), wrong_key, false),
+            Err(Error::Stale)
+        );
+        let wrong_catalogue = TlsInstallation {
+            key_manifest_hash: [3; 32],
+            ..installation
+        };
+        assert_eq!(
+            authorize(state, prod_slots(), wrong_catalogue, false),
+            Err(Error::Unauthorized)
+        );
+        let mut different_config = state;
+        different_config.offline_config_hash = [9; 32];
+        assert_eq!(
+            authorize(different_config, prod_slots(), installation, false),
+            Err(Error::Conflict)
+        );
+    }
+
+    #[test]
     fn production_boot_epoch_fail_closed_on_uncertain_commit() {
         let uuid = [1; 16];
         let state_raw = prod_state(uuid, 7, 5);

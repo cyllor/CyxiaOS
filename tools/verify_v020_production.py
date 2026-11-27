@@ -93,6 +93,7 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/sec_n_broker/receipt.rs",
     "kernel/src/arch/aarch64/sec_n_broker/signer.rs",
     "kernel/src/arch/aarch64/scratch_blk.rs",
+    "kernel/src/arch/aarch64/production/authorized.rs",
     "kernel/src/arch/aarch64/production/evidence.rs",
     "kernel/src/arch/aarch64/production/frames.rs",
     "kernel/src/arch/aarch64/production/frames/dense.rs",
@@ -103,6 +104,10 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/file_durable.rs",
     "kernel/src/arch/aarch64/production/file_receipt.rs",
     "kernel/src/arch/aarch64/production/recovery.rs",
+    "kernel/src/arch/aarch64/production/role_loader.rs",
+    "kernel/src/arch/aarch64/production/signed_budget_trace.rs",
+    "kernel/src/arch/aarch64/production/signed_resident.rs",
+    "kernel/src/arch/aarch64/production/startup_catalog.rs",
     "kernel/src/arch/aarch64/production/meter.rs",
     "kernel/src/arch/aarch64/production/net.rs",
     "kernel/src/arch/aarch64/production/net_entropy.rs",
@@ -110,6 +115,7 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/media_staging.rs",
     "kernel/src/arch/aarch64/production/media_staging/authority.rs",
     "kernel/src/arch/aarch64/production/media_staging/fsync.rs",
+    "kernel/src/arch/aarch64/production/media_staging/fsync_retire.rs",
     "kernel/src/arch/aarch64/production/media_staging/reopen.rs",
     "kernel/src/arch/aarch64/production/media_staging/signed.rs",
     "kernel/src/arch/aarch64/production/media_staging/volume.rs",
@@ -122,6 +128,7 @@ PRODUCTION_SOURCES = [
     "crates/arch-aarch64/src/entry.S",
     "crates/arch-aarch64/src/secondary.S",
     "crates/arch-aarch64/src/vectors.S",
+    "crates/arch-aarch64/src/mmu.rs",
     "crates/arch-aarch64/src/timer.rs",
     "crates/platform-virt/src/lib.rs",
     "crates/driver-virtio/src/lib.rs",
@@ -134,11 +141,14 @@ PRODUCTION_SOURCES = [
     "crates/driver-virtio/src/transport.rs",
     "crates/contracts/src/net_ingress.rs",
     "crates/contracts/src/tls_signer.rs",
+    "crates/kernel-core/src/control_plane/pie_image_v0199.rs",
     "crates/kernel-core/src/security/recovery_proof_v2.rs",
     "crates/kernel-core/src/security/boot_epoch_v1.rs",
     "crates/kernel-core/src/security/network/entropy.rs",
     "crates/kernel-core/src/security/network/tls_deadline.rs",
+    "crates/kernel-core/src/security/network/tls_packages.rs",
     "crates/kernel-core/src/security/startup_catalog_v0199.rs",
+    "crates/kernel-core/src/security/startup_catalog_v0199/lifecycle_packages.rs",
     "crates/kernel-core/src/security/startup_catalog_v0199/profile.rs",
     "crates/kernel-core/src/security/durable_role_epoch_v0199.rs",
     "crates/kernel-core/src/security/epoch_redo_v0199.rs",
@@ -189,6 +199,8 @@ PRODUCTION_SOURCES = [
     "user/local-echo/build.rs",
     "user/local-echo/linker.ld",
     "tools/verify_v020_production.py",
+    "tools/verify_v0199_sec_n.py",
+    "tools/test_v020_signed_scratch_vector.py",
     "tools/verify_v020_fsync_scratch.py",
     "tools/qmp_stdio.py",
     "tools/v020_production_media.py",
@@ -447,6 +459,17 @@ class Production:
                     and not any(line.startswith(("V020_W11_NET_", "V020_SEC_N_", "V020_SEC_D_NET_RESET_"))
                                 for line in lines), "network started without signed media custody")
             raise ValueError("guest reported V020_W11_MEDIA_STAGING_INCOMPLETE: a staging step failed")
+        rejected_packages = rows("V020_SEC_N_PACKAGE_REJECTED")
+        if rejected_packages:
+            require(self.modes.authenticated_net and len(rejected_packages) == 1
+                    and rejected_packages[0][0] > 0 and rejected_packages[0][1] > 0
+                    and rejected_packages[0][2] == 0 and not any(words[138:143])
+                    and words[160] == words[176] == 0
+                    and not any(line.startswith(("V020_W11_NET_", "V020_SEC_D_NET_RESET_"))
+                                for line in lines)
+                    and not rows("V020_SEC_N_SIGNER_SPACE"),
+                    "TLS package rejection did not fence the network before device ownership")
+            raise ValueError("V020_SEC_N_PACKAGE_REJECTED: both packaged credentials required")
         extensions = validate_extensions(words, lines, self.modes)
         wave11 = validate_w11(words, lines, serial, self.staging, snapshot_calls, self.modes,
                               pending_fsync_blocks=pending_fsync_blocks,
@@ -588,6 +611,15 @@ def check_w11_net(words: tuple, lines: list, serial: bytes) -> None:
             "direct Admission receipt missing or disagrees with the pinned connection")
 
 
+def fsync_checkpoint_retirement_io(row: tuple, commit_lsn: int,
+                                  pending_fsync_blocks: int | None) -> tuple:
+    epoch, lsn, retired = row
+    verify_smp.require(epoch == 1 and lsn == commit_lsn and 0 <= retired <= 32
+                       and retired == pending_fsync_blocks,
+                       "initial FSYNC checkpoint retirement differs from observed log")
+    return 6 + retired, 3 + int(retired != 0)
+
+
 def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
                       snapshot_calls: int, modes: Modes, *,
                       pending_fsync_blocks: int | None = None,
@@ -617,9 +649,14 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     require(lines.count(STAGING_MARKER) == 1,
             "staging marker with golden_vector_pending=1 must appear exactly once")
     steps = w11_rows(lines, "V020_W11_MEDIA_STEP")
+    retirement = w11_rows(lines, "V020_FSYNC_CHECKPOINT_RETIRE")
+    require(not retirement or (modes.fsync_scratch and reopen and epoch == 2
+                               and len(retirement) == 1),
+            "unexpected FSYNC checkpoint retirement")
+    selected_generation = 2 if retirement else epoch - int(reopen)
     live_inodes = (9 if modes.media_unified else 5) + int(modes.file_read or modes.fsync_scratch)
     require([step[:2] for step in steps] == [(index, 1) for index in range(1, 6)]
-            and steps[0][2] == epoch - int(reopen) and steps[1][2] == live_inodes
+            and steps[0][2] == selected_generation and steps[1][2] == live_inodes
             and steps[2][2] == 151 and steps[4][2] == 1,
             "media staging serial steps must show format, mount, map, epoch and admission success")
     require(steps[3][2] == words[148], "media staging BootEpoch disagrees with word 148")
@@ -639,6 +676,8 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
                 )), "BOUND receipt must preserve uncertainty")
         if not reopen:
             expected_io = (4155, 10)
+        elif retirement:
+            expected_io = fsync_checkpoint_retirement_io(retirement[0], 14, pending_fsync_blocks)
         elif epoch == 2:
             require(pending_fsync_blocks in (None, 18), "pre-replay BOUND log block count differs")
             expected_io = (30, 5)  # Five homes, a checkpoint, 18 retirements, six boot records.
@@ -656,7 +695,9 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
             commit in (21, 23) and terminal[0][1] > 0 and low <= terminal[0][2] <= high
         )
         require(terminal == legacy or current, "media staging FSYNC terminal differs")
-        if reopen and epoch > 2:
+        if retirement:
+            expected_io = fsync_checkpoint_retirement_io(retirement[0], commit, pending_fsync_blocks)
+        elif reopen and epoch > 2:
             # Only the earlier BootEpoch pair remains. The two data tails
             # are zero, and the boot-only recovery clears all six log blocks.
             require(pending_fsync_blocks in (None, 4),
@@ -721,11 +762,18 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
                                    pending_fsync_blocks=pending_fsync_blocks,
                                    expected_fsync_epoch=expected_fsync_epoch)
     net_boot_epoch = words[148] if modes.signed_media else 1
+    confirmed = w11_rows(lines, "V020_SEC_N_CONFIRMED_BOOT")
     if modes.signed_media:
+        require(confirmed == [(net_boot_epoch, 1, 1)],
+                "missing confirmed TLS boot binding for signed scratch media")
         listen = "V020_W11_NET_LISTEN a=7 b=0 c=0"
         confirmation = f"V020_W11_MEDIA_STEP a=4 b=1 c={net_boot_epoch}"
-        require(lines.count(listen) == 1 and lines.index(confirmation) < lines.index(listen),
-                "signed-media network listened before durable BootEpoch confirmation")
+        network = f"V020_SEC_N_CONFIRMED_BOOT a={net_boot_epoch} b=1 c=1"
+        require(lines.count(listen) == 1
+                and lines.index(confirmation) < lines.index(network) < lines.index(listen),
+                "signed-media network listened before durable BootEpoch binding")
+    else:
+        require(not confirmed, "unexpected signed scratch network binding")
     flags = {
         "frame_meta": words[129] == 1,
         "recovery": (words[131] == RECOVERY_ACCUMULATORS and words[133] == 1
@@ -766,6 +814,7 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
         "staging_confirmed_epoch": words[148] if staging else None,
         "staging_previous_epoch": words[163] if staging else None,
         "staging_reopened": modes.media_reopen,
+        "native_tls_confirmed_boot_epoch": confirmed[0][0] if confirmed else None,
         "w11_completion_marker": expected,
     }
 
@@ -829,6 +878,30 @@ def supervisor_copy_windows(elf, qmp, output, lines, *, snapshot_lists=None, fil
         scope: dict(readback, read_only_fragments_closed=reads, writable_fragments_closed=writes)
         for scope, (reads, writes) in counts.items()
     }
+
+
+def signer_retirement(elf, qmp, output, image_pages, retired_pages):
+    """Independently verify that the stopped Signer's root and writable pages are zero."""
+    require = verify_smp.require
+    page = 4096
+    frames, leaves, tables, shared, stack = 64, 9, 2, 4, 16
+    space = symbol(elf, "V020_SEC_N_SIGNER_SPACE_PAGES")
+    base = space["pa"]
+    require(base % page == 0 and space["size"] == (frames + leaves + tables + shared + stack) * page,
+            "unexpected private Signer address space geometry")
+    root = base + (frames + leaves + 1) * page
+    bss = retired_pages - shared - stack
+    require(0 <= bss < image_pages <= frames, "invalid retired Signer data range")
+
+    def erased(name, address, pages):
+        if pages:
+            path = output / f"signer-{name}.bin"
+            qmp.execute("pmemsave", {"val": address, "size": pages * page, "filename": str(path)})
+            require(path.read_bytes() == bytes(pages * page), f"Signer {name} was not erased")
+
+    erased("root-and-mailbox-stack", root, 1 + shared + stack)
+    erased("bss", base + (image_pages - bss) * page, bss)
+    return {"root_pa": hex(root), "root_invalid": True, "writable_pages_scrubbed": retired_pages}
 
 
 def ingress_mappings(elf, qmp, output, image_pages):
@@ -1101,6 +1174,11 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                         report["ingress_mappings"] = ingress_mappings(
                             elf.read_bytes(), qmp, output,
                             report["observations"]["native_parser_image_pages"],
+                        )
+                        report["signer_retirement"] = signer_retirement(
+                            elf.read_bytes(), qmp, output,
+                            report["observations"]["native_signer_image_pages"],
+                            report["observations"]["native_signer_discarded_pages"],
                         )
                         require(peer is not None, "missing authenticated host peer")
                         peer.join(timeout=min(max(end - time.monotonic(), 0), PEER_WAIT_SECONDS))

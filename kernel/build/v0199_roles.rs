@@ -6,7 +6,12 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+#[path = "../../crates/kernel-core/src/security/startup_catalog_v0199/lifecycle_packages.rs"]
+mod lifecycle_packages;
+use lifecycle_packages::{LifecyclePackageDigest, lifecycle_package_message};
+
 const ROLES: [u16; 8] = [6, 7, 2, 8, 9, 3, 10, 11];
+const SYSCALL_ABI: u16 = 3;
 fn u16at(b: &[u8], n: usize) -> u16 {
     u16::from_le_bytes(b[n..n + 2].try_into().unwrap())
 }
@@ -184,7 +189,7 @@ fn extract_relative(b: &[u8]) -> Vec<(u64, u64, i64)> {
     }
     entries
 }
-pub fn build() {
+pub fn build(default_catalog: bool) {
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
     let source = root.join("user/v0199-control/main.rs");
     let script = root.join("user/v0199-control/linker.ld");
@@ -226,7 +231,7 @@ pub fn build() {
     let snapshot_read = env::var_os("CARGO_FEATURE_V020_PRODUCTION_SNAPSHOT_READ").is_some();
     let mut manifest = String::from("[\n");
     let mut hashes = Vec::new();
-    for role in ROLES {
+    let packages = ROLES.map(|role| {
         let name = format!("v0199-role-{role}.elf");
         let target = out.join(&name);
         let mut compiler = Command::new(env::var("RUSTC").unwrap());
@@ -334,8 +339,22 @@ pub fn build() {
             "independent role ELF package unexpectedly identical"
         );
         hashes.push(hash);
-        manifest.push_str(&format!("BootPackage {{ role_id:{role}, bytes:include_bytes!(concat!(env!(\"OUT_DIR\"),\"/{name}\")), image_sha256:{hash:?}, relative_sha256:{rel:?},relative:{rust_entries} }},\n"));
-    }
+        manifest.push_str(&format!("BootPackage {{ role_id:{role}, syscall_abi:{SYSCALL_ABI}, bytes:include_bytes!(concat!(env!(\"OUT_DIR\"),\"/{name}\")), image_sha256:{hash:?}, relative_sha256:{rel:?},relative:{rust_entries} }},\n"));
+        LifecyclePackageDigest {
+            role,
+            image: hash,
+            relocations: rel,
+        }
+    });
     manifest.push(']');
     fs::write(out.join("v0199-role-catalog.rs"), manifest).unwrap();
+    if default_catalog {
+        let catalog = out.join("startup-catalog");
+        let config = digest(&catalog.join("offline-config.bin"));
+        fs::write(
+            catalog.join("lifecycle-packages-to-sign.bin"),
+            lifecycle_package_message(config, packages),
+        )
+        .expect("write offline lifecycle package signing input");
+    }
 }

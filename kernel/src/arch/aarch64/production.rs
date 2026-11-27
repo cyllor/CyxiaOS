@@ -625,6 +625,7 @@ fn load_role(index: usize) -> NativeRole {
             target_selector,
         },
     )
+    .expect("trusted diagnostic role translations")
 }
 
 // ---- in-vector production dispatch ----
@@ -1194,6 +1195,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     let info = &reserved_info;
     recovery::init_or_fatal();
     bring_up_production(info);
+    meter::check_target_lock_at_boot();
     for gate in GATES.iter().take(REQUIRED).skip(1) {
         gate.open(Token {
             generation: 1,

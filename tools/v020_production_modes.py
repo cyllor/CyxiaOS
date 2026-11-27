@@ -151,9 +151,20 @@ def net_signer(lines: list, enabled: bool, signed_boot_epoch: int | None) -> dic
     replies = rows(lines, "V020_SEC_N_SIGNER_REPLY")
     authenticated = rows(lines, "V020_SEC_N_VERIFIER_AUTHENTICATED")
     identities = rows(lines, "V020_SEC_N_SIGNER_IDENTITY")
+    packages = rows(lines, "V020_SEC_N_PACKAGE_AUTHORITY")
+    discarded = rows(lines, "V020_SEC_N_SIGNER_DISCARDED")
     if not enabled:
-        require(not (spaces or replies or authenticated or identities), "unexpected isolated signer evidence")
+        require(not (spaces or replies or authenticated or identities or packages or discarded),
+                "unexpected isolated signer evidence")
         return {}
+    boot_epoch = signed_boot_epoch or 1
+    require(packages == [(boot_epoch, 1, 1)], "missing TLS package qualification")
+    qualified_at = lines.index(f"V020_SEC_N_PACKAGE_AUTHORITY a={boot_epoch} b=1 c=1")
+    listen = "V020_W11_NET_LISTEN a=7 b=0 c=0"
+    require(lines.count(listen) == 1 and qualified_at < lines.index(listen),
+            "TLS package qualification must precede listen")
+    require(len(discarded) == 1 and discarded[0][:2] == (boot_epoch, 1)
+            and 20 <= discarded[0][2] <= 84, "missing retired Signer address space")
     if signed_boot_epoch is not None or identities:
         require(identities == [(signed_boot_epoch or 1, 1, 1)],
                 "Signer identity differs from the selected scratch BootEpoch or generation")
@@ -167,7 +178,12 @@ def net_signer(lines: list, enabled: bool, signed_boot_epoch: int | None) -> dic
     sign_at = lines.index("V020_SEC_N_SIGNER_REPLY a=1 b=1 c=1")
     auth_at = lines.index(f"V020_SEC_N_VERIFIER_AUTHENTICATED a=1 b={QEMU_GATEWAY_IPV4} c=1")
     require(sign_at < auth_at, "TLS verifier completed before its signer reply")
-    return {"native_signer_asid": spaces[0][0], "native_signer_certificate_verifies": len(replies),
+    discarded_at = lines.index(f"V020_SEC_N_SIGNER_DISCARDED a={boot_epoch} b=1 c={discarded[0][2]}")
+    require(auth_at < discarded_at, "Signer retired before authenticated verifier completion")
+    return {"native_signer_asid": spaces[0][0], "native_signer_image_pages": spaces[0][1],
+            "native_signer_certificate_verifies": len(replies),
+            "native_signer_discarded_pages": discarded[0][2],
+            "native_tls_packages_qualified_boot_epoch": boot_epoch,
             "native_verifier_authenticated_connections": len(authenticated)}
 
 

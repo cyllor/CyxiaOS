@@ -51,8 +51,11 @@ mod receipt;
 pub(super) mod signer;
 
 use super::*;
+#[cfg(feature = "v020-production-media-signed")]
+use cyxia_kernel_core::security::durable_role_epoch_v0199::ConfirmedBootPolicy;
 #[cfg(feature = "v020-production-authenticated-net")]
 use cyxia_kernel_core::security::network::tls_deadline::{Limit, Phase, TlsWindow};
+use cyxia_kernel_core::security::network::{ConfirmedTlsBoot, TlsInstallation};
 use cyxia_net_transport::device::{self, Port};
 
 // Trusted monotonic clocks from the EL1 architectural timer (the same source the
@@ -134,39 +137,83 @@ const PEER_NODE: [u8; 32] = [
 pub(crate) const SOURCE_IP: u32 = 0x0A00_0202; // 10.0.2.2, trusted native owner observation.
 const UNIX_SECONDS: u64 = 1_700_000_000; // fixed: no time-based handshake timeout.
 
-/// Input from the trusted owner, never from the Verifier's shared page.
+/// The signed profile borrows the confirmed boot owner through the whole
+/// network turn. Only the standalone diagnostic may use the fixture identity.
 #[derive(Clone, Copy)]
-pub(crate) struct BootIdentity {
-    pub(crate) boot_epoch: u64,
-    verifier_generation: u64,
-    #[cfg(feature = "v020-production-authenticated-net")]
-    key_generation: u64,
+pub(crate) struct BootIdentity<'a> {
+    confirmed: Option<ConfirmedTlsBoot<'a>>,
 }
 
-impl BootIdentity {
+impl<'a> BootIdentity<'a> {
     #[cfg(any(
         feature = "v0199-sec-n-selftest",
         not(feature = "v020-production-media-signed")
     ))]
-    pub(crate) const FIXTURE: Self = Self {
-        boot_epoch: 1,
-        verifier_generation: 1,
-        #[cfg(feature = "v020-production-authenticated-net")]
-        key_generation: 1,
-    };
+    pub(crate) const FIXTURE: Self = Self { confirmed: None };
 
     #[cfg(feature = "v020-production-media-signed")]
     pub(crate) fn from_signed_scratch(
-        state: &cyxia_kernel_core::security::file_index_v0199::SecurityStateStoreV2,
-        config: &cyxia_kernel_core::security::offline_config_v1::VerifiedOfflineConfig<'_>,
-        installation: cyxia_kernel_core::security::network::TlsInstallation,
+        policy: ConfirmedBootPolicy<'a>,
+        installation: TlsInstallation,
     ) -> Option<Self> {
         Some(Self {
-            boot_epoch: installation.authorize(config, state).ok()?,
-            verifier_generation: installation.verifier_generation,
-            #[cfg(feature = "v020-production-authenticated-net")]
-            key_generation: installation.key_generation,
+            confirmed: Some(installation.authorize(policy).ok()?),
         })
+    }
+
+    pub(crate) fn boot_epoch(&self) -> u64 {
+        self.confirmed
+            .as_ref()
+            .map_or(1, ConfirmedTlsBoot::boot_epoch)
+    }
+
+    fn verifier_generation(&self) -> u64 {
+        self.confirmed_installation()
+            .map_or(1, |installed| installed.verifier_generation)
+    }
+
+    pub(crate) fn confirmed_installation(&self) -> Option<TlsInstallation> {
+        self.confirmed.as_ref().map(ConfirmedTlsBoot::installation)
+    }
+
+    #[cfg(feature = "v020-production-authenticated-net")]
+    fn tls(&self) -> TlsInstallation {
+        const FIXTURE: TlsInstallation = TlsInstallation {
+            verifier_generation: 1,
+            signer_generation: 1,
+            key_generation: 1,
+            key_manifest_hash: [
+                0xb0, 0x01, 0x79, 0xae, 0x6e, 0xd2, 0xc6, 0xad, 0x68, 0x4f, 0x29, 0x5f, 0x30, 0x83,
+                0x21, 0x9c, 0x57, 0xa6, 0x75, 0x0b, 0x58, 0xd0, 0xf5, 0x55, 0x0d, 0x6f, 0x71, 0x68,
+                0x64, 0x66, 0xf2, 0xa8,
+            ],
+        };
+        self.confirmed_installation().unwrap_or(FIXTURE)
+    }
+
+    /// A diagnostic credential qualification, rooted in the public scratch
+    /// test boot key. Signed-media callers first authenticate the same
+    /// installation against the committed BootEpoch and key catalogue.
+    #[cfg(feature = "v020-production-authenticated-net")]
+    pub(crate) fn qualify_packages(self) -> Result<(), cyxia_kernel_core::security::Error> {
+        // RFC 8032 test vector 1, the existing signed scratch trust root.
+        const PUBLIC_KEY: &[u8; 32] = &[
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+        const SIGNATURE: &[u8; 64] = include_bytes!(
+            "../../../../target/aarch64-unknown-none/release/cyxia-tls-packages.sig"
+        );
+        let installed = self.tls();
+        installed.qualify_packages(PUBLIC_KEY, SIGNATURE, GUEST_ELF, signer::SIGNER_ELF)?;
+        report(
+            "V020_SEC_N_PACKAGE_AUTHORITY",
+            self.boot_epoch(),
+            installed.verifier_generation,
+            installed.key_generation,
+        );
+        Ok(())
     }
 }
 
@@ -527,7 +574,7 @@ pub(crate) fn stage_shared(local: [u8; 32], connected: bool, conn_epoch: u64) {
 }
 
 pub(crate) fn stage_connection(
-    identity: BootIdentity,
+    identity: BootIdentity<'_>,
     local: [u8; 32],
     connected: bool,
     conn_epoch: u64,
@@ -538,8 +585,8 @@ pub(crate) fn stage_connection(
     unsafe { core::ptr::write_bytes(p, 0, SHARED_PAGES * PAGE) };
     shared_write(OFF_MAGIC, SVC_MAGIC);
     shared_write(OFF_VERSION, SVC_VERSION);
-    shared_write(OFF_BOOT_EPOCH, identity.boot_epoch);
-    shared_write(OFF_SERVICE_GEN, identity.verifier_generation);
+    shared_write(OFF_BOOT_EPOCH, identity.boot_epoch());
+    shared_write(OFF_SERVICE_GEN, identity.verifier_generation());
     shared_write(OFF_UNIX_SECONDS, UNIX_SECONDS);
     shared_write(OFF_MONOTONIC_MS, now_ms());
     shared_write(OFF_MONOTONIC_NS, accepted_ns);
@@ -599,9 +646,22 @@ pub(crate) fn discard_guest_session(layout: &Layout, boot_epoch: u64) {
         TLS_WINDOW = None;
         TLS_AUTHENTICATED_EPOCH = 0;
         EMPTY_ACTIVE_READ = false;
-        core::ptr::addr_of_mut!((*memory.root).0[0]).write_volatile(0);
         CONN_EPOCH
     };
+    let pages = discard_role_space(&memory, layout);
+    report(
+        "V020_SEC_N_VERIFIER_DISCARDED",
+        boot_epoch,
+        conn_epoch,
+        pages as u64,
+    );
+}
+
+#[cfg(feature = "v020-production-authenticated-net")]
+fn discard_role_space(memory: &Memory, layout: &Layout) -> usize {
+    // SAFETY: the caller owns this stopped, pinned role root and its
+    // writable backing. No subsequent entry can reach its pages.
+    unsafe { core::ptr::addr_of_mut!((*memory.root).0[0]).write_volatile(0) };
     tlbi();
     // The loader admits one BSS-only writable LOAD. Volatile page writes
     // cover its exact extent and every private stack and shared page.
@@ -617,13 +677,7 @@ pub(crate) fn discard_guest_session(layout: &Layout, boot_epoch: u64) {
         }
         core::arch::asm!("dsb ishst", options(nostack));
     }
-    let pages = layout.bss_end.saturating_sub(layout.bss_first) + memory.stack_pages + SHARED_PAGES;
-    report(
-        "V020_SEC_N_VERIFIER_DISCARDED",
-        boot_epoch,
-        conn_epoch,
-        pages as u64,
-    );
+    layout.bss_end.saturating_sub(layout.bss_first) + memory.stack_pages + SHARED_PAGES
 }
 
 fn fresh_context(layout: &Layout) -> user::Context {
@@ -689,7 +743,7 @@ fn broker<P: Port>(
     port: &mut P,
     entropy: &mut EntropyFill<'_>,
     close_poll: Option<ClosePoll<P>>,
-    #[cfg(feature = "v020-production-authenticated-net")] signer: Option<&mut signer::Signer>,
+    #[cfg(feature = "v020-production-authenticated-net")] signer: Option<&mut signer::Signer<'_>>,
 ) {
     let op = shared_read(OFF_OP);
     let len = shared_read(OFF_LEN);
@@ -758,7 +812,7 @@ fn broker<P: Port>(
 }
 
 #[cfg(feature = "v020-production-authenticated-net")]
-fn broker_certificate_verify(signer: Option<&mut signer::Signer>) {
+fn broker_certificate_verify(signer: Option<&mut signer::Signer<'_>>) {
     let (connected, epoch, source, grant, state, deadline_ns) = unsafe {
         (
             CONNECTED,
@@ -789,7 +843,7 @@ fn broker_certificate_verify(signer: Option<&mut signer::Signer>) {
 }
 
 #[cfg(feature = "v020-production-authenticated-net")]
-fn broker_tls_authenticated(signer: Option<&mut signer::Signer>) {
+fn broker_tls_authenticated(signer: Option<&mut signer::Signer<'_>>) {
     let mut wire = [0u8; receipt::WIRE_BYTES];
     shared_bytes(OFF_PAYLOAD, &mut wire);
     let (connected, epoch, polled, source, grant, state, authenticated, expires) = unsafe {
@@ -1171,7 +1225,9 @@ pub(crate) fn run_guest<P: Port>(
     entropy: &mut EntropyFill<'_>,
     budget: u64,
     close_poll: Option<ClosePoll<P>>,
-    #[cfg(feature = "v020-production-authenticated-net")] mut signer: Option<&mut signer::Signer>,
+    #[cfg(feature = "v020-production-authenticated-net")] mut signer: Option<
+        &mut signer::Signer<'_>,
+    >,
 ) -> Result<u64, GuestStop> {
     struct SavedContext(user::Context);
     impl Drop for SavedContext {

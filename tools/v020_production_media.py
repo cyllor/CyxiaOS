@@ -99,6 +99,10 @@ def verify_signed_receipt_view(path: Path, expected: str) -> str:
 
 
 def require_read_only_refusal(report: dict, lines: list, output: Path, step: int) -> tuple:
+    # An I/O failure is not evidence of a semantic mount refusal, even if
+    # the disk is unchanged or an error code happens to match the expected one.
+    io_errors = rows(lines, "V020_W11_MEDIA_IO_ERROR")
+    require(not io_errors, f"device I/O failure during read-only refusal: {io_errors}")
     io = rows(lines, "V020_W11_MEDIA_IO")
     require(report["status"] == "FAIL"
             and report["error"] == "ValueError: guest reported V020_W11_MEDIA_STAGING_INCOMPLETE: a staging step failed"

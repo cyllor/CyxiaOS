@@ -502,6 +502,9 @@ impl<'a> VerifiedRolePackage<'a> {
     pub fn role(&self) -> Role {
         self.spec.role
     }
+    pub fn syscall_abi(&self) -> u16 {
+        self.spec.abi
+    }
     pub fn load_segments(&self) -> impl Iterator<Item = LoadSegment> + '_ {
         self.image.loads[..self.image.load_count]
             .iter()
@@ -787,6 +790,7 @@ mod tests {
         substituted[0].relative = &alternate;
         assert!(verify_role_inventory(&specs, &substituted).is_err());
         let verified = VerifiedRolePackage::verify(specs[0], inputs[0]).unwrap();
+        assert_eq!(verified.syscall_abi(), specs[0].abi);
         let mut out = vec![0xaa; 0x3000];
         assert_eq!(
             verified.stage(&mut out, 0x4000_0000, 0x4000_0000, 0x5000_0000),

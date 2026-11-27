@@ -176,6 +176,7 @@ jobs:
           sha256sum target/aarch64-unknown-none/release/cyxia-local-echo > artifacts/v020-production/guest.sha256
           sha256sum target/aarch64-unknown-none/release/cyxia-echo-signer > artifacts/v020-production/signer.sha256
           sha256sum target/aarch64-unknown-none/release/cyxia-echo-ingress > artifacts/v020-production/ingress.sha256
+          sha256sum target/aarch64-unknown-none/release/cyxia-tls-packages.sig > artifacts/v020-production/tls-packages.sha256
           cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v020-production-diagnostic 2>&1 | tee artifacts/v020-production/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel.elf
           # Opt-in staging profile (prototype-memory, RAM_MIB 1024).

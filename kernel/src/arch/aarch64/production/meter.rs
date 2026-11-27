@@ -115,9 +115,7 @@ impl ExecTarget {
         {
             return Err(Error::Denied);
         }
-        let saved_daif: u64;
-        // SAFETY: CPU0 reads its own saved IRQ mask in foreground.
-        unsafe { asm!("mrs {}, daif", out(reg) saved_daif, options(nostack, preserves_flags)) };
+        let saved_daif = local_daif();
         if saved_daif & IRQ_MASK == 0 {
             return Err(Error::Denied);
         }
@@ -136,7 +134,8 @@ impl ExecTarget {
             asm!("dsb sy", "isb", options(nostack, preserves_flags));
             timer::enable_irqs();
         }
-        let (installed, [before, work_start, work_end, after]) = self.try_commit_irq_off(prepared);
+        let (installed, [before, work_start, work_end, after]) =
+            self.try_commit_irq_off(prepared, saved_daif, saved_daif & !IRQ_MASK);
         // IRQ is enabled here. Convert and latch the real sampled bounds
         // before restoring the fixture's outer mask and timer routing.
         let timing = IrqOffTiming::from_ticks(before, work_start, work_end, after, frequency).ok();
@@ -164,49 +163,54 @@ impl ExecTarget {
     }
 
     #[inline(never)]
-    fn try_commit_irq_off(&self, prepared: PreparedWeight) -> (Result<(), Error>, [u64; 4]) {
+    fn try_commit_irq_off(
+        &self,
+        prepared: PreparedWeight,
+        masked: u64,
+        restored: u64,
+    ) -> (Result<(), Error>, [u64; 4]) {
         let before: u64;
         let work_start: u64;
         let work_end: u64;
         let after: u64;
         let lock_failed: u32;
         let prior: u64;
-        // SAFETY: CPU0 enters with IRQ enabled and owns the timer handoff.
-        // Both precomputed addresses refer to aligned, live atomics in this
-        // target. One acquire-exclusive attempt owns the byte only after a
-        // successful store-exclusive. Its owner installs and releases with
-        // release ordering. A failed attempt never writes the root or unlocks
-        // the existing holder. Every exit restores IRQ before the last tick.
+        // SAFETY: commit is entered only from the synchronous CPU0 runner,
+        // outside its vector and recovery handlers. No other CPU takes this
+        // lock. With IRQ masked, the acquire load and claim store form one
+        // bounded try-lock attempt. The addresses refer to live atomics.
+        // Readers acquire the installed root from its release store. A busy
+        // attempt leaves the existing holder and root intact.
+        // The DAIF operands contain this CPU's saved masks. Every exit
+        // restores the caller's mask before the last tick. Each DSB
+        // completes accesses to the inner-shareable target before the
+        // subsequent counter read.
         // No compiler-generated loads, stores, or conversions can enter
         // this mask-to-restore interval.
         unsafe {
             asm!(
                 "isb",
                 "mrs {before}, cntpct_el0",
-                "msr daifset, #2",
-                "isb",
-                "ldaxrb {lock_failed:w}, [{held}]",
+                "msr daif, {masked}",
+                "ldarb {lock_failed:w}, [{held}]",
                 "cbnz {lock_failed:w}, 3f",
-                "stxrb {lock_failed:w}, {one:w}, [{held}]",
-                "cbnz {lock_failed:w}, 4f",
-                "isb",
+                "stlrb {one:w}, [{held}]",
+                "dsb ish",
                 "mrs {work_start}, cntpct_el0",
                 "ldr {prior}, [{root}]",
                 "cbnz {prior}, 2f",
                 "stlr {new_root}, [{root}]",
                 "2:",
-                "isb",
+                "dsb ish",
                 "mrs {work_end}, cntpct_el0",
                 "stlrb wzr, [{held}]",
-                "msr daifclr, #2",
-                "isb",
+                "msr daif, {restored}",
+                "dsb ish",
                 "mrs {after}, cntpct_el0",
                 "b 5f",
                 "3:",
-                "clrex",
-                "4:",
-                "msr daifclr, #2",
-                "isb",
+                "msr daif, {restored}",
+                "dsb ish",
                 "mrs {after}, cntpct_el0",
                 "mov {prior}, xzr",
                 "mov {work_start}, {before}",
@@ -215,6 +219,8 @@ impl ExecTarget {
                 held = in(reg) self.held.as_ptr(),
                 root = in(reg) self.installed.as_ptr(),
                 new_root = in(reg) prepared.0,
+                masked = in(reg) masked,
+                restored = in(reg) restored,
                 one = in(reg) 1u32,
                 before = out(reg) before,
                 work_start = out(reg) work_start,
@@ -234,6 +240,44 @@ impl ExecTarget {
         };
         (installed, [before, work_start, work_end, after])
     }
+}
+
+#[inline]
+fn local_daif() -> u64 {
+    let daif;
+    // SAFETY: Read the current CPU's DAIF fields at EL1.
+    unsafe { asm!("mrs {}, daif", out(reg) daif, options(nostack, preserves_flags)) };
+    daif
+}
+
+/// Exercise the real target-lock routine on a private target before opening
+/// the business gates. This prepares its instruction path with the boot
+/// mask held throughout. Ordinary installs have their own admission receipt.
+#[inline(never)]
+pub(super) fn check_target_lock_at_boot() {
+    let daif = local_daif();
+    let frequency = timer::frequency();
+    if daif & IRQ_MASK == 0 || frequency == 0 {
+        return;
+    }
+    let scratch = ExecTarget::new();
+    // Both callers use the same compiled try-lock body with a runtime target.
+    let target = core::hint::black_box(&scratch);
+    let prepared = 1u64 << WEIGHT_BITS;
+    let (result, [before, start, end, after]) =
+        target.try_commit_irq_off(PreparedWeight(prepared), daif, daif);
+    assert_eq!(result, Ok(()));
+    assert_eq!(target.installed.load(Ordering::Acquire), prepared);
+    assert!(!target.held.load(Ordering::Acquire));
+    assert_eq!(local_daif(), daif);
+    let timing = IrqOffTiming::from_ticks(before, start, end, after, frequency)
+        .expect("monotonic boot target-lock clock");
+    report(
+        "V020_D01_BOOT_PROBE",
+        timing.work_ns,
+        timing.overhead_ns,
+        timing.total_ns,
+    );
 }
 
 fn with_observations<R>(f: impl FnOnce(&mut CompletedSectionObservations) -> R) -> R {

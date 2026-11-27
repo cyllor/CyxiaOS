@@ -508,6 +508,7 @@ class W11Validation(unittest.TestCase):
             "V020_SEC_N_SIGNER_SPACE a=65 b=17 c=0",
             "V020_SEC_N_SIGNER_REPLY a=1 b=1 c=1",
             f"V020_SEC_N_VERIFIER_AUTHENTICATED a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
+            "V020_SEC_N_SIGNER_DISCARDED a=1 b=1 c=21",
             f"V020_W13_NET_RETIRE a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
         ]
         self.rejects("isolated ingress parser", words=words, lines=lines, modes=modes)
@@ -515,6 +516,9 @@ class W11Validation(unittest.TestCase):
             "V020_SEC_N_PARSER_SPACE a=66 b=6 c=1",
             "V020_SEC_N_PARSER_FRAMES a=13 b=12 c=1",
         ]
+        self.rejects("TLS package qualification", words=words, lines=lines, modes=modes)
+        lines.insert(lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0"),
+                     "V020_SEC_N_PACKAGE_AUTHORITY a=1 b=1 c=1")
         obs = self.check(words=words, lines=lines, modes=modes)
         self.assertEqual(obs["native_parser_accepted_frames"], 12)
         self.assertEqual(obs["tls_drbg_guest_bytes"], 96)
@@ -562,17 +566,31 @@ class W11Validation(unittest.TestCase):
             "V020_SEC_N_SIGNER_SPACE a=65 b=17 c=0",
             "V020_SEC_N_SIGNER_REPLY a=1 b=1 c=1",
             f"V020_SEC_N_VERIFIER_AUTHENTICATED a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
+            "V020_SEC_N_SIGNER_DISCARDED a=1 b=1 c=21",
         ]
         lines += [
             "V020_SEC_N_PARSER_SPACE a=66 b=6 c=1",
             "V020_SEC_N_PARSER_FRAMES a=10 b=10 c=0",
         ]
+        lines.insert(lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0"),
+                     "V020_SEC_N_PACKAGE_AUTHORITY a=1 b=1 c=1")
         modes = v.Modes(authenticated_net=True, orderly_close=False)
         self.assertEqual(self.check(words=words, lines=lines, modes=modes)["native_admission_retirements"], 0)
         self.rejects("retirement proof", words=words, lines=lines, modes=v.Modes(authenticated_net=True))
         words[176] = 1
         lines.append(f"V020_W13_NET_RETIRE a=1 b={v.QEMU_GATEWAY_IPV4} c=1")
         self.rejects("retirement proof", words=words, lines=lines, modes=modes)
+
+    def test_unqualified_packages_fence_device_and_listener(self):
+        modes = v.Modes(authenticated_net=True)
+        words = w11_words()
+        words[138:143] = [0] * 5
+        lines = [line for line in w11_lines()
+                 if not line.startswith(("V020_W11_NET_", "V020_SEC_D_NET_RESET_"))]
+        lines += ["V020_SEC_N_PACKAGE_REJECTED a=1 b=1 c=0"]
+        self.rejects("V020_SEC_N_PACKAGE_REJECTED", words=words, lines=lines, modes=modes)
+        lines += ["V020_W11_NET_LISTEN a=7 b=0 c=0"]
+        self.rejects("before device ownership", words=words, lines=lines, modes=modes)
 
     def test_rng_missing_cannot_fall_back_to_listening(self):
         modes = v.Modes(authenticated_net=True)
@@ -614,9 +632,14 @@ class W11Validation(unittest.TestCase):
             "V020_W13_MEDIA_SCOPE test_key=true format_golden=false signed_config=true",
         ]
         modes = v.Modes(signed_media=True)
+        self.rejects("confirmed TLS boot binding", words=words, lines=lines,
+                     staging=True, modes=modes)
+        lines.insert(lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0"),
+                     "V020_SEC_N_CONFIRMED_BOOT a=1 b=1 c=1")
         obs = self.check(words=words, lines=lines, staging=True, modes=modes)
         self.assertTrue(obs["signed_test_config_verified"])
         self.assertEqual(obs["signed_config_bound_boot_epoch"], 1)
+        self.assertEqual(obs["native_tls_confirmed_boot_epoch"], 1)
         self.assertEqual(obs["signed_receipt_view_sha256"],
                          b"".join(word.to_bytes(8, "little") for word in (2, 3, 4, 5)).hex())
         self.rejects("signed receipt view", words=words,
@@ -648,6 +671,8 @@ class W11Validation(unittest.TestCase):
             "V020_W13_SIGNED_SCRATCH a=1 b=2 c=1",
             "V020_W13_MEDIA_SCOPE test_key=true format_golden=false signed_config=true",
         ]
+        lines.insert(lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0"),
+                     "V020_SEC_N_CONFIRMED_BOOT a=2 b=1 c=1")
         self.rejects("wrong generation", words=words, lines=lines, staging=True, modes=modes)
         prefix = "V020_SEC_D_NET_RESET_PROOF "
         for index, line in enumerate(lines):
@@ -904,6 +929,27 @@ class W11Validation(unittest.TestCase):
                         v.check_w11_staging(tuple(words), recovered + [off_by_one], b"", True,
                                             3, modes, pending_fsync_blocks=pending)
 
+    def test_fsync_resume_initial_checkpoint_retirement_checks_remaining_writes(self):
+        modes = v.Modes(fsync_scratch=True, media_reopen=True)
+        words = w11_words(staging=True)
+        words[145:151] = [0, 1, 1, 2, 1, 1]
+        words[162:164] = [1, 1]
+        lines = [v.STAGING_MARKER, "V020_W12_MEDIA_EPOCH a=1 b=2 c=1",
+                 "V020_FSYNC_RECOVERED a=2 b=21 c=7",
+                 f"V020_W11_MEDIA_SNAPSHOT_0X40 a=3 b={v.EAGAIN_RESULT} c=0"]
+        lines += [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
+                  for index, detail in enumerate((2, 6, 151, 2, 1), start=1)]
+        for pending in (0, 1, 28):
+            with self.subTest(pending=pending):
+                reported = lines + [f"V020_FSYNC_CHECKPOINT_RETIRE a=1 b=21 c={pending}",
+                                    f"V020_W11_MEDIA_IO a=4288 b={6 + pending} "
+                                    f"c={3 + int(pending != 0)}"]
+                v.check_w11_staging(tuple(words), reported, b"", True, 3, modes,
+                                    pending_fsync_blocks=pending)
+                with self.assertRaisesRegex(ValueError, "retirement differs"):
+                    v.check_w11_staging(tuple(words), reported, b"", True, 3, modes,
+                                        pending_fsync_blocks=pending + 1)
+
     def test_fsync_third_boot_keeps_original_receipt(self):
         modes = v.Modes(fsync_scratch=True, media_reopen=True)
         words = w11_words(staging=True)
@@ -1140,6 +1186,36 @@ class FileVolatileWriteEvidence(unittest.TestCase):
             page.write_bytes(struct.pack("<512Q", *self.words))
             with self.assertRaisesRegex(ValueError, "unexpected file volatile write evidence"):
                 media.require_read_only_refusal(report, lines, output, 2)
+
+    def test_read_only_refusal_rejects_device_io_error(self):
+        report = {
+            "status": "FAIL",
+            "error": "ValueError: guest reported V020_W11_MEDIA_STAGING_INCOMPLETE: a staging step failed",
+            "scratch_before_sha256": "unchanged",
+            "scratch_disk": {"scratch_after_sha256": "unchanged"},
+        }
+        # Even a coincidentally correct mount error cannot prove that the
+        # semantic check was reached after a device failure.
+        lines = [
+            "V020_W11_MEDIA_STAGING_INCOMPLETE step=2",
+            "V020_W11_MEDIA_IO a=319 b=0 c=0",
+            "V020_W11_MEDIA_STEP a=2 b=0 c=3",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "native-page.bin").write_bytes(bytes(4096))
+            media.require_read_only_refusal(report, lines, output, 2)
+            for failure in (
+                "V020_W11_MEDIA_IO_ERROR a=6 b=32928 c=13",
+                "V020_W11_MEDIA_IO_ERROR a=0 b=32928 c=15",
+            ):
+                with self.subTest(failure=failure):
+                    with self.assertRaisesRegex(ValueError, "device I/O failure"):
+                        media.require_read_only_refusal(report, lines + [failure], output, 2)
+            with self.assertRaisesRegex(ValueError, "malformed V020_W11_MEDIA_IO_ERROR"):
+                media.require_read_only_refusal(
+                    report, lines + ["V020_W11_MEDIA_IO_ERROR a=6 b=32928 c=bad"], output, 2
+                )
 
     def test_acl_mode_mismatch_rejects_and_restores_the_original_record(self):
         offset = 4126 * 4096 + 64

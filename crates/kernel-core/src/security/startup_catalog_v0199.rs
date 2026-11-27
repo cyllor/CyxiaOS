@@ -8,10 +8,15 @@ use super::{
         AuthenticatedEnvelope, CatalogBindings, ConfigHeader, Principal, VerifiedOfflineConfig,
     },
 };
-use crate::control_plane::rule_profile_v2::Profile;
+use crate::control_plane::{role_manifest_v0199::ROLES, rule_profile_v2::Profile};
+use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
+mod lifecycle_packages;
 mod profile;
+
+pub use lifecycle_packages::LifecyclePackageDigest;
+use lifecycle_packages::lifecycle_package_message;
 
 pub struct PinnedStartupCatalog<'a> {
     pub boot_public_key: &'a [u8; 32],
@@ -52,6 +57,25 @@ impl<'a> PinnedStartupCatalog<'a> {
         )
     }
 
+    /// Qualify the exact ABI3 lifecycle roster for this authenticated catalog.
+    /// The loader separately checks the actual ELF and relocation bytes.
+    pub fn qualify_lifecycle_packages(
+        &self,
+        policy: &VerifiedOfflineConfig<'_>,
+        packages: [LifecyclePackageDigest; ROLES.len()],
+        signature: &[u8; 64],
+    ) -> Result<(), Error> {
+        if policy.wire() != self.offline_config
+            || packages
+                .iter()
+                .zip(ROLES)
+                .any(|(package, role)| package.role != role.id())
+        {
+            return Err(Error::Conflict);
+        }
+        verify_lifecycle_signature(self.boot_public_key, signature, policy.digest(), packages)
+    }
+
     fn bindings(&self) -> Result<CatalogBindings, Error> {
         let rules = Profile::parse(self.rules).map_err(|_| Error::Invalid)?;
         let rule_hash: [u8; 32] = Sha256::digest(rules.canonical_bytes()).into();
@@ -71,11 +95,59 @@ impl<'a> PinnedStartupCatalog<'a> {
     }
 }
 
+fn verify_lifecycle_signature(
+    public_key: &[u8; 32],
+    signature: &[u8; 64],
+    config_digest: [u8; 32],
+    packages: [LifecyclePackageDigest; ROLES.len()],
+) -> Result<(), Error> {
+    let message = lifecycle_package_message(config_digest, packages);
+    VerifyingKey::from_bytes(public_key)
+        .and_then(|key| key.verify_strict(&message, &Signature::from_bytes(signature)))
+        .map_err(|_| Error::Unauthorized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::offline_config_v1::{SIGNATURE_LABEL, VerifiedOfflineConfig};
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn lifecycle_qualification_pins_the_config_and_each_package() {
+        let config = [17; 32];
+        let roles = [6u16, 7, 2, 8, 9, 3, 10, 11];
+        let packages = roles.map(|role| LifecyclePackageDigest {
+            role,
+            image: [role as u8; 32],
+            relocations: [role as u8 + 16; 32],
+        });
+        let mut message = b"CYX/STARTUP-LIFECYCLE-PACKAGES/v1".to_vec();
+        message.extend_from_slice(&config);
+        for role in roles {
+            message.extend_from_slice(&role.to_le_bytes());
+            message.extend_from_slice(&[role as u8; 32]);
+            message.extend_from_slice(&[role as u8 + 16; 32]);
+        }
+        let signer = SigningKey::from_bytes(&[0x38; 32]);
+        let signature = signer.sign(&message).to_bytes();
+        let public_key = signer.verifying_key().to_bytes();
+        let verify = |digest, packages| {
+            verify_lifecycle_signature(&public_key, &signature, digest, packages)
+        };
+        assert_eq!(verify(config, packages), Ok(()));
+        assert_eq!(verify([18; 32], packages), Err(Error::Unauthorized));
+
+        let mut other_image = packages;
+        other_image[4].image = [33; 32];
+        assert_eq!(verify(config, other_image), Err(Error::Unauthorized));
+        let mut other_relocations = packages;
+        other_relocations[7].relocations = [34; 32];
+        assert_eq!(verify(config, other_relocations), Err(Error::Unauthorized));
+        let mut reordered = packages;
+        reordered.swap(0, 1);
+        assert_eq!(verify(config, reordered), Err(Error::Unauthorized));
+    }
 
     #[test]
     fn signed_catalog_checks_independent_assets_before_payload_authorization() {

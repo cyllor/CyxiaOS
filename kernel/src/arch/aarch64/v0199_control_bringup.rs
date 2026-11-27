@@ -59,6 +59,7 @@ const MAGIC: u64 = 0x4359_5838_424f_4f54;
 
 struct BootPackage {
     role_id: u16,
+    syscall_abi: u16,
     bytes: &'static [u8],
     image_sha256: [u8; 32],
     relative_sha256: [u8; 32],
@@ -685,7 +686,7 @@ fn load_checkpointed(
     let spec = RolePackageSpec {
         role,
         package_id: u64::from(role.id()),
-        abi: 3,
+        abi: pkg.syscall_abi,
         image_bytes: pkg.bytes.len(),
         image_sha256: pkg.image_sha256,
         relative_count: pkg.relative.len(),

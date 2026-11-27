@@ -17,7 +17,7 @@ use cyxia_kernel_core::security::{
     file_auth_v3::{AdmitRequestV3, FILE_SERVICE_ROLE, TerminalState, Verdict},
     file_format_v1::{
         SCRATCH_FILE_BLOCK, SCRATCH_FILE_DATA, SCRATCH_FILE_FSYNC_RIGHTS, SCRATCH_FILE_GENERATION,
-        SCRATCH_FILE_INODE,
+        SCRATCH_FILE_INODE, baseline_fsync_genesis_metadata,
     },
     file_fsync_v1::{FsyncJob, FsyncProgress, FsyncWorkspace, commit_segment},
     file_index_v0199::{BLOCK_BYTES as BLOCK, FileStreamIndexV4, SecurityStateStoreV2},
@@ -37,6 +37,9 @@ use cyxia_kernel_core::security::{
     recovery_v1::{RedoImage, RedoTransaction, RedoWriter, retire_checkpointed_log},
 };
 use sha2::{Digest, Sha256};
+
+#[path = "fsync_retire.rs"]
+mod fsync_retire;
 
 const FILE_LEN: usize = SCRATCH_FILE_DATA.len();
 const SIZE_BYTES: usize = 8;
@@ -439,6 +442,27 @@ fn recovered_version(inode_block: &[u8; BLOCK], commit_lsn: u64) -> Result<(usiz
     Ok((size, inode.durable_write_seq))
 }
 
+fn version_inode_page(inode: &mut [u8; BLOCK], size: usize, write_seq: u64) -> Result<(), Error> {
+    let file = &mut inode[INODE_AT..INODE_AT + INODE_BYTES];
+    file[16..24].copy_from_slice(&(size as u64).to_le_bytes());
+    file[24..32].copy_from_slice(&write_seq.to_le_bytes());
+    file[56..60].copy_from_slice(&(size.div_ceil(BLOCK) as u32).to_le_bytes());
+    let crc = crc32c_zeroed(file, 252)?;
+    file[252..].copy_from_slice(&crc.to_le_bytes());
+    Ok(())
+}
+
+fn allocate_second_data_home(bitmap: &mut [u8; BLOCK]) -> Result<(), Error> {
+    // Both fixture data blocks are in the first canonical bitmap page.
+    let bit = (SCRATCH_FILE_BLOCK + 1) as usize;
+    let mask = 1 << (bit % 8);
+    if bitmap[bit / 8] & mask != 0 {
+        return Err(Error::Conflict);
+    }
+    bitmap[bit / 8] |= mask;
+    Ok(())
+}
+
 fn final_receipt(
     snapshot: &mut [u8; FROZEN_BYTES],
     size: usize,
@@ -521,6 +545,12 @@ pub(super) fn recover(
         // SAFETY: this private preflight ends before any view is published.
         let receipts = unsafe { &mut *core::ptr::addr_of_mut!(RECEIPTS) };
         let expected = read_retained_receipt(disk, origin, receipts)?;
+        if checkpoint.generation == 2
+            && fsync_retire::initial_residue_present(disk, checkpoint, config)?
+        {
+            let mounted = fsync_retire::resume(disk, checkpoint, config, expected)?;
+            return Ok((checkpoint, mounted));
+        }
         return reopen::recover_boot_pair(disk, checkpoint, Some(config), mode, |disk, epoch| {
             volume::validate_fsync_homes(
                 disk,
@@ -533,17 +563,21 @@ pub(super) fn recover(
         });
     }
     volume::unified_map(disk, checkpoint, mode)?;
-    volume::validate_homes(disk, checkpoint, 0, Some(config), mode)?;
     volume::require_zero_blocks(disk, LOG_END..BITMAP_START)?;
     let state = authority::verified_pair_state(disk, checkpoint, Some(config))?;
 
-    // Build exact intended after-images from the sealed genesis view.
-    let mut inode = [0; BLOCK];
-    let mut index = [0; BLOCK];
-    let mut bitmap = [0; BLOCK];
-    disk.read(INODE_START, &mut inode)?;
-    disk.read(RECEIPTS_HOME + 6, &mut index)?;
-    disk.read(BITMAP_START, &mut bitmap)?;
+    // Derive predecessor bytes from the same signed inputs and encoders as
+    // format. The physical homes may contain a mix after interrupted replay.
+    let manifest = volume::format_manifest(Some(config));
+    let mut prior_inode = [0; BLOCK];
+    let mut prior_index = [0; BLOCK];
+    let mut prior_bitmap = [0; BLOCK];
+    baseline_fsync_genesis_metadata(
+        &manifest,
+        &mut prior_bitmap,
+        &mut prior_inode,
+        &mut prior_index,
+    )?;
     let mut tail = [0; BLOCK];
     // Read both possible legacy tails before taking the exclusive redo view.
     let mut single_tail_blank = true;
@@ -556,10 +590,7 @@ pub(super) fn recover(
             single_tail_blank &= empty;
         }
     }
-    let file = &mut inode[INODE_AT..INODE_AT + INODE_BYTES];
-    if Inode::decode(file)?.durable_write_seq != 0 {
-        return Err(Error::Conflict);
-    }
+    let mut index = prior_index;
     issued_index(&mut index)?;
     // SAFETY: the second CPU0 boot borrows the same exclusive static areas.
     let workspace = unsafe { reopen::workspace() };
@@ -605,29 +636,24 @@ pub(super) fn recover(
         writer.read_committed_at(INODE_START, final_lsn, block)?;
         let (size, write_seq) = recovered_version(block, final_lsn)?;
         let pages = size.div_ceil(BLOCK);
-        file[16..24].copy_from_slice(&(size as u64).to_le_bytes());
-        file[24..32].copy_from_slice(&write_seq.to_le_bytes());
-        file[56..60].copy_from_slice(&(pages as u32).to_le_bytes());
-        let crc = crc32c_zeroed(file, 252)?;
-        file[252..].copy_from_slice(&crc.to_le_bytes());
-        if *block != inode {
-            return Err(Error::Conflict);
-        }
+        let mut inode = prior_inode;
+        version_inode_page(&mut inode, size, write_seq)?;
+        writer.verify_replay_home(INODE_START, final_lsn, &prior_inode, &inode)?;
         if pages == 2 {
-            // Both fixture data blocks are in the first canonical bitmap page.
-            let bit = (SCRATCH_FILE_BLOCK + 1) as usize;
-            let mask = 1 << (bit % 8);
-            if bitmap[bit / 8] & mask != 0 {
-                return Err(Error::Conflict);
-            }
-            bitmap[bit / 8] |= mask;
-            verify_block(&mut writer, BITMAP_START, final_lsn, &bitmap)?;
+            let mut bitmap = prior_bitmap;
+            allocate_second_data_home(&mut bitmap)?;
+            writer.verify_replay_home(BITMAP_START, final_lsn, &prior_bitmap, &bitmap)?;
         }
-        for (index, page) in snapshot[SIZE_BYTES..].as_chunks_mut::<BLOCK>().0[..pages]
+        let mut old_data = [0; BLOCK];
+        old_data[..FILE_LEN].copy_from_slice(SCRATCH_FILE_DATA);
+        for (offset, page) in snapshot[SIZE_BYTES..].as_chunks_mut::<BLOCK>().0[..pages]
             .iter_mut()
             .enumerate()
         {
-            writer.read_committed_at(SCRATCH_FILE_BLOCK + index as u32, final_lsn, page)?;
+            let home = SCRATCH_FILE_BLOCK + offset as u32;
+            writer.read_committed_at(home, final_lsn, page)?;
+            writer.verify_replay_home(home, final_lsn, &old_data, page)?;
+            old_data.fill(0);
         }
         final_receipt(snapshot, size, write_seq, final_lsn)?
     };
@@ -638,35 +664,57 @@ pub(super) fn recover(
     // The required homes must be in their respective commits even
     // when an after-image matches its checkpoint bytes. Together with the
     // exact union count this excludes unapproved targets before replay.
-    verify_block(
-        &mut writer,
+    writer.verify_replay_home(
         volume::SECURITY_HOME,
         BOOT_COMMIT_LSN,
+        &manifest.security.encode()?,
         &state.encode()?,
     )?;
-    verify_block(
-        &mut writer,
+    writer.verify_replay_home(
         volume::BOOT_HOME,
         BOOT_COMMIT_LSN,
+        &BootEpochStoreV1 {
+            fs_uuid: volume::UUID,
+            boot_epoch: 0,
+        }
+        .encode()?,
         &BootEpochStoreV1 {
             fs_uuid: volume::UUID,
             boot_epoch: 1,
         }
         .encode()?,
     )?;
-    verify_block(
-        &mut writer,
+    writer.verify_replay_home(
         RECEIPTS_HOME,
         final_lsn,
+        &[0; BLOCK],
         image[..BLOCK].try_into().unwrap(),
     )?;
-    verify_block(
-        &mut writer,
+    writer.verify_replay_home(
         RECEIPTS_HOME + 1,
         final_lsn,
+        &[0; BLOCK],
         image[BLOCK..2 * BLOCK].try_into().unwrap(),
     )?;
-    verify_block(&mut writer, RECEIPTS_HOME + 6, index_lsn, &index)?;
+    writer.verify_replay_home(RECEIPTS_HOME + 6, index_lsn, &prior_index, &index)?;
+
+    let receipt_bound = receipt.status == BOUND_STATUS;
+    {
+        // Validate all untouched structure, ACL, and system homes alongside
+        // the verified redo image before recovery can change any block.
+        let mut view = writer.committed_view();
+        volume::validate_fsync_homes(
+            &mut view,
+            checkpoint,
+            config,
+            1,
+            file_size(receipt),
+            receipt_bound,
+        )?;
+        if receipt_bound {
+            volume::read_scratch_file(&mut view, &mut [0; BLOCK], mode, config.principals()[0])?;
+        }
+    }
 
     let mut mounted = None;
     let (chain, next) = writer.checkpoint_verified(|disk, selected| {
@@ -679,7 +727,7 @@ pub(super) fn recover(
             config,
             1,
             file_size(receipt),
-            receipt.status == BOUND_STATUS,
+            receipt_bound,
         )?);
         Ok(())
     })?;

@@ -4,27 +4,28 @@ use cyxia_contracts::tls_signer::{
     Request, SIGN_TIMEOUT_NS, SIGNATURE_BYTES, TRANSCRIPT_BYTES, WIRE_BYTES,
 };
 
-const SIGNER_ELF: &[u8] =
+pub(super) const SIGNER_ELF: &[u8] =
     include_bytes!("../../../../../target/aarch64-unknown-none/release/cyxia-echo-signer");
 const SIGNER_ASID: u8 = 0x41;
 const SIGNER_FRAMES: usize = 64;
 const SIGNER_STACK_PAGES: usize = 16;
 #[unsafe(link_section = ".bss.sec_n")]
+#[unsafe(export_name = "V020_SEC_N_SIGNER_SPACE_PAGES")]
 static mut SIGNER: AddressSpace<SIGNER_FRAMES, SIGNER_STACK_PAGES> = AddressSpace::ZERO;
 
-pub(crate) struct Signer {
+pub(crate) struct Signer<'a> {
     memory: Memory,
-    entry: u64,
-    identity: BootIdentity,
+    layout: Layout,
+    identity: BootIdentity<'a>,
     issued: Option<(Request, Option<[u8; SIGNATURE_BYTES]>)>,
 }
 
-impl Signer {
+impl<'a> Signer<'a> {
     pub(super) fn issued_for(&self, generation: u64) -> bool {
         matches!(self.issued, Some((request, Some(_))) if request.conn_generation == generation)
     }
 
-    pub(crate) fn load(identity: BootIdentity) -> Self {
+    pub(crate) fn load(identity: BootIdentity<'a>) -> Self {
         // SAFETY: the single CPU0 network owner loads this address space once.
         // Its key pages are separate from the verifier's virtual address space.
         let memory = unsafe { AddressSpace::memory(core::ptr::addr_of_mut!(SIGNER)) };
@@ -37,7 +38,7 @@ impl Signer {
         );
         Self {
             memory,
-            entry: layout.entry,
+            layout,
             identity,
             issued: None,
         }
@@ -68,11 +69,11 @@ impl Signer {
         // authorization before entering the signer; failure cannot issue a
         // second nonce for the same pending connection.
         let request = Request {
-            boot_epoch: self.identity.boot_epoch,
-            verifier_generation: self.identity.verifier_generation,
+            boot_epoch: self.identity.boot_epoch(),
+            verifier_generation: self.identity.verifier_generation(),
             conn_id: connection,
             conn_generation: connection,
-            key_generation: self.identity.key_generation,
+            key_generation: self.identity.tls().key_generation,
             nonce: 1,
             expires_ns,
             transcript_hash,
@@ -90,13 +91,25 @@ impl Signer {
         Some(signature)
     }
 
+    /// This one-shot network owner will never enter the stopped root
+    /// again. Seal off the loaded private key and scrub writable pages.
+    pub(crate) fn discard(self) {
+        let pages = discard_role_space(&self.memory, &self.layout);
+        report(
+            "V020_SEC_N_SIGNER_DISCARDED",
+            self.identity.boot_epoch(),
+            self.identity.tls().key_generation,
+            pages as u64,
+        );
+    }
+
     fn sign(&mut self, request: &Request) -> Option<[u8; SIGNATURE_BYTES]> {
         let mailbox = self.memory.shared.cast::<[u8; WIRE_BYTES]>();
         // SAFETY: the separate address space is stopped. Its only user of
         // the mailbox and private stack is entered synchronously below.
         unsafe { mailbox.write_volatile(request.encode()) };
         let mut ctx = user::Context::empty();
-        ctx.pc = self.entry;
+        ctx.pc = self.layout.entry;
         ctx.sp = STACK_VA + (SIGNER_STACK_PAGES * PAGE) as u64;
         // This EL1 pin is independent of both ELF images and the request.
         for (reg, bytes) in ctx.regs[..4].iter_mut().zip(LOCAL_NODE.chunks_exact(8)) {

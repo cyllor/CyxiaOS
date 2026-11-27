@@ -1,11 +1,14 @@
 """Independent replay of the signed scratch CPU0 trace."""
 
 import unittest
+from unittest.mock import patch
 
 from v0199_budget_trace import (
     ROLE_GRANTS, SIGNED_EARLY_TRACE_BYTES, SIGNED_FRAME_SPAN, SIGNED_HEADER, SIGNED_MAGIC,
     SIGNED_ROW, SIGNED_TRACE_BYTES, WINDOW, verify_signed_trace,
 )
+
+from verify_v020_signed_resident import capture_role_syscall_abi
 
 
 class SignedBudgetTraceTests(unittest.TestCase):
@@ -51,6 +54,14 @@ class SignedBudgetTraceTests(unittest.TestCase):
 
     def replay(self, epoch=2):
         return verify_signed_trace(self.evidence(), epoch, self.roles, (300, 1_000), self.uart)
+
+    def test_role_abi_readback_accepts_archived_elf_without_the_symbol(self):
+        missing = ValueError("missing symbol V020_SIGNED_ROLE_SYSCALL_ABI")
+        with patch("verify_v020_signed_resident.symbol", side_effect=missing):
+            self.assertEqual(capture_role_syscall_abi(None, None, b""), {})
+        with patch("verify_v020_signed_resident.symbol", return_value={"pa": 0x4000, "size": 14}):
+            with self.assertRaisesRegex(ValueError, "invalid linked role syscall ABI table"):
+                capture_role_syscall_abi(None, None, b"")
 
     def test_replays_eight_complete_windows_and_all_returned_role_turns(self):
         proof = self.replay()
