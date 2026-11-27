@@ -766,7 +766,8 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
     }
 
 
-def supervisor_copy_windows(elf, qmp, output, lines, *, snapshot_lists=None, file_copy=False):
+def supervisor_copy_windows(elf, qmp, output, lines, *, snapshot_lists=None, file_copy=False,
+                            audit_copy=False):
     window = symbol(elf, "__copy_window_l3")
     require = verify_smp.require
     counts = {}
@@ -783,6 +784,12 @@ def supervisor_copy_windows(elf, qmp, output, lines, *, snapshot_lists=None, fil
         reads, writes, closed = witnessed[0]
         require(reads > 0 and writes > 0 and closed == 1, "invalid file copy-window close counts")
         counts["file_copy_window"] = (reads, writes)
+    if audit_copy:
+        witnessed = w11_rows(lines, "V020_SEC_S_AUDIT_COPY_WINDOW")
+        require(len(witnessed) == 1, "missing one Supervisor audit copy-window witness")
+        reads, writes, closed = witnessed[0]
+        require(reads >= writes > 0 and closed == 1, "invalid audit copy-window close counts")
+        counts["audit_copy_window"] = (reads, writes)
     page = 4096
     root_index = 258
 
@@ -1017,12 +1024,13 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                         report["dense_frame_meta"] = dense_frame_meta(
                             qmp, output, lines, report["observations"]["frame_meta_permanent_rows"],
                         )
-                    if modes.snapshot_catalog or modes.file_read or modes.fsync_scratch:
+                    if modes.live_control or modes.snapshot_catalog or modes.file_read or modes.fsync_scratch:
                         report.update(supervisor_copy_windows(
                             elf.read_bytes(), qmp, output, lines,
                             snapshot_lists=(report["observations"]["snapshot_catalog_lists"]
                                             if modes.snapshot_catalog else None),
                             file_copy=modes.file_read or modes.fsync_scratch,
+                            audit_copy=modes.live_control,
                         ))
                     relay_bytes = report["observations"]["echo_bytes_relayed"]
                     if modes.authenticated_net:

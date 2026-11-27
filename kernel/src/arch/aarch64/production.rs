@@ -109,6 +109,7 @@ use cyxia_kernel_core::security::{
 use sha2::{Digest, Sha256};
 
 #[cfg(any(
+    feature = "v020-production-live-control",
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch"

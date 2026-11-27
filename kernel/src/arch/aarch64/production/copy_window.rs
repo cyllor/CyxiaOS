@@ -1,4 +1,4 @@
-//! CPU0 copy window for the authorized file and snapshot endpoints.
+//! CPU0 copy window for authorized Supervisor endpoints.
 //! The stack and page tables are pinned in the image for the entire boot.
 
 use super::{
@@ -32,8 +32,36 @@ unsafe extern "C" {
     static __copy_window_l3: u8;
 }
 
-static READ_CLOSED: AtomicU64 = AtomicU64::new(0);
-static WRITE_CLOSED: AtomicU64 = AtomicU64::new(0);
+struct ClosedCopies {
+    reads: AtomicU64,
+    writes: AtomicU64,
+}
+
+impl ClosedCopies {
+    const fn new() -> Self {
+        Self {
+            reads: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+        }
+    }
+
+    fn counts(&self) -> (u64, u64, bool) {
+        (
+            self.reads.load(Ordering::Relaxed),
+            self.writes.load(Ordering::Relaxed),
+            unsafe { window_entry().read_volatile() } == 0,
+        )
+    }
+}
+
+#[cfg(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch"
+))]
+static FILE_COPIES: ClosedCopies = ClosedCopies::new();
+#[cfg(feature = "v020-production-live-control")]
+static AUDIT_COPIES: ClosedCopies = ClosedCopies::new();
 
 /// A byte range checked against the stopped role's actual table walk and
 /// exclusive static stack owner. It carries no pointer usable by its caller.
@@ -43,15 +71,43 @@ pub(super) struct StackSpan {
     owner: Identity,
     root_asid: u64,
     write: bool,
+    closed: &'static ClosedCopies,
 }
 
 impl StackSpan {
+    #[cfg(any(
+        feature = "v020-production-snapshot-catalog",
+        feature = "v020-production-file-read",
+        feature = "v020-production-fsync-scratch"
+    ))]
     pub(super) fn verify(
         index: usize,
         member: NativeRole,
         address: u64,
         length: usize,
         write: bool,
+    ) -> Result<Self, i64> {
+        Self::verify_using(index, member, address, length, write, &FILE_COPIES)
+    }
+
+    #[cfg(feature = "v020-production-live-control")]
+    pub(super) fn verify_audit(
+        index: usize,
+        member: NativeRole,
+        address: u64,
+        length: usize,
+        write: bool,
+    ) -> Result<Self, i64> {
+        Self::verify_using(index, member, address, length, write, &AUDIT_COPIES)
+    }
+
+    fn verify_using(
+        index: usize,
+        member: NativeRole,
+        address: u64,
+        length: usize,
+        write: bool,
+        closed: &'static ClosedCopies,
     ) -> Result<Self, i64> {
         if super::ROLES.get(index) != Some(&Role::Supervisor)
             || member.role != Role::Supervisor
@@ -79,6 +135,7 @@ impl StackSpan {
             owner: member.actor,
             root_asid,
             write,
+            closed,
         })
     }
 
@@ -191,9 +248,9 @@ impl StackSpan {
             invalidating.map_err(|_| EFAULT)?;
             window.finish_teardown(true).map_err(|_| EFAULT)?;
             let closed = if self.write {
-                &WRITE_CLOSED
+                &self.closed.writes
             } else {
-                &READ_CLOSED
+                &self.closed.reads
             };
             closed.fetch_add(1, Ordering::Relaxed);
             if !exact {
@@ -221,10 +278,16 @@ unsafe extern "C" fn cyxia_revoke_copy_window(entry: *mut u64) {
     }
 }
 
+#[cfg(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch"
+))]
 pub(super) fn closed_counts() -> (u64, u64, bool) {
-    (
-        READ_CLOSED.load(Ordering::Relaxed),
-        WRITE_CLOSED.load(Ordering::Relaxed),
-        unsafe { window_entry().read_volatile() } == 0,
-    )
+    FILE_COPIES.counts()
+}
+
+#[cfg(feature = "v020-production-live-control")]
+pub(super) fn audit_closed_counts() -> (u64, u64, bool) {
+    AUDIT_COPIES.counts()
 }

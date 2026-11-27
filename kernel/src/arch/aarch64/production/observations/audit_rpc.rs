@@ -1,5 +1,6 @@
 //! Serialized CPU0 endpoint. The transport ACK retires the previous RPC;
 //! only an authenticated AUDIT_ACK retires a delivered recovery record.
+use super::super::copy_window::StackSpan;
 use super::*;
 
 pub(super) fn dispatch(index: usize, m: NativeRole, args: [u64; 6]) -> Result<(), RpcError> {
@@ -16,11 +17,12 @@ pub(super) fn dispatch(index: usize, m: NativeRole, args: [u64; 6]) -> Result<()
         _ => return Err(RpcError::Format),
     };
     let n = usize::try_from(args[5]).map_err(|_| RpcError::Fault)?;
-    let src = stack_span(index, args[1], len, false).ok_or(RpcError::Fault)?;
-    let dst = stack_span(index, args[4], n, true).ok_or(RpcError::Fault)?;
+    let src =
+        StackSpan::verify_audit(index, m, args[1], len, false).map_err(|_| RpcError::Fault)?;
+    let dst = StackSpan::verify_audit(index, m, args[4], n, true).map_err(|_| RpcError::Fault)?;
     let mut buf = [0; 96];
     let request = &mut buf[..len];
-    unsafe { core::ptr::copy_nonoverlapping(src as *const u8, request.as_mut_ptr(), len) };
+    src.copy_in(request).map_err(|_| RpcError::Fault)?;
     let req = Request::decode(request)?;
     let permission = match req.op {
         Op::AuditRead => AuxOperation::AuditRead,
@@ -90,7 +92,7 @@ pub(super) fn dispatch(index: usize, m: NativeRole, args: [u64; 6]) -> Result<()
         Admission::Acknowledged(_) => return Err(RpcError::Auth),
     };
     let wire = frame.bytes();
-    if !copy_reply(dst, wire) {
+    if !dst.copy_out_and_check(wire).map_err(|_| RpcError::Fault)? {
         return Err(RpcError::Fault);
     }
     if req.op == Op::AuditRead && wire.len() == Op::AuditRead.max_reply_len() {

@@ -38,6 +38,7 @@ pub(crate) use exceptions::hex;
 
 pub(crate) const HIGH: u64 = cyxia_platform_virt::HIGH_BASE;
 pub(crate) const SUPERVISOR_COPY_WINDOW: u8 = cfg!(any(
+    feature = "v020-production-live-control",
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch"

@@ -32,6 +32,7 @@ use super::{EXEC_TARGET, ExecTarget, PLAN_POOL, PLAN_POOL_BYTES, evidence};
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(any(
+    feature = "v020-production-live-control",
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch",
@@ -74,6 +75,7 @@ const FATAL_FRAME_META: u64 = 0x5731_1290;
 
 static mut ROWS_BACKING: [FrameMeta; ROWS] = [FrameMeta::ZERO; ROWS];
 #[cfg(any(
+    feature = "v020-production-live-control",
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch",
@@ -193,6 +195,7 @@ fn register_production_statics() -> Result<(Inventory, u64), Error> {
     let ledger = Ledger::initialize_static_sparse(rows, base, &regions).map_err(Error::Ledger)?;
     let inventory = ledger.inventory().map_err(Error::Ledger)?;
     #[cfg(any(
+        feature = "v020-production-live-control",
         feature = "v020-production-snapshot-catalog",
         feature = "v020-production-file-read",
         feature = "v020-production-fsync-scratch",
@@ -203,6 +206,7 @@ fn register_production_statics() -> Result<(Inventory, u64), Error> {
 }
 
 #[cfg(any(
+    feature = "v020-production-live-control",
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch",
@@ -215,6 +219,7 @@ fn install_ledger(ledger: Ledger<'static>) {
 }
 
 #[cfg(any(
+    feature = "v020-production-live-control",
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch",
@@ -232,6 +237,7 @@ fn native_ledger() -> Option<&'static RefCell<Ledger<'static>>> {
 }
 
 #[cfg(any(
+    feature = "v020-production-live-control",
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch"
