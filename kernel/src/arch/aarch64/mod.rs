@@ -68,6 +68,7 @@ core::arch::global_asm!(
     ram_tables_bytes = const cyxia_platform_virt::RAM_MIB / 2 * 4096,
     exec_stack_bytes = const BOOT_EXEC_STACK_BYTES,
     software_pan = const cfg!(feature = "v020-production") as u8,
+    snapshot_copy = const cfg!(feature = "v020-production-snapshot-catalog") as u8,
 );
 // Versioned loader contract, retained in the ELF's read-only load segment.
 #[used]

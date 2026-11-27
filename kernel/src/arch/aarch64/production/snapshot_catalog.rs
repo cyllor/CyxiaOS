@@ -2,10 +2,13 @@
 //!
 //! Only the stopped PIE caller's synchronous SVC and the CPU0 driver access
 //! STATE. The driver releases every borrow before entering EL0. Copy-in and
-//! copy-out use the checked EL1 aliases of that caller's private stack pages.
+//! copy-out use the CPU0 temporary TTBR1 window over the pinned role stack.
 
 use super::*;
-use core::ptr::{addr_of, addr_of_mut, copy_nonoverlapping};
+use core::ptr::{addr_of, addr_of_mut};
+#[path = "copy_window.rs"]
+mod copy_window;
+use copy_window::StackSpan;
 use cyxia_kernel_core::security::{
     file_media_unified_v1::{SNAP_MAX_REPLY_BYTES, SNAP_MAX_REQUEST_BYTES},
     file_service_v4::{REPLY_HEADER, REQUEST_HEADER},
@@ -143,13 +146,13 @@ fn check_grant(state: &mut State, member: NativeRole, cap: u64, selector: u64) -
 }
 
 struct Buffers {
-    source: u64,
-    dest: u64,
+    source: StackSpan,
+    dest: StackSpan,
     len: usize,
     overlap: bool,
 }
 
-fn checked_buffers(index: usize, args: [u64; 6]) -> Result<Buffers, i64> {
+fn checked_buffers(index: usize, member: NativeRole, args: [u64; 6]) -> Result<Buffers, i64> {
     let len = usize::try_from(args[2]).map_err(|_| E_FORMAT)?;
     if !(REQUEST_HEADER..=SNAP_MAX_REQUEST_BYTES).contains(&len) {
         return Err(E_FORMAT);
@@ -158,8 +161,8 @@ fn checked_buffers(index: usize, args: [u64; 6]) -> Result<Buffers, i64> {
     if !(REPLY_HEADER..=SNAP_MAX_REPLY_BYTES).contains(&reply_cap) {
         return Err(EFAULT);
     }
-    let source = stack_span(index, args[1], len, false).ok_or(EFAULT)?;
-    let dest = stack_span(index, args[4], reply_cap, true).ok_or(EFAULT)?;
+    let source = StackSpan::verify(index, member, args[1], len, false)?;
+    let dest = StackSpan::verify(index, member, args[4], reply_cap, true)?;
     // Both half-open ends were checked by stack_span.
     let overlap = args[1] < args[4] + args[5] && args[4] < args[1] + args[2];
     Ok(Buffers {
@@ -181,7 +184,7 @@ pub(super) fn reject_preflight(index: usize, member: NativeRole, args: [u64; 6])
     if let Err(error) = check_grant(state, member, cap, args[3]) {
         return error as u64;
     }
-    match checked_buffers(index, args) {
+    match checked_buffers(index, member, args) {
         Ok(buffers) if buffers.overlap && state.mounted() => {
             state.checks.rejected |= OVERLAP;
             EFAULT as u64
@@ -204,12 +207,12 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
     let cap = caller_cap(index, member, args[0])?;
     let state = unsafe { &mut *addr_of_mut!(STATE) };
     check_grant(state, member, cap, args[3])?;
-    let buffers = checked_buffers(index, args)?;
+    let buffers = checked_buffers(index, member, args)?;
     if buffers.overlap {
         return Err(EFAULT);
     }
     let mut wire = [0; SNAP_MAX_REQUEST_BYTES];
-    unsafe { copy_nonoverlapping(buffers.source as *const u8, wire.as_mut_ptr(), buffers.len) };
+    buffers.source.copy_in(&mut wire[..buffers.len])?;
     let wire = &wire[..buffers.len];
     #[cfg(feature = "v020-production-snapshot-read")]
     if matches!(
@@ -246,12 +249,8 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
     let reply = view
         .reply(request, grant.service_generation)
         .map_err(|_| E_FORMAT)?;
-    let dest = buffers.dest as *mut u8;
-    unsafe { copy_nonoverlapping(reply.as_ptr(), dest, reply.len()) };
-    for (offset, &byte) in reply.iter().enumerate() {
-        if unsafe { dest.add(offset).read_volatile() } != byte {
-            fatal(FATAL_CATALOG + 5);
-        }
+    if !buffers.dest.copy_out_and_check(&reply)? {
+        fatal(FATAL_CATALOG + 5);
     }
     if let Some(id) = state.checks.read_ids.get_mut(state.checks.read_count) {
         *id = request.request_id;
@@ -421,6 +420,16 @@ pub(super) fn drive(
     }
     report("V020_W16_CATALOG", boot, generation, reads);
     report("V020_W16_CATALOG_CHECKS", unready, rejected, stale);
+    let (read_windows, write_windows, closed) = copy_window::closed_counts();
+    if !closed || read_windows == 0 || write_windows < reads {
+        fatal(FATAL_CATALOG + 6);
+    }
+    report(
+        "V020_SEC_M_COPY_WINDOW",
+        read_windows,
+        write_windows,
+        u64::from(closed),
+    );
     report(
         "V020_W16_CATALOG_BINDING",
         service_generation,

@@ -50,6 +50,7 @@ import tempfile
 import time
 
 import verify_smp
+from check_elf import symbol
 from run_qemu import Qmp
 from qmp_stdio import PipeTransport
 from transport import FrameDecoder
@@ -114,6 +115,7 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/observations/audit_record.rs",
     "kernel/src/arch/aarch64/production/observations/audit_rpc.rs",
     "kernel/src/arch/aarch64/production/snapshot_catalog.rs",
+    "kernel/src/arch/aarch64/production/copy_window.rs",
     "kernel/src/platform/virt/net_device.rs",
     "crates/arch-aarch64/src/entry.S",
     "crates/arch-aarch64/src/secondary.S",
@@ -152,6 +154,7 @@ PRODUCTION_SOURCES = [
     "crates/kernel-core/src/security/file_read_v4.rs",
     "crates/kernel-core/src/security/snapshot_list_v4.rs",
     "crates/kernel-core/src/security/snapshot_read_v4.rs",
+    "crates/kernel-core/src/security/memory.rs",
     "crates/kernel-core/src/security/syscall_v3.rs",
     "crates/kernel-core/src/frame_meta_v0199.rs",
     "crates/kernel-core/src/frames.rs",
@@ -737,6 +740,53 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
     }
 
 
+def snapshot_copy_window(elf, qmp, output, lines, lists):
+    try:
+        window = symbol(elf, "__copy_window_l3")
+    except ValueError as error:
+        if str(error) == "missing symbol __copy_window_l3":
+            return None
+        raise
+    require = verify_smp.require
+    witnessed = w11_rows(lines, "V020_SEC_M_COPY_WINDOW")
+    require(len(witnessed) == 1, "missing one Supervisor copy-window witness")
+    reads, writes, closed = witnessed[0]
+    require(lists > 0 and writes == 2 * lists and reads >= writes and closed == 1,
+            "cross-page snapshot copy-window close counts differ")
+    page = 4096
+    root_index = 258
+
+    def read_table(label, address):
+        require(address % page == 0, "unaligned copy table")
+        path = output / ("copy-" + label + ".bin")
+        qmp.execute("pmemsave", {"val": address, "size": page, "filename": str(path)})
+        raw = path.read_bytes()
+        require(len(raw) == page, "incomplete copy table readback")
+        return struct.unpack("<512Q", raw)
+
+    cpu0 = symbol(elf, "high_l1")["pa"]
+    secondary = symbol(elf, "__copy_secondary_l1")["pa"]
+    mid = symbol(elf, "__copy_window_l2")["pa"]
+    leaf = window["pa"]
+    require(len({cpu0, secondary, mid, leaf}) == 4, "copy table pages alias")
+    primary = read_table("primary-l1", cpu0)
+    common = read_table("secondary-l1", secondary)
+    require(primary[root_index] == (mid | 3) and common[root_index] == 0,
+            "copy L2 is not exclusive to the CPU0 root")
+    require(primary[:root_index] == common[:root_index]
+            and primary[root_index + 1:] == common[root_index + 1:],
+            "secondary root differs outside the copy slot")
+    branch = read_table("l2", mid)
+    require(branch[0] == (leaf | 3) and not any(branch[1:]), "copy window has multiple branches")
+    require(not any(read_table("l3", leaf)), "temporary copy translation remained valid")
+    return {
+        "cpu0_root_pa": hex(cpu0), "secondary_root_pa": hex(secondary),
+        "copy_l2_pa": hex(mid), "copy_l3_pa": hex(leaf),
+        "read_only_fragments_closed": reads, "writable_fragments_closed": writes,
+        "copy_leaf_invalid": True, "secondary_copy_branch_absent": True,
+    }
+
+
 def source_manifest() -> dict:
     names = {}
     for name in PRODUCTION_SOURCES:
@@ -869,6 +919,13 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                     report["observations"] = acceptance.validate(
                         bytes(decoded), page, len(actual_cpus), pending_fsync_blocks=pending_fsync_blocks,
                         expected_fsync_epoch=expected_fsync_epoch)
+                    if modes.snapshot_catalog:
+                        copy = snapshot_copy_window(
+                            elf.read_bytes(), qmp, output, decoded.decode("ascii").splitlines(),
+                            report["observations"]["snapshot_catalog_lists"],
+                        )
+                        if copy is not None:
+                            report["snapshot_copy_window"] = copy
                     relay_bytes = report["observations"]["echo_bytes_relayed"]
                     if modes.authenticated_net:
                         require(peer is not None, "missing authenticated host peer")

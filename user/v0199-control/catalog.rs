@@ -62,8 +62,16 @@ pub(super) fn probe_operations(cap: u64, target: u64) {
 
 #[cfg(control_role = "11")]
 fn expect_list(id: u64) {
-    let mut wire = request(LIST, id, 0);
-    let mut reply = [SENTINEL; REPLY_BYTES];
+    // Exercise ordinary nonoverlapping LIST buffers crossing adjacent stack
+    // pages. Both spans start 16 bytes before distinct page boundaries.
+    const PAGE: usize = 4096;
+    let mut buffers = [SENTINEL; 2 * PAGE + REPLY_BYTES];
+    let base = buffers.as_ptr() as usize;
+    let start = (base + 16).next_multiple_of(PAGE) - base - 16;
+    let (input, output) = buffers.split_at_mut(start + PAGE);
+    let wire = &mut input[start..start + REQUEST_BYTES];
+    let reply = &mut output[..REPLY_BYTES];
+    wire.copy_from_slice(&request(LIST, id, 0));
     let outcome = invoke(
         LIST_SELECTOR,
         wire.as_mut_ptr(),
@@ -77,7 +85,7 @@ fn expect_list(id: u64) {
     put64(&mut expected, 8, id);
     put64(&mut expected, 16, EXPECTED_SERVICE_GENERATION);
     put64(&mut expected, 72, 1);
-    if outcome != 0 || reply != expected {
+    if outcome != 0 || reply != &expected {
         reject_startup();
     }
 }

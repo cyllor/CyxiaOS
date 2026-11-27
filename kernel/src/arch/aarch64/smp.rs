@@ -242,6 +242,7 @@ core::arch::global_asm!(
     max_cpus = const C,
     exec_stack_pages = const EXEC_STACK_BYTES / 4096,
     software_pan = const cfg!(feature = "v020-production") as u8,
+    snapshot_copy = const cfg!(feature = "v020-production-snapshot-catalog") as u8,
 );
 core::arch::global_asm!(
     include_str!("smp_user.S"),
