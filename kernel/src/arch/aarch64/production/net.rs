@@ -2,7 +2,7 @@
 //! production boot (evidence words 138..142).
 //!
 //! After the advice chain, CPU0 brings up the REAL `driver-virtio` BatchedNet
-//! (`net_device::init`), runs the smoltcp `tcp::Tcp` stream as a passive listener
+//! (`net_device::with_device`), runs the smoltcp `tcp::Tcp` stream as a passive listener
 //! on 10.0.2.15:7 (static IPv4, /24), and accepts one connection from the QEMU
 //! user-net gateway 10.0.2.2 on whatever source port it presents (open-peer
 //! accept: the peer port is pinned with `select_peer` on the first SYN). The
@@ -41,12 +41,13 @@
 
 use super::super::{report, sec_n_broker};
 use super::evidence;
-use crate::net_device::{self, NetDevice};
+use crate::net_device;
 use crate::virtio_platform::Board;
 use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_arch_aarch64::timer;
 use cyxia_contracts::BootInfo;
 use cyxia_driver_virtio::net::BatchedNet;
+use cyxia_driver_virtio::queue::RetainedState;
 use cyxia_driver_virtio::reset::{RESET_PROOF_BYTES, ResetProof};
 use cyxia_net_transport::device::{self, Port, VirtioPort};
 use cyxia_net_transport::tcp::{self, BUFFER_SIZE, Config, State, Storage, Tcp};
@@ -217,7 +218,7 @@ fn accept(stream: &mut Stream<'_>) -> Result<(u32, u64), AcceptFailure> {
 /// Build the listening stream over the device. One-shot: the SERVED swap is
 /// the only gate to the static stream buffers.
 fn open_stream<'a>(
-    dev: &'a mut NetDevice,
+    dev: &'a mut BatchedNet,
     storage: &'a mut [Storage<'a>; 1],
     random_seed: u64,
 ) -> Option<Stream<'a>> {
@@ -225,7 +226,7 @@ fn open_stream<'a>(
         return None;
     }
     let config = Config {
-        mac: dev.net.mac(),
+        mac: dev.mac(),
         local: LOCAL_IP,
         peer: [0; 4],
         prefix_len: PREFIX_LEN,
@@ -234,7 +235,7 @@ fn open_stream<'a>(
         random_seed,
     };
     let port = VirtioPort {
-        net: &mut dev.net,
+        net: dev,
         platform: &Board,
     };
     // SAFETY: one-shot (SERVED swap above) on CPU0; these are the only
@@ -298,9 +299,10 @@ fn relay(
 
 /// One-shot SEC-N service run on CPU0 (after the advice chain).
 pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity) -> NetOutcome {
-    // net_device::init is itself one-shot (CLAIMED) and CPU0-only.
-    let mut dev = match net_device::init(info) {
-        Ok(dev) => dev,
+    let outcome = match net_device::with_device(info, identity.boot_epoch, |dev| {
+        serve_attached_network(info, dev, identity)
+    }) {
+        Ok(outcome) => outcome,
         Err(error) => {
             super::super::super::log(b"V020_W11_NET_ABSENT device=0 tcp_echo=0\n");
             report(
@@ -312,16 +314,42 @@ pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity) -> Ne
             return NetOutcome::default();
         }
     };
-    let outcome = serve_attached_network(info, &mut dev, identity);
-    // The stream and its polling port have been dropped. The exclusive
-    // device owner freezes both queues before attempting the MMIO reset.
-    match dev.stop(identity.boot_epoch) {
+    let retained = match net_device::terminal_custody(identity.boot_epoch) {
+        Ok(retained) => retained,
+        Err(error) => {
+            report("V020_SEC_D_NET_RESET_UNCONFIRMED", error as u64, 0, 0);
+            return outcome;
+        }
+    };
+    match retained.reset {
         Ok(proofs) => {
             for proof in proofs {
                 emit_reset_proof(proof);
             }
         }
         Err(error) => report("V020_SEC_D_NET_RESET_UNCONFIRMED", error as u64, 0, 0),
+    }
+    let [rx, tx] = retained.chains;
+    report(
+        "V020_SEC_D_NET_RESET_CUSTODY",
+        identity.boot_epoch,
+        rx.iter().flatten().count() as u64,
+        tx.iter().flatten().count() as u64,
+    );
+    for (queue, chains) in [rx, tx].iter().enumerate() {
+        for chain in chains.iter().flatten() {
+            let record = match chain.state {
+                RetainedState::Private => "V020_SEC_D_NET_RESET_CHAIN_PRIVATE",
+                RetainedState::Published => "V020_SEC_D_NET_RESET_CHAIN_PUBLISHED",
+                RetainedState::Complete => "V020_SEC_D_NET_RESET_CHAIN_COMPLETE",
+            };
+            report(
+                record,
+                queue as u64,
+                chain.token.slot.into(),
+                chain.token.generation,
+            );
+        }
     }
     outcome
 }
@@ -349,7 +377,7 @@ fn serve_attached_network(
         allow(unused_variables)
     )]
     info: &BootInfo,
-    dev: &mut NetDevice,
+    dev: &mut BatchedNet,
     identity: sec_n_broker::BootIdentity,
 ) -> NetOutcome {
     #[cfg(feature = "v020-production-authenticated-net")]
@@ -404,7 +432,7 @@ fn serve_attached_network(
 }
 
 fn serve_stream(
-    dev: &mut NetDevice,
+    dev: &mut BatchedNet,
     identity: sec_n_broker::BootIdentity,
     random_seed: u64,
     entropy: &mut sec_n_broker::EntropyFill<'_>,

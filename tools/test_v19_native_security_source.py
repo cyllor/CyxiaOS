@@ -613,7 +613,8 @@ class NativeSecurityWiring(unittest.TestCase):
     def test_v020_wave11_sec_n_production_pins(self):
         arm = ROOT / "kernel/src/arch/aarch64"
         net = source(arm / "production/net.rs")
-        self.assertIn("net_device::init(", net)
+        self.assertIn("net_device::with_device(", net)
+        self.assertIn("net_device::terminal_custody(identity.boot_epoch)", net)
         self.assertNotIn("LoopbackPort", net)
         self.assertNotIn("RateLimiter", net)
         self.assertIn("evidence::W11_TLS_ECHO_TURN_VERIFIED, 0", net)

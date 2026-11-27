@@ -95,6 +95,8 @@ def w11_lines(staging: bool = False) -> list:
         proof = struct.pack("<IHHQIHHQQQIIQ", 0x43595250, 1, 64, 1, 1,
                             queue, 0, 1, 1, 1, 0, 0, 5_000_000)
         lines.append("V020_SEC_D_NET_RESET_PROOF " + proof.hex())
+    lines += ["V020_SEC_D_NET_RESET_CUSTODY a=1 b=1 c=0",
+              "V020_SEC_D_NET_RESET_CHAIN_PUBLISHED a=0 b=0 c=1"]
     if staging:
         listen = lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0")
         lines[listen:listen] = [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
@@ -228,6 +230,17 @@ class W11Validation(unittest.TestCase):
         self.rejects("reset proof is incomplete", lines=lines[:transmit] + lines[transmit + 1:])
         lines[transmit] = lines[receive]
         self.rejects("wrong generation or readback", lines=lines)
+
+    def test_native_net_requires_terminal_chain_custody_after_reset(self):
+        lines = w11_lines()
+        self.assertEqual(
+            self.check(lines=lines)["native_net_retained_chains"],
+            [{"queue_id": 0, "slot": 0, "generation": 1, "state": "published"}],
+        )
+        row = "V020_SEC_D_NET_RESET_CHAIN_PUBLISHED a=0 b=0 c=1"
+        self.rejects("retained chain counts", lines=[line for line in lines if line != row])
+        at = lines.index(row)
+        self.rejects("retained chain identity", lines=lines[:at] + [row] + lines[at:])
 
     def test_requires_policy_lock_accounting_consistent(self):
         for at, value in ((135, 0), (137, 3), (136, 1)):
@@ -584,6 +597,8 @@ class W11Validation(unittest.TestCase):
                 encoded = bytearray.fromhex(line.removeprefix(prefix))
                 struct.pack_into("<Q", encoded, 8, 2)
                 lines[index] = prefix + encoded.hex()
+            elif line.startswith("V020_SEC_D_NET_RESET_CUSTODY "):
+                lines[index] = "V020_SEC_D_NET_RESET_CUSTODY a=2 b=1 c=0"
         self.assertEqual(self.check(words=words, lines=lines, staging=True, modes=modes)
                          ["native_net_reset_boot_epoch"], 2)
         listen = "V020_W11_NET_LISTEN a=7 b=0 c=0"

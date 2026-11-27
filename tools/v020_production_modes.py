@@ -167,8 +167,25 @@ def net_reset_proofs(lines: list, *, boot_epoch: int = 1) -> dict:
                 and fields[-1] > 0, "native net ResetProof v1 has the wrong generation or readback")
         observations.append(fields[-1])
     require(observations[0] == observations[1], "net queues were not proved in one device reset")
+    custody = rows(lines, "V020_SEC_D_NET_RESET_CUSTODY")
+    require(len(custody) == 1 and custody[0][0] == boot_epoch,
+            "native net terminal custody is absent or belongs to another boot")
+    _, receive_count, transmit_count = custody[0]
+    seen = set()
+    retained = []
+    counts = [0, 0]
+    for state in ("private", "published", "complete"):
+        for queue, slot, generation in rows(lines, "V020_SEC_D_NET_RESET_CHAIN_" + state.upper()):
+            require(queue in (0, 1) and slot < 8 and generation > 0 and (queue, slot) not in seen,
+                    "native net retained chain identity is invalid")
+            seen.add((queue, slot))
+            counts[queue] += 1
+            retained.append({"queue_id": queue, "slot": slot, "generation": generation, "state": state})
+    require(counts == [receive_count, transmit_count] and receive_count > 0,
+            "native net retained chain counts differ")
     return {"native_net_reset_queue_ids": [0, 1], "native_net_reset_boot_epoch": boot_epoch,
-            "native_net_reset_observed_ns": observations[0]}
+            "native_net_reset_observed_ns": observations[0],
+            "native_net_retained_chains": sorted(retained, key=lambda entry: (entry["queue_id"], entry["slot"]))}
 
 
 def control_observations(words: tuple, lines: list, enabled: bool) -> dict:
