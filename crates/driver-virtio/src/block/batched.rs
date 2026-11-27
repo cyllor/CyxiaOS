@@ -320,33 +320,32 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         header[8..16].copy_from_slice(&sector.to_le_bytes());
         let payload = if kind == 1 { data.as_slice() } else { &[] };
         let writable = if kind == 0 { BYTES + 1 } else { 1 };
-        // Like the single-request block owner, require an explicit device
-        // status write. A correct used length alone is not proof of success.
-        let token = match self.queue.enqueue_parts(
-            &mut self.transport,
-            (&header, payload),
-            (writable, Some(0xff)),
-            synchronous || kind == 4,
-            isolated,
-            p,
-        ) {
-            Ok(token) => token,
-            Err(e) => {
-                if !matches!(e, Error::Busy | Error::Address) {
-                    self.fail(p);
-                }
-                return Err(e);
-            }
-        };
         let started = p.now_ms();
-        // u64::MAX is reserved for a fully verified, not-yet-acknowledged
-        // completion; accepting it as a start tick could forge that state.
+        // This value is reserved for a verified completion. Check before
+        // reserving DMA so a clock fault leaves no new device obligation.
         if started == COMPLETED_RETAINED {
             self.fail(p);
             return Err(Error::Timeout);
         }
-        self.pending[usize::from(token.slot)] = Some((token, operation, started));
-        Ok(token)
+        let pending = &mut self.pending;
+        // Like the single-request block owner, require an explicit device
+        // status write. A correct used length alone is not proof of success.
+        match self.queue.enqueue_parts(
+            &mut self.transport,
+            (&header, payload),
+            (writable, Some(0xff)),
+            synchronous || isolated || kind == 4,
+            p,
+            |token| pending[usize::from(token.slot)] = Some((token, operation, started)),
+        ) {
+            Ok(token) => Ok(token),
+            Err(e) => {
+                if !matches!(e, Error::Busy | Error::Address) {
+                    self.fail(p);
+                }
+                Err(e)
+            }
+        }
     }
     pub fn drain(&mut self, p: &impl Platform) -> Result<(), Error> {
         self.require_capacity(p)?;
@@ -458,6 +457,8 @@ mod tests {
         idle_clock: Cell<Option<u64>>,
         mmio: usize,
         reset_on_completion_ack: Cell<bool>,
+        needs_reset_on_prepare: Cell<bool>,
+        request_clock: Option<u64>,
         feature_banks: Option<[u32; 2]>,
         reject_features: bool,
         complete_mmio_reset: bool,
@@ -507,9 +508,13 @@ mod tests {
             }
         }
         fn now_ms(&self) -> u64 {
-            self.clock.get() / 1_000_000
+            self.request_clock.unwrap_or(self.clock.get() / 1_000_000)
         }
         fn now_ns(&self) -> u64 {
+            if self.needs_reset_on_prepare.replace(false) {
+                // The device requested a reset between reservation and drain.
+                unsafe { write_volatile((self.mmio + 0x70) as *mut u32, 15 | 64) };
+            }
             let now = self.clock.get();
             self.clock.set(now.saturating_add(self.clock_step_ns));
             now
@@ -526,6 +531,8 @@ mod tests {
             idle_clock: Cell::new(None),
             mmio: mmio.address(),
             reset_on_completion_ack: Cell::new(false),
+            needs_reset_on_prepare: Cell::new(false),
+            request_clock: None,
             feature_banks: None,
             reject_features: false,
             complete_mmio_reset: false,
@@ -574,6 +581,8 @@ mod tests {
             idle_clock: Cell::new(None),
             mmio: mmio.address(),
             reset_on_completion_ack: Cell::new(false),
+            needs_reset_on_prepare: Cell::new(false),
+            request_clock: None,
             feature_banks: Some([low, 1]),
             reject_features,
             complete_mmio_reset: false,
@@ -728,6 +737,51 @@ mod tests {
         assert_eq!(block.acknowledge(token), Err(Error::Response));
         assert_eq!(block.retained_requests(), (1, 0));
         assert_eq!(block.free(), block.capacity() - 1);
+    }
+
+    #[test]
+    fn drain_failure_during_begin_preserves_the_reserved_operation() {
+        for operation in [Operation::Read(0), Operation::Write(0), Operation::Flush] {
+            let (mut block, platform, _) = fixture();
+            platform.needs_reset_on_prepare.set(true);
+
+            assert_eq!(
+                block.begin(operation, &[0; 512], true, true, &platform),
+                Err(Error::Device)
+            );
+            assert_eq!(block.free(), block.capacity() - 1);
+            assert_eq!(block.notify_stats().published, 0);
+            block.fence_for_recovery();
+
+            let custody = block.terminal_custody().unwrap();
+            assert_eq!(block.retained_requests(), (1, 0));
+            assert_eq!(
+                custody.requests[0],
+                Some(RetainedBlock {
+                    token: Token {
+                        slot: 0,
+                        generation: 1
+                    },
+                    operation,
+                    completed: false,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn failed_request_clock_never_leaves_an_unrecorded_published_write() {
+        let (mut block, mut platform, _) = fixture();
+        platform.request_clock = Some(u64::MAX);
+
+        assert_eq!(
+            block.begin(Operation::Write(0), &[0; 512], true, true, &platform),
+            Err(Error::Timeout)
+        );
+        block.fence_for_recovery();
+        assert_eq!(block.notify_stats().published, 0);
+        assert_eq!(block.free(), block.capacity());
+        assert_eq!(block.retained_requests(), (0, 0));
     }
 
     #[test]

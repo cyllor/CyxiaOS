@@ -337,23 +337,24 @@ impl BatchQueue {
             t,
             (request, &[]),
             (writable, None),
-            synchronous,
-            isolated,
+            synchronous || isolated,
             p,
+            |_| {},
         )
     }
 
     /// Optionally initialize the final device-writable byte while the slot
     /// is still private. Block status must not inherit a successful zero
-    /// from initial allocation or the preceding release.
+    /// from initial allocation or the preceding release. Record the exact
+    /// reservation with the owner before any fallible drain can publish it.
     pub(crate) fn enqueue_parts(
         &mut self,
         t: &mut Transport,
         request: (&[u8], &[u8]),
         response: (usize, Option<u8>),
-        synchronous: bool,
-        isolated: bool,
+        force_publish: bool,
         p: &impl Platform,
+        record: impl FnOnce(Token),
     ) -> Result<Token, Error> {
         let (writable, tail) = response;
         if self.poisoned {
@@ -440,8 +441,8 @@ impl BatchQueue {
         };
         self.private[self.count] = Some(token);
         self.count += 1;
-        if synchronous
-            || isolated
+        record(token);
+        if force_publish
             || self.count >= usize::from(self.frozen_batch)
             || now.saturating_sub(self.first) >= MAX_DELAY_NS
         {
