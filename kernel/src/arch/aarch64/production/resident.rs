@@ -1,9 +1,9 @@
 //! Resident startup diagnostics for the AArch64 default image.
 //!
 //! Ordinary EL0 admission needs deployment startup authority, a verified
-//! durable BootEpoch, and the remaining startup checks. The source tree
-//! lacks the deployment inputs, so only the trusted diagnostic loop runs
-//! here in SECURE_DEGRADED.
+//! durable BootEpoch, and the remaining startup checks. When deployment
+//! inputs were pinned at build time, this path authenticates the signed
+//! envelope before running read-only SECURE_DEGRADED diagnostics.
 
 use super::{
     BootInfo, FAILURES, IRQS, ONLINE, Ordering, STOPPED, TIMER_IRQ, bring_up_production, cpu, gic,
@@ -16,9 +16,13 @@ use cyxia_kernel_core::{
     console::OutputQueue,
     control_plane::{
         Error,
-        role_budget_v0199::{Class, Cpu0BudgetLedger, Settlement},
+        role_budget_v0199::{Class, Cpu0BudgetLedger, Settlement, Turn},
     },
 };
+
+#[cfg(cyxia_startup_catalog)]
+#[path = "startup_catalog.rs"]
+mod startup_catalog;
 
 const STATUS: &[u8] = b"status";
 const DISCARD_LINE: usize = STATUS.len() + 1;
@@ -27,12 +31,12 @@ const TX_BYTES_PER_TURN: usize = 64;
 const CONSOLE_TURN_NS: u64 = 1_000_000;
 const DEGRADED_POLL_INTERVAL: u64 = 4;
 
-struct ConsoleBudget {
+struct ResidentBudget {
     ledger: Cpu0BudgetLedger,
     frequency: u64,
 }
 
-impl ConsoleBudget {
+impl ResidentBudget {
     fn now_ns(&self) -> Result<u64, Error> {
         u64::try_from(u128::from(timer::ticks()) * 1_000_000_000 / u128::from(self.frequency))
             .map_err(|_| Error::Clock)
@@ -53,15 +57,41 @@ impl ConsoleBudget {
             result => result?,
         };
         work();
+        self.settle(start, grant).map(Some)
+    }
+
+    fn settle(&mut self, start: u64, grant: Turn) -> Result<Settlement, Error> {
         let end = self.now_ns()?;
         // The generic counter provides a conservative elapsed-time debit
-        // for a foreground console turn, with one tick of rounding margin.
-        // Timer IRQ handling and WFI outside the turn are outside this scope.
+        // for a foreground turn, with one tick of rounding margin.
         let bound = end
             .checked_sub(start)
             .and_then(|delta| delta.checked_add(1_000_000_000u64.div_ceil(self.frequency)))
             .ok_or(Error::Clock)?;
-        self.ledger.settle(cpu, grant, bound, end).map(Some)
+        self.ledger.settle(cpu::slot(), grant, bound, end)
+    }
+
+    #[cfg(cyxia_startup_catalog)]
+    fn verify_startup_envelope(&mut self) -> Result<bool, Error> {
+        use cyxia_kernel_core::control_plane::role_budget_v0199::CLASS_LIMITS;
+        let prepaid = CLASS_LIMITS[Class::Recovery as usize];
+        let (started, grant) = loop {
+            let now = self.now_ns()?;
+            match self
+                .ledger
+                .reserve_kernel(cpu::slot(), Class::Recovery, prepaid, now)
+            {
+                Ok(grant) => break (now, grant),
+                Err(Error::Exhausted) => timer::idle(),
+                Err(error) => return Err(error),
+            }
+        };
+        let verified = startup_catalog::authenticate().is_ok();
+        let settlement = self.settle(started, grant)?;
+        if settlement.overrun || settlement.crossed_window {
+            return Err(Error::Exhausted);
+        }
+        Ok(verified)
     }
 }
 
@@ -132,14 +162,9 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     // configuration untouched, and this CPU exclusively owns diagnostic I/O.
     let mut uart = unsafe { Pl011::attach(resource) }.expect("resident console");
     let mut pending = OutputQueue::new();
-    enqueue_resident_frame(
-        &mut pending,
-        b"V020_STARTUP state=SECURE_DEGRADED reason=missing_startup_authority command=status\n",
-    )
-    .expect("resident startup frame");
     let frequency = timer::frequency();
     assert_ne!(frequency, 0);
-    let mut budget = ConsoleBudget {
+    let mut budget = ResidentBudget {
         ledger: Cpu0BudgetLedger::new(),
         frequency,
     };
@@ -152,9 +177,30 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         timer::arm(timer_deadline());
         timer::enable_irqs();
     }
+    #[cfg(not(cyxia_startup_catalog))]
+    let (startup_banner, budget_degraded): (&[u8], _) = (
+        b"V020_STARTUP state=SECURE_DEGRADED reason=missing_startup_authority command=status\n",
+        false,
+    );
+    #[cfg(cyxia_startup_catalog)]
+    let (startup_banner, budget_degraded): (&[u8], _) = match budget.verify_startup_envelope() {
+        Ok(true) => (
+            b"V020_STARTUP state=SECURE_DEGRADED reason=catalog_verified_pending command=status\n",
+            false,
+        ),
+        Ok(false) => (
+            b"V020_STARTUP state=SECURE_DEGRADED reason=catalog_rejected command=status\n",
+            false,
+        ),
+        Err(_) => (
+            b"V020_STARTUP state=SECURE_DEGRADED reason=catalog_budget command=status\n",
+            true,
+        ),
+    };
+    enqueue_resident_frame(&mut pending, startup_banner).expect("resident startup frame");
     let mut command = 0;
     let mut last_interrupt = 0;
-    let mut degraded = false;
+    let mut degraded = budget_degraded;
     let mut notice = None;
     let mut accounting_fault = false;
     loop {

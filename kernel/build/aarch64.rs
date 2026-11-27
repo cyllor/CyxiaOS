@@ -29,10 +29,13 @@ fn assets(directory: &std::path::Path, paths: &mut Vec<PathBuf>) {
         }
     }
 }
+#[path = "startup_catalog.rs"]
+mod startup_catalog;
 #[path = "v0199_roles.rs"]
 mod v0199_roles;
 
 pub fn build() {
+    startup_catalog::build();
     if env::var_os("CARGO_FEATURE_V0199_CONTROL_BRINGUP").is_some()
         || env::var_os("CARGO_FEATURE_V0199_EPOCH_DISK_SELFTEST").is_some()
         || env::var_os("CARGO_FEATURE_V020_PRODUCTION_DIAGNOSTIC").is_some()

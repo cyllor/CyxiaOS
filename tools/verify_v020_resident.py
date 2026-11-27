@@ -16,12 +16,15 @@ from v020_production_modes import rows
 from verify_smp import require
 
 
-READY = ("V020_STARTUP state=SECURE_DEGRADED reason=missing_startup_authority "
-         "command=status")
+STARTUP_REASONS = ("missing_startup_authority", "catalog_verified_pending",
+                   "catalog_rejected", "catalog_budget")
 
 
-def verify(elf: Path, output: Path, timeout: float) -> dict:
+def verify(elf: Path, output: Path, timeout: float,
+           startup_reason: str = STARTUP_REASONS[0]) -> dict:
     require(1 <= timeout <= 120, "invalid run timeout")
+    require(startup_reason in STARTUP_REASONS, "invalid expected startup state")
+    ready = f"V020_STARTUP state=SECURE_DEGRADED reason={startup_reason} command=status"
     output.mkdir(parents=True, exist_ok=False)
     binary = shutil.which("qemu-system-aarch64")
     require(binary is not None, "qemu-system-aarch64 is missing")
@@ -57,8 +60,9 @@ def verify(elf: Path, output: Path, timeout: float) -> dict:
             def status():
                 return rows(lines, "V020_RESIDENT_STATUS")
 
-            read_until(deadline, lambda: READY in lines)
-            require(lines.count(READY) == 1, "missing or repeated startup admission state")
+            read_until(deadline, lambda: any(line.startswith("V020_STARTUP ") for line in lines))
+            require([line for line in lines if line.startswith("V020_STARTUP ")] == [ready],
+                    "unexpected resident startup admission state")
             require(rows(lines, "SMP_BOOT_OK") == [(4, 15, 0)], "incomplete SMP startup")
             for expected in range(1, 4):
                 # An idle interval separates every host-initiated request. An
@@ -78,7 +82,8 @@ def verify(elf: Path, output: Path, timeout: float) -> dict:
             require(not any(line.startswith(("V020_PROD_", "V020_W11_NET_", "FAIL"))
                             for line in lines), "diagnostic fixture or hardware error in resident boot")
             require(proc.poll() is None, "QEMU exited after the last resident response")
-            report.update(status="PASS", replies=len(snapshots), timer_irqs=counts)
+            report.update(status="PASS", startup_reason=startup_reason,
+                          replies=len(snapshots), timer_irqs=counts)
         except (OSError, ValueError) as error:
             report["error"] = f"{type(error).__name__}: {error}"
         finally:
@@ -102,8 +107,10 @@ def main() -> int:
     parser.add_argument("--elf", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=20)
+    parser.add_argument("--expected-startup-reason", choices=STARTUP_REASONS,
+                        default=STARTUP_REASONS[0])
     args = parser.parse_args()
-    result = verify(args.elf, args.output, args.timeout)
+    result = verify(args.elf, args.output, args.timeout, args.expected_startup_reason)
     print(json.dumps(result, indent=2))
     return int(result["status"] != "PASS")
 

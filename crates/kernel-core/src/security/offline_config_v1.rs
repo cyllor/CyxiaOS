@@ -55,23 +55,28 @@ pub struct CatalogBindings {
     pub security_hash: [u8; 32],
     pub key_manifest_hash: [u8; 32],
 }
-pub struct VerifiedOfflineConfig<'a> {
+/// The signed envelope and independent catalog match. Payload policy lists
+/// still need semantic authorization before this can become a Config grant.
+pub(super) struct AuthenticatedEnvelope<'a> {
     header: ConfigHeader,
     principals: [Principal; 16],
-    digest: [u8; 32],
     wire: &'a [u8],
 }
-impl<'a> VerifiedOfflineConfig<'a> {
+pub struct VerifiedOfflineConfig<'a> {
+    envelope: AuthenticatedEnvelope<'a>,
+    digest: [u8; 32],
+}
+
+impl<'a> AuthenticatedEnvelope<'a> {
     /// Mandatory real strict Ed25519 verification; no production callback
     /// may manufacture signature success. Caller provides an exclusive
     /// accounted control-pool scratch span, not a ~64KiB kernel stack array.
     /// The signed message is label || header || payload, NOT its SHA256.
-    pub fn verify(
+    pub(super) fn verify(
         wire: &'a [u8],
         locked_public_key: &[u8; 32],
         catalog: CatalogBindings,
         scratch: &mut [u8],
-        verify_payload: impl FnOnce(&ConfigHeader, &[Principal; 16], &[u8]) -> Result<(), Error>,
     ) -> Result<Self, Error> {
         Self::verify_with(
             wire,
@@ -91,7 +96,6 @@ impl<'a> VerifiedOfflineConfig<'a> {
                 work.fill(0);
                 result
             },
-            verify_payload,
         )
     }
     // Only this module can substitute the verifier (unit tests exercise
@@ -101,7 +105,6 @@ impl<'a> VerifiedOfflineConfig<'a> {
         locked_public_key: &[u8; 32],
         catalog: CatalogBindings,
         verify_ed25519: impl FnOnce(&[u8; 32], &[u8], &[u8], &[u8; 64]) -> Result<(), Error>,
-        verify_payload: impl FnOnce(&ConfigHeader, &[Principal; 16], &[u8]) -> Result<(), Error>,
     ) -> Result<Self, Error> {
         if !(HEADER + 256 + SIGNATURE..=HEADER + MAX_PAYLOAD + SIGNATURE).contains(&wire.len())
             || u32at(wire, 0) != 0x43594f46
@@ -182,32 +185,69 @@ impl<'a> VerifiedOfflineConfig<'a> {
             &wire[..HEADER + n],
             wire[HEADER + n..].try_into().unwrap(),
         )?;
-        verify_payload(&header, &principals, &payload[256..])?;
         Ok(Self {
             header,
             principals,
-            digest: hash(wire),
             wire,
         })
     }
+    fn check_payload(
+        self,
+        check: impl FnOnce(&ConfigHeader, &[Principal; 16], &[u8]) -> Result<(), Error>,
+    ) -> Result<VerifiedOfflineConfig<'a>, Error> {
+        let lists = &self.wire[HEADER + 256..self.wire.len() - SIGNATURE];
+        check(&self.header, &self.principals, lists)?;
+        Ok(VerifiedOfflineConfig {
+            digest: hash(self.wire),
+            envelope: self,
+        })
+    }
+}
+
+impl<'a> VerifiedOfflineConfig<'a> {
+    /// Verify the envelope against the boot key and frozen catalog, then
+    /// require an independent owner to check each payload policy list.
+    pub fn verify(
+        wire: &'a [u8],
+        locked_public_key: &[u8; 32],
+        catalog: CatalogBindings,
+        scratch: &mut [u8],
+        verify_payload: impl FnOnce(&ConfigHeader, &[Principal; 16], &[u8]) -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        AuthenticatedEnvelope::verify(wire, locked_public_key, catalog, scratch)?
+            .check_payload(verify_payload)
+    }
+
+    #[cfg(test)]
+    fn verify_with(
+        wire: &'a [u8],
+        locked_public_key: &[u8; 32],
+        catalog: CatalogBindings,
+        verify_ed25519: impl FnOnce(&[u8; 32], &[u8], &[u8], &[u8; 64]) -> Result<(), Error>,
+        verify_payload: impl FnOnce(&ConfigHeader, &[Principal; 16], &[u8]) -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        AuthenticatedEnvelope::verify_with(wire, locked_public_key, catalog, verify_ed25519)?
+            .check_payload(verify_payload)
+    }
+
     pub fn header(&self) -> ConfigHeader {
-        self.header
+        self.envelope.header
     }
     pub fn principals(&self) -> &[Principal; 16] {
-        &self.principals
+        &self.envelope.principals
     }
     pub fn digest(&self) -> [u8; 32] {
         self.digest
     }
     pub fn wire(&self) -> &'a [u8] {
-        self.wire
+        self.envelope.wire
     }
     /// Only the exact already-confirmed config may start ordinary work.
     /// A higher signed config needs a separate real persistent transition;
     /// same generation + different hash is a rollback/conflict, never a
     /// new admission. No restart implicitly clears isolation bits.
     pub fn check_committed(&self, state: &SecurityStateStoreV2) -> Result<(), Error> {
-        let h = self.header;
+        let h = self.header();
         if h.fs_uuid != state.fs_uuid
             || h.generation < state.offline_config_generation
             || h.rule_generation < state.rule_min_generation
@@ -221,7 +261,7 @@ impl<'a> VerifiedOfflineConfig<'a> {
         {
             return Err(Error::Busy);
         }
-        if self.digest != state.offline_config_hash {
+        if self.digest() != state.offline_config_hash {
             return Err(Error::Conflict);
         }
         Ok(())
