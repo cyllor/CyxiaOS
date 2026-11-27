@@ -11,9 +11,10 @@
 //! synchronously on CPU0 after the business CPUs were stopped (staging) or
 //! while they only run the smp business fixture (format fixture); no IRQ
 //! handler or secondary CPU touches the queue (completion interrupts are off).
-//! * QUEUE (static mut BatchMemory): the device's DMA ring/bounce memory. One
-//!   `&mut` is created by `attach` and moved into the returned ScratchBlock;
-//!   `attach` is called at most once per boot. Under v020-production it lives
+//! * QUEUE (static mut BatchMemory): the device's DMA ring/bounce memory.
+//!   `attach` claims it once and retains the driver in DEVICE. Returning
+//!   from the service leaves the driver, tokens and queue in custody.
+//!   Under v020-production this storage lives
 //!   in the `.bss.sec_n` range registered as permanently pinned static Arena
 //!   pages. This accounts for the storage across requests, independently of
 //!   the device queue's per-request DMA ownership.
@@ -25,7 +26,10 @@
 //!   they never influence control flow or DMA.
 use super::*;
 use crate::virtio_platform::Board;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    mem::MaybeUninit,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use cyxia_driver_virtio::{
     Error as DriverError, Platform, Transport,
     block::{BatchedBlockIo, Operation, SECTOR_BYTES},
@@ -43,6 +47,9 @@ pub(crate) type ScratchBlock = BatchedBlockIo<TRANSFER_BYTES>;
 
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut QUEUE: BatchMemory = BatchMemory::zeroed();
+#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
+static mut DEVICE: MaybeUninit<ScratchBlock> = MaybeUninit::uninit();
+static CLAIMED: AtomicBool = AtomicBool::new(false);
 
 // First failure of a scratch request, kept so the caller can report the real
 // driver error instead of the collapsed `SecurityError::Unknown`.
@@ -142,6 +149,8 @@ pub(crate) enum AttachError {
     Geometry = 4,
     /// The bounded batch notify policy was refused.
     Policy = 5,
+    /// The boot's exclusive CPU0 owner already claimed the pinned queue.
+    Owner = 6,
 }
 
 fn select(info: &BootInfo) -> Result<Transport, AttachError> {
@@ -177,12 +186,14 @@ fn select(info: &BootInfo) -> Result<Transport, AttachError> {
 }
 
 /// Attach the one dedicated 512 MiB scratch block device. Call at most once.
-pub(crate) fn attach(info: &BootInfo) -> Result<ScratchBlock, AttachError> {
+pub(crate) fn attach(info: &BootInfo) -> Result<&'static mut ScratchBlock, AttachError> {
     let transport = select(info)?;
-    // SAFETY: attach is called at most once per boot on CPU0 (module header);
-    // this is the only &mut to QUEUE and it moves into the device.
+    if cpu::slot() != 0 || CLAIMED.swap(true, Ordering::AcqRel) {
+        return Err(AttachError::Owner);
+    }
+    // SAFETY: the one-shot CPU0 claim gives this call exclusive access to QUEUE.
     let queue = unsafe { &mut *core::ptr::addr_of_mut!(QUEUE) };
-    let mut device = ScratchBlock::attach_writable_exact(
+    let device = ScratchBlock::attach_writable_exact(
         transport,
         queue,
         u64::from(BLOCK_COUNT) * SECTORS_PER_BLOCK,
@@ -192,6 +203,13 @@ pub(crate) fn attach(info: &BootInfo) -> Result<ScratchBlock, AttachError> {
         DriverError::Response => AttachError::Geometry,
         _ => AttachError::Device,
     })?;
+    // SAFETY: only this call can initialize DEVICE. The returned borrow is
+    // exclusive, and no later attach can drop or reset its retained state.
+    let device = unsafe {
+        let slot = core::ptr::addr_of_mut!(DEVICE).cast::<ScratchBlock>();
+        slot.write(device);
+        &mut *slot
+    };
     // Bounded fixture notify policy: batch both requests for one block.
     // FLUSH requests stay synchronous regardless of the batch policy.
     let now = Board.now_ns();
@@ -230,6 +248,13 @@ fn finish_io(
     if result.is_err()
         && let Some(stop) = device.stop_failed_mmio(&Board)
     {
+        let (unknown, completed) = device.retained_requests();
+        report(
+            "V020_SEC_D_BLOCK_CUSTODY",
+            unknown as u64,
+            completed as u64,
+            u64::from(stop.is_ok()),
+        );
         // An early media error might precede a verified BootEpoch. Report
         // the device observation without claiming a bound durable receipt.
         match stop {

@@ -249,7 +249,7 @@ pub(super) fn ordinary_file_refusal() -> Option<i64> {
 /// EpochBlockIo adapter over the shared scratch plumbing, bounded to the
 /// 512 MiB v1 image, with device-operation counters.
 struct Disk {
-    device: scratch_blk::ScratchBlock,
+    device: &'static mut scratch_blk::ScratchBlock,
     reads: u64,
     writes: u64,
     flushes: u64,
@@ -259,7 +259,7 @@ impl EpochBlockIo for Disk {
         if block >= BLOCK_COUNT {
             return Err(SecurityError::Invalid);
         }
-        scratch_blk::sectors(&mut self.device, u64::from(block) * 8, None, out)?;
+        scratch_blk::sectors(self.device, u64::from(block) * 8, None, out)?;
         self.reads += 1;
         Ok(())
     }
@@ -269,7 +269,7 @@ impl EpochBlockIo for Disk {
         }
         let mut scratch = [0; BLOCK_BYTES];
         scratch_blk::sectors(
-            &mut self.device,
+            self.device,
             u64::from(block) * 8,
             Some(data),
             &mut scratch,
@@ -278,7 +278,7 @@ impl EpochBlockIo for Disk {
         Ok(())
     }
     fn flush(&mut self) -> Result<(), SecurityError> {
-        scratch_blk::flush(&mut self.device)?;
+        scratch_blk::flush(self.device)?;
         self.flushes += 1;
         Ok(())
     }
@@ -436,8 +436,7 @@ fn run_chain(
         if committed.last_boot_epoch != out.confirmed_epoch {
             return None;
         }
-        out.network_boot =
-            super::super::sec_n_broker::BootIdentity::from_signed_scratch(&committed);
+        out.network_boot = super::super::sec_n_broker::BootIdentity::from_signed_scratch(&committed);
         out.receipt_query_digest =
             Some(volume::confirmed_receipt_query_digest(&mounted, &committed, &verified).ok()?);
         #[cfg(all(

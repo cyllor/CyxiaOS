@@ -147,6 +147,22 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
             && self.pending.iter().all(Option::is_none)
             && self.queue.is_quiescent()
     }
+
+    /// Requests without a verified completion, then verified requests still
+    /// held for acknowledgement. Reset alone changes neither count.
+    pub fn retained_requests(&self) -> (usize, usize) {
+        self.pending
+            .iter()
+            .flatten()
+            .fold((0, 0), |(unknown, completed), (_, _, state)| {
+                if *state == COMPLETED_RETAINED {
+                    (unknown, completed + 1)
+                } else {
+                    (unknown + 1, completed)
+                }
+            })
+    }
+
     pub fn free(&self) -> usize {
         self.queue.free()
     }
@@ -599,6 +615,7 @@ mod tests {
         assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (0, 0));
         assert_eq!(block.stop_failed_mmio(&platform), None);
         assert_eq!(block.acknowledge(token), Err(Error::Response));
+        assert_eq!(block.retained_requests(), (1, 0));
         assert_eq!(block.free(), block.capacity() - 1);
     }
 
