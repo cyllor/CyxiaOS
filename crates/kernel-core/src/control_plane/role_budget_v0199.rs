@@ -482,9 +482,9 @@ impl Cpu0BudgetLedger {
     /// eight-entry scan and no authority derived from the index alone.
     #[inline]
     #[allow(clippy::too_many_arguments)]
-    pub fn reserve_indexed_role_with_wall(
+    pub fn reserve_indexed_role_with_wall<const SERVICES: bool>(
         &mut self,
-        manifest: &ValidatedRoleManifest<'_>,
+        manifest: &ValidatedRoleManifest<'_, SERVICES>,
         index: usize,
         actor: Identity,
         cpu: usize,
@@ -926,6 +926,47 @@ mod tests {
             other_control_ns_per_100ms: 10_000_000,
         }
     }
+    #[test]
+    fn lifecycle_dispatch_requires_an_unprivileged_manifest_and_prepaid_turn() {
+        let mut m = manifest();
+        assert!(m.validated_lifecycle().is_err());
+        for member in &mut m.members {
+            member.actor.id = u64::from(member.role.id());
+            member.caps = 0;
+            member.endpoint_id = 0;
+        }
+        assert!(m.validated().is_err());
+        let lifecycle = m.validated_lifecycle().unwrap();
+        let controller = m.members[2];
+        let mut ledger = Cpu0BudgetLedger::new();
+        assert_eq!(
+            ledger.reserve_indexed_role_with_wall(
+                &lifecycle, 2, controller.actor, 1, Class::Decision, 1, 250_000, 1_000_000, 100,
+            ),
+            Err(Error::Denied)
+        );
+        let reserved = ledger
+            .reserve_indexed_role_with_wall(
+                &lifecycle, 2, controller.actor, 0, Class::Decision, 1, 250_000, 1_000_000, 100,
+            )
+            .unwrap();
+        assert_eq!(
+            reserved.accounting_scope(),
+            (Class::Decision, Some((2, controller.actor)), 1),
+        );
+        ledger.settle(0, reserved, 100, 200).unwrap();
+        assert_eq!(ledger.spent(Class::Decision), 100);
+
+        m.members[2].caps = controller.role.allowed_caps();
+        assert!(m.validated_lifecycle().is_err());
+        m.members[2].caps = 0;
+        m.members[2].endpoint_id = 11;
+        assert!(m.validated_lifecycle().is_err());
+        m.members[2].endpoint_id = 0;
+        m.members[2].actor.id = 20;
+        assert!(m.validated_lifecycle().is_err());
+    }
+
     #[test]
     fn continuous_accounting_cannot_skip_unsampled_interval_for_a_new_grant() {
         let m = manifest();

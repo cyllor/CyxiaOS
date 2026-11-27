@@ -148,11 +148,20 @@ fn seal_page(pa: u64) {
     }
     tlbi();
 }
+pub(super) enum RoleLaunch {
+    #[cfg(cyxia_signed_resident)]
+    Lifecycle,
+    #[cfg(feature = "v020-production-diagnostic")]
+    Diagnostic {
+        cap_selector: u64,
+        target_selector: u64,
+    },
+}
+
 pub(super) fn load_role_with_identity(
     index: usize,
     generation: u64,
-    cap_selector: u64,
-    target_selector: u64,
+    launch: RoleLaunch,
 ) -> NativeRole {
     let role = ROLES[index];
     let pkg = &CATALOG[index];
@@ -162,7 +171,20 @@ pub(super) fn load_role_with_identity(
         id: u64::from(role.id()),
         generation,
     };
-    let endpoint = 0xC000 + index as u64;
+    let (cap_selector, target_selector, caps, endpoint_id) = match launch {
+        #[cfg(cyxia_signed_resident)]
+        RoleLaunch::Lifecycle => (0u64, 0u64, 0, 0),
+        #[cfg(feature = "v020-production-diagnostic")]
+        RoleLaunch::Diagnostic {
+            cap_selector,
+            target_selector,
+        } => (
+            cap_selector,
+            target_selector,
+            role.allowed_caps(),
+            0xC000 + index as u64,
+        ),
+    };
     let b = backing(index);
     let t = tables(index);
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!(COPY_BUFFER.0) };
@@ -271,11 +293,11 @@ pub(super) fn load_role_with_identity(
             base: phys(b as u64),
             bytes: core::mem::size_of::<Backing>() as u64,
         },
-        caps: role.allowed_caps(),
+        caps,
         control_ns_per_100ms: 2_000_000,
         cpu_mask: profile::CONTROL_MASK,
         thread_count: 1,
-        endpoint_id: endpoint,
+        endpoint_id,
     }
 }
 static PIE_ENTRY: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
