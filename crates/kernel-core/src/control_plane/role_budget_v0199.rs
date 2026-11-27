@@ -67,6 +67,14 @@ pub struct MeasuredSegment {
     pub end_ns: u64,
     pub cpu_ns: u64,
 }
+impl MeasuredSegment {
+    fn follows(self, cursor: u64) -> bool {
+        self.start_ns == cursor
+            && self.end_ns > cursor
+            && self.cpu_ns <= self.end_ns - cursor
+            && cursor / WINDOW_NS == (self.end_ns - 1) / WINDOW_NS
+    }
+}
 #[derive(Clone)]
 pub struct Cpu0BudgetLedger {
     window: Option<u64>,
@@ -277,10 +285,7 @@ impl Cpu0BudgetLedger {
         let mut cursor = start;
         let mut total = 0u64;
         for segment in segments {
-            if segment.start_ns != cursor
-                || segment.end_ns <= segment.start_ns
-                || segment.start_ns / WINDOW_NS != (segment.end_ns - 1) / WINDOW_NS
-            {
+            if !segment.follows(cursor) {
                 return Err(Error::Clock);
             }
             total = total.checked_add(segment.cpu_ns).ok_or(Error::Exhausted)?;
@@ -677,10 +682,7 @@ impl Cpu0BudgetLedger {
         let mut cursor = start;
         let mut total = 0u64;
         for s in segments {
-            if s.start_ns != cursor
-                || s.end_ns <= s.start_ns
-                || s.start_ns / WINDOW_NS != (s.end_ns - 1) / WINDOW_NS
-            {
+            if !s.follows(cursor) {
                 return Err(Error::Clock);
             }
             total = total.checked_add(s.cpu_ns).ok_or(Error::Exhausted)?;
@@ -1072,6 +1074,42 @@ mod tests {
         assert!(q.ordinary_closed());
         assert_eq!(q.lifetime_total(), Ok(3_500_001));
     }
+
+    #[test]
+    fn an_impossible_exact_segment_cannot_consume_coordination_or_settle_a_turn() {
+        let mut q = Cpu0BudgetLedger::new();
+        q.start_continuous(0, 100, || Ok(())).unwrap();
+        let impossible = [MeasuredSegment {
+            start_ns: 100,
+            end_ns: 101,
+            cpu_ns: 2,
+        }];
+        assert_eq!(
+            q.account_exact_coordination(0, &impossible, 2, |_, _| Ok(())),
+            Err(Error::Clock)
+        );
+        let turn = q.reserve_kernel(0, Class::Coordination, 10, 100).unwrap();
+        assert_eq!(
+            q.settle_measured(0, turn, &impossible, 2, |_, _| Ok(())),
+            Err(Error::Clock)
+        );
+        assert_eq!(q.lifetime_total(), Ok(0));
+        assert_eq!(
+            q.reserve_kernel(0, Class::Recovery, 1, 100),
+            Err(Error::Busy)
+        );
+        let possible = [MeasuredSegment {
+            cpu_ns: 1,
+            ..impossible[0]
+        }];
+        assert_eq!(
+            q.settle_measured(0, turn, &possible, 1, |_, _| Ok(()))
+                .unwrap()
+                .actual_ns,
+            1
+        );
+    }
+
     #[test]
     fn fixed_categories_share_single_cpu_and_recovery_cannot_be_borrowed() {
         let m = manifest();
