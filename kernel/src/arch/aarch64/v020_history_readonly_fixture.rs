@@ -3,13 +3,10 @@
 //! actual ACL and archived bytes read from an isolated VirtIO device.
 
 use super::{BootInfo, cpu, report, scratch_blk};
-use crate::virtio_platform::Board;
-use cyxia_driver_virtio::{Transport, queue::BatchMemory};
 use cyxia_kernel_core::security::{
-    Error,
     boot_epoch_v1::BootEpochStoreV1,
     file_media_unified_v1::{
-        BLOCK_COUNT, DATA_START, SNAP_CAP_HISTORY_READ, SUPER_BYTES,
+        DATA_START, SNAP_CAP_HISTORY_READ, SUPER_BYTES,
         catalog_candidate::CatalogContext,
         history_candidate::{HistoryCaller, HistoryReadGrant, HistorySource, read_history},
         slot_candidate::SlotIdentity,
@@ -30,48 +27,12 @@ const DATA_SHA256: [u8; 32] = [
     0xa8, 0xa5, 0x46, 0x89, 0x89, 0x8b, 0xed, 0xd7, 0x47, 0x4e, 0xe8, 0xec, 0xe5, 0x1d, 0x51, 0xc4,
 ];
 
-static mut DMA: BatchMemory = BatchMemory::zeroed();
-
-fn attach(info: &BootInfo) -> Result<scratch_blk::ScratchBlock, Error> {
-    let mut selected = None;
-    for resource in info.virtio.get(..info.virtio_count).ok_or(Error::Invalid)? {
-        let base = resource.base.0;
-        if base < 0x0a000000
-            || base
-                .checked_add(resource.len)
-                .is_none_or(|end| end > 0x0a200000)
-        {
-            continue;
-        }
-        // SAFETY: the range is inside the DTB-described mapped VirtIO aperture.
-        let Ok(transport) =
-            (unsafe { Transport::attach((crate::HIGH + base) as usize, resource.len as usize) })
-        else {
-            continue;
-        };
-        if transport.device_id() == 2 && selected.replace(transport).is_some() {
-            return Err(Error::Conflict);
-        }
-    }
-    // SAFETY: CPU0 enters this terminal fixture once. DMA stays pinned.
-    let dma = unsafe { &mut *core::ptr::addr_of_mut!(DMA) };
-    let mut disk = scratch_blk::ScratchBlock::attach(selected.ok_or(Error::Invalid)?, dma, &Board)
-        .map_err(|_| Error::Unknown)?;
-    if !disk.read_only() || disk.sectors() != u64::from(BLOCK_COUNT) * 8 {
-        return Err(Error::Unauthorized);
-    }
-    let now = cyxia_driver_virtio::Platform::now_ns(&Board);
-    disk.set_notify_policy(2, 1, now.saturating_add(1_000_000_000), now)
-        .map_err(|_| Error::Invalid)?;
-    Ok(disk)
-}
-
 pub(super) fn run(info: &BootInfo) -> ! {
     assert_eq!(cpu::slot(), 0);
-    let mut disk = attach(info).expect("one read-only test device");
+    let disk = scratch_blk::attach_readonly(info).expect("one read-only test device");
     let mut reads = 0u64;
     let mut read = |block: u32, out: &mut [u8; SUPER_BYTES]| {
-        scratch_blk::sectors(&mut disk, u64::from(block) * 8, None, out)?;
+        scratch_blk::sectors(disk, u64::from(block) * 8, None, out)?;
         reads += 1;
         Ok(())
     };

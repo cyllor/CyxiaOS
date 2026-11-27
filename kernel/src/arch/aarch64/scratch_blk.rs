@@ -1,13 +1,13 @@
 //! Dedicated scratch VirtIO-blk plumbing shared by the V0.19.9 §9.2.1 format
-//! fixture (`v0199_format_fixture.rs`) and the V0.20 wave-11 opt-in media
-//! staging lane (`production/media_staging.rs`).
+//! fixture (`v0199_format_fixture.rs`), V0.20 media staging
+//! (`production/media_staging.rs`), and the read-only history fixture.
 //!
 //! Each 4 KiB block is transferred in two contiguous four-sector requests.
 //! Each request has its own validated and acknowledged device completion.
 //! The lane uses synchronous isolated FLUSH for durability boundaries.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
-//! Global invariant: both callers assert cpu::slot()==0 and drive the device
+//! Global invariant: callers assert cpu::slot()==0 and drive the device
 //! synchronously on CPU0 after the business CPUs were stopped (staging) or
 //! while they only run the smp business fixture (format fixture); no IRQ
 //! handler or secondary CPU touches the queue (completion interrupts are off).
@@ -143,7 +143,7 @@ pub(crate) enum AttachError {
     Absent = 1,
     /// More than one block device: the scratch target is ambiguous.
     Ambiguous = 2,
-    /// Not a writable modern VirtIO device with FLUSH.
+    /// The modern VirtIO, access mode or FLUSH requirements were not met.
     Device = 3,
     /// Not exactly 512 MiB.
     Geometry = 4,
@@ -187,13 +187,33 @@ fn select(info: &BootInfo) -> Result<Transport, AttachError> {
 
 /// Attach the one dedicated 512 MiB scratch block device. Call at most once.
 pub(crate) fn attach(info: &BootInfo) -> Result<&'static mut ScratchBlock, AttachError> {
+    attach_with(info, ScratchBlock::attach_writable_exact, 120_000_000_000)
+}
+
+/// Take custody of the one read-only 512 MiB archive without publishing a
+/// DMA queue when the device has the wrong access mode or geometry.
+#[cfg(feature = "v020-history-readonly-selftest")]
+pub(crate) fn attach_readonly(info: &BootInfo) -> Result<&'static mut ScratchBlock, AttachError> {
+    attach_with(info, ScratchBlock::attach_readonly_exact, 1_000_000_000)
+}
+
+fn attach_with(
+    info: &BootInfo,
+    attach_device: impl FnOnce(
+        Transport,
+        &'static mut BatchMemory,
+        u64,
+        &Board,
+    ) -> Result<ScratchBlock, DriverError>,
+    deadline_ns: u64,
+) -> Result<&'static mut ScratchBlock, AttachError> {
     let transport = select(info)?;
     if cpu::slot() != 0 || CLAIMED.swap(true, Ordering::AcqRel) {
         return Err(AttachError::Owner);
     }
     // SAFETY: the one-shot CPU0 claim gives this call exclusive access to QUEUE.
     let queue = unsafe { &mut *core::ptr::addr_of_mut!(QUEUE) };
-    let device = ScratchBlock::attach_writable_exact(
+    let device = attach_device(
         transport,
         queue,
         u64::from(BLOCK_COUNT) * SECTORS_PER_BLOCK,
@@ -214,7 +234,7 @@ pub(crate) fn attach(info: &BootInfo) -> Result<&'static mut ScratchBlock, Attac
     // FLUSH requests stay synchronous regardless of the batch policy.
     let now = Board.now_ns();
     device
-        .set_notify_policy(2, 1, now.saturating_add(120_000_000_000), now)
+        .set_notify_policy(2, 1, now.saturating_add(deadline_ns), now)
         .map_err(|_| AttachError::Policy)?;
     device.set_completion_interrupts(false, &Board);
     Ok(device)

@@ -37,7 +37,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         memory: &'static mut BatchMemory,
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        Self::attach_inner::<false>(t, memory, None, p)
+        Self::attach_inner(t, memory, None, None, p)
     }
 
     /// Attach a writable device using only VERSION_1 and FLUSH. A read-only
@@ -47,7 +47,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         memory: &'static mut BatchMemory,
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        Self::attach_inner::<true>(t, memory, None, p)
+        Self::attach_inner(t, memory, Some(false), None, p)
     }
 
     /// Require a writable device with the admitted geometry before publishing
@@ -58,12 +58,24 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         sectors: u64,
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        Self::attach_inner::<true>(t, memory, Some(sectors), p)
+        Self::attach_inner(t, memory, Some(false), Some(sectors), p)
     }
 
-    fn attach_inner<const WRITABLE_ONLY: bool>(
+    /// Require a read-only device with the admitted geometry before publishing
+    /// the DMA queue for an archived volume.
+    pub fn attach_readonly_exact(
+        t: Transport,
+        memory: &'static mut BatchMemory,
+        sectors: u64,
+        p: &impl Platform,
+    ) -> Result<Self, Error> {
+        Self::attach_inner(t, memory, Some(true), Some(sectors), p)
+    }
+
+    fn attach_inner(
         mut t: Transport,
         memory: &'static mut BatchMemory,
+        expected_read_only: Option<bool>,
         expected_sectors: Option<u64>,
         p: &impl Platform,
     ) -> Result<Self, Error> {
@@ -89,16 +101,15 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         p.barrier();
         let features = t.device_features();
         let read_only = features & READ_ONLY != 0;
-        if !modern || features & FLUSH == 0 || (WRITABLE_ONLY && read_only) {
+        if !modern
+            || features & FLUSH == 0
+            || expected_read_only.is_some_and(|expected| expected != read_only)
+        {
             t.fail();
             return Err(Error::Features);
         }
         t.select_driver_features(0);
-        t.set_driver_features(if WRITABLE_ONLY {
-            FLUSH
-        } else {
-            features & (FLUSH | READ_ONLY)
-        });
+        t.set_driver_features(features & (FLUSH | READ_ONLY));
         t.select_driver_features(1);
         t.set_driver_features(1);
         t.set_status(11);
@@ -580,6 +591,34 @@ mod tests {
                 .begin(Operation::Read(0), &[0; 512], true, true, &platform)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn exact_readonly_attach_checks_access_and_geometry_before_dma() {
+        const ARCHIVE_SECTORS: u64 = 1_048_576;
+        for (features, sectors, expected_error) in [
+            (FLUSH, ARCHIVE_SECTORS, Some(Error::Features)),
+            (FLUSH | READ_ONLY, 4096, Some(Error::Response)),
+            (FLUSH | READ_ONLY, ARCHIVE_SECTORS, None),
+        ] {
+            let (mmio, platform, memory) = attach_fixture(features, false);
+            mmio.put32(0x100, sectors as u32);
+            let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+            let result =
+                BatchedBlock::attach_readonly_exact(transport, memory, ARCHIVE_SECTORS, &platform);
+            if let Some(error) = expected_error {
+                assert_eq!(result.err(), Some(error));
+                assert_eq!(mmio.get32(0x44), 0);
+                for register in [0x80, 0x84, 0x90, 0x94, 0xa0, 0xa4] {
+                    assert_eq!(mmio.get32(register), 0);
+                }
+            } else {
+                let driver = result.unwrap();
+                assert!(driver.read_only());
+                assert_eq!(driver.sectors(), ARCHIVE_SECTORS);
+                assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (15, 1));
+            }
+        }
     }
 
     #[test]
