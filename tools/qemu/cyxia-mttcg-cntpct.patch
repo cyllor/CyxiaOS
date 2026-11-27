@@ -1,0 +1,93 @@
+diff --git a/target/arm/cpregs.h b/target/arm/cpregs.h
+index 48a406a..186e1f5 100644
+--- a/target/arm/cpregs.h
++++ b/target/arm/cpregs.h
+@@ -149,6 +149,11 @@ enum {
+      * should not trap to EL2 when HCR_EL2.NV is set.
+      */
+     ARM_CP_NV_NO_TRAP            = 1 << 22,
++    /*
++     * Flag: keep the I/O TB boundary, but the 64-bit read hook does not
++     * need the BQL. Use only for read hooks with their own synchronization.
++     */
++    ARM_CP_IO_READ_NO_BQL        = 1 << 23,
+ };
+
+ /*
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index 5d31c55..7f6dfe7 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -23,6 +23,7 @@
+ #include "hw/irq.h"
+ #include "system/cpu-timers.h"
+ #include "exec/icount.h"
++#include "exec/replay-core.h"
+ #include "system/kvm.h"
+ #include "system/tcg.h"
+ #include "qapi/error.h"
+@@ -2021,6 +2022,29 @@ void arm_gt_hvtimer_cb(void *opaque)
+     gt_recalc_timer(cpu, GTIMER_HYPVIRT);
+ }
+
++static void gt_define_cntpct_el0(ARMCPU *cpu)
++{
++    ARMCPRegInfo reg = {
++        .name = "CNTPCT_EL0", .state = ARM_CP_STATE_AA64,
++        .opc0 = 3, .opc1 = 3, .crn = 14, .crm = 0, .opc2 = 1,
++        .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO,
++        .accessfn = gt_pct_access, .readfn = gt_cnt_read,
++    };
++
++#ifdef CONFIG_TCG
++    /*
++     * Realtime MTTCG reads only vCPU-local state and the seqlock-protected
++     * VM clock, so its read hook does not need BQL serialization.
++     * Instruction counting and replay retain their original behavior.
++     */
++    if (tcg_enabled() && qemu_tcg_mttcg_enabled() &&
++        !icount_enabled() && replay_mode == REPLAY_MODE_NONE) {
++        reg.type |= ARM_CP_IO_READ_NO_BQL;
++    }
++#endif
++    define_one_arm_cp_reg(cpu, &reg);
++}
++
+ static const ARMCPRegInfo generic_timer_cp_reginfo[] = {
+     /*
+      * Note that CNTFRQ is purely reads-as-written for the benefit
+@@ -2131,11 +2155,6 @@ static const ARMCPRegInfo generic_timer_cp_reginfo[] = {
+       .accessfn = gt_pct_access,
+       .readfn = gt_cnt_read, .resetfn = arm_cp_reset_ignore,
+     },
+-    { .name = "CNTPCT_EL0", .state = ARM_CP_STATE_AA64,
+-      .opc0 = 3, .opc1 = 3, .crn = 14, .crm = 0, .opc2 = 1,
+-      .access = PL0_R, .type = ARM_CP_NO_RAW | ARM_CP_IO,
+-      .accessfn = gt_pct_access, .readfn = gt_cnt_read,
+-    },
+     { .name = "CNTVCT", .cp = 15, .crm = 14, .opc1 = 1,
+       .access = PL0_R, .type = ARM_CP_64BIT | ARM_CP_NO_RAW | ARM_CP_IO,
+       .accessfn = gt_vct_access,
+@@ -6978,6 +6997,9 @@ void register_cp_regs_for_features(ARMCPU *cpu)
+     }
+     if (arm_feature(env, ARM_FEATURE_GENERIC_TIMER)) {
+         define_arm_cp_regs(cpu, generic_timer_cp_reginfo);
++#ifndef CONFIG_USER_ONLY
++        gt_define_cntpct_el0(cpu);
++#endif
+     }
+     if (cpu_isar_feature(aa64_ecv_traps, cpu)) {
+         define_arm_cp_regs(cpu, gen_timer_ecv_cp_reginfo);
+diff --git a/target/arm/tcg/op_helper.c b/target/arm/tcg/op_helper.c
+index 9c0651f..e0d705f 100644
+--- a/target/arm/tcg/op_helper.c
++++ b/target/arm/tcg/op_helper.c
+@@ -1015,7 +1015,7 @@ uint64_t HELPER(get_cp_reg64)(CPUARMState *env, const void *rip)
+     const ARMCPRegInfo *ri = rip;
+     uint64_t res;
+
+-    if (ri->type & ARM_CP_IO) {
++    if ((ri->type & (ARM_CP_IO | ARM_CP_IO_READ_NO_BQL)) == ARM_CP_IO) {
+         bql_lock();
+         res = ri->readfn(env, ri);
+         bql_unlock();
