@@ -2,11 +2,9 @@
 //! fixture (`v0199_format_fixture.rs`) and the V0.20 wave-11 opt-in media
 //! staging lane (`production/media_staging.rs`).
 //!
-//! Extracted verbatim from the format fixture (wave 11 Task 6): device
-//! selection, the bounded batch notify policy, the eight-sector-per-block
-//! request/validate/acknowledge loop and the synchronous isolated FLUSH. The
-//! only behavioural change is that failures are returned to the caller instead
-//! of panicking here; the fixture keeps its original `expect`/`assert` policy.
+//! Each 4 KiB block is transferred in two contiguous four-sector requests.
+//! Each request has its own validated and acknowledged device completion.
+//! The lane uses synchronous isolated FLUSH for durability boundaries.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
 //! Global invariant: both callers assert cpu::slot()==0 and drive the device
@@ -14,7 +12,7 @@
 //! while they only run the smp business fixture (format fixture); no IRQ
 //! handler or secondary CPU touches the queue (completion interrupts are off).
 //! * QUEUE (static mut BatchMemory): the device's DMA ring/bounce memory. One
-//!   `&mut` is created by `attach` and moved into the returned BatchedBlock;
+//!   `&mut` is created by `attach` and moved into the returned ScratchBlock;
 //!   `attach` is called at most once per boot. Under v020-production it lives
 //!   in the `.bss.sec_n` range registered as permanently pinned static Arena
 //!   pages. This accounts for the storage across requests, independently of
@@ -30,12 +28,18 @@ use crate::virtio_platform::Board;
 use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_driver_virtio::{
     Error as DriverError, Platform, Transport,
-    block::{BatchedBlock, Operation, SECTOR_BYTES},
+    block::{BatchedBlockIo, Operation, SECTOR_BYTES},
     queue::{BatchMemory, Token},
 };
 use cyxia_kernel_core::security::{
     Error as SecurityError, file_index_v0199::BLOCK_BYTES, file_media_v0199::BLOCK_COUNT,
 };
+
+const TRANSFER_BYTES: usize = BLOCK_BYTES / 2;
+const SECTORS_PER_TRANSFER: u64 = (TRANSFER_BYTES / SECTOR_BYTES) as u64;
+const SECTORS_PER_BLOCK: u64 = (BLOCK_BYTES / SECTOR_BYTES) as u64;
+const EMPTY_INPUT: [u8; TRANSFER_BYTES] = [0; TRANSFER_BYTES];
+pub(crate) type ScratchBlock = BatchedBlockIo<TRANSFER_BYTES>;
 
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut QUEUE: BatchMemory = BatchMemory::zeroed();
@@ -173,40 +177,39 @@ fn select(info: &BootInfo) -> Result<Transport, AttachError> {
 }
 
 /// Attach the one dedicated 512 MiB scratch block device. Call at most once.
-pub(crate) fn attach(info: &BootInfo) -> Result<BatchedBlock, AttachError> {
+pub(crate) fn attach(info: &BootInfo) -> Result<ScratchBlock, AttachError> {
     let transport = select(info)?;
     // SAFETY: attach is called at most once per boot on CPU0 (module header);
     // this is the only &mut to QUEUE and it moves into the device.
     let queue = unsafe { &mut *core::ptr::addr_of_mut!(QUEUE) };
     let mut device =
-        BatchedBlock::attach(transport, queue, &Board).map_err(|_| AttachError::Device)?;
-    if device.sectors() != u64::from(BLOCK_COUNT) * 8 || device.read_only() {
+        ScratchBlock::attach(transport, queue, &Board).map_err(|_| AttachError::Device)?;
+    if device.sectors() != u64::from(BLOCK_COUNT) * SECTORS_PER_BLOCK || device.read_only() {
         return Err(AttachError::Geometry);
     }
-    // Bounded fixture notify policy: one doorbell per eight-sector block.
+    // Bounded fixture notify policy: batch both requests for one block.
     // FLUSH requests stay synchronous regardless of the batch policy.
     let now = Board.now_ns();
     device
-        .set_notify_policy(8, 1, now.saturating_add(120_000_000_000), now)
+        .set_notify_policy(2, 1, now.saturating_add(120_000_000_000), now)
         .map_err(|_| AttachError::Policy)?;
     device.set_completion_interrupts(false, &Board);
     Ok(device)
 }
 
 fn operation(first: u64, i: usize, write: bool) -> Operation {
+    let sector = first + i as u64 * SECTORS_PER_TRANSFER;
     if write {
-        Operation::Write(first + i as u64)
+        Operation::Write(sector)
     } else {
-        Operation::Read(first + i as u64)
+        Operation::Read(sector)
     }
 }
 
-// One 4 KiB block is exactly eight 512-byte sector requests. The batch queue
-// keeps all eight in flight under one bounded notify policy; every completion
-// is individually validated and acknowledged before the block is reported
-// complete. No buffered or inferred completion is accepted.
+// Validate the whole block before publishing either request. The transfer
+// counts as complete only after both used records have been acknowledged.
 pub(crate) fn sectors(
-    device: &mut BatchedBlock,
+    device: &mut ScratchBlock,
     first: u64,
     write: Option<&[u8; BLOCK_BYTES]>,
     out: &mut [u8; BLOCK_BYTES],
@@ -216,17 +219,27 @@ pub(crate) fn sectors(
     } else {
         KIND_READ
     };
-    let mut tokens: [Option<Token>; 8] = [None; 8];
+    if !first.is_multiple_of(SECTORS_PER_BLOCK)
+        || device
+            .sectors()
+            .checked_sub(first)
+            .is_none_or(|remaining| remaining < SECTORS_PER_BLOCK)
+    {
+        return Err(driver(first, kind, PHASE_BEGIN)(DriverError::Address));
+    }
+    let mut tokens: [Option<Token>; 2] = [None; 2];
     for (i, slot) in tokens.iter_mut().enumerate() {
-        let mut input = [0; SECTOR_BYTES];
-        if let Some(data) = write {
-            input.copy_from_slice(&data[i * SECTOR_BYTES..(i + 1) * SECTOR_BYTES]);
-        }
+        let input = write.map_or(&EMPTY_INPUT, |data| {
+            data[i * TRANSFER_BYTES..]
+                .first_chunk::<TRANSFER_BYTES>()
+                .unwrap()
+        });
+        let sector = first + i as u64 * SECTORS_PER_TRANSFER;
         let op = operation(first, i, write.is_some());
         *slot = Some(
             device
-                .begin(op, &input, false, false, &Board)
-                .map_err(driver(first + i as u64, kind, PHASE_BEGIN))?,
+                .begin(op, input, false, false, &Board)
+                .map_err(driver(sector, kind, PHASE_BEGIN))?,
         );
     }
     device
@@ -236,17 +249,17 @@ pub(crate) fn sectors(
 }
 
 fn complete(
-    device: &mut BatchedBlock,
+    device: &mut ScratchBlock,
     first: u64,
-    tokens: &[Option<Token>; 8],
+    tokens: &[Option<Token>; 2],
     write: bool,
     out: &mut [u8; BLOCK_BYTES],
 ) -> Result<(), SecurityError> {
     let kind = if write { KIND_WRITE } else { KIND_READ };
-    let mut done = [false; 8];
-    let mut remaining = 8usize;
+    let mut done = [false; 2];
+    let mut remaining = tokens.len();
+    let mut bytes = [0; TRANSFER_BYTES];
     while remaining != 0 {
-        let mut bytes = [0; SECTOR_BYTES];
         let Some(c) = device
             .poll(&mut bytes, &Board)
             .map_err(driver(first, kind, PHASE_POLL))?
@@ -257,16 +270,17 @@ fn complete(
         let Some(i) = tokens.iter().position(|t| *t == Some(c.token)) else {
             return Err(record(0, first, kind, PHASE_MISMATCH));
         };
+        let sector = first + i as u64 * SECTORS_PER_TRANSFER;
         if done[i] || c.operation != operation(first, i, write) {
-            return Err(record(0, first + i as u64, kind, PHASE_MISMATCH));
+            return Err(record(0, sector, kind, PHASE_MISMATCH));
         }
-        observe(kind, first + i as u64, c.latency_ns);
+        observe(kind, sector, c.latency_ns);
         if !write {
-            out[i * SECTOR_BYTES..(i + 1) * SECTOR_BYTES].copy_from_slice(&bytes);
+            out[i * TRANSFER_BYTES..(i + 1) * TRANSFER_BYTES].copy_from_slice(&bytes);
         }
         device
             .acknowledge(c.token)
-            .map_err(driver(first + i as u64, kind, PHASE_ACK))?;
+            .map_err(driver(sector, kind, PHASE_ACK))?;
         done[i] = true;
         remaining -= 1;
     }
@@ -275,12 +289,12 @@ fn complete(
 
 /// Synchronous isolated FLUSH: only the actual device completion, not queue
 /// admission or a CPU barrier, may satisfy this call.
-pub(crate) fn flush(device: &mut BatchedBlock) -> Result<(), SecurityError> {
+pub(crate) fn flush(device: &mut ScratchBlock) -> Result<(), SecurityError> {
     let token = device
-        .begin(Operation::Flush, &[0; SECTOR_BYTES], true, true, &Board)
+        .begin(Operation::Flush, &EMPTY_INPUT, true, true, &Board)
         .map_err(driver(0, KIND_FLUSH, PHASE_BEGIN))?;
+    let mut bytes = [0; TRANSFER_BYTES];
     loop {
-        let mut bytes = [0; SECTOR_BYTES];
         match device
             .poll(&mut bytes, &Board)
             .map_err(driver(0, KIND_FLUSH, PHASE_POLL))?

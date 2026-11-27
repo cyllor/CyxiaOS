@@ -56,7 +56,6 @@ use super::super::{report, scratch_blk};
 use super::{EAGAIN, evidence};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_contracts::BootInfo;
-use cyxia_driver_virtio::block::BatchedBlock;
 use cyxia_kernel_core::security::{
     Error as SecurityError, epoch_redo_v0199::EpochBlockIo, file_index_v0199::BLOCK_BYTES,
     file_media_v0199::BLOCK_COUNT,
@@ -134,7 +133,7 @@ impl StagingOutcome {
 /// EpochBlockIo adapter over the shared scratch plumbing, bounded to the
 /// 512 MiB v1 image, with device-operation counters.
 struct Disk {
-    device: BatchedBlock,
+    device: scratch_blk::ScratchBlock,
     reads: u64,
     writes: u64,
     flushes: u64,
@@ -343,6 +342,13 @@ pub(super) fn stage(info: &BootInfo) -> StagingOutcome {
     };
     out.chain_complete = run_chain(&mut disk, &mut out).is_some();
     report("V020_W11_MEDIA_IO", disk.reads, disk.writes, disk.flushes);
+    let queue = disk.device.notify_stats();
+    report(
+        "V020_W11_MEDIA_QUEUE",
+        queue.published,
+        queue.completed,
+        queue.doorbells,
+    );
     let (read_us, write_us, flush_us) = scratch_blk::max_latency_us();
     report(
         "V020_W11_MEDIA_IO_MAX_LATENCY_US",

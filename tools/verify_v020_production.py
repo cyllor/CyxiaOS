@@ -110,6 +110,10 @@ PRODUCTION_SOURCES = [
     "crates/arch-aarch64/src/entry.S",
     "crates/arch-aarch64/src/timer.rs",
     "crates/platform-virt/src/lib.rs",
+    "crates/driver-virtio/src/lib.rs",
+    "crates/driver-virtio/src/block.rs",
+    "crates/driver-virtio/src/block/batched.rs",
+    "crates/driver-virtio/src/queue.rs",
     "crates/kernel-core/src/security/recovery_proof_v2.rs",
     "crates/kernel-core/src/security/boot_epoch_v1.rs",
     "crates/kernel-core/src/security/durable_role_epoch_v0199.rs",
@@ -498,13 +502,13 @@ def check_w11_net(words: tuple, lines: list, serial: bytes) -> None:
 
 
 def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
-                      snapshot_calls: int, modes: Modes) -> None:
+                      snapshot_calls: int, modes: Modes) -> dict:
     require = verify_smp.require
     if not staging:
         require(all(v == 0 for v in words[144:152]),
                 "media staging words 144..151 must be zero in the G-A lane")
         require(b"V020_W11_MEDIA_" not in serial, "media staging markers in the G-A lane")
-        return
+        return {}
     require(b"V020_W11_MEDIA_ABSENT" not in serial, "V020_W11_MEDIA_ABSENT: no scratch disk")
     require(STAGING_INCOMPLETE not in serial,
             "guest reported V020_W11_MEDIA_STAGING_INCOMPLETE: a staging step failed")
@@ -535,6 +539,16 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     snapshot = w11_rows(lines, "V020_W11_MEDIA_SNAPSHOT_0X40")
     require(snapshot == [(snapshot_calls, EAGAIN_RESULT, 0)],
             "media staging snapshot refusal must match in-vector EAGAIN role calls")
+    queue = w11_rows(lines, "V020_W11_MEDIA_QUEUE")
+    if not queue:
+        return {}  # Historical staging ELFs report only logical block operations.
+    reads, writes, flushes = io[0]
+    expected = 2 * (reads + writes) + flushes
+    require(len(queue) == 1 and queue[0][:2] == (expected, expected)
+            and 0 <= queue[0][2] <= expected,
+            "scratch queue requests disagree with logical blocks and isolated flushes")
+    return {"scratch_virtio_requests_completed": expected,
+            "scratch_virtio_doorbells": queue[0][2]}
 
 
 def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
@@ -544,7 +558,7 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
     check_w11_baseline(words)
     measured_rows = check_w11_rows(words, lines)
     check_w11_net(words, lines, serial)
-    check_w11_staging(words, lines, serial, staging, snapshot_calls, modes)
+    media_rows = check_w11_staging(words, lines, serial, staging, snapshot_calls, modes)
     flags = {
         "frame_meta": words[129] == 1,
         "recovery": (words[131] == RECOVERY_ACCUMULATORS and words[133] == 1
@@ -565,6 +579,7 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
         "frame_meta_production_statics": True,
         "frame_meta_registered_static_pages": words[130],
         **measured_rows,
+        **media_rows,
         "recovery_accumulators": words[131],
         "degraded_events": words[132],
         "recovery_required_publish_rejected": words[133],
