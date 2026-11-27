@@ -15,13 +15,14 @@ use super::{
     file_index_v0199::{FileStreamIndexV4, STREAMS_PER_GROUP, SecurityStateStoreV2},
     file_media_unified_v1::FILE_TRANSACTION_WORKSPACE_KIB,
     file_media_v0199::{
-        BITMAP_START, BLOCK_COUNT, FileReceiptV4, INODE_START, RECEIPT_BYTES, crc32c_zeroed,
+        BITMAP_START, BLOCK_COUNT, DATA_START, FileReceiptV4, INODE_START, RECEIPT_BYTES,
+        crc32c_zeroed,
     },
     file_mount_v1::{Acl, MountEvidence},
     file_receipt_query_v4::ReceiptKey,
     file_receipt_store_v0199::{RECEIPT_STORE_BYTES, home_closure, scan_receipts_with_index},
     file_service_v4::Request,
-    file_structure_v1::{BLOCK, INODE_BYTES, INODES, Inode, SystemKind},
+    file_structure_v1::{BLOCK, Extent, INODE_BYTES, INODES, Inode, SystemKind},
     offline_config_v1::VerifiedOfflineConfig,
     recovery_v1::{CommittedRedo, RecoveryWorkspace, RedoImage, RedoTransaction, RedoWriter},
 };
@@ -33,9 +34,12 @@ const ISSUED: u16 = 1;
 const BOUND: u16 = 2;
 const DONE: u16 = 3;
 const MAX_DATA_HOMES: usize = 120;
+const BLOCKS_PER_BITMAP: u32 = (8 * BLOCK) as u32;
+const BITMAP_PAGES: u32 = INODE_START - BITMAP_START;
 // Data, both halves of a straddling receipt, its index, and the final inode
-// plus the allocation bitmap page when one new block is acquired.
+// plus the allocation bitmap page when the file acquires a new data run.
 const MAX_SEGMENT_HOMES: usize = MAX_DATA_HOMES + 5;
+const _: () = assert!(BITMAP_PAGES * BLOCKS_PER_BITMAP == BLOCK_COUNT);
 
 /// The protected file service resolves the caller's live cap to the v1
 /// inode and supplies the authenticated mount and original copied frame.
@@ -49,9 +53,9 @@ pub struct FsyncJob<'a> {
     pub frame: &'a [u8],
     pub key: ReceiptKey,
     /// Bind the new logical size as a little-endian u64 before the pages in
-    /// the frozen digest. Growth fits one final segment and may append one
-    /// adjacent free block to the last extent. An unchanged-size job uses
-    /// the legacy pages-only digest.
+    /// the frozen digest. Growth fits one final segment and may append a
+    /// free run described by one bitmap page. An unchanged-size job uses the
+    /// legacy pages-only digest.
     pub grown_size: Option<usize>,
     /// Complete frozen logical file, in order, with zero padding after EOF.
     pub pages: &'a [&'a [u8; BLOCK]],
@@ -104,29 +108,79 @@ fn same_key(receipt: &FileReceiptV4, key: ReceiptKey) -> bool {
         && receipt.request_seq == key.request_seq
 }
 
-fn extend_last_run(
+fn bitmap_bit(block: u32) -> (usize, u8) {
+    let bit = (block % BLOCKS_PER_BITMAP) as usize;
+    (bit / 8, 1 << (bit % 8))
+}
+
+fn first_free_run(bitmap: &[u8; BLOCK], start: u32, end: u32, blocks: u32) -> Option<u32> {
+    let mut free = 0;
+    for block in start..end {
+        let (byte, mask) = bitmap_bit(block);
+        if bitmap[byte] & mask != 0 {
+            free = 0;
+        } else {
+            free += 1;
+            if free == blocks {
+                return Some(block + 1 - blocks);
+            }
+        }
+    }
+    None
+}
+
+fn allocate_growth(
     writer: &mut RedoWriter<'_, impl EpochBlockIo>,
     inode: &mut Inode,
     bitmap: &mut [u8; BLOCK],
+    blocks: u32,
 ) -> Result<u32, Error> {
     let extent = inode.extents.checked_sub(1).ok_or(Error::Conflict)?;
-    let run = &mut inode.runs[usize::from(extent)];
-    let block = run
-        .physical
-        .checked_add(run.count)
-        .filter(|&block| block < BLOCK_COUNT)
-        .ok_or(Error::Capacity)?;
-    let bits_per_page = (BLOCK * 8) as u32;
-    let home = BITMAP_START + block / bits_per_page;
-    writer.read_committed(home, bitmap)?;
-    let bit = (block % bits_per_page) as usize;
-    let mask = 1 << (bit % 8);
-    if bitmap[bit / 8] & mask != 0 {
-        return Err(Error::Capacity);
+    let last = inode.runs[usize::from(extent)];
+    let adjacent = last.physical + last.count;
+    let adjacent_end = adjacent + blocks;
+    let preferred = (adjacent / BLOCKS_PER_BITMAP).min(BITMAP_PAGES - 1);
+    let can_append_extent = usize::from(inode.extents) < inode.runs.len();
+    let scan_pages = if can_append_extent { BITMAP_PAGES } else { 1 };
+    for offset in 0..scan_pages {
+        let page = (preferred + offset) % BITMAP_PAGES;
+        let first = (page * BLOCKS_PER_BITMAP).max(DATA_START);
+        let end = (page + 1) * BLOCKS_PER_BITMAP;
+        let home = BITMAP_START + page;
+        writer.read_committed(home, bitmap)?;
+        // Preserve a contiguous last extent when possible. Otherwise use
+        // the first free run on one verified bitmap page. The mount owner
+        // excludes all competing writes through the eventual commit.
+        let physical = if adjacent >= first
+            && adjacent_end <= end
+            && first_free_run(bitmap, adjacent, adjacent_end, blocks).is_some()
+        {
+            Some(adjacent)
+        } else if can_append_extent {
+            first_free_run(bitmap, first, end, blocks)
+        } else {
+            None
+        };
+        let Some(physical) = physical else {
+            continue;
+        };
+        for block in physical..physical + blocks {
+            let (byte, mask) = bitmap_bit(block);
+            bitmap[byte] |= mask;
+        }
+        if physical == adjacent {
+            inode.runs[usize::from(extent)].count += blocks;
+        } else {
+            inode.runs[usize::from(inode.extents)] = Extent {
+                logical: last.logical + last.count,
+                physical,
+                count: blocks,
+            };
+            inode.extents += 1;
+        }
+        return Ok(home);
     }
-    bitmap[bit / 8] |= mask;
-    run.count += 1;
-    Ok(home)
+    Err(Error::Capacity)
 }
 
 /// Bind an issued ticket or durably advance one FSYNC prefix on baseline
@@ -230,10 +284,7 @@ pub fn commit_segment<I: EpochBlockIo>(
     let pages = size.div_ceil(BLOCK);
     let old_pages = current_size.div_ceil(BLOCK);
     if job.grown_size.is_some()
-        && (current_size == 0
-            || size < current_size
-            || pages > MAX_DATA_HOMES
-            || pages > old_pages + 1)
+        && (current_size == 0 || size < current_size || pages > MAX_DATA_HOMES)
     {
         return Err(Error::Invalid);
     }
@@ -335,7 +386,12 @@ pub fn commit_segment<I: EpochBlockIo>(
     // BOUND records intentions only. Revalidate availability on the final
     // segment and publish bitmap, data, inode and DONE in one redo closure.
     let bitmap_home = if pages > old_pages {
-        Some(extend_last_run(writer, &mut inode, &mut work.bitmap)?)
+        Some(allocate_growth(
+            writer,
+            &mut inode,
+            &mut work.bitmap,
+            (pages - old_pages) as u32,
+        )?)
     } else {
         None
     };
@@ -377,8 +433,12 @@ pub fn commit_segment<I: EpochBlockIo>(
         }
         if bitmap_home.is_some() {
             let extent = usize::from(inode.extents) - 1;
-            let count_at = 56 + extent * 12;
-            raw[count_at..count_at + 4].copy_from_slice(&inode.runs[extent].count.to_le_bytes());
+            let at = 48 + extent * 12;
+            let run = inode.runs[extent];
+            raw[32..34].copy_from_slice(&inode.extents.to_le_bytes());
+            raw[at..at + 4].copy_from_slice(&run.logical.to_le_bytes());
+            raw[at + 4..at + 8].copy_from_slice(&run.physical.to_le_bytes());
+            raw[at + 8..at + 12].copy_from_slice(&run.count.to_le_bytes());
         }
         raw[24..32].copy_from_slice(&write_seq.to_le_bytes());
         let crc = crc32c_zeroed(raw, 252)?;

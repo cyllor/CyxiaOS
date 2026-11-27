@@ -450,7 +450,7 @@ mod tests {
             SNAPSHOT_PROTECTION_BLOCK, SNAPSHOT_SLOT_START, encode_object_envelope,
         },
         file_media_v0199::{BITMAP_START, DATA_START, INODE_START},
-        file_structure_v1::INODE_BYTES,
+        file_structure_v1::{Extent, INODE_BYTES},
     };
     use std::{boxed::Box, collections::BTreeMap};
     const STATE_HOME: u32 = 7000;
@@ -868,6 +868,15 @@ mod tests {
 
     #[test]
     fn signed_fsync_binds_then_recovers_segmented_data_and_receipt() {
+        check_signed_fsync_roundtrip(false);
+    }
+
+    #[test]
+    fn signed_fsync_growth_preserves_adjacent_owner_and_recovers_new_extent() {
+        check_signed_fsync_roundtrip(true);
+    }
+
+    fn check_signed_fsync_roundtrip(growing: bool) {
         use crate::security::{
             file_admission_flow_v1::FileAdmissionFlowV1,
             file_auth_context_v1::{AdmissionLedgerV1, AuthContextV1, AuthorityFacts},
@@ -933,18 +942,48 @@ mod tests {
             raw
         }
         const DATA: u32 = 9000;
-        const PAGES: usize = 121;
-        const SIZE: usize = 120 * BLOCK + 17;
         const FSYNC: u64 = 1 << 13;
         const CAP: u64 = 9;
         const BOOT: u64 = 2;
         const RECEIPT_SLOT: usize = 21;
+        let target_pages = if growing { 4 } else { 121 };
+        let target_size = (target_pages - 1) * BLOCK + 17;
+        let initial_pages = if growing { 1 } else { target_pages };
+        let initial_size = if growing { 8 } else { target_size };
         let mut source = fixture();
         source.set_allocated(STATE_HOME + 1, false);
-        for block in DATA..DATA + PAGES as u32 {
+        for block in DATA..DATA + initial_pages as u32 {
             source.set_allocated(block, true);
         }
-        inode(source.inode_slot(1), 1, SIZE as u64, DATA, PAGES as u32);
+        inode(
+            source.inode_slot(1),
+            1,
+            initial_size as u64,
+            DATA,
+            initial_pages as u32,
+        );
+        if growing {
+            // A second live ordinary inode owns the physical neighbor.
+            // Fill its entire extent so any unintended overwrite is visible.
+            source.set_allocated(DATA + 1, true);
+            source.0.insert(DATA + 1, Box::new([0xa5; BLOCK]));
+            inode(source.inode_slot(6), 1, BLOCK as u64, DATA + 1, 1);
+            inode(source.inode_slot(0), 2, 256, ROOT, 1);
+            let acl = source.acl_slot(6);
+            p32(acl, 4, 1);
+            p64(acl, 8, 1);
+            p64(acl, 16, 2);
+            p64(acl, 24, 1);
+            p32(acl, 32, 1 << 8);
+            p64(acl, 40, 1);
+            seal(acl, 60);
+            let sibling = &mut source.0.get_mut(&ROOT).unwrap()[128..256];
+            p32(sibling, 0, 6);
+            p16(sibling, 4, 1);
+            p64(sibling, 8, 1);
+            sibling[16] = b'y';
+            seal(sibling, 124);
+        }
         let acl = source.acl_slot(1);
         p32(acl, 32, FILE_RIGHTS);
         seal(acl, 60);
@@ -1015,8 +1054,10 @@ mod tests {
         );
         source.0.insert(1, Box::new(superblock(CHECKPOINT)));
 
-        let path =
-            std::env::temp_dir().join(std::format!("cyx-fsync-test-{}.raw", std::process::id()));
+        let path = std::env::temp_dir().join(std::format!(
+            "cyx-fsync-test-{}-{growing}.raw",
+            std::process::id()
+        ));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1046,8 +1087,10 @@ mod tests {
             (1, 1)
         );
 
-        let mut frozen = std::vec![0; PAGES * BLOCK];
-        frozen[..SIZE].fill(0x59);
+        let mut frozen = std::vec![0; target_pages * BLOCK];
+        for (index, page) in frozen[..target_size].chunks_mut(BLOCK).enumerate() {
+            page.fill(0x59 + index as u8);
+        }
         let pages: std::vec::Vec<&[u8; BLOCK]> = frozen
             .chunks_exact(BLOCK)
             .map(|page| page.try_into().unwrap())
@@ -1060,6 +1103,11 @@ mod tests {
         p32(&mut frame, 12, 8);
         p64(&mut frame, 16, key.request_id().unwrap());
         p64(&mut frame, REQUEST_HEADER, 17);
+        let mut sized_frozen = std::vec::Vec::new();
+        if growing {
+            sized_frozen.extend_from_slice(&(target_size as u64).to_le_bytes());
+            sized_frozen.extend_from_slice(&frozen);
+        }
         let mut flow = FileAdmissionFlowV1::freeze(
             AuthContextV1::new(3, 1, FILE_SERVICE_ROLE, 1, BOOT).unwrap(),
             &frame,
@@ -1076,7 +1124,7 @@ mod tests {
                 operation_digest: [0; 32],
             },
             0,
-            &frozen,
+            if growing { &sized_frozen } else { &frozen },
         )
         .unwrap();
         let mut ledger = AdmissionLedgerV1::new(BOOT).unwrap();
@@ -1101,7 +1149,7 @@ mod tests {
             cap_selector: CAP,
             frame: &frame,
             key,
-            grown_size: None,
+            grown_size: growing.then_some(target_size),
             pages: &pages,
         };
         let mut work = FsyncWorkspace::new();
@@ -1121,38 +1169,68 @@ mod tests {
             (receipt, redo.ordered_digest())
         };
         let mut raw = [0; BLOCK];
+        let mut bitmap_before = [0; BLOCK];
+        writer
+            .read_committed(BITMAP_START, &mut bitmap_before)
+            .unwrap();
         let (bound, _) = committed(&mut writer, &job, 8);
         assert_eq!((bound.status, bound.completed_prefix), (2, 0));
         writer.read_committed(DATA, &mut raw).unwrap();
         assert!(raw.iter().all(|&byte| byte == 0));
-        let (prefix, _) = committed(&mut writer, &job, 248);
-        assert_eq!(
-            (prefix.status, prefix.completed_prefix as usize),
-            (2, 120 * BLOCK)
-        );
-        writer.read_committed(INODE_START, &mut raw).unwrap();
-        assert_eq!(Inode::decode(&raw[256..512]).unwrap().durable_write_seq, 0);
-        writer.read_committed(DATA + 120, &mut raw).unwrap();
-        assert!(raw.iter().all(|&byte| byte == 0));
-        let (before_final, checkpoint) =
-            recover_checkpoint_with_evidence(&mut disk, &mut journal, |io, sb| {
-                let state =
-                    validate_signed(io, sb, &system, &config, &mut mount_workspace, |_, _, _| {
-                        Ok(())
-                    })?;
-                assert_eq!((state.receipts.occupied, state.receipts.unresolved), (1, 1));
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(before_final.transactions, 2);
-        assert_eq!(checkpoint.checkpoint_lsn, prefix.commit_lsn);
-        assert!(retire_checkpointed_log(&mut disk, &mut journal, checkpoint).unwrap() > 0);
-        let mut writer = RedoWriter::open(&mut disk, &mut journal, checkpoint).unwrap();
-        let (done, committed_digest) = committed(&mut writer, &job, 12);
-        assert_eq!(done.log_epoch, prefix.log_epoch + 1);
+        writer.read_committed(BITMAP_START, &mut raw).unwrap();
+        assert_eq!(raw, bitmap_before);
+        let (mut writer, final_epoch) = if growing {
+            (writer, CHECKPOINT.log_epoch)
+        } else {
+            let (prefix, _) = committed(&mut writer, &job, 248);
+            assert_eq!(
+                (prefix.status, prefix.completed_prefix as usize),
+                (2, 120 * BLOCK)
+            );
+            writer.read_committed(INODE_START, &mut raw).unwrap();
+            assert_eq!(Inode::decode(&raw[256..512]).unwrap().durable_write_seq, 0);
+            writer.read_committed(DATA + 120, &mut raw).unwrap();
+            assert!(raw.iter().all(|&byte| byte == 0));
+            let (before_final, checkpoint) =
+                recover_checkpoint_with_evidence(&mut disk, &mut journal, |io, sb| {
+                    let state = validate_signed(
+                        io,
+                        sb,
+                        &system,
+                        &config,
+                        &mut mount_workspace,
+                        |_, _, _| Ok(()),
+                    )?;
+                    assert_eq!((state.receipts.occupied, state.receipts.unresolved), (1, 1));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(before_final.transactions, 2);
+            assert_eq!(checkpoint.checkpoint_lsn, prefix.commit_lsn);
+            assert!(retire_checkpointed_log(&mut disk, &mut journal, checkpoint).unwrap() > 0);
+            (
+                RedoWriter::open(&mut disk, &mut journal, checkpoint).unwrap(),
+                prefix.log_epoch + 1,
+            )
+        };
+        let final_log_blocks = if growing { 20 } else { 12 };
+        let (done, committed_digest) = committed(&mut writer, &job, final_log_blocks);
+        assert_eq!(done.log_epoch, final_epoch);
+        if growing {
+            writer
+                .read_committed_at(BITMAP_START, done.commit_lsn, &mut raw)
+                .unwrap();
+            for block in DATA_START..DATA_START + 3 {
+                let byte = block as usize / 8;
+                bitmap_before[byte] |= 1 << (block % 8);
+            }
+            assert_eq!(raw, bitmap_before);
+            writer.read_committed(DATA + 1, &mut raw).unwrap();
+            assert_eq!(raw, [0xa5; BLOCK]);
+        }
         assert_eq!(
             (done.status, done.completed_prefix as usize, done.write_seq),
-            (3, SIZE, 17)
+            (3, target_size, 17)
         );
         let mut changed = pages.clone();
         changed[0] = &[0; BLOCK];
@@ -1186,7 +1264,7 @@ mod tests {
             cap_selector: CAP,
             frame: &frame,
             key,
-            grown_size: None,
+            grown_size: growing.then_some(target_size),
             pages: &pages,
         };
         assert_eq!(
@@ -1219,15 +1297,55 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(evidence.transactions, 1);
+        assert_eq!(evidence.transactions, 1 + u32::from(growing));
         assert_eq!(next.checkpoint_lsn, done.commit_lsn);
         disk.read(INODE_START, &mut raw).unwrap();
-        assert_eq!(Inode::decode(&raw[256..512]).unwrap().durable_write_seq, 17);
-        let mut contents = Sha256::new();
-        for block in DATA..DATA + PAGES as u32 {
-            disk.read(block, &mut raw).unwrap();
-            contents.update(raw);
+        let current = Inode::decode(&raw[256..512]).unwrap();
+        assert_eq!(current.durable_write_seq, 17);
+        assert_eq!(current.size, target_size as u64);
+        if growing {
+            let neighbor = Inode::decode(&raw[6 * INODE_BYTES..7 * INODE_BYTES]).unwrap();
+            assert_eq!(
+                neighbor.runs[0],
+                Extent {
+                    logical: 0,
+                    physical: DATA + 1,
+                    count: 1
+                }
+            );
+            assert_eq!(neighbor.durable_write_seq, 0);
+            assert_eq!(current.extents, 2);
+            assert_eq!(
+                current.runs[0],
+                Extent {
+                    logical: 0,
+                    physical: DATA,
+                    count: 1
+                }
+            );
+            assert_eq!(
+                current.runs[1],
+                Extent {
+                    logical: 1,
+                    physical: DATA_START,
+                    count: 3
+                }
+            );
+            disk.read(DATA + 1, &mut raw).unwrap();
+            assert_eq!(raw, [0xa5; BLOCK]);
         }
+        let mut contents = Sha256::new();
+        let mut logical = 0;
+        for block in current.runs[..usize::from(current.extents)]
+            .iter()
+            .flat_map(|run| run.physical..run.physical + run.count)
+        {
+            disk.read(block, &mut raw).unwrap();
+            assert_eq!(&raw, pages[logical]);
+            contents.update(raw);
+            logical += 1;
+        }
+        assert_eq!(logical, target_pages);
         assert_eq!(&contents.finalize()[..], &done.output_digest);
         let mut receipt = [0; RECEIPT_BYTES];
         disk.read(RECEIPTS, &mut raw).unwrap();
