@@ -10,6 +10,7 @@ import argparse
 import base64
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import time
 
@@ -159,6 +160,32 @@ def reopen(binary: Path, elf: Path, disk: Path, output: Path, timeout: float, *,
     return detail
 
 
+def preserve_disk(disk: Path, output: Path, expected: str) -> str:
+    """Retain independently replayable bytes before the next writable boot."""
+    require(disk.stat().st_size == SCRATCH_BYTES, "unexpected scratch image size")
+    with disk.open("rb") as source, output.open("xb") as target:
+        shutil.copyfileobj(source, target, 1024 * 1024)
+    require(output.stat().st_size == SCRATCH_BYTES and sha(output) == expected
+            and sha(disk) == expected, "preserved disk differs from the observed image")
+    return expected
+
+
+def seal_seed_capture(seed: dict, seed_dir: Path, disk: Path) -> None:
+    """Seal a returned boot's raw evidence even when its semantic check failed."""
+    seed["capture_sha256"] = {
+        name: sha(seed_dir / name) for name in ("serial.bin", "serial.txt", "qemu-stderr.log")
+    }
+    # Successful budget capture has its own stopped bytes and QMP transcript.
+    # Failed-progress capture is separately recorded by the resident verifier.
+    for name in ("cpu0-budget-trace.bin", "budget-qmp.jsonl", "role-syscall-abi.bin",
+                 "decision-returns.bin"):
+        if (seed_dir / name).is_file():
+            seed["capture_sha256"][name] = sha(seed_dir / name)
+    seed["preserved_disk_sha256"] = preserve_disk(disk, seed_dir / "scratch-after.raw", sha(disk))
+    require(seed["status"] == "PASS",
+            "could not seed a signed volume at BootEpoch 1: " + str(seed.get("error", "unknown")))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("fresh-elf", "reopen-elf", "qemu", "qemu-source", "output"):
@@ -185,12 +212,21 @@ def main() -> int:
         disk = output / "scratch.raw"
         require("," not in str(disk), "scratch path cannot contain a comma in QEMU drive options")
         create_scratch(disk)
-        result["seed"] = boot(str(binary), fresh, output / "seed", args.timeout, disk, 1)
-        require(result["seed"]["status"] == "PASS", "could not seed a signed volume at BootEpoch 1")
-        result["without_flush"] = reopen(binary, reopen_elf, disk, output / "without-flush", args.timeout,
+        result["initial_disk_sha256"] = sha(disk)
+        seed_dir = output / "seed"
+        result["seed"] = boot(str(binary), fresh, seed_dir, args.timeout, disk, 1,
+                              budget_trace=True)
+        seed = result["seed"]
+        seal_seed_capture(seed, seed_dir, disk)
+        negative_dir = output / "without-flush"
+        result["without_flush"] = reopen(binary, reopen_elf, disk, negative_dir, args.timeout,
                                          flush=False)
-        result["with_flush"] = reopen(binary, reopen_elf, disk, output / "with-flush", args.timeout, flush=True)
         negative = result["without_flush"]
+        negative["preserved_disk_sha256"] = preserve_disk(
+            disk, negative_dir / "scratch-after.raw", negative["after_sha256"])
+        require(seed["preserved_disk_sha256"] == negative["before_sha256"]
+                == negative["preserved_disk_sha256"], "retained negative media differs from the seed")
+        result["with_flush"] = reopen(binary, reopen_elf, disk, output / "with-flush", args.timeout, flush=True)
         positive = result["with_flush"]
         require(negative["after_sha256"] == positive["before_sha256"]
                 and set(positive["host_features"]) - {FLUSH} == set(negative["host_features"]),

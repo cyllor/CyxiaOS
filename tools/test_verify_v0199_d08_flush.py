@@ -1,9 +1,14 @@
 """Check that a refused writable mount requires corroborating device evidence."""
 
 import copy
+import struct
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import verify_v0199_d08_flush as check
+import verify_v020_signed_resident as resident
 
 
 class FlushGateTests(unittest.TestCase):
@@ -75,6 +80,101 @@ class FlushGateTests(unittest.TestCase):
         ):
             with self.subTest(lines=invalid), self.assertRaises(ValueError):
                 check.check_reopen(invalid, snapshot, flush=True, before=before, after=after)
+
+    def test_preserved_disks_survive_next_writable_boot(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(check, "SCRATCH_BYTES", 16):
+            root = Path(d)
+            disk = root / "scratch.raw"
+            disk.write_bytes(b"0123456789abcdef")
+            expected = check.sha(disk)
+            seed = root / "seed.raw"
+            negative = root / "negative.raw"
+            self.assertEqual(check.preserve_disk(disk, seed, expected), expected)
+            self.assertEqual(check.preserve_disk(disk, negative, expected), expected)
+            disk.write_bytes(b"fedcba9876543210")
+            self.assertEqual(check.sha(seed), expected)
+            self.assertEqual(check.sha(negative), expected)
+            self.assertNotEqual(check.sha(disk), expected)
+            with self.assertRaisesRegex(ValueError, "preserved disk differs"):
+                check.preserve_disk(disk, root / "mismatch.raw", expected)
+            with self.assertRaises(FileExistsError):
+                check.preserve_disk(disk, seed, check.sha(disk))
+            self.assertEqual(check.sha(seed), expected)
+            disk.write_bytes(b"short")
+            with self.assertRaisesRegex(ValueError, "unexpected scratch image size"):
+                check.preserve_disk(disk, root / "short.raw", check.sha(disk))
+
+
+    def test_decision_return_prefix(self):
+        raw = bytearray(resident.DECISION_RETURN_BYTES)
+        struct.pack_into("<Q", raw, 0, 2)
+        row = resident.DECISION_RETURN_ROW
+        row.pack_into(raw, 8, 100, 2, 9, 0, 0x10000, 4)
+        row.pack_into(raw, 8 + row.size, 200, 3, 8, 0x15 << 26, 0x10004, 2)
+        # Stopped mid-write: ignore an unpublished row, not a complete one.
+        row.pack_into(raw, 8 + 2 * row.size, 300, 2, 8, 0, 0, 4)
+        parsed = resident.decode_decision_returns(raw)
+        self.assertEqual([item["kind"] for item in parsed], [9, 8])
+        self.assertEqual([item["x8"] for item in parsed], [4, 2])
+        for offset, value in ((0, 33), (16, 5), (24, 0), (8 + row.size, 99)):
+            with self.subTest(offset=offset):
+                malformed = bytearray(raw)
+                struct.pack_into("<Q", malformed, offset, value)
+                with self.assertRaises(ValueError):
+                    resident.decode_decision_returns(malformed)
+        with self.assertRaises(ValueError):
+            resident.decode_decision_returns(raw[:-1])
+
+    def test_failed_progress_trace_retains_raw_capture(self):
+        for late_error in (False, True):
+            with self.subTest(late_error=late_error), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+
+                def capture(socket_path, elf, output, deadline):
+                    (output / resident.TRACE_FILE).write_bytes(b"raw trace fixture")
+                    (output / "budget-qmp.jsonl").write_bytes(b"raw QMP fixture")
+                    (output / "role-syscall-abi.bin").write_bytes(b"raw ABI fixture")
+                    (output / resident.DECISION_RETURN_FILE).write_bytes(b"raw return fixture")
+                    if late_error:
+                        raise ValueError("ABI mismatch after pmemsave")
+                    return {"budget_trace_sha256": check.sha(output / resident.TRACE_FILE)}
+
+                with patch.object(resident, "capture_budget_trace", side_effect=capture) as qmp:
+                    result = resident.retain_failed_progress_trace(
+                        root / "socket", root / "elf", root, 123)
+                    self.assertEqual(result["status"], "CAPTURE_ERROR" if late_error else "CAPTURED")
+                    self.assertEqual(result["capture_sha256"], {
+                        name: check.sha(root / "failed-progress" / name)
+                        for name in (resident.TRACE_FILE, "budget-qmp.jsonl",
+                                     "role-syscall-abi.bin", resident.DECISION_RETURN_FILE)
+                    })
+                    if late_error:
+                        self.assertIn("ABI mismatch", result["error"])
+                    repeated = resident.retain_failed_progress_trace(
+                        root / "socket", root / "elf", root, 123)
+                    self.assertEqual(repeated["status"], "CAPTURE_ERROR")
+                    self.assertEqual(qmp.call_count, 1)
+
+    def test_failed_seed_is_sealed_but_never_admitted(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(check, "SCRATCH_BYTES", 16):
+            root = Path(d)
+            for name in ("serial.bin", "serial.txt", "qemu-stderr.log"):
+                (root / name).write_bytes(name.encode())
+            disk = root / "disk.raw"
+            disk.write_bytes(b"0123456789abcdef")
+            (root / "cpu0-budget-trace.bin").write_bytes(b"trace")
+            (root / "budget-qmp.jsonl").write_bytes(b"qmp")
+            seed = {"status": "FAIL", "error": "incomplete role progress"}
+            with self.assertRaisesRegex(ValueError, "incomplete role progress"):
+                check.seal_seed_capture(seed, root, disk)
+            self.assertEqual(seed["status"], "FAIL")
+            self.assertEqual(seed["capture_sha256"], {
+                name: check.sha(root / name)
+                for name in ("serial.bin", "serial.txt", "qemu-stderr.log",
+                             "cpu0-budget-trace.bin", "budget-qmp.jsonl")
+            })
+            self.assertEqual(seed["preserved_disk_sha256"], check.sha(disk))
+            self.assertEqual(check.sha(root / "scratch-after.raw"), check.sha(disk))
 
 
 if __name__ == "__main__":
