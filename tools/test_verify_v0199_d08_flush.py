@@ -1,7 +1,10 @@
 """Check that a refused writable mount requires corroborating device evidence."""
 
 import copy
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import verify_v0199_d08_flush as check
 
@@ -75,6 +78,29 @@ class FlushGateTests(unittest.TestCase):
         ):
             with self.subTest(lines=invalid), self.assertRaises(ValueError):
                 check.check_reopen(invalid, snapshot, flush=True, before=before, after=after)
+
+    def test_preserved_disks_survive_next_writable_boot(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(check, "SCRATCH_BYTES", 16):
+            root = Path(d)
+            disk = root / "scratch.raw"
+            disk.write_bytes(b"0123456789abcdef")
+            expected = check.sha(disk)
+            seed = root / "seed.raw"
+            negative = root / "negative.raw"
+            self.assertEqual(check.preserve_disk(disk, seed, expected), expected)
+            self.assertEqual(check.preserve_disk(disk, negative, expected), expected)
+            disk.write_bytes(b"fedcba9876543210")
+            self.assertEqual(check.sha(seed), expected)
+            self.assertEqual(check.sha(negative), expected)
+            self.assertNotEqual(check.sha(disk), expected)
+            with self.assertRaisesRegex(ValueError, "preserved disk differs"):
+                check.preserve_disk(disk, root / "mismatch.raw", expected)
+            with self.assertRaises(FileExistsError):
+                check.preserve_disk(disk, seed, check.sha(disk))
+            self.assertEqual(check.sha(seed), expected)
+            disk.write_bytes(b"short")
+            with self.assertRaisesRegex(ValueError, "unexpected scratch image size"):
+                check.preserve_disk(disk, root / "short.raw", check.sha(disk))
 
 
 if __name__ == "__main__":
