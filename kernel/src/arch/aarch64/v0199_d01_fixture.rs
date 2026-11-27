@@ -1,7 +1,7 @@
-//! A bounded scheduler effect on CPU1 under the existing business gate.
-//! The equal-weight and approved-weight phases execute two identical EL0
-//! programs via distinct native roots. The QMP checker replays each choice
-//! from the measured CPU debits. Rule identity is fixture-only.
+//! Two measured CPU1 replay branches with independently retained receipts.
+//! Each branch installs a rule-selected policy before actual EL0 execution.
+//! The QMP checker replays both schedules from the measured CPU debits.
+//! Identity and rules are fixture-only. This does not create a training label.
 use super::{
     v0199_effect_fixture::{encode_decision, rule, sha},
     *,
@@ -77,7 +77,9 @@ const THREADS: [ObjectKey; 2] = [
 const CPU: usize = 1;
 const TURNS: usize = 24;
 const ITERATIONS: u64 = 2048;
-const APPROVED: u16 = 4;
+const WEIGHTS: [u16; 2] = [1, 4];
+const BRANCH_BYTES: usize = 1024;
+const BRANCH_HEAD_BYTES: usize = 512;
 const WORK_BYTES: usize = 82;
 const WORDS: usize = 16;
 const PRIVATE_SLOTS: [usize; 2] = [PRIVATE_SPACES - 2, PRIVATE_SPACES - 1];
@@ -290,11 +292,12 @@ pub(super) fn worker_step(generation: u64) -> bool {
                     )
                     .unwrap();
             }
-            phase(scheduler, layout, 0);
+            OUTPUT[0].store(Board.now_ns(), Ordering::Relaxed);
+            OUTPUT[1].store(u64::from(scheduler.stats().runnable), Ordering::Relaxed);
         }
-        2 => {
+        2 | 4 => {
             let mut raw = [0; WORK_BYTES];
-            for (chunk, field) in raw.chunks_mut(8).zip(INPUT.iter().skip(4)) {
+            for (chunk, field) in raw.chunks_mut(8).zip(INPUT.iter().skip(5)) {
                 chunk.copy_from_slice(&field.load(Ordering::Relaxed).to_le_bytes()[..chunk.len()]);
             }
             let work = ApplyWorkV1::decode(&raw).unwrap();
@@ -311,7 +314,7 @@ pub(super) fn worker_step(generation: u64) -> bool {
             let Ok(ActionV2::GroupWeight(weight)) = ActionV2::decode(1, 1, work.payload) else {
                 panic!("invalid D01 accepted work");
             };
-            assert_eq!(weight, APPROVED);
+            assert_eq!(weight, WEIGHTS[usize::from(round == 4)]);
             let now = Board.now_ns();
             let stamp = PolicyStamp::new(work.plan_version, load(1), now).unwrap();
             assert_eq!(stamp.installed_until_ns, load(2));
@@ -320,10 +323,10 @@ pub(super) fn worker_step(generation: u64) -> bool {
             scheduler
                 .install_weight(GROUPS[0], weight, stamp, now)
                 .unwrap();
-            assert_eq!(scheduler.policy_receipt(GROUPS[0]), Ok(0));
+            assert_eq!(scheduler.policy_receipt(GROUPS[0]), Ok(load(4)));
             OUTPUT[0].store(work.plan_version, Ordering::Relaxed);
         }
-        3 => phase(scheduler, layout, 1),
+        3 | 5 => phase(scheduler, layout, usize::from(round == 5)),
         _ => panic!("unexpected D01 request"),
     }
     DONE.store(round, Ordering::Release);
@@ -337,9 +340,8 @@ pub(super) fn run(
     inbox: &mut FeedbackInbox,
     desired: &mut DesiredBank,
 ) {
-    let baseline = exchange(1, &[], &[]);
-    let sampled = baseline[1];
-    assert_eq!(baseline[7], 2);
+    let initial = exchange(1, &[], &[]);
+    assert_eq!(initial[1], 2);
     let target = Target {
         domain: 1,
         object: TARGET,
@@ -347,6 +349,18 @@ pub(super) fn run(
             id: 1,
             generation: 1,
         },
+    };
+    let binding = ExecutorBindingV1 {
+        domain: 1,
+        role: 1,
+        active: true,
+        target: TARGET,
+        executor_generation: 1,
+        holder: Identity {
+            id: 0,
+            generation: 0,
+        },
+        endpoint_cap_id: 0,
     };
     snapshots
         .register_target(target, |t| {
@@ -357,7 +371,104 @@ pub(super) fn run(
             }
         })
         .unwrap();
-    let fields = [Some(baseline[7]), Some(baseline[6]), None, None];
+    desired
+        .register_target(binding, |b| {
+            if b.target == target.object {
+                Ok(())
+            } else {
+                Err(Error::Denied)
+            }
+        })
+        .unwrap();
+
+    // Freeze one profile for both sides. Its first rule can match only
+    // after we have an actual positive wait observation; absent is not zero.
+    let generation = desired.version() + 1;
+    let preferred = rule(target, generation, 2, 1, 2);
+    let fallback = rule(target, generation, 1, 2, 0);
+    let mut rules = [0; 144];
+    rules[..88].copy_from_slice(&preferred);
+    rules[16..20].copy_from_slice(&2u32.to_le_bytes());
+    rules[20..24].copy_from_slice(&144u32.to_le_bytes());
+    rules[88..].copy_from_slice(&fallback[32..]);
+    rules[88..92].copy_from_slice(&2u32.to_le_bytes());
+    let profile = Profile::parse(&rules).unwrap();
+    let (baseline, baseline_accept) = run_branch(
+        boot,
+        0,
+        initial[0],
+        [Some(initial[1]), None, None, None],
+        0,
+        target,
+        binding,
+        &profile,
+        gate,
+        snapshots,
+        inbox,
+        desired,
+    );
+    let (weighted, weighted_accept) = run_branch(
+        boot,
+        1,
+        baseline[1],
+        [Some(baseline[7]), Some(baseline[6]), None, None],
+        baseline[8],
+        target,
+        binding,
+        &profile,
+        gate,
+        snapshots,
+        inbox,
+        desired,
+    );
+    assert!(baseline[0] / WINDOW_NS < weighted[0] / WINDOW_NS);
+    assert!(
+        u128::from(weighted[2]) * u128::from(baseline[3])
+            > u128::from(weighted[3]) * u128::from(baseline[2]),
+        "D01 selected task group did not gain share"
+    );
+    let head = &V0199_D01_EVIDENCE.header;
+    for (at, v) in head.iter().zip([
+        0x4359443031465832,
+        boot,
+        baseline[8],
+        weighted[8],
+        baseline_accept,
+        weighted_accept,
+        inbox.len() as u64,
+    ]) {
+        at.store(v, Ordering::Relaxed);
+    }
+    for (at, v) in head[8..]
+        .iter()
+        .zip(baseline[..11].iter().chain(&weighted[..11]))
+    {
+        at.store(*v, Ordering::Relaxed);
+    }
+    for (i, slot) in PRIVATE_SLOTS.into_iter().enumerate() {
+        let root = unsafe { core::ptr::addr_of!(ROOTS).cast::<Page>().add(slot) };
+        head[30 + i].store(phys(root as u64), Ordering::Relaxed);
+    }
+    copy_words(&rules, &head[32..]);
+    report("V0199_D01_EFFECT", baseline[4], weighted[4], weighted[8]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_branch(
+    boot: u64,
+    branch: usize,
+    sampled: u64,
+    fields: [Option<u64>; 4],
+    prior_version: u64,
+    target: Target,
+    binding: ExecutorBindingV1,
+    profile: &Profile<'_>,
+    gate: &mut RegisteredDecisionGate<'_>,
+    snapshots: &mut SnapshotStore,
+    inbox: &mut FeedbackInbox,
+    desired: &mut DesiredBank,
+) -> ([u64; WORDS], u64) {
+    let expected_weight = WEIGHTS[branch];
     let seq = snapshots
         .capture(
             1,
@@ -408,8 +519,6 @@ pub(super) fn run(
         |v| Ok(matches!(v, ActionV2::GroupWeight(1 | 2 | 4 | 8))),
     )
     .unwrap();
-    let rules = rule(target, seq, 1, 2, 2);
-    let profile = Profile::parse(&rules).unwrap();
     let matched = profile
         .match_candidates(
             1,
@@ -423,12 +532,12 @@ pub(super) fn run(
         .unwrap();
     let view = candidates.view();
     let local = view.selected(matched.fallback_index).unwrap();
-    assert_eq!(local.action_payload, &APPROVED.to_le_bytes());
+    assert_eq!(local.action_payload, &expected_weight.to_le_bytes());
     let scope = TrustedRegistrationScope {
         boot_epoch: boot,
         controller_epoch: 1,
-        rules_generation: seq,
-        rules_hash: sha(&rules),
+        rules_generation: profile.generation,
+        rules_hash: sha(profile.canonical_bytes()),
         base_plan_version: desired.version(),
         ledger_generation: 1,
         core_generation: 1,
@@ -447,30 +556,9 @@ pub(super) fn run(
     let actions = [local];
     let decisions = [decision];
     assert_eq!(
-        gate.register_rule_only(CTL, &plan, &decisions, &profile, &actions, scope),
+        gate.register_rule_only(CTL, &plan, &decisions, profile, &actions, scope),
         Ok(Registration::Frozen)
     );
-    let binding = ExecutorBindingV1 {
-        domain: 1,
-        role: 1,
-        active: true,
-        target: TARGET,
-        executor_generation: 1,
-        holder: Identity {
-            id: 0,
-            generation: 0,
-        },
-        endpoint_cap_id: 0,
-    };
-    desired
-        .register_target(binding, |b| {
-            if b.target == target.object {
-                Ok(())
-            } else {
-                Err(Error::Denied)
-            }
-        })
-        .unwrap();
     let publication = TrustedRegistrationScope {
         now_ns: Board.now_ns(),
         ..scope
@@ -480,7 +568,7 @@ pub(super) fn run(
             PUB,
             &plan,
             &decisions,
-            &profile,
+            profile,
             &actions,
             publication,
             || {
@@ -489,8 +577,8 @@ pub(super) fn run(
                         let a = stage[0].ok_or(Error::Denied)?;
                         if stage.len() == 1
                             && a.binding == binding
-                            && a.value == ActionV2::GroupWeight(APPROVED)
-                            && a.prior_target_version == baseline[8]
+                            && a.value == ActionV2::GroupWeight(expected_weight)
+                            && a.prior_target_version == prior_version
                         {
                             Ok(())
                         } else {
@@ -523,8 +611,8 @@ pub(super) fn run(
                     return Err(Error::Denied);
                 }
                 let result = exchange(
-                    2,
-                    &[boot, sampled, action.until_ns, apply.now_ns],
+                    2 + 2 * branch as u64,
+                    &[boot, sampled, action.until_ns, apply.now_ns, prior_version],
                     frame.bytes(),
                 );
                 if result[0] == work.plan_version {
@@ -536,19 +624,13 @@ pub(super) fn run(
         })
         .unwrap();
     let work = ApplyWorkV1::decode(accepted.bytes()).unwrap();
-    let weighted = exchange(3, &[], &[]);
-    let actual_change = || {
-        baseline[0] / WINDOW_NS < weighted[0] / WINDOW_NS
-            && apply.now_ns <= weighted[0]
-            && weighted[8] == work.plan_version
-            && weighted[7] == baseline[7]
-            && u128::from(weighted[2]) * u128::from(baseline[3])
-                > u128::from(weighted[3]) * u128::from(baseline[2])
+    let observed = exchange(3 + 2 * branch as u64, &[], &[]);
+    let effect_verified = || {
+        apply.now_ns <= observed[0]
+            && observed[8] == work.plan_version
+            && Some(observed[7]) == fields[0]
     };
-    assert!(
-        actual_change(),
-        "D01 selected task group did not gain share"
-    );
+    assert!(effect_verified());
     let mut raw = [0; MAX_APPLY_REPORT_BYTES];
     let len = ApplyReportV1 {
         key: work.key,
@@ -559,14 +641,14 @@ pub(super) fn run(
         executor_generation: work.executor_generation,
         plan_version: work.plan_version,
         result: 0,
-        completed_ns: weighted[1],
+        completed_ns: observed[1],
         action: work.payload,
     }
     .encode(&mut raw)
     .unwrap();
     let applied = ApplyReportV1::decode(&raw[..len]).unwrap();
     let verify = |r: &ApplyReportV1<'_>| {
-        if *r == applied && work.matches_report(*r) && actual_change() {
+        if *r == applied && work.matches_report(*r) && effect_verified() {
             Ok(())
         } else {
             Err(Error::Denied)
@@ -608,31 +690,12 @@ pub(super) fn run(
             }
         })
         .unwrap();
-    let head = &V0199_D01_EVIDENCE.header;
-    for (at, v) in head.iter().zip([
-        0x4359443031465831,
-        boot,
-        seq,
-        apply.now_ns,
-        len as u64,
-        inbox.len() as u64,
-    ]) {
-        at.store(v, Ordering::Relaxed);
-    }
-    for (at, v) in head[8..]
-        .iter()
-        .zip(baseline[..11].iter().chain(&weighted[..11]))
-    {
-        at.store(*v, Ordering::Relaxed);
-    }
-    for (i, slot) in PRIVATE_SLOTS.into_iter().enumerate() {
-        let root = unsafe { core::ptr::addr_of!(ROOTS).cast::<Page>().add(slot) };
-        head[30 + i].store(phys(root as u64), Ordering::Relaxed);
-    }
-    copy_words(&snap.encode().unwrap(), &head[32..]);
-    copy_words(&rules, &head[65..]);
-    copy_words(&plan, &head[76..]);
-    copy_words(&decision, &head[103..]);
-    copy_words(&raw[..len], &head[135..]);
-    report("V0199_D01_EFFECT", baseline[4], weighted[4], seq);
+    let offset = (BRANCH_HEAD_BYTES + branch * BRANCH_BYTES) / 8;
+    let record = &V0199_D01_EVIDENCE.header[offset..offset + BRANCH_BYTES / 8];
+    copy_words(&snap.encode().unwrap(), record);
+    copy_words(&plan, &record[33..]);
+    copy_words(&decision, &record[60..]);
+    assert_eq!(len, 98);
+    copy_words(&raw[..len], &record[92..]);
+    (observed, apply.now_ns)
 }

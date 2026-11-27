@@ -269,7 +269,7 @@ jobs:
             args+=(--d11-rng)
           fi
           if [ '${{ matrix.artifact }}' = epoch-disk-d01 ]; then
-            args+=(--d01-scheduler)
+            args+=(--d01-paired-receipts)
           fi
           PATH="$PWD/artifacts/eight-qemu/bin:$PATH" python3 -B tools/verify_v0199_epoch_disk.py "${args[@]}" \
             --elf artifacts/epoch-disk/kernel.elf --role7 artifacts/epoch-disk/role7.elf \

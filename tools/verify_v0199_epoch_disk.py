@@ -621,21 +621,32 @@ class EpochFixture:
             return raw
 
         proof=physical('d01-scheduler.bin',self.d01_proof_pa,2*BLOCK)
-        magic,boot,seq,accept,n,retained=struct.unpack_from('<6Q',proof)
-        require((magic,boot,seq,n,retained)==(0x4359443031465831,self.epoch,
-                    6 if self.dedicated_d11_rng else 5,98,seq),'D01 publication identities differ')
-        require(not any(proof[48:64]) and not any(proof[820:824])
-                and not any(proof[1178:BLOCK]) and not any(proof[BLOCK+48*80:]),
-                'noncanonical D01 evidence padding')
+        version,boot,*header=struct.unpack_from('<8Q',proof)
+        first=6 if self.dedicated_d11_rng else 5
+        paired=version==0x4359443031465832
+        require(boot==self.epoch,'D01 wrong boot scope')
+        if paired:
+            base_seq,trial_seq,base_accept,trial_accept,retained,padding=header
+            require((base_seq,trial_seq,retained,padding)==(first,first+1,first+1,0)
+                    and not any(proof[400:512]) and not any(proof[2560:BLOCK]),
+                    'D01 two-branch publication identity or padding differs')
+        else:
+            trial_seq,trial_accept,n,retained,*padding=header
+            require((version,trial_seq,n,retained)==(0x4359443031465831,first,98,first)
+                    and not any(padding) and not any(proof[820:824])
+                    and not any(proof[1178:BLOCK]),'D01 legacy publication or padding differs')
+            base_seq,base_accept=0,0
+        require(not any(proof[BLOCK+48*80:]),'D01 noncanonical turn padding')
         baseline=struct.unpack_from('<11Q',proof,64)
         weighted=struct.unpack_from('<11Q',proof,152)
         roots=struct.unpack_from('<2Q',proof,240)
         require(baseline[0]//100_000_000<weighted[0]//100_000_000
-                and 0<baseline[0]<=baseline[1]<=accept<baseline[1]+100_000_000
-                and accept<=weighted[0]<=weighted[1]<baseline[1]+10_000_000_000
-                and baseline[7:9]==(2,0) and weighted[7:9]==(2,seq)
+                and 0<baseline[0]<=baseline[1]<=trial_accept<baseline[1]+100_000_000
+                and base_accept<=baseline[0]
+                and trial_accept<=weighted[0]<=weighted[1]<baseline[1]+10_000_000_000
+                and baseline[7:9]==(2,base_seq) and weighted[7:9]==(2,trial_seq)
                 and baseline[9:11]==weighted[9:11]
-                and self.d01_uart==(baseline[4],weighted[4],seq),
+                and self.d01_uart==(baseline[4],weighted[4],trial_seq),
                 'D01 aligned phases, requester or installed version differs')
         last_dispatch=[0,0]
         for phase,header,weights in ((0,baseline,(1,1)),(1,weighted,(4,1))):
@@ -656,7 +667,7 @@ class EpochFixture:
                 credit=min(2_000_000,10_000_000-spent[task],90_000_000-sum(spent),
                            (start//100_000_000+1)*100_000_000-start)
                 require(reserve==credit and wait==start-ready[task] and wait<100_000_000
-                        and version==(seq if phase and task==0 else 0)
+                        and version==(header[8] if task==0 else 0)
                         and work==(count[task]+1)*2048,
                         'D01 dispatch reservation, readiness or EL0 work count differs')
                 count[task]+=1
@@ -697,51 +708,108 @@ class EpochFixture:
             data_page=physical(f'd01-private-data-{i}.bin',checked(data))
             require(struct.unpack_from('<Q',data_page)[0]==completed*2048,
                     'D01 final physical EL0 counter differs from CPU debit')
-        snap,rules,plan,decision,report=(proof[a:b] for a,b in
-                                        ((256,520),(520,608),(608,820),(824,1080),(1080,1178)))
-        sample=baseline[1]
-        require(struct.unpack_from('<IHH',snap)==(0x4359534e,3,72)
-                and struct.unpack_from('<7Q',snap,8)==(seq,self.epoch,1,1,17,1,sample)
-                and struct.unpack_from('<HHI',snap,64)==(1,12,0),'D01 snapshot scope differs')
-        for i,value in enumerate([None]*8+[2,baseline[6],None,None]):
-            at=72+i*16
-            require(struct.unpack_from('<HB5xQ',snap,at)==(16+i,int(value is not None),value or 0)
-                    and snap[at+3:at+8]==bytes(5),'D01 scheduler observation fields differ')
-        expected=bytearray(88)
-        put(expected,0,'IHHQIIQ',0x43595255,2,32,seq,1,88,0)
-        put(expected,32,'IHHQHHHHII',1,1,1,17,0,1,1,0,56,0)
-        put(expected,64,'HB5xQ',1,3,2)
-        put(expected,80,'HHI',2,0,0)
-        require(rules==bytes(expected),'D01 exact deterministic rule differs')
-        h=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
-        h.update(hashlib.sha256(b'CYX/D01-CPU1-FIXTURE/0=1,1=2,2=4,3=8').digest())
-        h.update(snap);h.update(bytes(1))
-        for value in [2,baseline[6],None,None,0,2,1]:
-            h.update(struct.pack('<BQ',value is not None,value or 0))
-        h.update(struct.pack('<H',4))
-        for ordinal,tier in enumerate((1,2,4,8)):
-            h.update(struct.pack('<HBH',ordinal,2,tier))
-        digest=h.digest()
-        require(struct.unpack_from('<IHHIHH6Q',plan)==(0x43594c31,2,64,212,1,0,seq,seq-1,0,1,seq,sample+10_000_000_000)
-                and struct.unpack_from('<IHHHHI8Q',plan,64)==(0x43595031,2,144,1,1,4,1,seq,seq,17,1,1,1,sample+100_000_000)
-                and plan[144:176]==bytes(32) and plan[176:208]==digest and plan[208:]==bytes([2,0,4,0]),
-                'D01 publication differs from observed deterministic decision')
-        require(struct.unpack_from('<IHH',decision)==(0x43594431,3,256)
-                and struct.unpack_from('<10Q',decision,8)==(self.epoch,1,seq,seq,seq,17,1,1,1,seq)
-                and struct.unpack_from('<IHHH',decision,88)==(1,0,1,1)
-                and decision[98:102]==bytes(4) and struct.unpack_from('<HHHI',decision,102)==(2,65535,0,3)
-                and struct.unpack_from('<5Q',decision,112)==(0,0,0,0,sample+100_000_000)
-                and struct.unpack_from('<IHH',decision,152)==(4,2,0)
-                and decision[160:192]==hashlib.sha256(rules).digest()
-                and decision[192:224]==hashlib.sha256(plan).digest() and decision[224:256]==digest,
-                'D01 exact decision binding differs')
-        require(struct.unpack_from('<QQQHHHHQQQQiIQ',report)==(self.epoch,1,seq,0,1,1,0,17,1,1,seq,0,2,weighted[1])
-                and report[80:96]==bytes(16) and report[96:]==bytes([4,0])
-                and custody.count(decision)==custody.count(report)==1,'D01 protected APPLIED receipt differs')
+        if paired:
+            rules=proof[256:400]
+            expected=bytearray(144)
+            put(expected,0,'IHHQIIQ',0x43595255,2,32,base_seq,2,144,0)
+            put(expected,32,'IHHQHHHHII',1,1,1,17,0,1,1,0,56,0)
+            put(expected,64,'HB5xQ',2,3,1)
+            put(expected,80,'HHI',2,0,0)
+            put(expected,88,'IHHQHHHHII',2,1,1,17,0,1,1,0,56,0)
+            put(expected,120,'HB5xQ',1,3,2)
+            put(expected,136,'HHI',0,0,0)
+            require(rules==bytes(expected),'D01 shared two-branch rule differs')
+            branch_results=[]
+            for i,(seq,accept,phase) in enumerate(((base_seq,base_accept,baseline),
+                                                   (trial_seq,trial_accept,weighted))):
+                row=proof[512+i*1024:1536+i*1024]
+                snap,plan,decision,report=row[:264],row[264:476],row[480:736],row[736:834]
+                require(not any(row[476:480]) and not any(row[834:]),
+                        'D01 noncanonical protected branch record padding')
+                sample=struct.unpack_from('<Q',snap,56)[0]
+                require(0<sample<=accept<sample+100_000_000 and accept<=phase[0]
+                        and phase[1]<sample+10_000_000_000
+                        and (i==0 or sample==baseline[1] and baseline[6]>0),
+                        'D01 branch observation and acceptance chronology differs')
+                branch_results.append(self.d01_branch(
+                    snap,rules,plan,decision,report,custody,seq,base_seq,sample,
+                    baseline[6] if i else None,2 if i else 0,1 if i else 2,phase[1]))
+            left,right=branch_results
+            require(left['decision_key']!=right['decision_key'] and left['apply_id']!=right['apply_id']
+                    and left['receipt_sha256']!=right['receipt_sha256'],
+                    'D01 comparison reused a protected decision or receipt')
+            comparison=dict(native_d01_both_branch_receipts_verified=True,
+                            d01_comparison=dict(eligibility='diagnostic_only', domain=1,
+                                rules_sha256=hashlib.sha256(rules).hexdigest(),
+                                baseline=left, comparison=right,
+                                missing_requirements=['signed_trial','frozen_request_schedule',
+                                                      'reproduced_initial_state','complete_reward_window',
+                                                      'full_cpu_accounting','renewal_and_restoration']))
+        else:
+            snap,rules,plan,decision,report=(proof[a:b] for a,b in
+                                            ((256,520),(520,608),(608,820),(824,1080),(1080,1178)))
+            expected=bytearray(88)
+            put(expected,0,'IHHQIIQ',0x43595255,2,32,first,1,88,0)
+            put(expected,32,'IHHQHHHHII',1,1,1,17,0,1,1,0,56,0)
+            put(expected,64,'HB5xQ',1,3,2)
+            put(expected,80,'HHI',2,0,0)
+            require(rules==bytes(expected),'D01 original deterministic rule differs')
+            self.d01_branch(snap,rules,plan,decision,report,custody,first,first,
+                            baseline[1],baseline[6],2,1,weighted[1])
+            comparison={}
         return dict(native_d01_scheduler_effect_fixture_verified=True,d01_common_cpu=1,
                     d01_observed_real_dispatches=48,d01_baseline_cpu_ns=list(baseline[2:4]),
                     d01_approved_cpu_ns=list(weighted[2:4]),d01_baseline_turns=list(baseline[4:6]),
-                    d01_approved_turns=list(weighted[4:6]),d01_evidence_sha256=hashlib.sha256(proof).hexdigest())
+                    d01_approved_turns=list(weighted[4:6]),d01_evidence_sha256=hashlib.sha256(proof).hexdigest(),
+                    **comparison)
+
+    def d01_branch(self,snap,rules,plan,decision,report,custody,seq,generation,sample,
+                   wait,ordinal,rule_id,finished):
+        require=verify_smp.require
+        require(struct.unpack_from('<IHH',snap)==(0x4359534e,3,72)
+                and struct.unpack_from('<7Q',snap,8)==(seq,self.epoch,1,1,17,1,sample)
+                and struct.unpack_from('<HHI',snap,64)==(1,12,0),'D01 snapshot scope differs')
+        for i,value in enumerate([None]*8+[2,wait,None,None]):
+            at=72+i*16
+            require(struct.unpack_from('<HB5xQ',snap,at)==(16+i,int(value is not None),value or 0)
+                    and snap[at+3:at+8]==bytes(5),'D01 scheduler observation fields differ')
+        h=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
+        h.update(hashlib.sha256(b'CYX/D01-CPU1-FIXTURE/0=1,1=2,2=4,3=8').digest())
+        h.update(snap)
+        h.update(bytes(1))
+        for value in [2,wait,None,None,0,2,1]:
+            h.update(struct.pack('<BQ',value is not None,value or 0))
+        h.update(struct.pack('<H',4))
+        for rank,tier in enumerate((1,2,4,8)):
+            h.update(struct.pack('<HBH',rank,2,tier))
+        digest=h.digest()
+        weight=(1,2,4,8)[ordinal]
+        require(struct.unpack_from('<IHHIHH6Q',plan)==(0x43594c31,2,64,212,1,0,seq,seq-1,0,1,seq,sample+10_000_000_000)
+                and struct.unpack_from('<IHHHHI8Q',plan,64)==(0x43595031,2,144,1,1,4,1,seq,seq,17,1,1,1,sample+100_000_000)
+                and plan[144:176]==bytes(32) and plan[176:208]==digest
+                and plan[208:]==struct.pack('<HH',ordinal,weight),
+                'D01 publication differs from observed deterministic decision')
+        require(struct.unpack_from('<IHH',decision)==(0x43594431,3,256)
+                and struct.unpack_from('<10Q',decision,8)==(self.epoch,1,seq,seq,seq,17,1,1,1,generation)
+                and struct.unpack_from('<IHHH',decision,88)==(rule_id,0,1,1)
+                and decision[98:102]==bytes(4) and struct.unpack_from('<HHHI',decision,102)==(ordinal,65535,0,3)
+                and struct.unpack_from('<5Q',decision,112)==(0,0,0,0,sample+100_000_000)
+                and struct.unpack_from('<IHH',decision,152)==(1<<ordinal,ordinal,0)
+                and decision[160:192]==hashlib.sha256(rules).digest()
+                and decision[192:224]==hashlib.sha256(plan).digest() and decision[224:256]==digest,
+                'D01 exact decision binding differs')
+        require(struct.unpack_from('<QQQHHHHQQQQiIQ',report)==(self.epoch,1,seq,0,1,1,0,17,1,1,seq,0,2,finished)
+                and report[80:96]==bytes(16) and report[96:]==struct.pack('<H',weight)
+                and custody.count(decision)==custody.count(report)==1,'D01 protected APPLIED receipt differs')
+        receipt=hashlib.sha256(b'CYX/EXECUTION-FEEDBACK/v0199')
+        receipt.update(decision)
+        receipt.update(struct.pack('<H',len(report)))
+        receipt.update(report)
+        receipt.update(bytes(2))  # NoAdoption; no advice or disposition.
+        return dict(decision_key=[self.epoch,1,seq],apply_id=[self.epoch,1,seq,0,17,1],
+                    weight=weight,receipt_sha256=receipt.hexdigest(),
+                    snapshot_sha256=hashlib.sha256(snap).hexdigest(),
+                    observed_finished_ns=finished)
 
     def capture_extra(self,qmp,out,page):
         # This hook runs after validate(), with all four CPUs stopped.
@@ -898,7 +966,9 @@ def main():
     p.add_argument('--patch-sha256',required=True)
     p.add_argument('--d11-rng',action='store_true',help='require dedicated VirtIO RNG effect evidence')
     p.add_argument('--d01-scheduler',action='store_true',help='require native D01 CPU1 scheduler evidence')
+    p.add_argument('--d01-paired-receipts',action='store_true',help='require both protected D01 branch receipts')
     a=p.parse_args()
+    d01=a.d01_scheduler or a.d01_paired_receipts
     out=a.output.resolve()
     out.mkdir(parents=True,exist_ok=False)
     disk=out/'scratch.raw'
@@ -908,7 +978,7 @@ def main():
         previous=verify_smp.sha(disk)
         for epoch in (1,2):
             capture=out/f'boot-{epoch}'
-            summary=verify_smp.run(a.elf,capture,45,4,acceptance=EpochFixture(epoch,a.qemu_sha256,a.patch_sha256,hashlib.sha256(a.role7.read_bytes()).digest(),a.d11_rng,a.d01_scheduler),
+            summary=verify_smp.run(a.elf,capture,45,4,acceptance=EpochFixture(epoch,a.qemu_sha256,a.patch_sha256,hashlib.sha256(a.role7.read_bytes()).digest(),a.d11_rng,d01),
                                    ram_mib=1024,scratch_disk=disk)
             result['boots'].append(summary)
             verify_smp.require(summary['status']=='PASS' and summary.get('forced_process_stop'),
@@ -937,11 +1007,17 @@ def main():
                 b.get('observations',{}).get('native_d11_rng_effect_fixture_verified') is True
                 for b in result['boots']),'missing dedicated D11 RNG effect proof')
             result['native_d11_rng_actual_effect_fixture_verified']=True
-        if a.d01_scheduler:
+        if d01:
             verify_smp.require(all(
                 b.get('observations',{}).get('native_d01_scheduler_effect_fixture_verified') is True
                 for b in result['boots']),'missing native D01 scheduler effect proof')
             result['native_d01_scheduler_actual_effect_fixture_verified']=True
+            result['native_d01_both_branch_receipts_verified']=all(
+                b.get('observations',{}).get('native_d01_both_branch_receipts_verified') is True
+                for b in result['boots'])
+            if a.d01_paired_receipts:
+                verify_smp.require(result['native_d01_both_branch_receipts_verified'],
+                                   'missing independent protected D01 baseline and comparison receipts')
         result['status']='PASS'
     except (OSError,ValueError,RuntimeError) as e:
         result['status']='FAIL'
