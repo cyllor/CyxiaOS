@@ -30,7 +30,6 @@ use role_loader::{
 };
 
 const E_AUTH: i64 = -1;
-const E_FORMAT: i64 = -2;
 
 pub(crate) fn run(info: &BootInfo) -> ! {
     signed_resident::run(info)

@@ -576,7 +576,9 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("production_skeleton=true, full_authority=false, real_models=false", prod)
         # In-vector dispatch reuses the SAME kernel-core bridge APIs as the
         # advice-e2e fixture (no reinvented chain).
-        self.assertIn("decode_aarch64_svc_v3(3, f.esr, &f.regs)", prod)
+        self.assertIn("decode_aarch64_svc_v3(ABI_VERSION, f.esr, &f.regs)", prod)
+        self.assertIn("return Some(preflight_errno(error) as u64)", prod)
+        self.assertNotIn('expect("actual ABI3 role trap")', prod)
         self.assertIn("bridge.register_assisted_one(", prod)
         self.assertIn("bridge.publish_assisted_one(", prod)
         self.assertIn(".claim_apply_work(", prod)

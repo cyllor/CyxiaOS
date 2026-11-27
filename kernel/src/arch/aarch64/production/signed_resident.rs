@@ -9,10 +9,10 @@
 //! one continuous CPU0 cursor covers both prepaid turns and EL1 coordination.
 
 use super::{
-    BootInfo, E_AUTH, E_FORMAT, Error, ExceptionFrame, IRQS, Identity, NativeRole,
-    NativeRoleManifest, Ordering, ROLE_COUNT, ROLES, Role, TIMER_IRQ, bring_up_production, cpu,
-    frames, gic, load_role_with_identity, media_staging, now_ns, ns_from_ticks, pie_context,
-    profile, recovery, report, report_payload, resident, role_asid, timer, trapped_ttbr0, user,
+    BootInfo, E_AUTH, Error, ExceptionFrame, IRQS, Identity, NativeRole, NativeRoleManifest,
+    Ordering, ROLE_COUNT, ROLES, Role, TIMER_IRQ, bring_up_production, cpu, frames, gic,
+    load_role_with_identity, media_staging, now_ns, ns_from_ticks, pie_context, profile, recovery,
+    report, report_payload, resident, role_asid, timer, trapped_ttbr0, user,
 };
 use crate::machine::enqueue_resident_frame;
 use core::sync::atomic::AtomicU64;
@@ -26,7 +26,7 @@ use cyxia_kernel_core::{
         Error as SvcError,
         durable_role_epoch_v0199::ConfirmedBootPolicy,
         syscall::Syscall,
-        syscall_v3::{ABI_VERSION, decode_aarch64_lifecycle_svc_v3},
+        syscall_v3::{ABI_VERSION, decode_aarch64_lifecycle_svc_v3, preflight_errno},
     },
 };
 
@@ -66,6 +66,12 @@ struct Task {
     activity: u16,
 }
 
+enum TaskAction {
+    Resume,
+    EndTurn,
+    Exit(i32),
+}
+
 enum Fault {
     Operation(Error),
     Budget {
@@ -82,6 +88,10 @@ enum Fault {
         used: u64,
         ended: u64,
         crossed: bool,
+    },
+    RoleExit {
+        actor: Identity,
+        status: i32,
     },
 }
 
@@ -265,24 +275,22 @@ impl Budget {
 }
 
 impl Task {
-    fn trap(&mut self) -> Result<bool, Error> {
+    fn trap(&mut self) -> Result<TaskAction, Error> {
         let ctx = &mut self.context;
         if ctx.kind == 9 {
-            return Ok(true);
+            return Ok(TaskAction::EndTurn);
         }
         if ctx.kind != 8 || ctx.esr >> 26 != 0x15 {
             return Err(Error::Denied);
         }
         let call = match decode_aarch64_lifecycle_svc_v3(ABI_VERSION, ctx.esr, &ctx.regs) {
             Ok(call) => call,
-            Err(SvcError::Unauthorized) => {
-                ctx.regs[0] = E_AUTH as u64;
-                self.activity |= DENIED;
-                return Ok(false);
-            }
-            Err(_) => {
-                ctx.regs[0] = E_FORMAT as u64;
-                return Ok(false);
+            Err(error) => {
+                if error == SvcError::Unauthorized {
+                    self.activity |= DENIED;
+                }
+                ctx.regs[0] = preflight_errno(error) as u64;
+                return Ok(TaskAction::Resume);
             }
         };
         ctx.regs[0] = 0;
@@ -292,17 +300,21 @@ impl Task {
                 ctx.regs[0] = now as u64;
                 self.activity |= CLOCK;
             }
-            Syscall::Yield => self.activity |= YIELD,
-            Syscall::Sleep => {
-                self.wake_ns = call.args[0];
-                self.activity |= SLEEP;
+            Syscall::Yield => {
+                self.activity |= YIELD;
+                return Ok(TaskAction::EndTurn);
             }
-            // Retain the pinned private frames and fence this diagnostic
-            // cohort on exit or fault. No implicit restart is authorized.
-            Syscall::Exit => return Err(Error::Denied),
+            Syscall::Sleep => {
+                self.activity |= SLEEP;
+                if call.args[0] > now_ns() {
+                    self.wake_ns = call.args[0];
+                    return Ok(TaskAction::EndTurn);
+                }
+            }
+            Syscall::Exit => return Ok(TaskAction::Exit(call.args[0] as i32)),
             _ => ctx.regs[0] = E_AUTH as u64,
         }
-        Ok(matches!(call.operation, Syscall::Yield | Syscall::Sleep))
+        Ok(TaskAction::Resume)
     }
 }
 
@@ -382,7 +394,15 @@ fn turn(
         Err(Error::Denied)
     };
     budget.settle(grant, start, returned)?;
-    result.map_err(Into::into)
+    if let Some(status) = result? {
+        // The full cohort owns startup readiness. An orderly exit stops its
+        // admission after settlement and retains the private backing.
+        return Err(Fault::RoleExit {
+            actor: member.actor,
+            status,
+        });
+    }
+    Ok(())
 }
 
 fn run_quantum(
@@ -392,7 +412,7 @@ fn run_quantum(
     grant: Turn,
     start: &Sample,
     returned: &mut u64,
-) -> Result<(), Error> {
+) -> Result<Option<i32>, Error> {
     // A separate physical timer forces return before the prepaid bound
     // expires. Reserve exit/settlement margin using the native fixture's
     // role limits. Clock, rejection and waiting cannot refill a grant.
@@ -428,8 +448,9 @@ fn run_quantum(
         ACTIVE_ROLE_TTBR0.store(0, Ordering::Release);
         *returned += 1;
         match task.trap() {
-            Ok(false) => {}
-            Ok(true) => break,
+            Ok(TaskAction::Resume) => {}
+            Ok(TaskAction::EndTurn) => break,
+            Ok(TaskAction::Exit(status)) => return Ok(Some(status)),
             Err(error) => {
                 recovery::record_role_failure(member.actor, task.context.esr, task.context.far)
                     .map_err(|_| Error::Denied)?;
@@ -437,7 +458,7 @@ fn run_quantum(
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn run_tasks(
@@ -627,6 +648,10 @@ fn fence(info: &BootInfo, budget: Budget, pending: OutputQueue<128>, fault: Faul
         } => (
             "V020_SIGNED_RESIDENT_COORD_OVERRUN",
             [used, ended, u64::from(crossed)],
+        ),
+        Fault::RoleExit { actor, status } => (
+            "V020_SIGNED_RESIDENT_EXIT",
+            [actor.id, actor.generation, i64::from(status) as u64],
         ),
     };
     // Finish any retained serial suffix before the read-only status banner.

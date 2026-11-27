@@ -102,7 +102,10 @@ use cyxia_kernel_core::control_plane::{
     rule_profile_v2::Profile,
     svc_bridge_v3::{FrozenNativePlan, SvcV3Bridge, VerifiedNativeCaller},
 };
-use cyxia_kernel_core::security::syscall_v3::decode_aarch64_svc_v3;
+use cyxia_kernel_core::security::{
+    syscall::Syscall,
+    syscall_v3::{ABI_VERSION, decode_aarch64_svc_v3, preflight_errno},
+};
 use sha2::{Digest, Sha256};
 
 #[path = "production/evidence.rs"]
@@ -629,10 +632,15 @@ fn svc_dispatch(f: &mut ExceptionFrame) -> Option<u64> {
     if caller >= SVC_OUT.len() as u64 {
         return Some(E_AUTH as u64);
     }
+    if caller >= ADVICE_CALLER_BASE && f.esr & 0xffff == 4 {
+        // The linked advice diagnostic uses SVC #4 only to return to its
+        // bounded owner. An ABI3 PIE task uses the SVC #0 lifecycle entry.
+        return None;
+    }
     let x8 = f.regs[8];
-    let args = match decode_aarch64_svc_v3(3, f.esr, &f.regs) {
-        Ok(call) => call.args,
-        Err(_) => {
+    let call = match decode_aarch64_svc_v3(ABI_VERSION, f.esr, &f.regs) {
+        Ok(call) => call,
+        Err(error) => {
             // A failed ABI check can report a refusal for the recognized endpoint.
             #[cfg(any(
                 feature = "v020-production-snapshot-catalog",
@@ -647,16 +655,20 @@ fn svc_dispatch(f: &mut ExceptionFrame) -> Option<u64> {
                     return Some(outcome);
                 }
             }
-            return None;
+            return Some(preflight_errno(error) as u64);
         }
     };
-    if !matches!(x8, 0x40 | 0x41 | 0x50) {
-        return None;
+    match call.operation {
+        Syscall::ReadSnapshot | Syscall::SubmitPlan | Syscall::ServiceCall => {}
+        Syscall::Clock | Syscall::Yield | Syscall::Sleep if caller < ADVICE_CALLER_BASE => {
+            return None;
+        }
+        _ => return Some(E_AUTH as u64),
     }
     let outcome = if caller < ADVICE_CALLER_BASE {
-        pie_dispatch(caller as usize, x8, args, f)
+        pie_dispatch(caller as usize, x8, call.args, f)
     } else {
-        advice_dispatch((caller - ADVICE_CALLER_BASE) as usize, x8, args, f)
+        advice_dispatch((caller - ADVICE_CALLER_BASE) as usize, x8, call.args, f)
     };
     let idx = caller as usize;
     SVC_ESR[idx].store(f.esr, Ordering::Relaxed);
@@ -743,11 +755,9 @@ fn wait_for_role_yield(
     failure: u64,
     done: impl Fn() -> bool,
 ) {
-    use cyxia_kernel_core::security::syscall::Syscall;
-
     loop {
         if ctx.kind == 8
-            && decode_aarch64_svc_v3(3, ctx.esr, &ctx.regs)
+            && decode_aarch64_svc_v3(ABI_VERSION, ctx.esr, &ctx.regs)
                 .is_ok_and(|call| call.operation == Syscall::Yield)
             && done()
         {
@@ -1124,21 +1134,27 @@ fn pie_turn(index: usize, ctx: &mut user::Context) {
     if ctx.kind != 8 || ctx.esr >> 26 != 0x15 {
         fatal(600 + index as u64);
     }
-    let call = decode_aarch64_svc_v3(3, ctx.esr, &ctx.regs).expect("actual ABI3 role trap");
+    let call = match decode_aarch64_svc_v3(ABI_VERSION, ctx.esr, &ctx.regs) {
+        Ok(call) => call,
+        Err(error) => {
+            ctx.regs[0] = preflight_errno(error) as u64;
+            return;
+        }
+    };
     let result = match call.operation {
-        cyxia_kernel_core::security::syscall::Syscall::Clock => {
+        Syscall::Clock => {
             PIE_CLOCKS[index].fetch_add(1, Ordering::Relaxed);
             i64::try_from(now_ns()).unwrap_or(0)
         }
-        cyxia_kernel_core::security::syscall::Syscall::Yield => {
+        Syscall::Yield => {
             PIE_YIELDS[index].fetch_add(1, Ordering::Relaxed);
             0
         }
-        cyxia_kernel_core::security::syscall::Syscall::Sleep => {
+        Syscall::Sleep => {
             PIE_YIELDS[index].fetch_add(1, Ordering::Relaxed);
             0
         }
-        _ => fatal(601 + index as u64),
+        _ => E_AUTH,
     };
     ctx.regs[0] = result as u64;
 }
