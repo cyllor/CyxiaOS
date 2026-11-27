@@ -437,6 +437,31 @@ pub(super) fn pie_syscall_abi(index: usize, root: u64) -> Option<u16> {
     (abi != 0).then_some(abi)
 }
 
+/// Disconnect a stopped CPU0 role's verified root. Its ASID and all
+/// private pages stay reserved for the rest of the boot.
+#[cfg(cyxia_signed_resident)]
+pub(super) fn retire_stopped_role(index: usize, expected_root: u64) -> Result<(), Error> {
+    if super::cpu::slot() != 0
+        || index >= ROLE_COUNT
+        || pie_syscall_abi(index, expected_root).is_none()
+    {
+        return Err(Error::Denied);
+    }
+    let tables = tables(index);
+    // SAFETY: this CPU is the sole writer of the pinned role tables. The
+    // scheduler captured the role's exit and will never enter it again.
+    unsafe {
+        let root = core::ptr::addr_of_mut!((*tables).root.0[0]);
+        let child = PhysAddr(phys(core::ptr::addr_of!((*tables).mid) as u64));
+        mmu::checked_single_child_table(child, |slot| root.add(slot).read_volatile())
+            .map_err(|_| Error::Denied)?;
+        root.write_volatile(0);
+    }
+    tlbi();
+    PIE_SYSCALL_ABI[index].store(0, Ordering::Release);
+    Ok(())
+}
+
 pub(super) fn pie_context(index: usize) -> user::Context {
     let mut ctx = user::Context::empty();
     ctx.pc = PIE_ENTRY[index].load(Ordering::Acquire);
