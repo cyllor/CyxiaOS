@@ -58,6 +58,7 @@ pub mod ipc_receive_v3;
 
 pub mod file_structure_v1;
 
+pub mod recovery_proof_store;
 pub mod recovery_proof_v2;
 pub mod recovery_v1;
 

@@ -8,6 +8,8 @@ build = "build.rs"
 default = []
 guest = []
 guest-signer = ["guest", "dep:ring"]
+# A deployed signer receives its private key on a signer-only page.
+guest-resident = ["guest-signer"]
 
 [dependencies]
 cyxia-contracts = { path = "../../crates/contracts" }

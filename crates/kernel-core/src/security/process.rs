@@ -334,8 +334,8 @@ impl<const N: usize> SpawnLedger<N> {
 //     user; WFI/WFE confirmed → saved ELR checked+4 + bounded yield, no
 //     repeat trap.
 //
-// CONTRACT-ONLY host model. The native EL1 vector wiring (exceptions.rs /
-// ERET stub) is a later step; nothing here touches hardware. The ESR_EL1 bit
+// Shared by host policy tests and the signed AArch64 execution adapter.
+// Nothing here touches hardware. The ESR_EL1 bit
 // layouts below are ARMv8-A architectural encodings (ARM DDI 0487, ESR_EL1
 // EC/IL/ISS), NOT invented protocol bytes: the baseline fixes the *policy*,
 // the architecture fixes the *syndrome layout*. Unspecified details are
@@ -361,8 +361,7 @@ pub enum TrapKind {
 }
 
 // ESR_EL1 architectural fields (ARM DDI 0487). EC = bits[31:26], IL = bit[25],
-// ISS = bits[24:0]. The SVC64 value mirrors the encoding already gated by
-// security::syscall_v3::decode_aarch64_svc_v3 (0x5600_0000).
+// ISS = bits[24:0]. Syscall ABI preflight separately rejects nonzero immediates.
 const ESR_EC_SHIFT: u32 = 26;
 const ESR_IL: u64 = 1 << 25;
 const ESR_ISS_MASK: u64 = (1 << 25) - 1;
@@ -378,8 +377,10 @@ const EC_PC_ALIGNMENT: u64 = 0x22;
 const EC_DATA_ABORT_LOWER: u64 = 0x24;
 const EC_SP_ALIGNMENT: u64 = 0x26;
 const EC_BRK_AARCH64: u64 = 0x3C;
-/// EC=0x15, IL=1, ISS immediate=0, RES0 — identical to syscall_v3's SVC64 gate.
+/// EC=0x15, IL=1, ISS[24:16]=RES0, ISS[15:0] contains the instruction immediate.
 const ESR_SVC64: u64 = (EC_SVC64 << ESR_EC_SHIFT) | ESR_IL;
+/// AArch64 WF* syndrome carries CV=1 and COND=AL in ISS[24:20].
+const WFX_AARCH64_CONDITION: u64 = 0x01E0_0000;
 
 /// Classification of a lower-EL AArch64 *synchronous* syndrome. Pure function
 /// of the saved ESR_EL1; `Unconfirmed` is the fail-closed bucket for anything
@@ -401,6 +402,21 @@ pub enum El0SyncClass {
     Unconfirmed,
 }
 
+fn attributable_lower_abort(esr_iss: u64, data: bool) -> bool {
+    // FnV, EA, and S1PTW must be clear for an ordinary EL1 task abort.
+    const UNCONFIRMED_ABORT_FLAGS: u64 = (1 << 10) | (1 << 9) | (1 << 7);
+    if esr_iss & UNCONFIRMED_ABORT_FLAGS != 0 {
+        return false;
+    }
+    // ARM DDI 0487 ESR_EL1.IFSC/DFSC, without A53-unsupported features.
+    // External, ECC, table-walk, and TLB conflict codes are outside this set.
+    match esr_iss & 0x3f {
+        0x00..=0x07 | 0x09..=0x0b | 0x0d..=0x0f => true,
+        0x21 => data, // Ordinary data alignment fault.
+        _ => false,
+    }
+}
+
 /// Pure ESR classification for the lower-EL AArch64 synchronous vector.
 pub fn classify_el0_sync(esr: u64) -> El0SyncClass {
     let ec = esr >> ESR_EC_SHIFT;
@@ -411,12 +427,11 @@ pub fn classify_el0_sync(esr: u64) -> El0SyncClass {
         return El0SyncClass::Unconfirmed;
     }
     match ec {
-        EC_SVC64 if esr == ESR_SVC64 => El0SyncClass::Svc64,
+        EC_SVC64 if esr & !u64::from(u16::MAX) == ESR_SVC64 => El0SyncClass::Svc64,
         EC_WFI_WFE => {
-            // ISS TI[1:0]: 0b00=WFI, 0b01=WFE; all other ISS bits RES0.
-            // A53 is ARMv8.0: FEAT_WFxT (WFET/WFIT, extended ISS) does not
-            // exist, so any nonzero upper ISS or reserved TI is unconfirmed.
-            if iss & !0b11 != 0 {
+            // TI=0b00 is WFI and TI=0b01 is WFE. The intervening ISS bits
+            // are RES0 on Cortex-A53, which has no FEAT_WFxT.
+            if iss & !0b11 != WFX_AARCH64_CONDITION {
                 return El0SyncClass::Unconfirmed;
             }
             match iss & 0b11 {
@@ -443,8 +458,12 @@ pub fn classify_el0_sync(esr: u64) -> El0SyncClass {
             }
             El0SyncClass::CtrEl0Read { rt }
         }
-        EC_INSTR_ABORT_LOWER | EC_PC_ALIGNMENT | EC_DATA_ABORT_LOWER | EC_SP_ALIGNMENT
-        | EC_BRK_AARCH64 => El0SyncClass::Fault,
+        EC_INSTR_ABORT_LOWER | EC_DATA_ABORT_LOWER
+            if attributable_lower_abort(iss, ec == EC_DATA_ABORT_LOWER) =>
+        {
+            El0SyncClass::Fault
+        }
+        EC_PC_ALIGNMENT | EC_SP_ALIGNMENT | EC_BRK_AARCH64 => El0SyncClass::Fault,
         // EC=0x00 "Unknown reason" is explicitly fail-closed, never a benign
         // yield; any other unrecognised EC falls through to the same bucket.
         EC_UNKNOWN => El0SyncClass::Unconfirmed,
@@ -789,7 +808,7 @@ mod tests {
         }
     }
     fn esr_wfx(wfe: bool) -> u64 {
-        (EC_WFI_WFE << ESR_EC_SHIFT) | ESR_IL | u64::from(wfe)
+        0x07e0_0000 | u64::from(wfe)
     }
     fn esr_ctr_read(rt: u64) -> u64 {
         (EC_MSR_MRS << ESR_EC_SHIFT) | ESR_IL | 0x0032_C001 | (rt << 5)
@@ -838,9 +857,17 @@ mod tests {
     }
     #[test]
     fn sec_p11_unconfirmed_wfx_syndrome_fails_closed() {
-        let base = (EC_WFI_WFE << ESR_EC_SHIFT) | ESR_IL;
-        // Reserved TI values, a WFxT-style upper ISS bit, and IL=0.
-        for bad in [base | 0b10, base | 0b11, base | (1 << 2), base & !ESR_IL] {
+        let base = esr_wfx(false);
+        // Reserved TI values, an unsupported WFxT field, a condition
+        // syndrome inconsistent with AArch64 and a missing IL bit.
+        for bad in [
+            base | 0b10,
+            base | 0b11,
+            base | (1 << 2),
+            base ^ (1 << 24),
+            base ^ (1 << 20),
+            base & !ESR_IL,
+        ] {
             assert_eq!(classify_el0_sync(bad), El0SyncClass::Unconfirmed);
             assert_eq!(
                 decide_trap(TrapSource::LowerElAarch64, TrapKind::Sync, bad, 0x1000, 0),
@@ -973,6 +1000,18 @@ mod tests {
     #[test]
     fn sec_p11_svc64_routes_to_syscall_and_faults_terminate() {
         assert_eq!(classify_el0_sync(ESR_SVC64), El0SyncClass::Svc64);
+        // A valid architectural SVC instruction with an unsupported
+        // immediate is an ABI error, not an unattributable machine fault.
+        let unsupported = ESR_SVC64 | 1;
+        assert_eq!(classify_el0_sync(unsupported), El0SyncClass::Svc64);
+        assert_eq!(
+            super::super::syscall_v3::decode_aarch64_lifecycle_svc_v3(3, unsupported, &[0; 31]),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            classify_el0_sync(ESR_SVC64 | (1 << 16)),
+            El0SyncClass::Unconfirmed,
+        );
         assert_eq!(
             decide_trap(
                 TrapSource::LowerElAarch64,
@@ -1003,6 +1042,41 @@ mod tests {
                 0
             ),
             TrapDecision::FailStop
+        );
+    }
+
+    #[test]
+    fn sec_p10_separates_task_address_faults_from_unconfirmed_machine_failures() {
+        for ec in [EC_INSTR_ABORT_LOWER, EC_DATA_ABORT_LOWER] {
+            let esr = (ec << ESR_EC_SHIFT) | ESR_IL;
+            for code in [0x00, 0x04, 0x07, 0x0b, 0x0f] {
+                assert_eq!(classify_el0_sync(esr | code), El0SyncClass::Fault);
+            }
+            for field in [
+                0x08,       // Access flag level 0 is reserved on Cortex-A53.
+                0x0c,       // Permission level 0 is reserved on Cortex-A53.
+                0x10,       // Synchronous external abort.
+                0x17,       // External abort while walking the page table.
+                0x18,       // Synchronous parity or ECC error.
+                0x1f,       // ECC error on a page table walk.
+                0x30,       // TLB conflict abort.
+                0x07 | 128, // Stage-1 walk syndrome flag is unexpected at EL1.
+                0x07 | 512, // External abort type is invalid here.
+                0x07 | 1024, // FAR invalid.
+            ] {
+                assert_eq!(
+                    decide_trap(TrapSource::LowerElAarch64, TrapKind::Sync, esr | field, 0x1000, 0),
+                    TrapDecision::FailStop,
+                );
+            }
+        }
+        assert_eq!(
+            classify_el0_sync((EC_DATA_ABORT_LOWER << ESR_EC_SHIFT) | ESR_IL | 0x21),
+            El0SyncClass::Fault,
+        );
+        assert_eq!(
+            classify_el0_sync((EC_INSTR_ABORT_LOWER << ESR_EC_SHIFT) | ESR_IL | 0x21),
+            El0SyncClass::Unconfirmed,
         );
     }
     #[test]

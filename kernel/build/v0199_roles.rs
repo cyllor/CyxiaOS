@@ -1,6 +1,7 @@
-//! Separate compiler invocations and read-only build manifest for eight
-//! ABI3 static PIE bootstrap packages. No downloader or mutable filesystem
-//! package resolution is used at guest launch.
+//! Read-only build manifest for eight ABI3 static PIE bootstrap packages.
+//! They are compiled independently or supplied as a complete offline roster.
+//! Guest launch never resolves packages on a mutable filesystem.
+use super::startup_catalog::{ROLE_PACKAGES_DIR, load};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -12,6 +13,7 @@ use lifecycle_packages::{LifecyclePackageDigest, lifecycle_package_message};
 
 const ROLES: [u16; 8] = [6, 7, 2, 8, 9, 3, 10, 11];
 const SYSCALL_ABI: u16 = 3;
+const MAX_ROLE_BYTES: usize = 128 * 1024;
 fn u16at(b: &[u8], n: usize) -> u16 {
     u16::from_le_bytes(b[n..n + 2].try_into().unwrap())
 }
@@ -190,6 +192,7 @@ fn extract_relative(b: &[u8]) -> Vec<(u64, u64, i64)> {
     entries
 }
 pub fn build(default_catalog: bool) {
+    let external = env::var_os(ROLE_PACKAGES_DIR).map(PathBuf::from);
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("..");
     let source = root.join("user/v0199-control/main.rs");
     let script = root.join("user/v0199-control/linker.ld");
@@ -263,7 +266,7 @@ pub fn build(default_catalog: bool) {
         if snapshot_read && role == 11 {
             compiler.args(["--cfg", "snapshot_read_probe"]);
         }
-        let status = compiler
+        compiler
             .arg(&source)
             .args([
                 "--edition=2024",
@@ -311,13 +314,21 @@ pub fn build(default_catalog: bool) {
             .arg("-C")
             .arg(format!("link-arg=-T{}", script.display()))
             .arg("-o")
-            .arg(&target)
-            .status()
-            .expect("native role compiler");
-        assert!(status.success(), "native role {role} build failed");
-        let bytes = fs::read(&target).unwrap();
-        assert!(bytes.len() <= 128 * 1024);
+            .arg(&target);
+        let bytes = if let Some(directory) = &external {
+            load(directory, &name, 64, MAX_ROLE_BYTES)
+        } else {
+            let status = compiler.status().expect("native role compiler");
+            assert!(status.success(), "native role {role} build failed");
+            fs::read(&target).expect("read compiled native role package")
+        };
+        assert!(bytes.len() <= MAX_ROLE_BYTES);
         let entries = extract_relative(&bytes);
+        if external.is_some() {
+            // Validate and embed the same bounded snapshot of the deployer's
+            // package. The next signature covers precisely these bytes.
+            fs::write(&target, &bytes).expect("copy external native role package");
+        }
         let mut canonical = b"CyxiaOS-v0199-relative-sidecar".to_vec();
         canonical.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         let mut rust_entries = String::from("&[");

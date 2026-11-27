@@ -12,6 +12,12 @@ use super::{
     file_media_v0199::FileReceiptV4,
 };
 
+mod reconcile;
+pub use reconcile::{
+    ReceiptDisposition, ReceiptRecoveryJob, ReceiptRecoveryOutcome, ReceiptRecoveryWorkspace,
+    reconcile_receipt,
+};
+
 pub const RECEIPTS: usize = 128;
 pub const RECEIPT_BYTES: usize = 192;
 pub const BLOCK_BYTES: usize = 4096;

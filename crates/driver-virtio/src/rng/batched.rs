@@ -26,6 +26,36 @@ impl BatchedRng {
             return Err(Error::Device);
         }
         t.negotiate(p)?;
+        Self::activate(t, memory, p)
+    }
+
+    /// Admit entropy DMA only after an ordered modern MMIO reset of queue 0.
+    pub fn attach_native(
+        t: Transport,
+        memory: &'static mut BatchMemory,
+        p: &impl Platform,
+    ) -> Result<Self, Error> {
+        Self::attach_native_with_checkpoint(t, memory, p, &mut || Ok(()))
+    }
+
+    pub fn attach_native_with_checkpoint(
+        mut t: Transport,
+        memory: &'static mut BatchMemory,
+        p: &impl Platform,
+        checkpoint: &mut dyn FnMut() -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        t.observe_mmio_reset(4, &[0], p, &mut *checkpoint)?;
+        checkpoint()?;
+        t.negotiate_version_one(p)?;
+        checkpoint()?;
+        Self::activate(t, memory, p)
+    }
+
+    fn activate(
+        mut t: Transport,
+        memory: &'static mut BatchMemory,
+        p: &impl Platform,
+    ) -> Result<Self, Error> {
         let q = BatchQueue::configure(&mut t, memory, 0, p)?;
         t.start(p)?;
         Ok(Self {
@@ -277,6 +307,36 @@ mod tests {
             base,
         )
     }
+
+    #[test]
+    fn native_rng_refuses_fresh_dma_while_the_old_queue_stays_ready() {
+        let platform = Host(Cell::new(0), Cell::new(None));
+        let mmio = Box::new(Page::zeroed());
+        mmio.put32(0, 0x74726976);
+        mmio.put32(4, 2);
+        mmio.put32(8, 4);
+        mmio.put32(0x44, 1);
+        mmio.put32(0x70, 15);
+        let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+        let memory = Box::leak(Box::new(BatchMemory::zeroed()));
+        let mut checkpoint = || {
+            platform.0.set(platform.0.get() + 25_000_000);
+            Ok(())
+        };
+        assert!(matches!(
+            BatchedRng::attach_native_with_checkpoint(
+                transport,
+                memory,
+                &platform,
+                &mut checkpoint
+            ),
+            Err(Error::Timeout)
+        ));
+        assert_eq!(mmio.get32(0x70), 0);
+        assert_eq!(mmio.get32(0x44), 1);
+        assert_eq!(mmio.get32(0x80), 0);
+    }
+
     unsafe fn all_complete(base: usize) {
         unsafe {
             for slot in 0..8 {

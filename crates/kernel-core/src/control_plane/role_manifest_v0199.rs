@@ -152,6 +152,47 @@ pub struct NativeRole {
     /// Distinct EL1 endpoint selector; cannot be self-reported by EL0.
     pub endpoint_id: u64,
 }
+impl NativeRole {
+    fn lifecycle_only(&self) -> bool {
+        self.endpoint_id == 0 && self.caps == 0 && self.actor.id == u64::from(self.role.id())
+    }
+}
+
+/// EL1's live ABI registration for a signed CPU0 lifecycle task. It binds
+/// this exact holder generation to the staged root and hardware ASID.
+#[derive(Clone, Copy)]
+pub struct LifecycleBinding {
+    member: NativeRole,
+    ttbr0_asid: u64,
+    abi: u16,
+}
+impl LifecycleBinding {
+    pub fn new(member: NativeRole, asid: u8, abi: u16) -> Result<Self, Error> {
+        if !member.lifecycle_only()
+            || !member.actor.valid()
+            || member.cpu_mask != CONTROL_MASK
+            || member.thread_count != 1
+            || member.ttbr0_root == 0
+            || member.ttbr0_root >= 1 << 48
+            || !member.ttbr0_root.is_multiple_of(PAGE_SIZE)
+            || asid == 0
+            || abi != crate::security::syscall_v3::ABI_VERSION
+        {
+            return Err(Error::Denied);
+        }
+        Ok(Self {
+            member,
+            ttbr0_asid: member.ttbr0_root | (u64::from(asid) << 48),
+            abi,
+        })
+    }
+
+    pub fn authenticate(&self, member: NativeRole, captured_ttbr0: u64, cpu: usize) -> Option<u16> {
+        (cpu == CONTROL_CPU && self.member == member && self.ttbr0_asid == captured_ttbr0)
+            .then_some(self.abi)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct NativeRoleManifest {
     pub online_mask: u64,
@@ -223,9 +264,7 @@ impl NativeRoleManifest {
             let authority_valid = if services {
                 entry.endpoint_id != 0 && entry.caps == entry.role.allowed_caps()
             } else {
-                entry.endpoint_id == 0
-                    && entry.caps == 0
-                    && entry.actor.id == u64::from(entry.role.id())
+                entry.lifecycle_only()
             };
             if entry.role != ROLES[index]
                 || !entry.actor.valid()
@@ -413,6 +452,30 @@ impl NativeRoleManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_registration_binds_a_live_holder_to_its_root_asid_and_cpu() {
+        let mut member = manifest().members[0];
+        member.actor.id = u64::from(member.role.id());
+        member.actor.generation = 19;
+        member.caps = 0;
+        member.endpoint_id = 0;
+        let binding = LifecycleBinding::new(member, 0xa0, 3).unwrap();
+        let captured = member.ttbr0_root | (0xa0u64 << 48);
+        assert_eq!(binding.authenticate(member, captured, 0), Some(3));
+        assert_eq!(binding.authenticate(member, captured, 1), None);
+        assert_eq!(binding.authenticate(member, captured ^ (1 << 48), 0), None);
+        assert_eq!(binding.authenticate(member, captured ^ 4096, 0), None);
+
+        let mut stale = member;
+        stale.actor.generation -= 1;
+        assert_eq!(binding.authenticate(stale, captured, 0), None);
+        let mut altered = member;
+        altered.caps = SNAPSHOT;
+        assert_eq!(binding.authenticate(altered, captured, 0), None);
+        assert!(LifecycleBinding::new(altered, 0xa0, 3).is_err());
+        assert!(LifecycleBinding::new(member, 0xa0, 2).is_err());
+    }
     fn manifest() -> NativeRoleManifest {
         let members = core::array::from_fn(|i| NativeRole {
             role: ROLES[i],

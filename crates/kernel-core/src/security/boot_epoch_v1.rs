@@ -196,6 +196,85 @@ impl BootPairRedo {
             .chain(self.commit.iter())
             .all(|&v| v == 0)
     }
+
+    fn prepared_blocks(&self) -> [&[u8; BLOCK]; 5] {
+        [
+            &self.begin,
+            self.state_redo.first_chunk().unwrap(),
+            self.state_redo.last_chunk().unwrap(),
+            self.boot_redo.first_chunk().unwrap(),
+            self.boot_redo.last_chunk().unwrap(),
+        ]
+    }
+
+    fn encode_recovery_pair(
+        &mut self,
+        sb: SuperblockV1,
+        first: u32,
+        homes: [u32; 2],
+        state: SecurityStateStoreV2,
+    ) -> Result<(), Error> {
+        Self::extent(first)?;
+        if homes[0] == homes[1]
+            || homes
+                .iter()
+                .any(|home| !(DATA_START..BLOCK_COUNT).contains(home))
+            || state.fs_uuid != sb.fs_uuid
+            || state.last_boot_epoch != sb.generation
+        {
+            return Err(Error::Conflict);
+        }
+        let boot = BootEpochStoreV1 {
+            fs_uuid: state.fs_uuid,
+            boot_epoch: state.last_boot_epoch,
+        };
+        self.encode(
+            sb,
+            homes[0],
+            homes[1],
+            state.last_boot_epoch,
+            sb.checkpoint_lsn.checked_add(4).ok_or(Error::Exhausted)?,
+            &state.encode()?,
+            &boot.encode()?,
+        )
+    }
+
+    /// Identify the materialized blocks of an exact preparation with an empty
+    /// COMMIT block. Recovery must separately validate both old homes and the
+    /// absence of later records under exclusive, reset-complete device ownership.
+    pub fn verify_uncommitted_prefix(
+        &mut self,
+        io: &mut impl EpochBlockIo,
+        sb: SuperblockV1,
+        first: u32,
+        homes: [u32; 2],
+        expected_state: SecurityStateStoreV2,
+    ) -> Result<u8, Error> {
+        self.encode_recovery_pair(sb, first, homes, expected_state)?;
+        let mut raw = [0; BLOCK];
+        io.read(first + 5, &mut raw)?;
+        if raw != [0; BLOCK] {
+            return Err(Error::Conflict);
+        }
+        let mut present = 0;
+        let mut missing = false;
+        for (offset, expected) in self.prepared_blocks().into_iter().enumerate() {
+            io.read(first + offset as u32, &mut raw)?;
+            if raw == [0; BLOCK] {
+                // A continuation may be canonically zero even after its write.
+                missing |= expected != &[0; BLOCK];
+            } else if missing || raw != *expected {
+                return Err(Error::Conflict);
+            } else {
+                present |= 1 << offset;
+            }
+        }
+        if present == 0 {
+            return Err(Error::Conflict);
+        }
+        Ok(present)
+    }
+
     /// With the successor checkpoint selected, recognize only zero blocks
     /// and exact blocks from its previously committed boot-only transaction.
     /// The caller must verify the selected checkpoint and all mounted homes
@@ -208,34 +287,12 @@ impl BootPairRedo {
         homes: [u32; 2],
         state: SecurityStateStoreV2,
     ) -> Result<(), Error> {
-        Self::extent(first)?;
-        if state.fs_uuid != prior.fs_uuid || state.last_boot_epoch != prior.generation {
-            return Err(Error::Conflict);
-        }
-        let boot = BootEpochStoreV1 {
-            fs_uuid: state.fs_uuid,
-            boot_epoch: state.last_boot_epoch,
-        };
-        self.encode(
-            prior,
-            homes[0],
-            homes[1],
-            state.last_boot_epoch,
-            prior
-                .checkpoint_lsn
-                .checked_add(4)
-                .ok_or(Error::Exhausted)?,
-            &state.encode()?,
-            &boot.encode()?,
-        )?;
+        self.encode_recovery_pair(prior, first, homes, state)?;
         let mut raw = [0; BLOCK];
-        let records = core::iter::once(self.begin.as_slice())
-            .chain(self.state_redo.chunks_exact(BLOCK))
-            .chain(self.boot_redo.chunks_exact(BLOCK))
-            .chain(core::iter::once(self.commit.as_slice()));
+        let records = self.prepared_blocks().into_iter().chain([&self.commit]);
         for (offset, expected) in records.enumerate() {
             io.read(first + offset as u32, &mut raw)?;
-            if raw != [0; BLOCK] && raw != expected {
+            if raw != [0; BLOCK] && raw != *expected {
                 return Err(Error::Conflict);
             }
         }
@@ -365,7 +422,7 @@ impl BootPairRedo {
         state: &[u8; BLOCK],
     ) -> Result<BootPairCommit, Error> {
         let decoded = SecurityStateStoreV2::decode(state)?;
-        if ticket.change != Change::AllocateBoot
+        if !ticket.change.allocates_boot()
             || ticket.fs_uuid != sb.fs_uuid
             || decoded.fs_uuid != sb.fs_uuid
             || decoded.state_generation != ticket.new_state_generation
@@ -387,11 +444,8 @@ impl BootPairRedo {
         }
         self.encode(sb, state_home, boot_home, txid, lsn, state, &boot)?;
         self.verify(sb, first, state_home, boot_home, txid, lsn)?;
-        io.write(first, &self.begin).map_err(|_| Error::Unknown)?;
-        for (i, raw) in [&self.state_redo, &self.boot_redo].into_iter().enumerate() {
-            io.write(first + 1 + 2 * i as u32, raw[..BLOCK].try_into().unwrap())
-                .map_err(|_| Error::Unknown)?;
-            io.write(first + 2 + 2 * i as u32, raw[BLOCK..].try_into().unwrap())
+        for (offset, raw) in self.prepared_blocks().into_iter().enumerate() {
+            io.write(first + offset as u32, raw)
                 .map_err(|_| Error::Unknown)?;
         }
         io.flush().map_err(|_| Error::Unknown)?;
@@ -547,6 +601,9 @@ impl StartupEpochBinding {
 pub struct BootEpochAuthority {
     gate: DurableEpochGate,
 }
+pub(super) mod tls_policy;
+pub use tls_policy::{TlsBootPolicy, TlsBootTransition};
+
 impl BootEpochAuthority {
     /// Reopen from the two committed protected home images. `verify_recovered`
     /// must be the native owner's real startup verification; see the type-level
@@ -618,6 +675,45 @@ impl BootEpochAuthority {
     ) -> Result<StartupEpochBinding, Error> {
         self.gate.verify_startup_config(config)?;
         let grant = self.allocate(io, pair, tx)?;
+        self.bind_startup_grant(grant, config)
+    }
+
+    /// Change the TLS installation and allocate BootEpoch in the same
+    /// paired redo append. The authenticated old config was opened from
+    /// the actual mounted predecessor and no old role has run in this boot.
+    pub fn allocate_tls_boot(
+        &mut self,
+        io: &mut impl EpochBlockIo,
+        pair: &mut BootPairRedo,
+        tx: BootEpochTx<'_>,
+        transition: TlsBootTransition<'_>,
+    ) -> Result<StartupEpochBinding, Error> {
+        self.gate
+            .verify_startup_config(transition.previous().config())?;
+        let ticket = self.gate.prepare_tls_boot(transition)?;
+        let grant = self.append_prepared(io, pair, tx, ticket)?;
+        self.bind_startup_grant(grant, transition.current().config())
+    }
+
+    /// Apply the exact manifest state, including durable revocation,
+    /// to an unchanged authorized boot. Opaque legacy catalogs grant
+    /// no deployment TLS authority through this entry.
+    pub fn allocate_with_tls_policy(
+        &mut self,
+        io: &mut impl EpochBlockIo,
+        pair: &mut BootPairRedo,
+        tx: BootEpochTx<'_>,
+        policy: TlsBootPolicy<'_>,
+    ) -> Result<StartupEpochBinding, Error> {
+        self.gate.bind_tls_startup(policy)?;
+        self.allocate_for_startup(io, pair, tx, policy.config())
+    }
+
+    fn bind_startup_grant(
+        &self,
+        grant: BootEpochGrant,
+        config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+    ) -> Result<StartupEpochBinding, Error> {
         let policy = self.confirmed_boot_policy(config)?;
         if policy.boot_epoch() != grant.epoch() {
             return Err(Error::Conflict);
@@ -644,11 +740,21 @@ impl BootEpochAuthority {
         if self.gate.boot_epoch().is_some() {
             return Err(Error::Conflict);
         }
-        let sb = SuperblockV1::decode(tx.superblock_raw)?;
         // Boot allocation never authorizes a service stop/restart.
         let ticket = self
             .gate
             .prepare(Change::AllocateBoot, |_| Err(Error::Unauthorized))?;
+        self.append_prepared(io, pair, tx, ticket)
+    }
+
+    fn append_prepared(
+        &mut self,
+        io: &mut impl EpochBlockIo,
+        pair: &mut BootPairRedo,
+        tx: BootEpochTx<'_>,
+        ticket: PreparedEpoch,
+    ) -> Result<BootEpochGrant, Error> {
+        let sb = SuperblockV1::decode(tx.superblock_raw)?;
         // The mounted-volume owner supplies the authenticated reservation in tx.
         // The append checks the empty extent against the device before writing.
         let proof = pair

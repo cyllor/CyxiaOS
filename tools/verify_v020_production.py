@@ -55,6 +55,7 @@ from check_elf import symbol
 from run_qemu import Qmp
 from qmp_stdio import PipeTransport
 from transport import FrameDecoder
+from v020_frame_meta import FRAME_ROW, PERMANENT_ROW, queue_dma_rows
 from v020_production_media import (
     count_fsync_retirement_blocks, run_media_reopen, verify_signed_disk, verify_signed_receipt_view,
 )
@@ -87,6 +88,7 @@ PRODUCTION_SOURCES = [
     "kernel/Cargo.toml",
     "kernel/linker/aarch64.ld",
     "kernel/build/aarch64.rs",
+    "kernel/build/business_package.rs",
     "kernel/build/v0199_roles.rs",
     "kernel/build/startup_catalog.rs",
     "kernel/src/arch/aarch64/sec_n_broker.rs",
@@ -107,6 +109,8 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/recovery.rs",
     "kernel/src/arch/aarch64/production/role_loader.rs",
     "kernel/src/arch/aarch64/production/signed_budget_trace.rs",
+    "kernel/src/arch/aarch64/production/signed_business.rs",
+    "kernel/src/arch/aarch64/production/signed_exec_trap.rs",
     "kernel/src/arch/aarch64/production/signed_resident.rs",
     "kernel/src/arch/aarch64/production/startup_catalog.rs",
     "kernel/src/arch/aarch64/production/meter.rs",
@@ -125,7 +129,9 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/observations/audit_rpc.rs",
     "kernel/src/arch/aarch64/production/snapshot_catalog.rs",
     "kernel/src/arch/aarch64/production/copy_window.rs",
+    "kernel/src/arch/aarch64/copy_window.rs",
     "kernel/src/platform/virt/net_device.rs",
+    "kernel/src/platform/virt/virtio_platform.rs",
     "crates/arch-aarch64/src/entry.S",
     "crates/arch-aarch64/src/secondary.S",
     "crates/arch-aarch64/src/vectors.S",
@@ -143,12 +149,14 @@ PRODUCTION_SOURCES = [
     "crates/contracts/src/net_ingress.rs",
     "crates/contracts/src/tls_signer.rs",
     "crates/kernel-core/src/control_plane/pie_image_v0199.rs",
+    "crates/kernel-core/src/control_plane/role_manifest_v0199.rs",
     "crates/kernel-core/src/security/recovery_proof_v2.rs",
     "crates/kernel-core/src/security/boot_epoch_v1.rs",
     "crates/kernel-core/src/security/network/entropy.rs",
     "crates/kernel-core/src/security/network/tls_deadline.rs",
     "crates/kernel-core/src/security/network/tls_packages.rs",
     "crates/kernel-core/src/security/startup_catalog_v0199.rs",
+    "crates/kernel-core/src/security/startup_catalog_v0199/business_package.rs",
     "crates/kernel-core/src/security/startup_catalog_v0199/lifecycle_packages.rs",
     "crates/kernel-core/src/security/startup_catalog_v0199/profile.rs",
     "crates/kernel-core/src/security/durable_role_epoch_v0199.rs",
@@ -161,6 +169,7 @@ PRODUCTION_SOURCES = [
     "crates/kernel-core/src/security/recovery_v1.rs",
     "crates/kernel-core/src/security/file_receipt_query_v4.rs",
     "crates/kernel-core/src/security/file_receipt_store_v0199.rs",
+    "crates/kernel-core/src/security/file_receipt_store_v0199/reconcile.rs",
     "crates/kernel-core/src/security/file_index_v0199.rs",
     "crates/kernel-core/src/security/file_media_v0199.rs",
     "crates/kernel-core/src/security/file_structure_v1.rs",
@@ -171,6 +180,7 @@ PRODUCTION_SOURCES = [
     "crates/kernel-core/src/security/memory.rs",
     "crates/kernel-core/src/security/syscall_v3.rs",
     "crates/kernel-core/src/frame_meta_v0199.rs",
+    "crates/kernel-core/src/frame_meta_v0199/dma.rs",
     "crates/kernel-core/src/frames.rs",
     "crates/kernel-core/src/control_plane/policy_lock_v0199.rs",
     "crates/kernel-core/src/control_plane/control_rpc_v1.rs",
@@ -200,6 +210,7 @@ PRODUCTION_SOURCES = [
     "user/local-echo/build.rs",
     "user/local-echo/linker.ld",
     "tools/verify_v020_production.py",
+    "tools/v020_frame_meta.py",
     "tools/verify_v0199_sec_n.py",
     "tools/test_v020_signed_scratch_vector.py",
     "tools/verify_v020_fsync_scratch.py",
@@ -821,7 +832,7 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
 
 
 def supervisor_copy_windows(elf, qmp, output, lines, *, snapshot_lists=None, file_copy=False,
-                            audit_copy=False):
+                            audit_copy=False, syscall_copy=False):
     window = symbol(elf, "__copy_window_l3")
     require = verify_smp.require
     counts = {}
@@ -844,6 +855,14 @@ def supervisor_copy_windows(elf, qmp, output, lines, *, snapshot_lists=None, fil
         reads, writes, closed = witnessed[0]
         require(reads >= writes > 0 and closed == 1, "invalid audit copy-window close counts")
         counts["audit_copy_window"] = (reads, writes)
+    if syscall_copy:
+        witnessed = w11_rows(lines, "V020_SEC_M_SYSCALL_COPY_WINDOW")
+        require(len(witnessed) == 1, "missing one syscall copy-window witness")
+        reads, writes, closed = witnessed[0]
+        reply_copies_ok = writes >= 2 if audit_copy else writes == 0
+        require(reads >= 7 and reply_copies_ok and closed == 1,
+                "invalid syscall copy-window close counts")
+        counts["syscall_copy_window"] = (reads, writes)
     page = 4096
     root_index = 258
 
@@ -965,7 +984,7 @@ def ingress_mappings(elf, qmp, output, image_pages):
             "mailbox_scrubbed": True, "stack_pages": stack_pages, "private_leaves_verified": True}
 
 
-def dense_frame_meta(qmp, output, lines, permanent_observed):
+def dense_frame_meta(qmp, output, lines, permanent_observed, image, dma_queues):
     require = verify_smp.require
 
     def observed(name):
@@ -980,7 +999,7 @@ def dense_frame_meta(qmp, output, lines, permanent_observed):
     permanent, free, reserved = observed("ROWS")
     slot, actor, actor_generation = observed("OWNER")
     frame, previous_generation, generation = observed("REVOKE")
-    row = struct.Struct("<IIQQIIII")
+    row = FRAME_ROW
     require(count == (ram_end - ram_base) // page and table_bytes == count * row.size
             and pool_bytes == 8 * 1024 * 1024, "dense FrameMeta geometry differs")
     ranges = sorted((start, start + size) for start, size in (
@@ -1000,18 +1019,24 @@ def dense_frame_meta(qmp, output, lines, permanent_observed):
     qmp.execute("pmemsave", {"val": table, "size": table_bytes, "filename": str(path)})
     raw = path.read_bytes()
     require(len(raw) == table_bytes, "incomplete dense FrameMeta readback")
+    dma_rows, queues = queue_dma_rows(qmp, image, raw, dma_queues)
     permanent_rows = 0
-    for owner, flags, owner_generation, _, refs, pins, dma, shares in row.iter_unpack(raw):
-        require(owner == 0xFFFFFFFF and not any((owner_generation, refs, pins, dma, shares))
-                and flags in (0, 4, 8), "dense FrameMeta leaked a frame or reference")
+    for index, record in enumerate(row.iter_unpack(raw)):
+        owner, flags, owner_generation, _, refs, pins, dma, shares = record
+        if index in dma_rows:
+            require(record == dma_rows[index], "dense FrameMeta DMA queue record differs")
+        else:
+            require(owner == 0xFFFFFFFF and not any((owner_generation, refs, pins, dma, shares))
+                    and flags in (0, 4, 8), "dense FrameMeta leaked a frame or reference")
         permanent_rows += flags == 4
     require((permanent, free, reserved) == (permanent_rows, count - permanent_rows, 0)
             and permanent == permanent_observed, "dense FrameMeta inventory differs from the table")
     for start, end in [(ram_base, arena_end), (table, table + table_bytes),
                        (control, control + pool_bytes), (progress, progress + pool_bytes)]:
-        begin, finish = ((pa - ram_base) // page * row.size for pa in (start, end))
-        require(all(record == (0xFFFFFFFF, 4, 0, 0, 0, 0, 0, 0)
-                    for record in row.iter_unpack(raw[begin:finish])),
+        begin, finish = ((pa - ram_base) // page for pa in (start, end))
+        require(all(record == dma_rows.get(index, PERMANENT_ROW)
+                    for index, record in enumerate(row.iter_unpack(
+                        raw[begin * row.size:finish * row.size]), start=begin)),
                 "a fixed dense FrameMeta reservation was not permanent")
     require(row.unpack_from(raw, (frame - ram_base) // page * row.size)
             == (0xFFFFFFFF, 0, 0, generation, 0, 0, 0, 0), "reclaimed frame row differs")
@@ -1022,7 +1047,7 @@ def dense_frame_meta(qmp, output, lines, permanent_observed):
             "control_pool_pa": hex(control), "progress_pool_pa": hex(progress),
             "permanent_rows": permanent, "free_rows": free, "probe_pa": hex(frame),
             "owner_slot": slot, "actor": actor, "actor_generation": actor_generation,
-            "frame_generation": generation, "scrubbed": True}
+            "frame_generation": generation, "scrubbed": True, "dma_queues": queues}
 
 
 def source_manifest() -> dict:
@@ -1172,17 +1197,21 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                         expected_fsync_epoch=expected_fsync_epoch)
                     lines = decoded.decode("ascii").splitlines()
                     if modes.frame_pool and staging:
+                        dma_queues = {"block", "net_rx", "net_tx"}
+                        if modes.authenticated_net and rng_present:
+                            dma_queues.add("rng")
                         report["dense_frame_meta"] = dense_frame_meta(
                             qmp, output, lines, report["observations"]["frame_meta_permanent_rows"],
+                            elf.read_bytes(), dma_queues,
                         )
-                    if modes.live_control or modes.snapshot_catalog or modes.file_read or modes.fsync_scratch:
-                        report.update(supervisor_copy_windows(
-                            elf.read_bytes(), qmp, output, lines,
-                            snapshot_lists=(report["observations"]["snapshot_catalog_lists"]
-                                            if modes.snapshot_catalog else None),
-                            file_copy=modes.file_read or modes.fsync_scratch,
-                            audit_copy=modes.live_control,
-                        ))
+                    report.update(supervisor_copy_windows(
+                        elf.read_bytes(), qmp, output, lines,
+                        snapshot_lists=(report["observations"]["snapshot_catalog_lists"]
+                                        if modes.snapshot_catalog else None),
+                        file_copy=modes.file_read or modes.fsync_scratch,
+                        audit_copy=modes.live_control,
+                        syscall_copy=True,
+                    ))
                     relay_bytes = report["observations"]["echo_bytes_relayed"]
                     if modes.authenticated_net:
                         report["ingress_mappings"] = ingress_mappings(

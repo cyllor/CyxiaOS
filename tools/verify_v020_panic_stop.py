@@ -19,6 +19,8 @@ from v020_production_qemu import connect_qmp, sha, shutdown
 from verify_smp import require
 
 MAGIC = 0x43595853544F5001
+DMA_MAGIC = 0x435958444D415301
+DMA_DEVICES = ((1, 3), (2, 1), (4, 1))  # (VirtIO device ID, registered queue mask)
 SGI = 15
 ALL = 15
 HEADER = 11
@@ -125,6 +127,62 @@ def validate_uart(data, wire, stop):
     }, b"".join(frames)
 
 
+def validate_dma_record(data, stop, with_dma):
+    require(len(data) == PAGE, "incomplete protected DMA stop record")
+    magic, token, registered, confirmed, unknown, result, began, ended = struct.unpack_from("<8Q", data)
+    require(magic == DMA_MAGIC and token == (stop["generation"] << 8) | (stop["owner"] + 1),
+            "DMA stop is not bound to the CPU stop owner")
+    requested = (1 << len(DMA_DEVICES)) - 1 if with_dma else 0
+    all_cpus_stopped = stop["confirmed_mask"] == ALL
+    expected = (requested, 0, 1) if all_cpus_stopped else (0, requested, 3)
+    require(registered == requested and (confirmed, unknown, result) == expected,
+            "DMA reset classification disagrees with device registration and CPU ACKs")
+    hz = stop["frequency_hz"]
+    require(stop["finished_ticks"] <= began <= ended <= stop["owner_uart"]["started_ticks"],
+            "DMA stop was not sealed between CPU ACKs and emergency UART")
+    rows = []
+    previous = began
+    for index, (device_id, queues) in enumerate(DMA_DEVICES):
+        row = struct.unpack_from("<8Q", data, (8 + index * 8) * 8)
+        if not with_dma:
+            require(not any(row), "unregistered device has DMA stop evidence")
+            continue
+        address, actual_id, actual_queues, status, start, finish, observed, error = row
+        require(0x0A00_0000 <= address < 0x0A20_0000 and address % 4 == 0
+                and (actual_id, actual_queues) == (device_id, queues), "invalid registered DMA identity")
+        if all_cpus_stopped:
+            require(status == 1 and error == 0 and previous <= start <= finish <= ended,
+                    "missing ordered reset observation")
+            require(finish - start <= hz // 10 and start * 1_000_000_000 // hz <= observed
+                    <= finish * 1_000_000_000 // hz, "device reset observation missed its 100 ms bound")
+            previous = finish
+        else:
+            require((status, start, finish, observed, error) == (0, 0, 0, 0, 0),
+                    "a device was reset while a CPU remained unconfirmed")
+        rows.append({"mmio_pa": address, "device_id": device_id, "queues": queues,
+                     "reset_observed_ns": observed or None,
+                     "elapsed_ns": (finish - start) * 1_000_000_000 // hz})
+    require(len({row["mmio_pa"] for row in rows}) == len(rows), "registered device MMIO identities overlap")
+    return {"registered_mask": registered, "confirmed_mask": confirmed, "unknown_mask": unknown,
+            "complete": result == 1, "start_ticks": began, "finish_ticks": ended, "devices": rows}
+
+
+def validate_device_registers(qmp, stop, rows):
+    def read(address):
+        reply = qmp.execute("human-monitor-command", {"command-line": f"xp /1wx {address:#x}"})
+        value = re.fullmatch(r"[0-9a-f]+:\s+0x([0-9a-f]{8})\s*", reply, re.IGNORECASE)
+        require(value is not None, f"failed to observe device MMIO register at {address:#x}")
+        return int(value[1], 16)
+
+    stopped = stop["confirmed_mask"] == ALL
+    for row in rows:
+        address = row["mmio_pa"]
+        device_id, status, ready = read(address + 0x08), read(address + 0x70), read(address + 0x44)
+        require(device_id == row["device_id"] and (status, ready) == ((0, 0) if stopped else (15, 1)),
+                "QEMU MMIO disagrees with the kernel's device cessation witness")
+        row.update(device_status=status, last_selected_queue_ready=ready)
+
+
 def check_empty_root(raw, qmp, dump):
     try:
         empty = symbol(raw, "empty_l1")["pa"]
@@ -142,22 +200,26 @@ def check_empty_root(raw, qmp, dump):
     return {"empty_root_pa": f"{empty:#x}", "root_bytes_zero": PAGE, "alias_leaf": f"{descriptor:#x}"}
 
 
-def verify(elf, output, qemu_digest, timeout, late_peer=False):
+def verify(elf, output, qemu_digest, timeout, late_peer=False, with_dma=False):
     require(1 <= timeout <= 120, "invalid test deadline")
     raw = elf.read_bytes()
     symbol(raw, "cyxia_request_quiescent_stop")
     symbol(raw, "cyxia_terminal_stop")
     scratch = symbol(raw, "__exception_scratch")
     page, park = symbol(raw, "CYXIA_STOP_EVIDENCE"), symbol(raw, "cyxia_stop_park")
+    dma_page = symbol(raw, "CYXIA_DMA_STOP_EVIDENCE")
     admission = symbol(raw, "EXCEPTION_ADMISSION_CLOSED")
     require(page["size"] == 4096 and page["pa"] % 4096 == 0 and park["size"] >= 12,
             "wrong stop evidence or terminal park layout")
+    require(dma_page["size"] == PAGE and dma_page["pa"] % PAGE == 0 and dma_page["pa"] != page["pa"],
+            "DMA stop evidence page layout is not independent of the CPU record")
     binary = shutil.which("qemu-system-aarch64")
     require(binary and sha(Path(binary)) == qemu_digest, "incorrect QEMU executable")
     version = subprocess.check_output([binary, "--version"], text=True, timeout=10).splitlines()[0]
     require(version.startswith("QEMU emulator version 10.2.2"), "unsupported QEMU version")
     output.mkdir(parents=True, exist_ok=False)
-    report = {"status": "FAIL", "scope": "healthy-boot-terminal-four-cpu-ack-subcheck",
+    report = {"status": "FAIL", "scope": "terminal-cpu-and-virtio-dma-stop" if with_dma
+              else "healthy-boot-terminal-four-cpu-ack-subcheck",
               "formal_verdict": False, "elf_sha256": sha(elf), "qemu_sha256": qemu_digest,
               "qemu_version": version, "proof_class": "RUNTIME_QEMU"}
     wire = bytearray()
@@ -169,6 +231,17 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
                 "-accel", "tcg,thread=multi", "-display", "none", "-monitor", "none", "-nic", "none",
                 "-chardev", "ringbuf,id=cyxlog,size=65536", "-serial", "chardev:cyxlog",
                 "-qmp", f"unix:{path},server=on,wait=off", "-kernel", str(elf), "-no-reboot"]
+        if with_dma:
+            disk = Path(tmp) / "scratch.raw"
+            with disk.open("wb") as scratch_file:
+                scratch_file.truncate(512 * 1024 * 1024)
+            argv += ["-global", "virtio-mmio.force-legacy=false",
+                     "-drive", f"file={disk},if=none,id=scratch,format=raw,cache=none",
+                     "-device", "virtio-blk-device,drive=scratch",
+                     "-netdev", "hubport,id=stopnet,hubid=0",
+                     "-device", "virtio-net-device,netdev=stopnet,mac=52:54:00:12:34:56",
+                     "-object", "rng-random,id=stoprng,filename=/dev/urandom",
+                     "-device", "virtio-rng-device,rng=stoprng"]
         report["argv"] = argv
         proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=err)
         qmp = None
@@ -232,6 +305,14 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
                 report["software_pan_root"] = check_empty_root(raw, qmp, data)
                 read_uart()
                 report["owner_uart"], serial = validate_uart(record, bytes(wire), report)
+                qmp.execute("pmemsave", {"val": dma_page["pa"], "size": PAGE, "filename": str(data)})
+                device_record = data.read_bytes()
+                (output / "native-dma-stop-evidence.bin").write_bytes(device_record)
+                report["dma"] = validate_dma_record(device_record, report, with_dma)
+                if with_dma:
+                    require(b"V020_SEC_D_STOP_FIXTURE a=1 b=1 c=1\n" in serial,
+                            "the fixture never observed retained chains for all three devices")
+                    validate_device_registers(qmp, report, report["dma"]["devices"])
                 require(elf.read_bytes() == raw, "kernel ELF changed during the run")
                 report["status"] = "PASS"
                 shutdown(proc, qmp)
@@ -252,8 +333,10 @@ def main():
     parser.add_argument("--qemu-sha256", required=True)
     parser.add_argument("--timeout", type=float, default=20)
     parser.add_argument("--expect-late-peer", action="store_true")
+    parser.add_argument("--with-dma", action="store_true")
     args = parser.parse_args()
-    result = verify(args.elf, args.output, args.qemu_sha256, args.timeout, args.expect_late_peer)
+    result = verify(args.elf, args.output, args.qemu_sha256, args.timeout, args.expect_late_peer,
+                    args.with_dma)
     print(json.dumps(result, indent=2))
     return int(result["status"] != "PASS")
 

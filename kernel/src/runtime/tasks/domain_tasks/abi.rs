@@ -1,4 +1,4 @@
-use super::memory::{Pages, copy_from, copy_to, fault_page, frame_ptr, prepare};
+use super::memory::{Pages, fault_page, frame_ptr};
 use super::*;
 
 pub(super) struct Mailbox<'a> {
@@ -183,28 +183,10 @@ pub fn grant_endpoint(
     })
 }
 fn read(s: &mut State, owner: ObjectKey, address: u64, out: &mut [u8]) -> Result<(), Error> {
-    prepare(
-        &mut s.memory,
-        &s.tasks,
-        s.remote,
-        owner,
-        address,
-        out.len(),
-        false,
-    )?;
-    copy_from(&s.memory, &s.tasks, owner, address, out)
+    s.user_memory(owner)?.copyin(address, out)
 }
 fn write(s: &mut State, owner: ObjectKey, address: u64, input: &[u8]) -> Result<(), Error> {
-    prepare(
-        &mut s.memory,
-        &s.tasks,
-        s.remote,
-        owner,
-        address,
-        input.len(),
-        true,
-    )?;
-    copy_to(&s.memory, owner, address, input)
+    s.user_memory(owner)?.copyout(address, input)
 }
 fn spawn_result(context: &mut user::Context, state: SpawnState) {
     let (status, id, generation) = match state {
@@ -403,15 +385,7 @@ pub(super) fn syscall_locked(
             if len > 8192 || len < 32 {
                 return Err(Error::Range);
             }
-            prepare(
-                &mut s.memory,
-                &s.tasks,
-                s.remote,
-                task.key,
-                args[0],
-                len,
-                true,
-            )?;
+            s.user_memory(task.key)?.probe(args[0], len, true)?;
             let mut bytes = [0u8; 8192];
             let mut backend = Mailbox {
                 tasks: &s.tasks,
@@ -426,7 +400,8 @@ pub(super) fn syscall_locked(
             if count == 0 {
                 return Err(Error::Again);
             }
-            copy_to(&s.memory, task.key, args[0], &bytes[..used])?;
+            s.user_memory(task.key)?
+                .copyout_resident(args[0], &bytes[..used])?;
             context.regs[1] = count as u64;
             context.regs[2] = used as u64;
         }
@@ -464,15 +439,7 @@ pub(super) fn syscall_locked(
             }
             let mut encoded = [0u8; MAX_VECTOR * 32];
             read(s, task.key, args[0], &mut encoded[..count * 32])?;
-            prepare(
-                &mut s.memory,
-                &s.tasks,
-                s.remote,
-                task.key,
-                args[3],
-                count * 24,
-                true,
-            )?;
+            s.user_memory(task.key)?.probe(args[3], count * 24, true)?;
             let mut items = [ServiceItem::default(); MAX_VECTOR];
             for (j, item) in items[..count].iter_mut().enumerate() {
                 let row = &encoded[j * 32..j * 32 + 32];
@@ -571,6 +538,7 @@ pub(super) fn syscall_locked(
                     tasks: &s.tasks,
                     remote: s.remote,
                     load: None,
+                    frame_meta: &mut s.frame_meta,
                 },
             )?;
             if result.remaining != 0 {
@@ -668,6 +636,7 @@ pub(super) fn fault_locked(
             tasks: &s.tasks,
             remote: s.remote,
             load: None,
+            frame_meta: &mut s.frame_meta,
         },
     )?;
     Ok(())

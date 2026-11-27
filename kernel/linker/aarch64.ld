@@ -19,6 +19,9 @@ SECTIONS {
   . = ALIGN(16); __bss_start = .;
   /* The pinned network/staging arena must not share a page with other statics. */
   __sec_n_start = .;
+  __sec_n_dma_start = .;
+  *(.bss.sec_n.dma)
+  __sec_n_dma_end = .;
   *(.bss.sec_n .bss.sec_n.*)
   . = (. == __sec_n_start) ? . : ALIGN(4096);
   __sec_n_end = .;
@@ -31,6 +34,8 @@ SECTIONS {
  }
  ASSERT(__sec_n_start == __sec_n_end || (__sec_n_start % 4096) == 0,
         "SEC-N arena must start on a page boundary")
+ ASSERT(__sec_n_dma_start == __sec_n_dma_end || (__sec_n_dma_end % 4096) == 0,
+        "DMA arena must end on a page boundary")
  . = ALIGN(4096);
  .stack (NOLOAD) : AT(ADDR(.stack)-HIGH) {
   __stack_guard = .;

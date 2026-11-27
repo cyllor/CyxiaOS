@@ -26,6 +26,7 @@ fn acquire() -> Result<Guard, Errno> {
     Ok(Guard)
 }
 use cyxia_posix::Errno;
+#[cfg_attr(feature = "unified-runtime", unsafe(link_section = ".bss.sec_n.dma"))]
 static mut MEMORY: QueueMemory = QueueMemory::zeroed();
 static mut RNG: Option<Rng> = None;
 #[cfg(target_arch = "aarch64")]

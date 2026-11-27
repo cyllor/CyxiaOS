@@ -930,12 +930,13 @@ pub fn reset_echo(key: ObjectKey) -> Result<[u8; 32], Error> {
             return Err(Error::Busy);
         }
         let zero = [0u8; 16];
-        memory::copy_to(&s.memory, key, 0x21000, &zero[..8])?;
-        memory::copy_to(&s.memory, key, 0x30000, &zero)?;
+        let mut memory = s.user_memory(key)?;
+        memory.write_launch_input(0x21000, &zero[..8])?;
+        memory.copyout_resident(0x30000, &zero)?;
         let mut actual = [0u8; 16];
-        memory::copy_from(&s.memory, &s.tasks, key, 0x30000, &mut actual)?;
+        memory.copyin_resident(0x30000, &mut actual)?;
         let mut input = [0u8; 8];
-        memory::copy_from(&s.memory, &s.tasks, key, 0x21000, &mut input)?;
+        memory.copyin_resident(0x21000, &mut input)?;
         if actual != zero || input != [0; 8] {
             return Err(Error::Io);
         }

@@ -461,7 +461,14 @@ impl<'a, P: Port> Tcp<'a, P> {
     /// moves the socket into CloseWait. Only an accepted ACK of our *transmitted*
     /// FIN can establish the LastAck -> Closed witness. A timer or RST cannot.
     pub fn poll_passive_close(&mut self, now_ms: u64) -> Result<bool, Error> {
-        let state = self.poll(now_ms)?;
+        self.poll(now_ms)?;
+        self.finish_passive_close()
+    }
+
+    /// Report normal retirement after the scheduler has driven the socket
+    /// and NIC for this turn. A successful true result requires its final ACK.
+    pub fn finish_passive_close(&mut self) -> Result<bool, Error> {
+        let state = self.state()?;
         let socket = self.sockets.get_mut::<Socket>(self.socket);
         if socket.recv_queue() != 0 {
             return Err(Error::Socket);
@@ -477,6 +484,45 @@ impl<'a, P: Port> Tcp<'a, P> {
             }
             _ => Err(Error::Closed),
         }
+    }
+
+    /// Reset the observed socket identity and listen for a new allowed peer.
+    /// Require the completed old FIN and quiescent TX before any reuse.
+    pub fn relisten_open_after_close(&mut self) -> Result<(), Error> {
+        if self.state()? != State::Closed || !self.finish_passive_close()? {
+            return Err(Error::WouldBlock);
+        }
+        self.relisten_open()
+    }
+
+    /// The trusted TLS verifier rejected a pending handshake. Queue a TCP
+    /// reset and allow subsequent reactor turns to retire the native TX work.
+    pub fn abort_rejected(&mut self) -> Result<(), Error> {
+        self.healthy()?;
+        self.sockets.get_mut::<Socket>(self.socket).abort();
+        Ok(())
+    }
+
+    /// Require the aborted socket to release its endpoint, the transport's
+    /// staged reset to have drained, and the NIC's TX leases to be quiescent.
+    /// A reset carries no authenticated normal-close claim.
+    pub fn relisten_open_after_rejection(&mut self) -> Result<bool, Error> {
+        if self.state()? != State::Closed
+            || self.remote().is_some()
+            || !self.device.tx_staging_empty()
+            || !self.device.port().tx_quiescent()
+        {
+            return Ok(false);
+        }
+        self.relisten_open()?;
+        Ok(true)
+    }
+
+    fn relisten_open(&mut self) -> Result<(), Error> {
+        self.config.peer = [0; 4];
+        self.config.peer_port = 0;
+        self.device.port_mut().reset_peer(self.config);
+        self.listen()
     }
 
     pub fn observation(&self) -> Observation {

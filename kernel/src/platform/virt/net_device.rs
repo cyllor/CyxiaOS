@@ -23,51 +23,80 @@
 //! * The foreground owner explicitly fences and resets both queues when its
 //!   one-shot TCP stream ends. Both pools stay pinned, including on reset
 //!   timeout or unproven credit retirement.
-use crate::virtio_platform::Board;
+use crate::virtio_platform::{Board, find_transport};
 use core::{
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, Ordering},
 };
 use cyxia_contracts::BootInfo;
+use cyxia_driver_virtio::{Error, net::BatchedNet, queue::BatchMemory};
+#[cfg(feature = "v020-production-diagnostic")]
 use cyxia_driver_virtio::{
-    Error, Transport,
-    net::BatchedNet,
-    queue::{BatchMemory, MAX_CHAINS, RetainedChain},
+    queue::{MAX_CHAINS, RetainedChain},
     reset::ResetProof,
 };
 
-/// Board VirtIO MMIO window decoded from the DTB.
-const VIRTIO_WINDOW_START: u64 = 0x0a00_0000;
-const VIRTIO_WINDOW_END: u64 = 0x0a20_0000;
+#[cfg(feature = "v020-production-diagnostic")]
 const NATIVE_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
 static CLAIMED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "v020-production-diagnostic")]
 static TERMINAL: AtomicBool = AtomicBool::new(false);
 // The statically registered production arena includes both pinned DMA pools.
-#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
+#[unsafe(link_section = ".bss.sec_n.dma")]
+#[unsafe(export_name = "V020_DMA_NET_RX_QUEUE")]
 static mut RX: BatchMemory = BatchMemory::zeroed();
-#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
+#[unsafe(link_section = ".bss.sec_n.dma")]
+#[unsafe(export_name = "V020_DMA_NET_TX_QUEUE")]
 static mut TX: BatchMemory = BatchMemory::zeroed();
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut OWNER: MaybeUninit<NetDevice> = MaybeUninit::uninit();
 
 struct NetDevice {
     net: BatchedNet,
+    #[cfg(feature = "v020-production-diagnostic")]
     boot_epoch: u64,
+    #[cfg(feature = "v020-production-diagnostic")]
     reset: Option<Result<[ResetProof; 2], Error>>,
 }
 
+#[cfg(feature = "v020-production-diagnostic")]
 pub(crate) struct TerminalCustody {
     pub(crate) reset: Result<[ResetProof; 2], Error>,
     pub(crate) chains: [[Option<RetainedChain>; MAX_CHAINS]; 2],
 }
 
 /// Run the one CPU0 service with the pinned driver and then freeze it.
+#[cfg(feature = "v020-production-diagnostic")]
 pub(crate) fn with_device<R>(
     info: &BootInfo,
     boot_epoch: u64,
     serve: impl FnOnce(&mut BatchedNet) -> R,
 ) -> Result<R, Error> {
+    let owner = initialize(info, boot_epoch, NATIVE_MAC, &mut || Ok(()))?;
+    let result = serve(&mut owner.net);
+    owner.reset = Some(owner.net.stop_native(boot_epoch, &Board));
+    TERMINAL.store(true, Ordering::Release);
+    Ok(result)
+}
+
+/// Stage the permanent device owner on CPU0 before handing it to CPU1.
+#[cfg(cyxia_resident_net)]
+pub(crate) fn open_resident(
+    info: &BootInfo,
+    boot_epoch: u64,
+    mac: [u8; 6],
+    checkpoint: &mut dyn FnMut() -> Result<(), Error>,
+) -> Result<&'static mut BatchedNet, Error> {
+    initialize(info, boot_epoch, mac, checkpoint).map(|owner| &mut owner.net)
+}
+
+fn initialize(
+    info: &BootInfo,
+    boot_epoch: u64,
+    mac: [u8; 6],
+    checkpoint: &mut dyn FnMut() -> Result<(), Error>,
+) -> Result<&'static mut NetDevice, Error> {
     if boot_epoch == 0 {
         return Err(Error::Address);
     }
@@ -80,35 +109,33 @@ pub(crate) fn with_device<R>(
     // SAFETY: single CPU0 foreground owner; the static pools are exclusively
     // borrowed here and stay pinned through every error path.
     let net = unsafe {
-        BatchedNet::initialize_native(
+        BatchedNet::initialize_native_with_checkpoint(
             transport,
             &mut *core::ptr::addr_of_mut!(RX),
             &mut *core::ptr::addr_of_mut!(TX),
-            NATIVE_MAC,
+            mac,
             &Board,
+            checkpoint,
         )
     }?;
-    // SAFETY: the one-shot claim grants this scope exclusive OWNER access.
-    // The callback cannot return a borrow of its argument. No reader can
-    // reach OWNER until after it has stopped taking mutable references.
-    let outcome = unsafe {
+    // SAFETY: the one-shot claim grants sole ownership. Diagnostic
+    // readback can access OWNER only after the terminal seal.
+    Ok(unsafe {
         let owner = core::ptr::addr_of_mut!(OWNER).cast::<NetDevice>();
         owner.write(NetDevice {
             net,
+            #[cfg(feature = "v020-production-diagnostic")]
             boot_epoch,
+            #[cfg(feature = "v020-production-diagnostic")]
             reset: None,
         });
-        let owner = &mut *owner;
-        let result = serve(&mut owner.net);
-        owner.reset = Some(owner.net.stop_native(boot_epoch, &Board));
-        result
-    };
-    TERMINAL.store(true, Ordering::Release);
-    Ok(outcome)
+        &mut *owner
+    })
 }
 
 /// Inspect the old generation in place without clearing pins or restarting
 /// the device. Repeated reads of the same epoch see the same sealed state.
+#[cfg(feature = "v020-production-diagnostic")]
 pub(crate) fn terminal_custody(boot_epoch: u64) -> Result<TerminalCustody, Error> {
     if cyxia_arch_aarch64::cpu::slot() != 0 || !TERMINAL.load(Ordering::Acquire) {
         return Err(Error::Busy);
@@ -123,37 +150,4 @@ pub(crate) fn terminal_custody(boot_epoch: u64) -> Result<TerminalCustody, Error
         reset: owner.reset.ok_or(Error::Busy)?,
         chains: owner.net.stopped_chains().ok_or(Error::Response)?,
     })
-}
-
-/// Find one transport of the expected device type in the board window.
-pub(crate) fn find_transport(info: &BootInfo, device_id: u32) -> Result<Transport, Error> {
-    let mut selected = None;
-    for resource in info.virtio.get(..info.virtio_count).ok_or(Error::Address)? {
-        if resource.base.0 < VIRTIO_WINDOW_START
-            || resource
-                .base
-                .0
-                .checked_add(resource.len)
-                .is_none_or(|end| end > VIRTIO_WINDOW_END)
-        {
-            continue;
-        }
-        // SAFETY: boot CPU alone probes the mapped Device window; the transport
-        // remains exclusively owned and pinned even if a later step fails.
-        let Ok(transport) = (unsafe {
-            Transport::attach(
-                (crate::HIGH + resource.base.0) as usize,
-                resource.len as usize,
-            )
-        }) else {
-            continue;
-        };
-        if transport.device_id() == device_id {
-            if selected.is_some() {
-                return Err(Error::Device);
-            }
-            selected = Some(transport);
-        }
-    }
-    selected.ok_or(Error::Device)
 }

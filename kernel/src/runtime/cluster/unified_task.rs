@@ -369,7 +369,7 @@ pub fn request(
         let Ok(next) = admitted else {
             return (3, 0, 0);
         };
-        let leaf = unsafe { core::ptr::addr_of_mut!(TABLES).cast::<Page>().add(2) } as u64;
+        let root = core::ptr::addr_of!(TABLES) as u64;
         if let Err(error) = crate::peer_replay::accept_remote(
             terms.contract,
             terms.input_hash,
@@ -388,7 +388,7 @@ pub fn request(
                 0,
             );
         }
-        if let Err(error) = crate::domain_tasks::remote_start(next, leaf) {
+        if let Err(error) = crate::domain_tasks::remote_start(next, root) {
             crate::peer_replay::abort_remote(next);
             let _ = unsafe { (&mut *core::ptr::addr_of_mut!(AUTHORITY)).release(next) };
             return (

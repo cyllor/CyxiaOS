@@ -1113,7 +1113,7 @@ fn validate_selection_with_at(
     if cfg!(feature = "unified-runtime")
         && matches!(action, Action::ControlSet(mask) if mask != 0b0001)
     {
-        return Err(Error::Denied);
+        return Err(Error::Auth);
     }
     let current = current()?;
     if action == current {

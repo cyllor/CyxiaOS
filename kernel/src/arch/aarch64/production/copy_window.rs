@@ -1,36 +1,31 @@
-//! CPU0 copy window for authorized Supervisor endpoints.
-//! The stack and page tables are pinned in the image for the entire boot.
+//! Checked views of the stopped CPU0 role's pinned buffers for native SVCs.
 
-use super::{
-    EFAULT, NativeRole, Role, cpu, fatal, frames, mmu, phys, role_asid, root_pa, stack_span,
-    trapped_ttbr0,
-};
-use core::{
-    arch::asm,
-    ptr,
-    sync::atomic::{AtomicU64, Ordering},
-};
-use cyxia_contracts::{PagePermissions, PhysAddr};
+#[cfg(cyxia_startup_catalog)]
+use super::signed_resident::SignedCaller;
+#[cfg(feature = "v020-production-diagnostic")]
+use super::trapped_ttbr0;
+use super::{EFAULT, cpu, frames};
+#[cfg(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch",
+    feature = "v020-production-live-control"
+))]
+use super::{NativeRole, Role, role_asid, trapped_pie_cap};
+#[cfg(any(
+    cyxia_startup_catalog,
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch",
+    feature = "v020-production-live-control"
+))]
+use super::{phys, role_loader::stack_span};
+use crate::machine::copy_window;
+use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_kernel_core::{
     control_plane::Identity,
-    security::memory::{COPY_SPAN_ALIGN, CopyWindow, PAGE_SIZE, SoftwarePanContext},
+    security::{Error, memory::PAGE_SIZE},
 };
-
-const WINDOW_VA: u64 = crate::HIGH + 0x8000_0000;
-const LOCAL_TLBI: u64 = (WINDOW_VA >> 12) & ((1 << 44) - 1);
-const PAGE_MASK: u64 = PAGE_SIZE - 1;
-const NON_GLOBAL: u64 = 1 << 11;
-const FATAL_WINDOW: u64 = 0x5732_1657;
-const _: () = {
-    assert!(WINDOW_VA - crate::HIGH >= cyxia_platform_virt::USER_RAM_END);
-    assert!((WINDOW_VA >> 30) & 511 == 258);
-};
-
-unsafe extern "C" {
-    static high_l1: u8;
-    static empty_l1: u8;
-    static __copy_window_l3: u8;
-}
 
 struct ClosedCopies {
     reads: AtomicU64,
@@ -45,15 +40,17 @@ impl ClosedCopies {
         }
     }
 
+    #[cfg(feature = "v020-production-diagnostic")]
     fn counts(&self) -> (u64, u64, bool) {
         (
             self.reads.load(Ordering::Relaxed),
             self.writes.load(Ordering::Relaxed),
-            unsafe { window_entry().read_volatile() } == 0,
+            copy_window::cpu0_closed(),
         )
     }
 }
 
+static SYSCALL_COPIES: ClosedCopies = ClosedCopies::new();
 #[cfg(any(
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
@@ -63,17 +60,64 @@ static FILE_COPIES: ClosedCopies = ClosedCopies::new();
 #[cfg(feature = "v020-production-live-control")]
 static AUDIT_COPIES: ClosedCopies = ClosedCopies::new();
 
-/// A byte range checked against the stopped role's actual table walk and
-/// exclusive static stack owner. It carries no pointer usable by its caller.
-pub(super) struct StackSpan {
+/// A range verified against the stopped role's actual table walk and its
+/// exclusive static backing. Callers hold only this checked description.
+pub(super) struct VerifiedSpan<'call> {
     physical: u64,
     length: usize,
     owner: Identity,
     root_asid: u64,
     write: bool,
     closed: &'static ClosedCopies,
+    origin: Origin<'call>,
 }
 
+enum Origin<'call> {
+    #[cfg(feature = "v020-production-diagnostic")]
+    Vector(core::marker::PhantomData<&'call ()>),
+    #[cfg(cyxia_startup_catalog)]
+    Signed(&'call SignedCaller),
+}
+
+impl Origin<'_> {
+    fn matches_root(&self, root_asid: u64) -> bool {
+        match self {
+            #[cfg(feature = "v020-production-diagnostic")]
+            Self::Vector(_) => trapped_ttbr0() == root_asid,
+            #[cfg(cyxia_startup_catalog)]
+            Self::Signed(caller) => caller.root_asid() == root_asid && caller.registered(),
+        }
+    }
+}
+
+impl<'call> VerifiedSpan<'call> {
+    #[cfg(cyxia_startup_catalog)]
+    pub(super) fn verify_signed(
+        caller: &'call SignedCaller,
+        address: u64,
+        length: usize,
+        write: bool,
+    ) -> Result<Self, i64> {
+        if !caller.registered() {
+            return Err(EFAULT);
+        }
+        let physical = phys(stack_span(caller.index, address, length, write).ok_or(EFAULT)?);
+        Self::from_static(
+            physical,
+            length,
+            caller.member.actor,
+            caller.root_asid(),
+            write,
+            &SYSCALL_COPIES,
+            Origin::Signed(caller),
+        )
+    }
+}
+
+#[cfg(feature = "v020-production-diagnostic")]
+pub(super) type StackSpan = VerifiedSpan<'static>;
+
+#[cfg(feature = "v020-production-diagnostic")]
 impl StackSpan {
     #[cfg(any(
         feature = "v020-production-snapshot-catalog",
@@ -87,7 +131,10 @@ impl StackSpan {
         length: usize,
         write: bool,
     ) -> Result<Self, i64> {
-        Self::verify_using(index, member, address, length, write, &FILE_COPIES)
+        if member.role != Role::Supervisor {
+            return Err(EFAULT);
+        }
+        Self::verify_stack(index, member, address, length, write, &FILE_COPIES)
     }
 
     #[cfg(feature = "v020-production-live-control")]
@@ -98,10 +145,50 @@ impl StackSpan {
         length: usize,
         write: bool,
     ) -> Result<Self, i64> {
-        Self::verify_using(index, member, address, length, write, &AUDIT_COPIES)
+        if member.role != Role::Supervisor {
+            return Err(EFAULT);
+        }
+        Self::verify_stack(index, member, address, length, write, &AUDIT_COPIES)
     }
 
-    fn verify_using(
+    #[cfg(feature = "v020-production-live-control")]
+    pub(super) fn verify_syscall(
+        index: usize,
+        member: NativeRole,
+        address: u64,
+        length: usize,
+        write: bool,
+    ) -> Result<Self, i64> {
+        Self::verify_stack(index, member, address, length, write, &SYSCALL_COPIES)
+    }
+
+    /// # Safety
+    /// The selected role and root are authenticated, and the actual user
+    /// page tables grant access to this exclusive advice backing. That
+    /// backing stays pinned and stopped for this synchronous dispatch.
+    pub(super) unsafe fn from_syscall_static(
+        physical: u64,
+        length: usize,
+        owner: Identity,
+        root_asid: u64,
+        write: bool,
+    ) -> Result<Self, i64> {
+        Self::from_static(
+            physical,
+            length,
+            owner,
+            root_asid,
+            write,
+            &SYSCALL_COPIES,
+            Origin::Vector(core::marker::PhantomData),
+        )
+    }
+
+    #[cfg(any(
+        feature = "v020-production-live-control",
+        feature = "v020-production-fsync-scratch"
+    ))]
+    fn verify_stack(
         index: usize,
         member: NativeRole,
         address: u64,
@@ -109,21 +196,38 @@ impl StackSpan {
         write: bool,
         closed: &'static ClosedCopies,
     ) -> Result<Self, i64> {
-        if super::ROLES.get(index) != Some(&Role::Supervisor)
-            || member.role != Role::Supervisor
-            || member.actor.id == 0
-            || member.actor.generation == 0
-            || member.ttbr0_root != root_pa(index)
-        {
-            return Err(EFAULT);
-        }
+        trapped_pie_cap(index, member).map_err(|_| EFAULT)?;
         let root_asid = member.ttbr0_root | (u64::from(role_asid(index)) << 48);
-        if trapped_ttbr0() != root_asid {
-            return Err(EFAULT);
-        }
         let physical = phys(stack_span(index, address, length, write).ok_or(EFAULT)?);
+        Self::from_static(
+            physical,
+            length,
+            member.actor,
+            root_asid,
+            write,
+            closed,
+            Origin::Vector(core::marker::PhantomData),
+        )
+    }
+}
+
+impl<'call> VerifiedSpan<'call> {
+    fn from_static(
+        physical: u64,
+        length: usize,
+        owner: Identity,
+        root_asid: u64,
+        write: bool,
+        closed: &'static ClosedCopies,
+        origin: Origin<'call>,
+    ) -> Result<Self, i64> {
         let end = physical.checked_add(length as u64).ok_or(EFAULT)?;
-        if physical < cyxia_platform_virt::ENTRY
+        if length == 0
+            || !owner.valid()
+            || root_asid >> 48 == 0
+            || cpu::registered_slot() != Some(0)
+            || !origin.matches_root(root_asid)
+            || physical < cyxia_platform_virt::ENTRY
             || end > cyxia_platform_virt::KERNEL_POOL_END
             || !frames::statically_pinned_control_span(physical..end)
         {
@@ -132,10 +236,11 @@ impl StackSpan {
         Ok(Self {
             physical,
             length,
-            owner: member.actor,
+            owner,
             root_asid,
             write,
             closed,
+            origin,
         })
     }
 
@@ -143,115 +248,58 @@ impl StackSpan {
         if self.write {
             return Err(EFAULT);
         }
-        self.copy(buffer.len(), |mapped, at, count| {
-            // Only the exact checked range is used and the kernel buffer is a
-            // private endpoint-local array outside the pinned user stack.
-            unsafe { ptr::copy_nonoverlapping(mapped, buffer.as_mut_ptr().add(at), count) };
-            true
+        self.copy(buffer.len(), |physical, at, count, asid| {
+            // SAFETY: self describes the stopped role's pinned span. The
+            // endpoint-local buffer is separate and the fragment fits a page.
+            unsafe {
+                copy_window::copy_in(physical, self.owner, asid, &mut buffer[at..at + count])?;
+            }
+            Ok(true)
         })
         .map(|_| ())
     }
 
+    #[cfg(any(
+        cyxia_startup_catalog,
+        feature = "v020-production-live-control",
+        feature = "v020-production-fsync-scratch"
+    ))]
     pub(super) fn copy_out_and_check(&self, buffer: &[u8]) -> Result<bool, i64> {
         if !self.write {
             return Err(EFAULT);
         }
-        self.copy(buffer.len(), |mapped, at, count| {
-            let bytes = &buffer[at..at + count];
-            // The trusted reply is endpoint-local, independent of the window.
-            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), mapped, count) };
-            bytes
-                .iter()
-                .enumerate()
-                .all(|(index, byte)| unsafe { mapped.add(index).read_volatile() == *byte })
+        self.copy(buffer.len(), |physical, at, count, asid| {
+            // SAFETY: self proves write permission over this pinned span.
+            // The endpoint-local input is disjoint from the destination.
+            unsafe {
+                copy_window::copy_out_and_check(physical, self.owner, asid, &buffer[at..at + count])
+            }
         })
     }
 
     fn copy(
         &self,
         length: usize,
-        mut transfer: impl FnMut(*mut u8, usize, usize) -> bool,
+        mut transfer: impl FnMut(u64, usize, usize, u8) -> Result<bool, Error>,
     ) -> Result<bool, i64> {
         if length == 0
             || length > self.length
             || cpu::registered_slot() != Some(0)
-            || trapped_ttbr0() != self.root_asid
+            || !self.origin.matches_root(self.root_asid)
         {
             return Err(EFAULT);
         }
-        let (root0, root1, daif): (u64, u64, u64);
-        unsafe {
-            asm!("mrs {}, ttbr0_el1", "mrs {}, ttbr1_el1", "mrs {}, daif",
-                 out(reg) root0, out(reg) root1, out(reg) daif,
-                 options(nomem, nostack, preserves_flags));
-        }
-        let pan = SoftwarePanContext {
-            ttbr0_empty_root: root0 == ptr::addr_of!(empty_l1) as u64,
-            // A complete root comparison also identifies the CPU0-only tree.
-            ttbr1_asid_zero: root1 == ptr::addr_of!(high_l1) as u64,
-            daif_masked: daif & 0x3c0 == 0x3c0,
-            epd0: false,
-        };
-        let entry = window_entry();
         let asid = (self.root_asid >> 48) as u8;
-        let perm = PagePermissions::new(self.write, false).map_err(|_| EFAULT)?;
+        let closed = if self.write {
+            &self.closed.writes
+        } else {
+            &self.closed.reads
+        };
         let mut at = 0;
         while at < length {
             let physical = self.physical + at as u64;
-            let offset = physical & PAGE_MASK;
-            let count = (length - at).min((PAGE_SIZE - offset) as usize);
-            // Contract granularity is 8 bytes. The enclosing aligned fragment
-            // is on this same verified page; the copy uses exactly count bytes.
-            let start = WINDOW_VA + offset;
-            let aligned = start & !(COPY_SPAN_ALIGN - 1);
-            let mut window = CopyWindow::open(
-                0,
-                WINDOW_VA,
-                WINDOW_VA + PAGE_SIZE,
-                self.owner.id,
-                self.owner.generation,
-                asid,
-                pan,
-            )
-            .map_err(|_| EFAULT)?;
-            window
-                .authorize_copy(
-                    0,
-                    self.owner.id,
-                    self.owner.id,
-                    self.owner.generation,
-                    aligned,
-                    (start - aligned) as usize + count,
-                )
-                .map_err(|_| EFAULT)?;
-            let leaf = mmu::encode_leaf(
-                PhysAddr(physical & !PAGE_MASK),
-                perm,
-                mmu::MemoryAttr::Normal,
-            )
-            .map_err(|_| EFAULT)?
-                | NON_GLOBAL;
-            // One CPU0 dispatcher owns the slot with interrupts masked.
-            // A stale descriptor cannot be reused or survive a return to EL0.
-            if unsafe { entry.read_volatile() } != 0 {
-                fatal(FATAL_WINDOW);
-            }
-            unsafe {
-                entry.write_volatile(leaf);
-                asm!("dsb ishst", "isb", options(nostack, preserves_flags));
-            }
-            let exact = transfer(ptr::without_provenance_mut(start as usize), at, count);
-            let invalidating = window.begin_teardown();
-            // Clearing the PTE and completing the local VA+ASID0 invalidation
-            // precede release of this fragment and any reuse of the slot.
-            unsafe { cyxia_revoke_copy_window(entry) };
-            invalidating.map_err(|_| EFAULT)?;
-            window.finish_teardown(true).map_err(|_| EFAULT)?;
-            let closed = if self.write {
-                &self.closed.writes
-            } else {
-                &self.closed.reads
-            };
+            let count = (length - at).min((PAGE_SIZE - physical % PAGE_SIZE) as usize);
+            let exact = transfer(physical, at, count, asid).map_err(|_| EFAULT)?;
             closed.fetch_add(1, Ordering::Relaxed);
             if !exact {
                 return Ok(false);
@@ -262,20 +310,9 @@ impl StackSpan {
     }
 }
 
-fn window_entry() -> *mut u64 {
-    // This is the only runtime writer of the dedicated third-level table's
-    // first descriptor. The table lives in the existing privileged RAM map.
-    ptr::without_provenance_mut((crate::HIGH + ptr::addr_of!(__copy_window_l3) as u64) as usize)
-}
-
-#[inline(never)]
-#[unsafe(no_mangle)]
-unsafe extern "C" fn cyxia_revoke_copy_window(entry: *mut u64) {
-    unsafe {
-        entry.write_volatile(0);
-        asm!("dsb ishst", "tlbi vae1, {}", "dsb ish", "isb", in(reg) LOCAL_TLBI,
-             options(nostack, preserves_flags));
-    }
+#[cfg(feature = "v020-production-diagnostic")]
+pub(super) fn syscall_closed_counts() -> (u64, u64, bool) {
+    SYSCALL_COPIES.counts()
 }
 
 #[cfg(any(

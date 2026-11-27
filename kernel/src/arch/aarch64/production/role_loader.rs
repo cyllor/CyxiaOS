@@ -8,13 +8,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(cyxia_startup_catalog)]
 use cyxia_contracts::PagePermissions;
 use cyxia_contracts::PhysAddr;
+#[cfg(cyxia_signed_resident)]
+use cyxia_kernel_core::control_plane::role_manifest_v0199::LifecycleBinding;
 use cyxia_kernel_core::control_plane::{
     Error, Identity, cpu0_v0199 as profile,
     pie_image_v0199::{
         ROLE_STACK_BYTES, RelativeRelocation, RolePackageInput, RolePackageSpec,
         VerifiedRolePackage,
     },
-    role_manifest_v0199::{NativeRole, PrivateRegion, ROLE_COUNT, ROLES},
+    role_manifest_v0199::{NativeRole, PrivateRegion, ROLE_COUNT, ROLES, Role},
 };
 
 // PIE loader layout (mirrors v0199_control_bringup).
@@ -130,7 +132,7 @@ pub(super) fn high_leaf(pa: u64) -> *mut u64 {
     assert!(offset < (cyxia_platform_virt::RAM_MIB * 1024 * 1024 / PAGE as u64));
     unsafe { ((core::ptr::addr_of!(ram_l3) as u64 + crate::HIGH) as *mut u64).add(offset as usize) }
 }
-fn sync_code(addr: u64, bytes: usize) {
+pub(super) fn sync_code(addr: u64, bytes: usize) {
     let ctr: u64;
     unsafe {
         core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
@@ -257,7 +259,10 @@ fn verify_signed_translations(
 
 pub(super) enum RoleLaunch {
     #[cfg(cyxia_signed_resident)]
-    Lifecycle,
+    Lifecycle {
+        cap_selector: u64,
+        object_epoch: Option<u64>,
+    },
     #[cfg(feature = "v020-production-diagnostic")]
     Diagnostic {
         cap_selector: u64,
@@ -265,37 +270,12 @@ pub(super) enum RoleLaunch {
     },
 }
 
-pub(super) fn load_role_with_identity(
-    index: usize,
-    generation: u64,
-    launch: RoleLaunch,
-) -> Result<NativeRole, Error> {
-    let role = ROLES[index];
-    let pkg = &CATALOG[index];
-    assert_eq!(pkg.role_id, role.id());
-    assert!(pkg.bytes.len() <= COPY);
-    let actor = Identity {
-        id: u64::from(role.id()),
-        generation,
-    };
-    let (cap_selector, target_selector, caps, endpoint_id) = match launch {
-        #[cfg(cyxia_signed_resident)]
-        RoleLaunch::Lifecycle => (0u64, 0u64, 0, 0),
-        #[cfg(feature = "v020-production-diagnostic")]
-        RoleLaunch::Diagnostic {
-            cap_selector,
-            target_selector,
-        } => (
-            cap_selector,
-            target_selector,
-            role.allowed_caps(),
-            0xC000 + index as u64,
-        ),
-    };
-    let b = backing(index);
-    let t = tables(index);
-    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(COPY_BUFFER.0) };
-    scratch[..pkg.bytes.len()].copy_from_slice(pkg.bytes);
+fn stage_image(
+    role: Role,
+    pkg: &BootPackage,
+    copy: &[u8],
+    image: &mut [u8],
+) -> Result<(u64, [u8; IMAGE / PAGE], u16), Error> {
     let spec = RolePackageSpec {
         role,
         package_id: u64::from(role.id()),
@@ -310,28 +290,13 @@ pub(super) fn load_role_with_identity(
         spec,
         RolePackageInput {
             package_id: spec.package_id,
-            bytes: &scratch[..pkg.bytes.len()],
+            bytes: copy,
             relative: pkg.relative,
         },
-        &mut || {},
-    )
-    .expect("trusted ABI3 role package");
-    #[cfg(cyxia_signed_resident)]
+        || {},
+    )?;
     let syscall_abi = verified.syscall_abi();
-    let relro = verified.relro();
-    let image = unsafe { &mut *core::ptr::addr_of_mut!((*b).image) };
-    let entry = verified
-        .stage(image, BASE, BASE, BASE + IMAGE as u64)
-        .expect("private PIE stage");
-    let stack = unsafe { &mut *core::ptr::addr_of_mut!((*b).stack) };
-    let mut args = [0u8; 24];
-    args[..8].copy_from_slice(&cap_selector.to_le_bytes());
-    args[8..16].copy_from_slice(&target_selector.to_le_bytes());
-    args[16..24].copy_from_slice(&actor.generation.to_le_bytes());
-    let startup =
-        cyxia_kernel_core::security::syscall_v3::stage_spawn_args(stack, STACK_BASE, &args)
-            .expect("private ABI3 startup arguments");
-    assert_eq!(startup.sp, STACK_END - 32);
+    let entry = verified.stage(image, BASE, BASE, BASE + IMAGE as u64)?;
     let mut map = [0u8; IMAGE / PAGE];
     for seg in verified.load_segments() {
         let start = seg.virtual_address as usize / PAGE;
@@ -342,16 +307,94 @@ pub(super) fn load_role_with_identity(
             *page = seg.flags as u8;
         }
     }
-    if let Some((start, len)) = relro {
+    if let Some((start, len)) = verified.relro() {
         assert_eq!(start % PAGE as u64, 0);
-        let end = start.checked_add(len).unwrap().div_ceil(PAGE as u64);
-        assert!(end <= map.len() as u64);
-        for page in &mut map[start as usize / PAGE..end as usize] {
-            assert_eq!(*page, 6);
+        let end = start
+            .checked_add(len)
+            .ok_or(Error::Invalid)?
+            .div_ceil(PAGE as u64);
+        let range = map
+            .get_mut(start as usize / PAGE..end as usize)
+            .ok_or(Error::Invalid)?;
+        for page in range {
+            if *page != 6 {
+                return Err(Error::Denied);
+            }
             *page = 4;
         }
     }
+    Ok((entry, map, syscall_abi))
+}
+
+pub(super) fn load_role_with_identity(
+    index: usize,
+    generation: u64,
+    launch: RoleLaunch,
+) -> Result<NativeRole, Error> {
+    let role = *ROLES.get(index).ok_or(Error::Invalid)?;
+    let pkg = &CATALOG[index];
+    if pkg.role_id != role.id() || pkg.bytes.len() > COPY || generation == 0 {
+        return Err(Error::Denied);
+    }
+    #[cfg(cyxia_signed_resident)]
+    let lifecycle = matches!(launch, RoleLaunch::Lifecycle { .. });
+    #[cfg(cyxia_signed_resident)]
+    if lifecycle {
+        if super::cpu::registered_slot() != Some(profile::CONTROL_CPU) {
+            return Err(Error::Denied);
+        }
+        // SAFETY: CPU0 exclusively owns the registry, and staging never
+        // reuses a live or retired slot during the same boot.
+        if !matches!(unsafe { registration(index).read() }, Registration::Vacant) {
+            return Err(Error::Denied);
+        }
+    }
+    let actor = Identity {
+        id: u64::from(role.id()),
+        generation,
+    };
+    let (cap_selector, target_selector, caps, endpoint_id, object_epoch) = match launch {
+        #[cfg(cyxia_signed_resident)]
+        RoleLaunch::Lifecycle {
+            cap_selector,
+            object_epoch,
+        } => (cap_selector, 0u64, 0, 0, object_epoch),
+        #[cfg(feature = "v020-production-diagnostic")]
+        RoleLaunch::Diagnostic {
+            cap_selector,
+            target_selector,
+        } => (
+            cap_selector,
+            target_selector,
+            role.allowed_caps(),
+            0xC000 + index as u64,
+            None::<u64>,
+        ),
+    };
+    let b = backing(index);
+    let t = tables(index);
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(COPY_BUFFER.0) };
+    scratch[..pkg.bytes.len()].copy_from_slice(pkg.bytes);
+    let image = unsafe { &mut *core::ptr::addr_of_mut!((*b).image) };
+    let staged = stage_image(role, pkg, &scratch[..pkg.bytes.len()], image);
     scratch.fill(0);
+    let (entry, map, syscall_abi) = staged?;
+    #[cfg(not(cyxia_signed_resident))]
+    let _ = syscall_abi;
+    let stack = unsafe { &mut *core::ptr::addr_of_mut!((*b).stack) };
+    let mut args = [0u8; 32];
+    args[..8].copy_from_slice(&cap_selector.to_le_bytes());
+    args[8..16].copy_from_slice(&target_selector.to_le_bytes());
+    args[16..24].copy_from_slice(&actor.generation.to_le_bytes());
+    let args = if let Some(epoch) = object_epoch {
+        args[24..].copy_from_slice(&epoch.to_le_bytes());
+        &args[..]
+    } else {
+        &args[..24]
+    };
+    let startup = cyxia_kernel_core::security::syscall_v3::stage_spawn_args(stack, STACK_BASE, args)
+        .map_err(|_| Error::Denied)?;
+    assert_eq!(startup.sp, STACK_END - 32);
     let image_base = b as u64;
     for (i, flags) in map.iter().copied().enumerate() {
         if flags & 1 != 0 {
@@ -403,9 +446,7 @@ pub(super) fn load_role_with_identity(
     PIE_SP[index].store(startup.sp, Ordering::Release);
     PIE_X0[index].store(startup.x0, Ordering::Release);
     PIE_X1[index].store(startup.x1, Ordering::Release);
-    #[cfg(cyxia_signed_resident)]
-    PIE_SYSCALL_ABI[index].store(syscall_abi, Ordering::Release);
-    Ok(NativeRole {
+    let member = NativeRole {
         role,
         actor,
         ttbr0_root: root_pa(index),
@@ -414,11 +455,34 @@ pub(super) fn load_role_with_identity(
             bytes: core::mem::size_of::<Backing>() as u64,
         },
         caps,
-        control_ns_per_100ms: 2_000_000,
+        control_ns_per_100ms: if cfg!(all(
+            cyxia_startup_catalog,
+            feature = "v020-production-sec-s-load"
+        )) {
+            use cyxia_kernel_core::control_plane::role_manifest_v0199::{
+                OPERATIONS_MAX_NS, SECURITY_MAX_NS,
+            };
+            match role {
+                Role::Operations => OPERATIONS_MAX_NS,
+                Role::Security => SECURITY_MAX_NS,
+                _ => 2_000_000,
+            }
+        } else {
+            2_000_000
+        },
         cpu_mask: profile::CONTROL_MASK,
         thread_count: 1,
         endpoint_id,
-    })
+    };
+    #[cfg(cyxia_signed_resident)]
+    if lifecycle {
+        let binding = LifecycleBinding::new(member, role_asid(index), syscall_abi)?;
+        // SAFETY: verified mappings and the fresh context are committed by
+        // the sole CPU0 owner. No exception hook reads this registry.
+        unsafe { registration(index).write(Registration::Live(binding)) };
+        PIE_SYSCALL_ABI[index].store(syscall_abi, Ordering::Release);
+    }
+    Ok(member)
 }
 static PIE_ENTRY: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
 static PIE_SP: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
@@ -429,22 +493,50 @@ static PIE_X1: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUN
 static PIE_SYSCALL_ABI: [AtomicU16; ROLE_COUNT] = [const { AtomicU16::new(0) }; ROLE_COUNT];
 
 #[cfg(cyxia_signed_resident)]
-pub(super) fn pie_syscall_abi(index: usize, root: u64) -> Option<u16> {
-    if root_pa(index) != root {
+#[derive(Clone, Copy)]
+enum Registration {
+    Vacant,
+    Live(LifecycleBinding),
+    Retired,
+}
+
+#[cfg(cyxia_signed_resident)]
+static mut REGISTRATIONS: [Registration; ROLE_COUNT] = [Registration::Vacant; ROLE_COUNT];
+
+#[cfg(cyxia_signed_resident)]
+fn registration(index: usize) -> *mut Registration {
+    assert!(index < ROLE_COUNT);
+    // SAFETY: callers ensure CPU0 ownership before reading/writing.
+    unsafe {
+        core::ptr::addr_of_mut!(REGISTRATIONS)
+            .cast::<Registration>()
+            .add(index)
+    }
+}
+
+#[cfg(cyxia_signed_resident)]
+pub(super) fn registered_role_abi(
+    index: usize,
+    member: NativeRole,
+    captured_ttbr0: u64,
+) -> Option<u16> {
+    let cpu = super::cpu::registered_slot()?;
+    if cpu != profile::CONTROL_CPU || ROLES.get(index) != Some(&member.role) {
         return None;
     }
-    let abi = PIE_SYSCALL_ABI[index].load(Ordering::Acquire);
-    (abi != 0).then_some(abi)
+    // SAFETY: CPU0 is the only accessor, including for task retirement.
+    match unsafe { registration(index).read() } {
+        Registration::Live(binding) => binding.authenticate(member, captured_ttbr0, cpu),
+        Registration::Vacant | Registration::Retired => None,
+    }
 }
 
 /// Disconnect a stopped CPU0 role's verified root. Its ASID and all
 /// private pages stay reserved for the rest of the boot.
 #[cfg(cyxia_signed_resident)]
-pub(super) fn retire_stopped_role(index: usize, expected_root: u64) -> Result<(), Error> {
-    if super::cpu::slot() != 0
-        || index >= ROLE_COUNT
-        || pie_syscall_abi(index, expected_root).is_none()
-    {
+pub(super) fn retire_stopped_role(index: usize, member: NativeRole) -> Result<(), Error> {
+    let ttbr0 = member.ttbr0_root | (u64::from(role_asid(index)) << 48);
+    if registered_role_abi(index, member, ttbr0).is_none() {
         return Err(Error::Denied);
     }
     let tables = tables(index);
@@ -455,6 +547,7 @@ pub(super) fn retire_stopped_role(index: usize, expected_root: u64) -> Result<()
         let child = PhysAddr(phys(core::ptr::addr_of!((*tables).mid) as u64));
         mmu::checked_single_child_table(child, |slot| root.add(slot).read_volatile())
             .map_err(|_| Error::Denied)?;
+        registration(index).write(Registration::Retired);
         root.write_volatile(0);
     }
     tlbi();
@@ -470,7 +563,7 @@ pub(super) fn pie_context(index: usize) -> user::Context {
     ctx.regs[1] = PIE_X1[index].load(Ordering::Acquire);
     ctx
 }
-#[cfg(feature = "v020-production-diagnostic")]
+#[cfg(any(cyxia_startup_catalog, feature = "v020-production-diagnostic"))]
 /// The sole accepted pointer range for a PIE role is its private stack.
 pub(super) fn stack_span(index: usize, va: u64, n: usize, write: bool) -> Option<u64> {
     if n == 0 {

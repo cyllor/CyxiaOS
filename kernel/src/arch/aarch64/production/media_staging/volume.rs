@@ -23,6 +23,8 @@
 //! call made only from `media_staging::stage`, which is one-shot (STAGED swap).
 use super::Disk;
 use core::{mem::MaybeUninit, ops::Range};
+#[cfg(any(test, cyxia_startup_catalog))]
+use cyxia_kernel_core::security::boot_epoch_v1::TlsBootPolicy;
 use cyxia_kernel_core::security::{
     Error as SecurityError,
     epoch_redo_v0199::EpochBlockIo,
@@ -586,6 +588,66 @@ pub(super) fn validate_homes(
     Ok(e)
 }
 
+/// The authorized resident accepts checkpointed ordinary file homes on the
+/// baseline v1 layout. The boot-only log owner still validates the paired
+/// epoch separately, and the volume grants no new user service capability.
+#[cfg(test)]
+pub(super) fn validate_resident_homes(
+    disk: &mut impl EpochBlockIo,
+    checkpoint: SuperblockV1,
+    epoch: u64,
+    config: &VerifiedOfflineConfig<'_>,
+) -> Result<MountEvidence, SecurityError> {
+    validate_resident_homes_for(disk, checkpoint, epoch, TlsBootPolicy::new(config, None)?)
+}
+
+#[cfg(any(test, cyxia_startup_catalog))]
+pub(super) fn validate_resident_homes_for(
+    disk: &mut impl EpochBlockIo,
+    checkpoint: SuperblockV1,
+    epoch: u64,
+    policy: TlsBootPolicy<'_>,
+) -> Result<MountEvidence, SecurityError> {
+    let config = policy.config();
+    // SAFETY: the one-shot CPU0 mount excludes other MOUNT borrows.
+    let workspace = unsafe { &mut *core::ptr::addr_of_mut!(MOUNT) };
+    let mounted = file_mount_v1::validate_signed(
+        disk,
+        checkpoint,
+        &SYSTEM,
+        config,
+        workspace,
+        |acl, inode, system| {
+            if let Some(kind) = system {
+                return staging_acl(
+                    acl,
+                    inode,
+                    Some(UnifiedSystemKind::from_baseline(kind)),
+                    SnapshotLayout::LegacyZero,
+                    config.principals()[0],
+                    0,
+                );
+            }
+            // No service delegation is present in the resident's verified
+            // policy. The owner and parent of each ordinary inode were
+            // checked by the joined ACL/structure scan.
+            if acl.system_rights != 0
+                || inode.runs[..usize::from(inode.extents)]
+                    .iter()
+                    .any(|run| run.physical < CANONICAL_BUSINESS_START)
+            {
+                return Err(SecurityError::Unauthorized);
+            }
+            Ok(())
+        },
+    )?;
+    if mounted.security != policy.resident_state(epoch)? || mounted.boot.boot_epoch != epoch {
+        return Err(SecurityError::Conflict);
+    }
+    workspace.verify_checkpointed_receipts(checkpoint)?;
+    Ok(mounted)
+}
+
 /// Validate the signed FSYNC diagnostic's persisted file and paired epoch.
 #[cfg(feature = "v020-production-fsync-scratch")]
 pub(super) fn validate_fsync_homes(
@@ -628,7 +690,7 @@ pub(super) fn validate_fsync_homes(
 /// The exclusive mount workspace retains the seven receipt/index blocks
 /// read by validate_homes. Only the known paired boot transaction has run
 /// since that mount; its independently verified state is required here.
-#[cfg(feature = "v020-production-media-signed")]
+#[cfg(any(feature = "v020-production-media-signed", cyxia_startup_catalog))]
 pub(super) fn confirmed_receipt_query_digest(
     mounted: &MountEvidence,
     committed: &SecurityStateStoreV2,
@@ -638,6 +700,17 @@ pub(super) fn confirmed_receipt_query_digest(
     // workspace borrows have ended, and no other CPU can access MOUNT.
     let workspace = unsafe { &*core::ptr::addr_of!(MOUNT) };
     workspace.confirmed_receipt_query_digest(mounted, committed, config)
+}
+
+#[cfg(any(test, cyxia_startup_catalog))]
+pub(super) fn confirm_tls_receipts(
+    mounted: &MountEvidence,
+    committed: &SecurityStateStoreV2,
+    transition: cyxia_kernel_core::security::boot_epoch_v1::TlsBootTransition<'_>,
+) -> Result<[u8; 32], SecurityError> {
+    // SAFETY: this follows the same one-shot CPU0 mount as ordinary BootEpoch.
+    let workspace = unsafe { &*core::ptr::addr_of!(MOUNT) };
+    workspace.confirmed_receipt_query_digest_after_tls(mounted, committed, transition)
 }
 
 fn checked_map() -> Result<[UnifiedSystemObject; unified::UNIFIED_SYSTEM_OBJECTS], SecurityError> {
@@ -668,10 +741,27 @@ fn verify_snapshot_envelopes(
 }
 
 /// Return the selected v1 checkpoint and its bytes for the paired boot grant.
+#[cfg(not(cyxia_startup_catalog))]
 pub(super) fn read_checkpoint(
     disk: &mut impl EpochBlockIo,
     raw: &mut [u8; BLOCK_BYTES],
     config: Config<'_>,
+) -> Result<SuperblockV1, SecurityError> {
+    read_checkpoint_for(disk, raw, config, Checkpoints::Staging)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Checkpoints {
+    Staging,
+    #[cfg(any(test, cyxia_startup_catalog))]
+    Resident,
+}
+
+pub(super) fn read_checkpoint_for(
+    disk: &mut impl EpochBlockIo,
+    raw: &mut [u8; BLOCK_BYTES],
+    config: Config<'_>,
+    checkpoints: Checkpoints,
 ) -> Result<SuperblockV1, SecurityError> {
     let fs_uuid = config.map_or(UUID, |config| config.header().fs_uuid);
     let mut other = [0; BLOCK_BYTES];
@@ -683,10 +773,23 @@ pub(super) fn read_checkpoint(
     // The formatter writes identical generation 1 headers. Later checkpoints
     // alternate copies and each fixture checks its exact committed boundary.
     for copy in [a, b] {
-        if copy.fs_uuid != fs_uuid
-            || copy.log_epoch != copy.generation
-            || !checkpoint_lsn_valid(copy)
-        {
+        let valid_lsn = match checkpoints {
+            Checkpoints::Staging => checkpoint_lsn_valid(copy),
+            #[cfg(any(test, cyxia_startup_catalog))]
+            Checkpoints::Resident => {
+                if copy.generation == 1 {
+                    copy.checkpoint_lsn == 0
+                } else {
+                    // Each prior epoch advanced the protected boot pair.
+                    // Ordinary file transactions may have advanced the LSN
+                    // further and are checked against retained receipt homes.
+                    (copy.generation - 1)
+                        .checked_mul(4)
+                        .is_some_and(|boot_lsn| copy.checkpoint_lsn >= boot_lsn)
+                }
+            }
+        };
+        if copy.fs_uuid != fs_uuid || copy.log_epoch != copy.generation || !valid_lsn {
             return Err(SecurityError::Conflict);
         }
     }
@@ -694,7 +797,10 @@ pub(super) fn read_checkpoint(
         return Err(SecurityError::Conflict);
     }
     #[cfg(feature = "v020-production-fsync-scratch")]
-    if sb.generation > 2 && super::fsync::receipt_lsn(a) != super::fsync::receipt_lsn(b) {
+    if matches!(checkpoints, Checkpoints::Staging)
+        && sb.generation > 2
+        && super::fsync::receipt_lsn(a) != super::fsync::receipt_lsn(b)
+    {
         return Err(SecurityError::Conflict);
     }
     if sb != a {

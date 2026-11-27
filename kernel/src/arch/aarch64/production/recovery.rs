@@ -1,4 +1,4 @@
-//! Wave 11 volatile recovery gate and per-CPU exception summaries.
+//! Recovery gate and per-CPU exception summaries.
 //!
 //! Each authorized 0x41 checks the EL1-owned checkpoint pair facts. This boot
 //! starts with staged facts for the identical initial pair. After the successful
@@ -12,9 +12,10 @@
 //!   facts. The signed resident boot has no staged gate. READY publishes
 //!   initialization. Only synchronous CPU0 code accesses GATE.
 //! * Each CPU exclusively owns its accumulator in SLOTS while running EL0.
-//!   CPU0 can take a worker's slot only after observing QUIT, its quiescent
-//!   business gate and its STOPPED release. That worker disabled its timer,
-//!   returned from its last EL0 turn and has no path back to EL0.
+//!   The diagnostic handoff requires QUIT, a quiescent business gate and
+//!   STOPPED. A signed business worker instead publishes its writer stop
+//!   after dropping the last dispatch permit and retiring its private root.
+//!   The network worker may still run on that core with independent state.
 //! * EVENTS and REJECTED publish each producer's own count. TAKEN records
 //!   completed transfers. CPU0 consumes the retained summaries for the seal.
 //!   The live-control service derives three volatile RECONCILE audit slots
@@ -25,6 +26,10 @@
 //! * BLOCK_HOLD is the CPU0 foreground's immutable terminal custody. The
 //!   scratch owner transfers the sealed record once, then the mount gate
 //!   remains closed. The driver still owns all queue/DMA storage.
+//! * Signed resident staging can transfer an independently authorized
+//!   carrier and the exclusive block device into durable custody. Only
+//!   metered CPU0 foreground work performs its I/O. The in-vector audit
+//!   service reads the confirmed state and reserves acknowledged writes.
 
 #[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
 use super::super::scratch_blk::{self, ScratchTerminalCustody};
@@ -38,6 +43,8 @@ use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_kernel_core::control_plane::Identity;
+#[cfg(cyxia_business_package)]
+use cyxia_kernel_core::control_plane::cpu0_v0199::{BUSINESS_MASK, BUSINESS_THREAD_ID_BASE};
 use cyxia_kernel_core::security::Error;
 #[cfg(cyxia_signed_resident)]
 use cyxia_kernel_core::security::durable_role_epoch_v0199::ConfirmedBootPolicy;
@@ -49,6 +56,15 @@ use cyxia_kernel_core::security::recovery_proof_v2::{
     CheckpointPairFacts, RecoveryGate, RecoveryState,
 };
 use sha2::{Digest, Sha256};
+
+#[cfg(cyxia_startup_catalog)]
+#[path = "recovery/durable.rs"]
+mod durable;
+#[cfg(cyxia_startup_catalog)]
+pub(super) use durable::{
+    ack_durable, check_durable_ack, confirm_delivery, durable_available, has_pending_persistence,
+    install_durable, open_durable, persist_pending, read_durable,
+};
 
 /// Protection generation of the staged boot (first generation).
 #[cfg(feature = "v020-production-diagnostic")]
@@ -85,6 +101,8 @@ static mut SLOTS: [Slot; ACCUMULATOR_COUNT] =
 static READY: AtomicBool = AtomicBool::new(false);
 static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
 static EVENTS: [AtomicU64; ACCUMULATOR_COUNT] = [const { AtomicU64::new(0) }; ACCUMULATOR_COUNT];
+#[cfg(cyxia_startup_catalog)]
+static STOPPED_WRITERS: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
 static mut BLOCK_HOLD: Option<&'static ScratchTerminalCustody> = None;
 #[cfg(feature = "v020-production-diagnostic")]
@@ -177,7 +195,10 @@ pub(super) fn init_signed(policy: &ConfirmedBootPolicy<'_>) -> Result<(), Error>
         policy.boot_epoch(),
         #[cfg(feature = "v020-production-diagnostic")]
         None,
-    )
+    )?;
+    #[cfg(cyxia_startup_catalog)]
+    durable::bind(policy)?;
+    Ok(())
 }
 
 fn event_digest(cpu: u32, actor: Option<Identity>, esr: u64, far: u64) -> [u8; 32] {
@@ -214,17 +235,63 @@ pub(super) fn record_role_failure(actor: Identity, esr: u64, far: u64) -> Result
     if cyxia_arch_aarch64::cpu::slot() != 0 || !actor.valid() {
         return Err(Error::Unauthorized);
     }
+    record_event(0, Some(actor), esr, attributed_far(esr, far))
+}
+
+#[cfg(cyxia_signed_resident)]
+fn attributed_far(esr: u64, far: u64) -> u64 {
     // FAR is defined for the relevant abort classes only, when FnV is clear.
-    let far = if matches!(esr >> 26, 0x20 | 0x24) && esr & (1 << 10) == 0 {
+    if matches!((esr >> 26) & 0x3f, 0x20 | 0x24) && esr & (1 << 10) == 0 {
         far
     } else {
         0
-    };
-    record_event(0, Some(actor), esr, far)
+    }
+}
+
+/// Only a classified abort from the current pinned business context supplies
+/// this actor. The caller retires the writer before CPU0 may read its slot.
+#[cfg(cyxia_business_package)]
+pub(super) fn record_business_failure(actor: Identity, esr: u64, far: u64) -> Result<(), Error> {
+    let i = cyxia_arch_aarch64::cpu::slot();
+    if i == 0
+        || i >= ACCUMULATOR_COUNT
+        || !actor.valid()
+        || actor.id != BUSINESS_THREAD_ID_BASE + i as u64
+    {
+        return Err(Error::Unauthorized);
+    }
+    record_event(i, Some(actor), esr, attributed_far(esr, far))
+}
+
+/// This worker has returned from its last EL0 turn and retired its root.
+/// Its release hands off all writes to the CPU0 foreground recovery owner.
+#[cfg(cyxia_business_package)]
+pub(super) fn stop_business_writer() {
+    let i = cyxia_arch_aarch64::cpu::slot();
+    assert!((1..ACCUMULATOR_COUNT).contains(&i) && READY.load(Ordering::Acquire));
+    STOPPED_WRITERS.fetch_or(1 << i, Ordering::Release);
+}
+
+#[cfg(cyxia_business_package)]
+pub(super) fn business_writers_stopped() -> bool {
+    STOPPED_WRITERS.load(Ordering::Acquire) & BUSINESS_MASK == BUSINESS_MASK
+}
+
+/// Preserve the unclassified CPU0 syndrome before the terminal stop. It
+/// carries no task attribution and cannot authorize a replacement.
+#[cfg(cyxia_signed_resident)]
+pub(super) fn record_unattributed_sync(esr: u64, far: u64) {
+    if cyxia_arch_aarch64::cpu::slot() == 0 {
+        let _ = record_event(0, None, esr, far);
+    }
 }
 
 fn record_event(i: usize, actor: Option<Identity>, esr: u64, far: u64) -> Result<(), Error> {
     if !READY.load(Ordering::Acquire) || TAKEN.load(Ordering::Acquire) & (1 << i) != 0 {
+        return Err(Error::Unauthorized);
+    }
+    #[cfg(cyxia_startup_catalog)]
+    if STOPPED_WRITERS.load(Ordering::Acquire) & (1 << i) != 0 {
         return Err(Error::Unauthorized);
     }
     // SAFETY: slot i was initialized before READY (Acquire above) and is only
@@ -237,7 +304,7 @@ fn record_event(i: usize, actor: Option<Identity>, esr: u64, far: u64) -> Result
         event_digest: event_digest(i as u32, actor, esr, far),
         object_id: actor.map_or(0, |id| id.id),
         object_generation: actor.map_or(1, |id| id.generation),
-        failure_code: (esr >> 26) as u32,
+        failure_code: ((esr >> 26) & 0x3f) as u32,
     };
     acc.record(&ev)?;
     EVENTS[i].store(acc.proof().total_count, Ordering::Release);

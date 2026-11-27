@@ -28,8 +28,12 @@ cyxia_secondary_start:
  msr mair_el1, x0
  ldr x0, =low_l1
  msr ttbr0_el1, x0
-.if {supervisor_copy}
+.if {software_pan}
  ldr x0, =__copy_secondary_l1
+.if {secondary_copy_windows}
+ sub x1, x19, #1
+ add x0, x0, x1, lsl #12
+.endif
 .else
  ldr x0, =high_l1
 .endif

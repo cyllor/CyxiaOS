@@ -156,21 +156,7 @@ pub fn verify_slot(
     let mut digest = Sha256::new();
     for page in 0..SLOT_MIRROR_BLOCKS {
         read(block + 1 + page, &mut raw)?;
-        for (index, bytes) in raw.chunks_exact(INODE_BYTES).enumerate() {
-            let inode = Inode::decode(bytes)?;
-            if (inode.kind != 0 && inode.parent >= BUSINESS_INODES)
-                || (page == 0
-                    && index == 0
-                    && (
-                        inode.kind,
-                        inode.generation,
-                        inode.parent,
-                        inode.parent_generation,
-                    ) != (2, 1, 0, 1))
-            {
-                return Err(Error::Invalid);
-            }
-        }
+        validate_mirror_page(page, &raw)?;
         digest.update(raw);
     }
     let actual: [u8; 32] = digest.finalize().into();
@@ -178,4 +164,23 @@ pub fn verify_slot(
         return Err(Error::Conflict);
     }
     Ok(descriptor)
+}
+
+pub(super) fn validate_mirror_page(page: u32, raw: &[u8; SUPER_BYTES]) -> Result<(), Error> {
+    for (index, bytes) in raw.chunks_exact(INODE_BYTES).enumerate() {
+        let inode = Inode::decode(bytes)?;
+        if (inode.kind != 0 && inode.parent >= BUSINESS_INODES)
+            || (page == 0
+                && index == 0
+                && (
+                    inode.kind,
+                    inode.generation,
+                    inode.parent,
+                    inode.parent_generation,
+                ) != (2, 1, 0, 1))
+        {
+            return Err(Error::Invalid);
+        }
+    }
+    Ok(())
 }

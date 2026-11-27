@@ -4,6 +4,7 @@
 
 use super::{
     Error,
+    file_auth_v3::FILE_SERVICE_ROLE,
     file_index_v0199::{FileStreamIndexV4, GROUP_COUNT, SecurityStateStoreV2},
     file_media_v0199::{FileReceiptV4, RECEIPT_BYTES, local_request_id},
     file_receipt_store_v0199::scan_receipts_with_index,
@@ -17,6 +18,7 @@ const RECEIPT_KEY_OFFSET: usize = 8;
 const BOUND: u16 = 2;
 const UNKNOWN: u16 = 5;
 const E_TIMEOUT: i32 = -6;
+const FILE_SERVICE_SLOT: usize = (FILE_SERVICE_ROLE - 1) as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceiptKey {
@@ -43,15 +45,32 @@ impl ReceiptKey {
             stream_generation: u64::from_le_bytes(field(bytes, 40)),
             request_seq: u64::from_le_bytes(field(bytes, 48)),
         };
-        if key.fs_uuid == [0; 16]
-            || key.issued_boot_epoch == 0
-            || key.group_generation == 0
-            || !(1..=u64::from(u32::MAX)).contains(&key.stream_generation)
-            || key.request_id().is_none()
+        key.validate()?;
+        Ok(key)
+    }
+
+    fn validate(self) -> Result<(), Error> {
+        if self.fs_uuid == [0; 16]
+            || self.issued_boot_epoch == 0
+            || self.group_generation == 0
+            || !(1..=u64::from(u32::MAX)).contains(&self.stream_generation)
+            || self.request_id().is_none()
         {
             return Err(Error::Invalid);
         }
-        Ok(key)
+        Ok(())
+    }
+
+    fn encode(self) -> [u8; RECEIPT_KEY_BYTES] {
+        let mut out = [0; RECEIPT_KEY_BYTES];
+        out[..16].copy_from_slice(&self.fs_uuid);
+        out[16..24].copy_from_slice(&self.issued_boot_epoch.to_le_bytes());
+        out[24..28].copy_from_slice(&self.group_id.to_le_bytes());
+        out[28..32].copy_from_slice(&self.group_generation.to_le_bytes());
+        out[32..40].copy_from_slice(&self.stream_slot.to_le_bytes());
+        out[40..48].copy_from_slice(&self.stream_generation.to_le_bytes());
+        out[48..56].copy_from_slice(&self.request_seq.to_le_bytes());
+        out
     }
 
     /// Return the canonical local ID projected from the group, stream and sequence.
@@ -76,6 +95,7 @@ pub struct MountedReceiptQuery<'a> {
     fs_uuid: [u8; 16],
     boot_epoch: u64,
     principals: [u64; GROUP_COUNT],
+    service_generation: Option<u64>,
 }
 
 impl<'a> MountedReceiptQuery<'a> {
@@ -91,12 +111,17 @@ impl<'a> MountedReceiptQuery<'a> {
         security: &SecurityStateStoreV2,
     ) -> Result<Self, Error> {
         config.check_committed(security)?;
+        let generation = security.service_generations[FILE_SERVICE_SLOT];
+        let service_generation = (generation != 0
+            && security.isolated_service_bitmap & (1 << FILE_SERVICE_SLOT) == 0)
+            .then_some(generation);
         Self::from_principals(
             receipts,
             index_block,
             security.fs_uuid,
             security.last_boot_epoch,
             config.principals().map(|principal| principal.id),
+            service_generation,
         )
     }
 
@@ -106,6 +131,7 @@ impl<'a> MountedReceiptQuery<'a> {
         fs_uuid: [u8; 16],
         boot_epoch: u64,
         principals: [u64; GROUP_COUNT],
+        service_generation: Option<u64>,
     ) -> Result<Self, Error> {
         if boot_epoch == 0 {
             return Err(Error::Invalid);
@@ -127,7 +153,28 @@ impl<'a> MountedReceiptQuery<'a> {
             fs_uuid,
             boot_epoch,
             principals,
+            service_generation,
         })
+    }
+
+    /// For trusted recovery of an exact retained key, including inspection
+    /// while the ordinary service is isolated. A missing key conveys no
+    /// information about the effect of an earlier operation.
+    pub(super) fn exact(&self, key: ReceiptKey) -> Result<Option<(usize, FileReceiptV4)>, Error> {
+        key.validate()?;
+        if key.fs_uuid != self.fs_uuid {
+            return Err(Error::Unauthorized);
+        }
+        if key.issued_boot_epoch > self.boot_epoch {
+            return Err(Error::Stale);
+        }
+        let key = key.encode();
+        self.receipts
+            .chunks_exact(RECEIPT_BYTES)
+            .enumerate()
+            .find(|(_, raw)| raw[RECEIPT_KEY_OFFSET..RECEIPT_KEY_OFFSET + RECEIPT_KEY_BYTES] == key)
+            .map(|(slot, raw)| FileReceiptV4::decode(raw).map(|record| (slot, record)))
+            .transpose()
     }
 
     /// Read one exact receipt for the authenticated current holder. The caller
@@ -144,7 +191,9 @@ impl<'a> MountedReceiptQuery<'a> {
         if caller.principal_id == 0 || caller.boot_epoch == 0 || caller.service_generation == 0 {
             return Err(Error::Unauthorized);
         }
-        if caller.boot_epoch != self.boot_epoch {
+        if caller.boot_epoch != self.boot_epoch
+            || caller.service_generation != self.service_generation.ok_or(Error::Unauthorized)?
+        {
             return Err(Error::Stale);
         }
         let request = Request::decode(frame, selector)?;
@@ -160,18 +209,7 @@ impl<'a> MountedReceiptQuery<'a> {
         {
             return Err(Error::Unauthorized);
         }
-        if key.issued_boot_epoch > self.boot_epoch {
-            return Err(Error::Stale);
-        }
-
-        let raw = self
-            .receipts
-            .chunks_exact(RECEIPT_BYTES)
-            .find(|raw| {
-                &raw[RECEIPT_KEY_OFFSET..RECEIPT_KEY_OFFSET + RECEIPT_KEY_BYTES] == request.payload
-            })
-            .ok_or(Error::Stale)?;
-        let receipt = FileReceiptV4::decode(raw)?;
+        let (_, receipt) = self.exact(key)?.ok_or(Error::Stale)?;
         if receipt.owner_principal_id != caller.principal_id {
             return Err(Error::Unauthorized);
         }
@@ -362,6 +400,7 @@ mod tests {
             fs_uuid,
             boot_epoch,
             core::array::from_fn(|group| 100 + group as u64),
+            Some(CALLER.service_generation),
         )
     }
 
@@ -455,11 +494,29 @@ mod tests {
             offline_config_hash: config.digest(),
             service_generations: [1; 16],
         };
+        let service_slot = FILE_SERVICE_SLOT;
+        security.service_generations[service_slot] = CALLER.service_generation;
         let (receipts, index) = mounted_image(4, -16);
         let view = MountedReceiptQuery::new(&receipts, &index, &config, &security).unwrap();
         let mut reply = [0; REPLY_HEADER];
         assert_eq!(view.serve(CALLER, 0, &QUERY, &mut reply), Ok(REPLY_HEADER));
         assert_eq!(reply, PARTIAL_REPLY);
+        let old_service = ReceiptQueryCaller {
+            service_generation: CALLER.service_generation - 1,
+            ..CALLER
+        };
+        assert_eq!(
+            view.serve(old_service, 0, &QUERY, &mut reply),
+            Err(Error::Stale)
+        );
+        assert_eq!(reply, PARTIAL_REPLY);
+        security.isolated_service_bitmap |= 1 << service_slot;
+        let view = MountedReceiptQuery::new(&receipts, &index, &config, &security).unwrap();
+        assert_eq!(
+            view.serve(CALLER, 0, &QUERY, &mut reply),
+            Err(Error::Unauthorized)
+        );
+        security.isolated_service_bitmap = 0;
 
         security.offline_config_hash = [0x99; 32];
         assert_eq!(

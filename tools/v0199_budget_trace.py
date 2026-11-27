@@ -28,6 +28,8 @@ SIGNED_EARLY_TRACE_BYTES = ((SIGNED_HEADER.size + SIGNED_EARLY_CAPACITY * SIGNED
 SIGNED_MAGIC = 0x4359583253425544
 SIGNED_ROLES = (6, 7, 2, 8, 9, 3, 10, 11)
 SIGNED_ROLE_LIMIT = 2_000_000
+SEC_S_ROLE_LIMITS = CLASS_LIMITS[:2] + (SIGNED_ROLE_LIMIT,) * (len(SIGNED_ROLES) - 2)
+SEC_S_ROLE_TURNS = (15, 4, 1, 1, 1, 1, 1, 1)
 SIGNED_CONSOLE_QUOTA = 1_000_000
 SIGNED_RECOVERY_QUOTA = CLASS_LIMITS[RECOVERY]
 
@@ -62,18 +64,26 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, 
 
 
 def _replay_intervals(intervals, origin, summary, replacement_roles=None, recovery_slices=None,
-                      *, boot_accounting=None, signed_roles=None, opening_recovery=None):
+                      *, boot_accounting=None, signed_roles=None, opening_recovery=None,
+                      sec_s_load=False):
     wall, counter, before = origin
     boot_intervals, boot_end, boot_cpu_ns = boot_accounting or (0, 0, 0)
     signed = signed_roles is not None
     opening_window, opening_cpu_ns = opening_recovery or (-1, 0)
-    role_limits = [SIGNED_ROLE_LIMIT] * len(ROLE_GRANTS) if signed else ROLE_LIMITS
+    if sec_s_load:
+        role_limits = SEC_S_ROLE_LIMITS
+    elif signed:
+        role_limits = (SIGNED_ROLE_LIMIT,) * len(ROLE_GRANTS)
+    else:
+        role_limits = ROLE_LIMITS
     start_wall, start_counter = wall, counter
     lifetime = [0] * len(CLASS_LIMITS)
     window = None
     spending = []
     role_spending = []
     role_returns = []
+    role_turns = []
+    role_returned_turns = []
     all_role_debits = [0] * len(ROLE_GRANTS)
     all_role_returns = [0] * len(ROLE_GRANTS)
     windows = []
@@ -97,12 +107,14 @@ def _replay_intervals(intervals, origin, summary, replacement_roles=None, recove
             windows.append({
                 "window": window, "upper_ns": window_upper, "class_cpu_ns": spending,
                 "role_cpu_ns": role_spending, "role_returns": role_returns,
+                "role_turns": role_turns, "role_returned_turns": role_returned_turns,
                 "kernel_coordination_cpu_ns": kernel_coordination,
                 "kernel_coordination_upper_ns": kernel_coordination_upper,
             })
 
     def enter(window_number):
-        nonlocal window, spending, role_spending, role_returns, window_upper
+        nonlocal window, spending, role_spending, role_returns, role_turns, role_returned_turns
+        nonlocal window_upper
         nonlocal kernel_coordination, kernel_coordination_upper
         nonlocal operations_seen, security_count, decision_spending
         if window != window_number:
@@ -113,6 +125,8 @@ def _replay_intervals(intervals, origin, summary, replacement_roles=None, recove
             window_upper = sum(spending)
             role_spending = [0] * len(role_limits)
             role_returns = [0] * len(role_limits)
+            role_turns = [0] * len(role_limits)
+            role_returned_turns = [0] * len(role_limits)
             kernel_coordination = 0
             kernel_coordination_upper = 0
             operations_seen = set()
@@ -188,12 +202,18 @@ def _replay_intervals(intervals, origin, summary, replacement_roles=None, recove
                     largest_recovery = max(largest_recovery, actual)
             else:
                 role = actor - 1
-                require((category, domain, quota) == ROLE_GRANTS[role],
+                expected_class, expected_domain, expected_quota = ROLE_GRANTS[role]
+                require((category, quota) == (expected_class, expected_quota)
+                        and (domain == expected_domain or (sec_s_load and role == 0)),
                         "incorrect role grant class, domain, or quota")
+                if sec_s_load:
+                    require(role_turns[role] < SEC_S_ROLE_TURNS[role],
+                            "too many SEC-S grants for one role in a window")
                 if signed:
                     require((role, actor_id, generation) == signed_roles[role],
                             "signed role identity differs from the durable role table")
-                    require(returned <= (1 if category == 2 else 8)
+                    return_limit = (1 if category == 2 else 32 if sec_s_load and role < 2 else 8)
+                    require(returned <= return_limit
                             and (returned == 0 or actual > 0),
                             "invalid native EL0 return count")
                 else:
@@ -224,6 +244,8 @@ def _replay_intervals(intervals, origin, summary, replacement_roles=None, recove
         if role is not None:
             role_spending[role] += actual
             role_returns[role] += returned
+            role_turns[role] += 1
+            role_returned_turns[role] += bool(returned)
             all_role_debits[role] += actual
             all_role_returns[role] += returned
         elif category == COORDINATION:
@@ -264,8 +286,9 @@ def _replay_intervals(intervals, origin, summary, replacement_roles=None, recove
 
 
 def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
-                        media_budget=None, frame_budget=None):
-    """Bind a sealed prefix to the durable role inventory and native UART."""
+                        media_budget=None, frame_budget=None, business_entropy_budget=None,
+                        runtime_recovery=(), sec_s_load=False, trace_final=None):
+    """Bind sealed CPU accounting to the durable role inventory and native UART."""
     trace_sizes = {1: (SIGNED_TRACE_BYTES, SIGNED_CAPACITY),
                    2: (SIGNED_EARLY_TRACE_BYTES, SIGNED_EARLY_CAPACITY),
                    3: (SIGNED_EARLY_TRACE_BYTES, SIGNED_EARLY_CAPACITY)}
@@ -282,6 +305,11 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
     require(before < wall and before // WINDOW == wall // WINDOW, "CPU0 sample straddles a window")
     elapsed = end_tick - tick
     require((elapsed, charged, idle) in uart_budget, "trace endpoint differs from the UART CPU0 ledger")
+    require(not sec_s_load or (version == 3 and trace_final is not None),
+            "SEC-S load requires a terminal dense trace")
+    if trace_final is not None:
+        require(trace_final == (end_wall // WINDOW, count, elapsed),
+                "trace endpoint differs from the terminal UART witness")
     require((version == 3) == (frame_budget is not None),
             "missing or unexpected FrameMeta Recovery settlement")
     rows_offset = SIGNED_HEADER.size
@@ -297,7 +325,8 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
     replay = (elapsed, charged, peak, None, wall, end_wall, *classes)
     split_startup = 1 + len(SIGNED_ROLES)  # roster preflight and each package
     if version == 1:
-        require(media_budget is None and len(recovery) in (2, 1 + split_startup)
+        require(media_budget is None and business_entropy_budget is None
+                and not runtime_recovery and len(recovery) in (2, 1 + split_startup)
                 and phase_start <= wall // WINDOW
                 and 0 < phase_end == recovery[0] <= SIGNED_RECOVERY_QUOTA,
                 "invalid opening signed Recovery debit")
@@ -312,7 +341,9 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
                                  recovery_slices=(len(debits), max(debits)), signed_roles=roles,
                                  opening_recovery=(phase_start, phase_end))
 
-    require(media_budget is not None and len(recovery) in (3, 2 + split_startup)
+    expected_recovery_counts = ((3, 2 + split_startup) if business_entropy_budget is None
+                                else (2 + split_startup + 3,))
+    require(media_budget is not None and len(recovery) in expected_recovery_counts
             and 0 < phase_start < phase_end < count,
             "missing signed media accounting span")
     media_rows = intervals[phase_start:phase_end]
@@ -325,10 +356,15 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
     media_recovery = []
     frame_recovery = []
     startup_recovery = []
+    foreground_recovery = []
+    roles_entered = False
     for index, row in enumerate(intervals):
+        roles_entered |= bool(row[4] & 0xff00)
         if row[4] == RECOVERY + 1:
             debits = startup_recovery
-            if frame_start <= index < frame_end:
+            if roles_entered:
+                debits = foreground_recovery
+            elif frame_start <= index < frame_end:
                 debits = frame_recovery
             elif phase_start <= index < phase_end:
                 debits = media_recovery
@@ -339,13 +375,31 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
                 and all(0 <= used <= SIGNED_RECOVERY_QUOTA for used in frame_recovery)
                 and frame_budget == (len(frame_recovery), sum(frame_recovery), SIGNED_RECOVERY_QUOTA)
                 and sum(frame_recovery) > 0, "FrameMeta PMU debits differ from UART")
-    require(startup_recovery == list(recovery) and all(used >= 0 for used in media_recovery)
+    startup_reports = startup_recovery
+    if business_entropy_budget is not None:
+        batches, used, quota = business_entropy_budget
+        roster_end = 2 + split_startup
+        business_start = roster_end + batches
+        entropy = startup_recovery[roster_end:business_start]
+        require(batches == len(entropy) > 0 and sum(entropy) == used > 0
+                and quota == SIGNED_RECOVERY_QUOTA,
+                "business entropy PMU debits differ from UART")
+        startup_reports = startup_recovery[:roster_end] + startup_recovery[business_start:]
+    require(startup_reports == list(recovery) and all(used >= 0 for used in media_recovery)
             and media_budget == (len(media_recovery), sum(media_recovery), SIGNED_RECOVERY_QUOTA)
             and sum(media_recovery) > 0, "signed media PMU debits differ from UART")
+    pending = foreground_recovery
+    for count, used, quota in runtime_recovery:
+        require(count > 0 and 0 < used <= count * quota == count * SIGNED_RECOVERY_QUOTA,
+                "invalid signed runtime Recovery budget")
+        require(len(pending) >= count and sum(pending[:count]) == used,
+                "signed runtime Recovery PMU debits differ from UART")
+        pending = pending[count:]
+    require(not pending, "missing signed runtime Recovery settlement")
+    all_recovery = frame_recovery + media_recovery + startup_recovery + foreground_recovery
     result = _replay_intervals(
         intervals, (wall, tick, before), replay, signed_roles=roles,
-        recovery_slices=(len(frame_recovery) + len(media_recovery) + len(startup_recovery),
-                         max(startup_recovery + frame_recovery + media_recovery)),
+        recovery_slices=(len(all_recovery), max(all_recovery)), sec_s_load=sec_s_load,
     )
     if frame_budget is not None:
         result.update(boot_frame_meta_recovery_batches=len(frame_recovery),
@@ -355,6 +409,9 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
                   boot_media_recovery_cpu_ns=sum(media_recovery),
                   boot_media_accounting_intervals=len(media_rows),
                   early_boot_recovery_cpu_ns=startup_recovery[0])
+    if foreground_recovery:
+        result.update(runtime_recovery_batches=len(foreground_recovery),
+                      runtime_recovery_cpu_ns=sum(foreground_recovery))
     return result
 
 

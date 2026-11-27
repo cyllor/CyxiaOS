@@ -31,6 +31,7 @@ enum End {
     FinAck,
     Reset,
     Timeout,
+    Rejected,
 }
 
 fn exercise(end: End) {
@@ -74,6 +75,20 @@ fn exercise(end: End) {
         server.poll(ms).unwrap();
     }
     assert_eq!(server.state(), Ok(State::Established));
+    if end == End::Rejected {
+        server.abort_rejected().unwrap();
+        assert!(!server.relisten_open_after_rejection().unwrap());
+        for ms in 20..30 {
+            server.poll(ms).unwrap();
+            client.poll(ms).unwrap();
+        }
+        assert_eq!(client.state(), Ok(State::Closed));
+        assert!(!server.relisten_open_after_rejection().unwrap());
+        server.port_mut().tx_done = true;
+        assert!(server.relisten_open_after_rejection().unwrap());
+        assert_eq!(server.state(), Ok(State::Listen));
+        return;
+    }
     client.sockets.get_mut::<Socket>(client.socket).close();
     client.poll(20).unwrap();
     assert_eq!(server.poll_passive_close(20), Ok(false));
@@ -82,9 +97,11 @@ fn exercise(end: End) {
         End::Reset => {
             client.close(21);
             assert_eq!(server.poll_passive_close(21), Err(Error::Closed));
+            assert!(server.relisten_open_after_close().is_err());
         }
         End::Timeout => {
             assert_eq!(server.poll_passive_close(100_000), Err(Error::Closed));
+            assert!(server.relisten_open_after_close().is_err());
         }
         End::FinAck => {
             for ms in 21..40 {
@@ -92,9 +109,15 @@ fn exercise(end: End) {
                 assert_eq!(server.poll_passive_close(ms), Ok(false));
             }
             assert_eq!(server.state(), Ok(State::Closed));
+            assert_eq!(server.relisten_open_after_close(), Err(Error::WouldBlock));
             server.port_mut().tx_done = true;
             assert_eq!(server.poll_passive_close(40), Ok(true));
+            assert_eq!(server.relisten_open_after_close(), Ok(()));
+            assert_eq!(server.state(), Ok(State::Listen));
+            assert_eq!(server.peer_ipv4(), None);
+            assert!(server.relisten_open_after_close().is_err());
         }
+        End::Rejected => unreachable!(),
     }
 }
 
@@ -109,4 +132,9 @@ fn passive_close_refuses_peer_reset_in_last_ack() {
 #[test]
 fn passive_close_refuses_socket_timeout_in_last_ack() {
     exercise(End::Timeout)
+}
+
+#[test]
+fn pending_rejection_drains_local_reset_and_native_tx_before_relisten() {
+    exercise(End::Rejected)
 }

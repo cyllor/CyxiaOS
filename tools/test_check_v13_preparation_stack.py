@@ -41,6 +41,21 @@ class PreparationStackTests(unittest.TestCase):
         self.assertEqual(result["exception_reserve_bytes"], 4096)
         self.assertEqual(result["stack_bytes"], 65536)
 
+    def test_outlined_secondary_worker_is_charged_to_the_preparation_path(self):
+        disassembly = chain(False).replace("1004: bl 0x2000", "1004: bl 0x1800")
+        disassembly += """
+1800 <cyxia_kernel::smp::secondary_work::h0123>:
+1800: sub sp, sp, #0x2000
+1804: bl 0x2000
+1808: ret
+"""
+        result = inspect(disassembly)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["peak"]["frame_bytes"], 64080)
+        self.assertEqual(result["peak"]["path"][:3], ["secondary_entry", "secondary_work", "run_turn"])
+        with self.assertRaisesRegex(ValueError, "missing direct preparation path"):
+            inspect(disassembly.replace("1804: bl 0x2000", "1804: bl 0x8000"))
+
     def test_compiler_closure_is_not_the_named_preparation_function(self):
         closure = function("next_normal", 0x8000, 16).replace(
             NAMES["next_normal"], NAMES["next_normal"] + "_$u7b$$u7b$closure$u7d$$u7d$::h1234"

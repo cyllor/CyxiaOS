@@ -37,6 +37,7 @@ impl Ring {
         if !pa.is_multiple_of(4096) || pa.checked_add(size as u64).is_none() {
             return Err(Error::Address);
         }
+        platform.admit_queue_dma(t.owner(), t.device_id(), index, pa, size)?;
         memory.desc.clear();
         memory.avail.clear();
         memory.used.clear();
@@ -188,7 +189,7 @@ impl Net {
         tx: &'static mut QueueMemory,
         p: &impl Platform,
     ) -> Result<([u8; 6], Ring, Ring), Error> {
-        Self::negotiate(t, p, true)?;
+        Self::negotiate(t, p, true, &mut || Ok(()))?;
         let mac = Self::read_mac(t, p)?;
         let rx = Ring::configure(t, rx, 0, p)?;
         let tx = Ring::configure(t, tx, 1, p)?;
@@ -199,16 +200,23 @@ impl Net {
         t: &mut Transport,
         p: &impl Platform,
         allow_mergeable_rx: bool,
+        checkpoint: &mut dyn FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
+        if !allow_mergeable_rx {
+            t.observe_mmio_reset(1, &[0, 1], p, &mut *checkpoint)?;
+            checkpoint()?;
+        }
         let result = (|| {
-            t.set_status(0);
-            p.barrier();
-            let start = p.now_ms();
-            while t.status() != 0 {
-                if p.now_ms().wrapping_sub(start) >= 100 {
-                    return Err(Error::Timeout);
+            if allow_mergeable_rx {
+                t.set_status(0);
+                p.barrier();
+                let start = p.now_ms();
+                while t.status() != 0 {
+                    if p.now_ms().wrapping_sub(start) >= 100 {
+                        return Err(Error::Timeout);
+                    }
+                    core::hint::spin_loop();
                 }
-                core::hint::spin_loop();
             }
             t.set_status(3);
             t.select_device_features(0);
@@ -557,6 +565,30 @@ mod tests {
     }
 
     #[test]
+    fn native_net_refuses_fresh_dma_while_an_old_queue_stays_ready() {
+        let mac = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let mut h = host(u64::MAX);
+        h.keep_rx_ready_on_reset = true;
+        h.saw_driver_ok.set(true);
+        h.mmio.put32(0x70, 15);
+        h.mmio.put32(0x44, 1);
+        let t = unsafe { Transport::attach(h.mmio.address(), 4096).unwrap() };
+        assert!(matches!(
+            BatchedNet::initialize_native(
+                t,
+                Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+                Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+                mac,
+                &h,
+            ),
+            Err(Error::Timeout)
+        ));
+        assert_eq!(*h.queue_desc.borrow(), [0; 2]);
+        assert_eq!(h.mmio.get32(0x70), 0);
+        assert_eq!(*h.ready.borrow(), [1, 0]);
+    }
+
+    #[test]
     fn native_stop_proves_both_queues_and_keeps_inflight_dma_accounted() {
         let mac = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
         let h = host(u64::MAX);
@@ -632,6 +664,41 @@ mod tests {
         assert_eq!(net.notify_stats().inflight, inflight);
         assert_eq!(net.poll_rx(&h), Err(Error::Device));
     }
+
+    #[test]
+    fn terminal_mmio_reset_observes_each_net_queue_after_abandoned_owner() {
+        let mac = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+        for keep_rx in [false, true] {
+            let mut h = host(u64::MAX);
+            let transport = unsafe { Transport::attach(h.mmio.address(), 4096).unwrap() };
+            let _abandoned = BatchedNet::initialize_native(
+                transport,
+                Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+                Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+                mac,
+                &h,
+            )
+            .unwrap();
+            assert_eq!(h.ready.borrow()[0], 1);
+            assert_eq!(h.selected.get(), 1);
+            assert_eq!(h.mmio.get32(0x44), 1);
+            h.keep_rx_ready_on_reset = keep_rx;
+            let region = crate::MappedRegion {
+                base: h.mmio.address(),
+                len: 4096,
+            };
+            // SAFETY: the original owner will never touch this transport again.
+            let observation = unsafe { Transport::terminal_mmio_reset(region, 1, &[0, 1], &h) };
+            assert_eq!(h.mmio.get32(0x70), 0);
+            assert_eq!(*h.ready.borrow(), [u32::from(keep_rx), 0]);
+            if keep_rx {
+                assert_eq!(observation, Err(Error::Timeout));
+            } else {
+                assert!(observation.is_ok());
+            }
+        }
+    }
+
     fn complete(r: &Ring, id: u32, length: u32, advance: u16) {
         let at = 4 + usize::from(r.used % 8) * 8;
         r.memory.used.put32(at, id);

@@ -57,12 +57,30 @@ pub fn decode_aarch64_svc_v3(
     esr: u64,
     regs: &[u64; 31],
 ) -> Result<ValidatedCall, Error> {
-    if esr != AARCH64_SVC {
+    decode_aarch64_authorized_svc_v3(verified_package_abi, esr, regs, |_, _| true)
+}
+
+/// Let the native adapter check the stopped caller's operation and selector
+/// before decoding untrusted request arguments. The adapter authenticates the
+/// live task before calling and still verifies full endpoint rights and copy
+/// spans before any side effect.
+pub fn decode_aarch64_authorized_svc_v3(
+    verified_package_abi: u16,
+    esr: u64,
+    regs: &[u64; 31],
+    permits: impl FnOnce(Syscall, u64) -> bool,
+) -> Result<ValidatedCall, Error> {
+    if verified_package_abi != ABI_VERSION || esr != AARCH64_SVC {
         return Err(Error::Invalid);
     }
-    decode_v3(
-        verified_package_abi,
-        regs[8],
+    let number = regs[8];
+    let operation = decode_syscall(number)?;
+    if !permits(operation, regs[0]) {
+        return Err(Error::Unauthorized);
+    }
+    validate_arguments(
+        number,
+        operation,
         [regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]],
     )
 }
@@ -75,15 +93,12 @@ pub fn decode_aarch64_lifecycle_svc_v3(
     esr: u64,
     regs: &[u64; 31],
 ) -> Result<ValidatedCall, Error> {
-    if verified_package_abi != ABI_VERSION || esr != AARCH64_SVC {
-        return Err(Error::Invalid);
-    }
-    match decode_syscall(regs[8])? {
-        Syscall::Exit | Syscall::Yield | Syscall::Sleep | Syscall::Clock => {
-            decode_aarch64_svc_v3(verified_package_abi, esr, regs)
-        }
-        _ => Err(Error::Unauthorized),
-    }
+    decode_aarch64_authorized_svc_v3(verified_package_abi, esr, regs, |operation, _| {
+        matches!(
+            operation,
+            Syscall::Exit | Syscall::Yield | Syscall::Sleep | Syscall::Clock
+        )
+    })
 }
 
 fn vector_shape(input_len: u64, output_cap: u64) -> bool {
@@ -105,7 +120,10 @@ pub fn decode_v3(
     if verified_package_abi != ABI_VERSION {
         return Err(Error::Invalid);
     }
-    let operation = decode_syscall(x8)?;
+    validate_arguments(x8, decode_syscall(x8)?, args)
+}
+
+fn validate_arguments(x8: u64, operation: Syscall, args: [u64; 6]) -> Result<ValidatedCall, Error> {
     let zero_tail = |start: usize| args[start..].iter().all(|v| *v == 0);
     let allowed = match x8 {
         0x01 => zero_tail(1) && args[0] == (args[0] as i32 as i64 as u64),
@@ -352,6 +370,51 @@ mod tests {
             assert!(decode_syscall(n).is_ok());
         }
         assert_eq!(decode_syscall(0x51), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn native_authority_precedes_argument_preflight_for_every_call() {
+        let mut regs = [0; 31];
+        regs[0] = 42;
+        regs[5] = u64::MAX;
+        for number in [
+            0x01, 0x02, 0x03, 0x04, 0x10, 0x11, 0x12, 0x13, 0x20, 0x21, 0x22, 0x30, 0x31, 0x32,
+            0x40, 0x41, 0x42, 0x43, 0x50,
+        ] {
+            regs[8] = number;
+            assert_eq!(
+                decode_aarch64_authorized_svc_v3(
+                    ABI_VERSION,
+                    AARCH64_SVC,
+                    &regs,
+                    |operation, first| {
+                        assert_eq!(operation, decode_syscall(number).unwrap());
+                        assert_eq!(first, 42);
+                        false
+                    }
+                ),
+                Err(Error::Unauthorized)
+            );
+            assert_eq!(
+                decode_aarch64_authorized_svc_v3(ABI_VERSION, AARCH64_SVC, &regs, |_, _| true),
+                Err(Error::Invalid)
+            );
+        }
+
+        regs[8] = 0x04;
+        assert_eq!(
+            decode_aarch64_authorized_svc_v3(1, AARCH64_SVC, &regs, |_, _| panic!()),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            decode_aarch64_authorized_svc_v3(ABI_VERSION, AARCH64_SVC | 1, &regs, |_, _| panic!()),
+            Err(Error::Invalid)
+        );
+        regs[8] = 0x51;
+        assert_eq!(
+            decode_aarch64_authorized_svc_v3(ABI_VERSION, AARCH64_SVC, &regs, |_, _| panic!()),
+            Err(Error::Invalid)
+        );
     }
     #[test]
     fn lifecycle_without_grants_uses_the_same_abi_and_refuses_all_protected_calls() {

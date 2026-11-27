@@ -634,7 +634,7 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
 
     /// Consult the verified overlay before the older checkpoint homes.
     pub fn read_committed(&mut self, home: u32, out: &mut [u8; BLOCK]) -> Result<(), Error> {
-        self.read_view(home, None, out)
+        self.read_view(home, None, None, out)
     }
 
     /// Read the latest after-image only if it belongs to the required
@@ -645,7 +645,23 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
         commit_lsn: u64,
         out: &mut [u8; BLOCK],
     ) -> Result<(), Error> {
-        self.read_view(home, Some(commit_lsn), out)
+        self.read_view(home, Some(commit_lsn), None, out)
+    }
+
+    /// Read a retained after-image from the exact current-epoch transaction.
+    /// The selected superblock already binds the log epoch. The REDO header
+    /// was verified against this commit during the scan or append.
+    pub fn read_committed_at_transaction(
+        &mut self,
+        home: u32,
+        commit_lsn: u64,
+        txid: u64,
+        out: &mut [u8; BLOCK],
+    ) -> Result<(), Error> {
+        if txid == 0 {
+            return Err(Error::Invalid);
+        }
+        self.read_view(home, Some(commit_lsn), Some(txid), out)
     }
 
     /// Read-only committed home view for preflight before any replay writes.
@@ -680,6 +696,7 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
         &mut self,
         home: u32,
         required_commit: Option<u64>,
+        required_txid: Option<u64>,
         out: &mut [u8; BLOCK],
     ) -> Result<(), Error> {
         let w = &mut self.workspace;
@@ -692,8 +709,11 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
             return Err(Error::Stale);
         }
         let result = if let Some(&row) = row {
-            read_exact_image(self.io, row, e.superblock.log_epoch, &mut w.raw)
-                .map(|()| &w.raw[64..64 + BLOCK])
+            let checked = read_exact_image(self.io, row, e.superblock.log_epoch, &mut w.raw);
+            if checked.is_ok() && required_txid.is_some_and(|txid| txid != u64at(&w.raw, 16)) {
+                return Err(Error::Conflict);
+            }
+            checked.map(|()| &w.raw[64..64 + BLOCK])
         } else {
             let block = &mut w.raw[..BLOCK];
             self.io

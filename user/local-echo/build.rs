@@ -16,9 +16,10 @@ fn main() {
     );
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let signer = env::var_os("CARGO_FEATURE_GUEST_SIGNER").is_some();
+    let embedded_fixture_key = signer && env::var_os("CARGO_FEATURE_GUEST_RESIDENT").is_none();
     for name in ["cert.der", "peer.pin"]
         .into_iter()
-        .chain(signer.then_some("key.der"))
+        .chain(embedded_fixture_key.then_some("key.der"))
     {
         let source = root.join(name);
         println!("cargo:rerun-if-changed={}", source.display());

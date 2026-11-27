@@ -64,6 +64,9 @@ pub(crate) mod production;
 ))]
 #[path = "production/resident.rs"]
 pub(crate) mod production;
+#[cfg(cyxia_signed_resident)]
+#[path = "production/signed_exec_trap.rs"]
+pub(crate) mod signed_exec_trap;
 #[cfg(all(
     feature = "v020-production",
     any(
@@ -138,8 +141,14 @@ mod v0199_effect_fixture;
 #[path = "v0199_epoch_disk.rs"]
 mod v0199_epoch_disk;
 #[cfg(feature = "v0199-format-selftest")]
-#[cfg_attr(not(feature = "v020-history-readonly-selftest"), path = "v0199_format_fixture.rs")]
-#[cfg_attr(feature = "v020-history-readonly-selftest", path = "v020_history_readonly_fixture.rs")]
+#[cfg_attr(
+    not(feature = "v020-history-readonly-selftest"),
+    path = "v0199_format_fixture.rs"
+)]
+#[cfg_attr(
+    feature = "v020-history-readonly-selftest",
+    path = "v020_history_readonly_fixture.rs"
+)]
 mod v0199_format_fixture;
 // Dedicated scratch VirtIO-blk plumbing, shared by the format fixture and the
 // v020 opt-in media-staging lane (production/media_staging.rs).
@@ -154,7 +163,8 @@ mod scratch_blk;
 // and the V0.20 diagnostic boot (production/net.rs).
 #[cfg(any(
     feature = "v0199-sec-n-selftest",
-    feature = "v020-production-diagnostic"
+    feature = "v020-production-diagnostic",
+    cyxia_resident_net
 ))]
 #[path = "sec_n_broker.rs"]
 mod sec_n_broker;
@@ -241,8 +251,8 @@ core::arch::global_asm!(
     include_str!("../../../../crates/arch-aarch64/src/secondary.S"),
     max_cpus = const C,
     exec_stack_pages = const EXEC_STACK_BYTES / 4096,
-    software_pan = const cfg!(feature = "v020-production") as u8,
-    supervisor_copy = const crate::machine::SUPERVISOR_COPY_WINDOW,
+    software_pan = const crate::machine::SOFTWARE_PAN,
+    secondary_copy_windows = const crate::machine::SECONDARY_COPY_WINDOWS,
 );
 core::arch::global_asm!(
     include_str!("smp_user.S"),
@@ -508,6 +518,10 @@ fn stop_failed(code: u64) -> ! {
 /// IRQ singleton or CPU0 user scheduler is touched by a secondary CPU.
 pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
     let slot = cpu::slot();
+    #[cfg(any(cyxia_business_package, cyxia_resident_net))]
+    if slot != 0 && matches!(kind, 8 | 9) {
+        verify_business_trap(slot, frame, kind);
+    }
     #[cfg(feature = "unified-runtime")]
     if slot < 4 && RECORD_SLICE_EXCEPTION[slot].load(Ordering::Acquire) && matches!(kind, 8 | 9) {
         let row = 2 + slot * 30;
@@ -538,9 +552,18 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
                     }
                     #[cfg(not(feature = "unified-runtime"))]
                     cpu::disable_timer();
+                    #[cfg(cyxia_business_package)]
+                    if slot != 0 && kind == 5 {
+                        production::signed_business::rearm_idle_timer(slot);
+                    }
+                    #[cfg(cyxia_resident_net)]
+                    if kind == 5 {
+                        production::network_worker::rearm_idle_timer(slot);
+                    }
                     #[cfg(feature = "v020-production-authenticated-net")]
                     {
-                        active_poll = slot == 0 && kind == 5 && sec_n_broker::rearm_active_poll_timer();
+                        active_poll =
+                            slot == 0 && kind == 5 && sec_n_broker::rearm_active_poll_timer();
                     }
                     #[cfg(any(
                         feature = "v020-production-signed-resident",
@@ -617,7 +640,10 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
                 not(feature = "unified-runtime")
             ))]
             IrqAck::Spurious
-                if slot == 0 && kind == 5 && sec_n_broker::rearm_active_poll_timer() => return,
+                if slot == 0 && kind == 5 && sec_n_broker::rearm_active_poll_timer() =>
+            {
+                return;
+            }
             #[cfg(not(feature = "unified-runtime"))]
             _ => fatal(10 + kind),
         }
@@ -653,6 +679,19 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
     record_fault(40 + kind, kind, Some(frame));
     stop_failed(40 + kind)
 }
+
+#[cfg(any(cyxia_business_package, cyxia_resident_net))]
+fn verify_business_trap(slot: usize, _frame: &super::ExceptionFrame, _kind: u64) {
+    #[cfg(cyxia_resident_net)]
+    if production::net_resident::verify_resident_trap(slot, _frame, _kind) {
+        return;
+    }
+    #[cfg(cyxia_business_package)]
+    production::signed_business::verify_captured_root(slot);
+    #[cfg(not(cyxia_business_package))]
+    fatal(0x534e_0001);
+}
+
 unsafe fn init_memory() {
     unsafe {
         let code = core::ptr::addr_of!(smp_user_start) as u64;
@@ -756,7 +795,7 @@ fn bring_up_production(info: &BootInfo) {
     crate::machine::panic_stop::publish_ready(online);
     report("SMP_BOOT_OK", topo.count as u64, online, 0);
     #[cfg(feature = "v020-panic-stop-selftest")]
-    crate::machine::panic_stop::exercise();
+    crate::machine::panic_stop::exercise(info);
 }
 
 // SAFETY: called only after the stop coordinator acquires its registered
@@ -909,10 +948,7 @@ fn fixture_context_valid(ctx: &user::Context, i: usize) -> bool {
     }
     valid != 0
 }
-#[cfg(all(
-    not(feature = "unified-runtime"),
-    not(cyxia_signed_resident)
-))]
+#[cfg(all(not(feature = "unified-runtime"), not(cyxia_signed_resident)))]
 fn fixture_yielded(ctx: &user::Context) -> bool {
     ctx.kind == 9
 }
@@ -993,11 +1029,20 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
     crate::machine::panic_stop::hold_healthy_peer_until_result(slot);
     #[cfg(feature = "register-v15-selftest")]
     register_evidence::worker(slot);
-    #[cfg(any(
-        feature = "v020-production-signed-resident",
-        all(
-            feature = "v020-production",
-            not(feature = "v020-production-diagnostic")
+    #[cfg(cyxia_business_package)]
+    production::signed_business::worker(slot);
+    #[cfg(all(cyxia_resident_net, not(cyxia_business_package)))]
+    if slot == production::network_worker::CPU {
+        production::network_worker::worker(slot);
+    }
+    #[cfg(all(
+        not(cyxia_business_package),
+        any(
+            feature = "v020-production-signed-resident",
+            all(
+                feature = "v020-production",
+                not(feature = "v020-production-diagnostic")
+            )
         )
     ))]
     {

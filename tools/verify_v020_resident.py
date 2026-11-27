@@ -16,8 +16,9 @@ from v020_production_modes import rows
 from verify_smp import require
 
 
-STARTUP_REASONS = ("missing_startup_authority", "catalog_verified_pending",
-                   "catalog_rejected", "catalog_budget")
+CATALOG_CHECK_REASONS = ("catalog_verified_pending", "catalog_rejected", "catalog_budget")
+STARTUP_REASONS = ("missing_startup_authority", *CATALOG_CHECK_REASONS,
+                   "lifecycle_packages_unqualified")
 STARTUP_BANNERS = {
     f"V020_STARTUP state=SECURE_DEGRADED reason={reason} command=status": reason
     for reason in STARTUP_REASONS
@@ -91,8 +92,8 @@ def verify(elf: Path, output: Path, timeout: float,
             require(proc.poll() is None, "QEMU exited after the last resident response")
             report.update(replies=len(snapshots), timer_irqs=counts)
             costs = rows(lines, "V020_STARTUP_CATALOG_COST")
-            if observed_reason == STARTUP_REASONS[0]:
-                require(not costs, "absent startup catalog performed verification work")
+            if observed_reason not in CATALOG_CHECK_REASONS:
+                require(not costs, "unexpected catalog-only verification work")
             else:
                 require(len(costs) == 1, "missing or repeated startup catalog budget settlement")
                 elapsed_ns, prepaid_ns, flags = costs[0]

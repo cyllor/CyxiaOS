@@ -12,9 +12,12 @@ use crate::control_plane::{role_manifest_v0199::ROLES, rule_profile_v2::Profile}
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
+mod business_package;
 mod lifecycle_packages;
 mod profile;
+pub mod role_services;
 
+use business_package::business_package_message;
 pub use lifecycle_packages::LifecyclePackageDigest;
 use lifecycle_packages::lifecycle_package_message;
 
@@ -76,6 +79,24 @@ impl<'a> PinnedStartupCatalog<'a> {
         verify_lifecycle_signature(self.boot_public_key, signature, policy.digest(), packages)
     }
 
+    /// Qualify the static, unprivileged ABI3 business package under this
+    /// exact offline policy. The native owner verifies its execution layout.
+    pub fn qualify_business_package(
+        &self,
+        policy: &VerifiedOfflineConfig<'_>,
+        package_digest: [u8; 32],
+        signature: &[u8; 64],
+    ) -> Result<(), Error> {
+        if policy.wire() != self.offline_config {
+            return Err(Error::Conflict);
+        }
+        if package_digest == [0; 32] {
+            return Err(Error::Invalid);
+        }
+        let message = business_package_message(policy.digest(), package_digest);
+        verify_startup_signature(self.boot_public_key, signature, &message)
+    }
+
     fn bindings(&self) -> Result<CatalogBindings, Error> {
         let rules = Profile::parse(self.rules).map_err(|_| Error::Invalid)?;
         let rule_hash: [u8; 32] = Sha256::digest(rules.canonical_bytes()).into();
@@ -102,8 +123,16 @@ fn verify_lifecycle_signature(
     packages: [LifecyclePackageDigest; ROLES.len()],
 ) -> Result<(), Error> {
     let message = lifecycle_package_message(config_digest, packages);
+    verify_startup_signature(public_key, signature, &message)
+}
+
+fn verify_startup_signature(
+    public_key: &[u8; 32],
+    signature: &[u8; 64],
+    message: &[u8],
+) -> Result<(), Error> {
     VerifyingKey::from_bytes(public_key)
-        .and_then(|key| key.verify_strict(&message, &Signature::from_bytes(signature)))
+        .and_then(|key| key.verify_strict(message, &Signature::from_bytes(signature)))
         .map_err(|_| Error::Unauthorized)
 }
 
@@ -204,6 +233,57 @@ mod tests {
             catalog.verify_policy(&mut scratch, |_, _, _| Err(Error::Unauthorized)),
             Err(Error::Unauthorized)
         ));
+        let policy = catalog
+            .verify_policy(&mut scratch, |_, _, lists| {
+                assert_eq!(lists, &[255]);
+                Ok(())
+            })
+            .unwrap();
+        let package = [21; 32];
+        let expected = [
+            &b"CYX/STARTUP-BUSINESS-PACKAGE/v1"[..],
+            &policy.digest(),
+            &package,
+        ]
+        .concat();
+        let signature = signer.sign(&expected).to_bytes();
+        assert_eq!(
+            catalog.qualify_business_package(&policy, package, &signature),
+            Ok(())
+        );
+        assert_eq!(
+            catalog.qualify_business_package(&policy, [22; 32], &signature),
+            Err(Error::Unauthorized)
+        );
+        let other_authority = PinnedStartupCatalog {
+            boot_public_key: &SigningKey::from_bytes(&[0x39; 32])
+                .verifying_key()
+                .to_bytes(),
+            ..catalog
+        };
+        assert_eq!(
+            other_authority.qualify_business_package(&policy, package, &signature),
+            Err(Error::Unauthorized)
+        );
+        let mut refreshed_wire = wire;
+        refreshed_wire[32..40].copy_from_slice(&2u64.to_le_bytes());
+        let message = [SIGNATURE_LABEL, &refreshed_wire[..513]].concat();
+        refreshed_wire[513..].copy_from_slice(&signer.sign(&message).to_bytes());
+        let refreshed_authority = PinnedStartupCatalog {
+            offline_config: &refreshed_wire,
+            ..catalog
+        };
+        assert_eq!(
+            refreshed_authority.qualify_business_package(&policy, package, &signature),
+            Err(Error::Conflict)
+        );
+        let refreshed_policy = refreshed_authority
+            .verify_policy(&mut scratch, |_, _, _| Ok(()))
+            .unwrap();
+        assert_eq!(
+            refreshed_authority.qualify_business_package(&refreshed_policy, package, &signature),
+            Err(Error::Unauthorized)
+        );
 
         let mut widened = security;
         widened[118..120].copy_from_slice(&4000u16.to_le_bytes());

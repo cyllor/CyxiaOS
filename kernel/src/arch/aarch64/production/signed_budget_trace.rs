@@ -150,13 +150,23 @@ impl Trace {
         charged: u64,
         idle: u64,
     ) {
+        let _ = self.seal(end, ledger, charged, idle);
+    }
+
+    pub(super) fn seal(
+        &mut self,
+        end: Sample,
+        ledger: &Cpu0BudgetLedger,
+        charged: u64,
+        idle: u64,
+    ) -> Option<usize> {
         if self.sealed
             || self.next == CAPACITY
             || self
                 .first_role_window
                 .is_none_or(|window| end.wall / WINDOW_NS <= window + 8)
         {
-            return;
+            return None;
         }
         let header = &V020_SIGNED_CPU_BUDGET_TRACE.header;
         for (cell, word) in header[9..14].iter().zip([
@@ -179,5 +189,6 @@ impl Trace {
         header[1].store(VERSION, Ordering::Relaxed);
         header[2].store(self.next as u64, Ordering::Release);
         self.sealed = true;
+        Some(self.next)
     }
 }

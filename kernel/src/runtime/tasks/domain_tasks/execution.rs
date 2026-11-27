@@ -1,4 +1,4 @@
-use super::memory::{Pages, copy_from, copy_to, frame_phys, frame_ptr, prepare, synchronize};
+use super::memory::{Pages, UserMemoryAccess, frame_phys, frame_ptr, synchronize};
 use super::*;
 use cyxia_prototype::domains::tasks::ThreadReservation;
 #[path = "lifecycle.rs"]
@@ -64,6 +64,7 @@ struct Creator<'a> {
     tasks: &'a mut [Task; TASKS],
     launches: &'a [Launch; LAUNCHES],
     memory: &'a mut Memory<PAGES, 512>,
+    frame_meta: &'a mut Option<RuntimePool<'static>>,
     scheduler: &'a mut Scheduler,
     services: &'a mut ServiceBatch,
     ipc: &'a mut Ipc<IPC_BYTES>,
@@ -310,26 +311,23 @@ impl Creator<'_> {
             t.region_count += 1;
         }
         trace.step(16); // Prepare/copy the original task input.
-        prepare(self.memory, self.tasks, self.remote, key, 0x20000, 8, false)?;
+        let mut memory = UserMemoryAccess::new(
+            self.memory,
+            Pages {
+                tasks: self.tasks,
+                remote: self.remote,
+                load: None,
+                frame_meta: self.frame_meta,
+            },
+            key,
+        );
+        memory.probe(0x20000, 8, false)?;
         trace.step(17);
-        prepare(
-            self.memory,
-            self.tasks,
-            self.remote,
-            key,
-            0x21000,
-            launch.len,
-            false,
-        )?;
+        memory.probe(0x21000, launch.len, false)?;
         trace.step(18);
-        copy_to(
-            self.memory,
-            key,
-            0x20000,
-            &(launch.len as u64).to_le_bytes(),
-        )?;
+        memory.write_launch_input(0x20000, &(launch.len as u64).to_le_bytes())?;
         trace.step(19);
-        copy_to(self.memory, key, 0x21000, &launch.input[..launch.len])?;
+        memory.write_launch_input(0x21000, &launch.input[..launch.len])?;
         trace.step(20); // Actual TASK_QUERY capability grant.
         let cap = self.services.grant(key, key, TASK_SERVICE, 2)?;
         self.tasks[slot].own_query_cap = cap;
@@ -457,6 +455,7 @@ impl Creator<'_> {
             tasks: self.tasks,
             remote: self.remote,
             load: None,
+            frame_meta: self.frame_meta,
         };
         for base in self.tasks[slot].regions[..self.tasks[slot].region_count]
             .iter()
@@ -751,6 +750,7 @@ fn submit_package(
         tasks: &mut s.tasks,
         launches: &s.launches,
         memory: &mut s.memory,
+        frame_meta: &mut s.frame_meta,
         scheduler: &mut s.scheduler,
         services: &mut s.services,
         ipc: &mut s.ipc,
@@ -971,6 +971,7 @@ fn cleanup_inner(s: &mut State, i: usize) -> Result<(), Error> {
         tasks: &s.tasks,
         remote: s.remote,
         load: None,
+        frame_meta: &mut s.frame_meta,
     };
     for base in s.tasks[i].regions[..s.tasks[i].region_count]
         .iter()
@@ -1064,6 +1065,7 @@ fn advance_admission_bounded(s: &mut State, maximum: usize, cleanup: usize) -> R
             tasks: &mut s.tasks,
             launches: &s.launches,
             memory: &mut s.memory,
+            frame_meta: &mut s.frame_meta,
             scheduler: &mut s.scheduler,
             services: &mut s.services,
             ipc: &mut s.ipc,
@@ -1187,16 +1189,9 @@ fn recipe_turn_inner(s: &mut State, i: usize) -> Result<(), Error> {
         return Ok(());
     }
     let sequence = u64::from_le_bytes(bytes[..8].try_into().map_err(|_| Error::Format)?);
-    prepare(
-        &mut s.memory,
-        &s.tasks,
-        s.remote,
-        task.key,
-        0x21000,
-        8,
-        false,
-    )?;
-    copy_to(&s.memory, task.key, 0x21000, &bytes[32..40])?;
+    let mut memory = s.user_memory(task.key)?;
+    memory.probe(0x21000, 8, false)?;
+    memory.write_launch_input(0x21000, &bytes[32..40])?;
     unsafe {
         let context = &mut *core::ptr::addr_of_mut!(CONTEXTS)
             .cast::<user::Context>()
@@ -1655,6 +1650,7 @@ fn memory_piece(s: &mut State) {
             tasks: &s.tasks,
             remote: s.remote,
             load: None,
+            frame_meta: &mut s.frame_meta,
         },
     );
     let (_, finished_ns, actual_ns) = finish_cpu_interval(cpu_started);
@@ -1735,7 +1731,9 @@ fn process_return_inner(s: &mut State, i: usize, c: &mut user::Context) {
     } else if c.kind == 8 && c.esr >> 26 == 0x15 && c.esr & 0xffff == 0x44 {
         s.tasks[i].terminal_seen = true;
         let mut output = [0u8; 16];
-        let result = copy_from(&s.memory, &s.tasks, key, 0x30000, &mut output);
+        let result = s
+            .user_memory(key)
+            .and_then(|mut memory| memory.copyin_resident(0x30000, &mut output));
         let status = u64::from_le_bytes(output[..8].try_into().unwrap());
         if s.tasks[i].recipe != 0 && result.is_ok() && status == 0 {
             let task = &mut s.tasks[i];
@@ -2074,9 +2072,13 @@ pub fn remote_capacity() -> [u64; 4] {
     })
     .unwrap_or([0; 4])
 }
-pub fn remote_start(token: u64, leaf: u64) -> Result<(), Error> {
+pub fn remote_start(token: u64, root: u64) -> Result<(), Error> {
     locked(|s| {
-        if token == 0 || leaf < crate::HIGH || !leaf.is_multiple_of(4096) {
+        if token == 0
+            || root < crate::HIGH + cyxia_platform_virt::ENTRY
+            || root > crate::HIGH + cyxia_platform_virt::KERNEL_POOL_END - 3 * 4096
+            || !root.is_multiple_of(4096)
+        {
             return Err(Error::Format);
         }
         let key = ObjectKey {
@@ -2095,7 +2097,7 @@ pub fn remote_start(token: u64, leaf: u64) -> Result<(), Error> {
         }
         s.remote = Some(Remote {
             key,
-            leaf,
+            root,
             ended: false,
         });
         let result = (|| {
@@ -2125,6 +2127,7 @@ pub fn remote_start(token: u64, leaf: u64) -> Result<(), Error> {
                 tasks: &s.tasks,
                 remote: s.remote,
                 load: None,
+                frame_meta: &mut s.frame_meta,
             };
             for base in [0x30000, 0x40000] {
                 let _ = s.memory.unmap_step(key, base, 2, &mut pages);
@@ -2190,6 +2193,7 @@ pub fn remote_release(token: u64) -> Result<(), Error> {
             tasks: &s.tasks,
             remote: s.remote,
             load: None,
+            frame_meta: &mut s.frame_meta,
         };
         for base in [0x30000, 0x40000] {
             match s.memory.unmap_step(remote.key, base, 2, &mut pages) {
@@ -2220,7 +2224,8 @@ pub fn remote_word(token: u64, address: u64) -> Result<u64, Error> {
             .filter(|r| r.key.generation == token)
             .ok_or(Error::Stale)?;
         let mut bytes = [0u8; 8];
-        copy_from(&s.memory, &s.tasks, remote.key, address, &mut bytes)?;
+        s.user_memory(remote.key)?
+            .copyin_resident(address, &mut bytes)?;
         Ok(u64::from_le_bytes(bytes))
     })
 }
@@ -2607,6 +2612,7 @@ pub fn start_generation(old: ObjectKey, next: u64, apply: ApplyId) -> Result<(),
             tasks: &mut s.tasks,
             launches: &s.launches,
             memory: &mut s.memory,
+            frame_meta: &mut s.frame_meta,
             scheduler: &mut s.scheduler,
             services: &mut s.services,
             ipc: &mut s.ipc,

@@ -14,6 +14,8 @@ pub fn init(info: &BootInfo) {
     };
     // This board's existing device mapping spans 0x09000000..0x09200000.
     if rtc.base.0 < 0x09000000
+        || !rtc.base.0.is_multiple_of(4096)
+        || rtc.len < 4096
         || rtc
             .base
             .0
@@ -39,10 +41,15 @@ pub fn init(info: &BootInfo) {
 
 #[cfg(feature = "ported")]
 pub fn realtime_seconds() -> Result<u64, Errno> {
+    seconds().ok_or(Errno::Nodev)
+}
+
+#[cfg(any(feature = "ported", cyxia_resident_net))]
+pub(crate) fn seconds() -> Option<u64> {
     let base = RTC.load(Ordering::Acquire);
     if base == 0 {
-        return Err(Errno::Nodev);
+        return None;
     }
     // SAFETY: init published a validated, permanently mapped PL031 resource.
-    Ok(unsafe { core::ptr::read_volatile(base as *const u32) } as u64)
+    Some(unsafe { core::ptr::read_volatile(base as *const u32) } as u64)
 }

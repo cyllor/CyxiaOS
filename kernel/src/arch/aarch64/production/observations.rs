@@ -6,9 +6,10 @@
 //!
 //! CPU0 exclusively initializes or accesses the stores between PIE turns or
 //! synchronously inside the stopped caller's SVC. No references cross a turn.
-//! Recovery audit frames use the CPU0 copy window and the stopped Supervisor's
-//! checked private stack. D01 snapshot replies use their own fixed role spans.
+//! Audit frames and D01 snapshot replies use the CPU0 copy window and the
+//! stopped caller's checked private stack.
 
+use super::copy_window::StackSpan;
 use super::*;
 use core::ptr::{addr_of, addr_of_mut};
 use cyxia_control_model::native_v0199::SnapshotReplyV3;
@@ -135,16 +136,6 @@ fn manifest() -> Option<&'static NativeRoleManifest> {
     unsafe { (&*addr_of!(MANIFEST)).as_ref() }
 }
 
-/// Copy to the already translated private stack, then read it back before
-/// reporting evidence. The role cannot run concurrently with its handler.
-fn copy_reply(address: u64, wire: &[u8]) -> bool {
-    let ptr = address as *mut u8;
-    unsafe { core::ptr::copy_nonoverlapping(wire.as_ptr(), ptr, wire.len()) };
-    wire.iter()
-        .enumerate()
-        .all(|(i, &v)| unsafe { ptr.add(i).read_volatile() } == v)
-}
-
 pub(super) fn snapshot(index: usize, m: NativeRole, args: [u64; 6]) -> Option<u64> {
     let cap = match trapped_pie_cap(index, m) {
         Ok(cap) => cap,
@@ -162,7 +153,7 @@ pub(super) fn snapshot(index: usize, m: NativeRole, args: [u64; 6]) -> Option<u6
     }
     let Some(dst) = usize::try_from(args[4])
         .ok()
-        .and_then(|n| stack_span(index, args[3], n, true))
+        .and_then(|n| StackSpan::verify_syscall(index, m, args[3], n, true).ok())
     else {
         return Some(EFAULT as u64);
     };
@@ -196,7 +187,7 @@ pub(super) fn snapshot(index: usize, m: NativeRole, args: [u64; 6]) -> Option<u6
     let Ok(reply) = SnapshotReplyV3::decode(&wire) else {
         return Some(E_FORMAT as u64);
     };
-    if !copy_reply(dst, &wire) {
+    if dst.copy_out_and_check(&wire) != Ok(true) {
         return Some(EFAULT as u64);
     }
     if reply.target_id == TARGET.id && reply.fields[6].is_some() {

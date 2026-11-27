@@ -1,8 +1,8 @@
-//! V0.20 wave 11 G-B: OPT-IN media staging lane (evidence words 144..151).
-//! Compiled only under `v020-production-media-staging`; the G-A
-//! `v020-production` build never reads or writes any v1 on-disk layout.
+//! Baseline v1 boot owner shared by the authorized resident and opt-in
+//! diagnostic media staging. The authorized resident reopens a signed
+//! volume with checkpointed file homes before publishing its BootEpoch.
 //!
-//! After the business CPUs stopped, CPU0 attaches one
+//! In the diagnostic configuration, after the business CPUs stopped, CPU0 attaches one
 //! dedicated 512 MiB scratch VirtIO-blk device through
 //! the shared format-fixture plumbing (`scratch_blk`) and runs, each step only
 //! if the previous one passed (fail-closed chain):
@@ -56,11 +56,10 @@
 //! * SNAPSHOT_FAIL_CLOSED (atomic): incremented only by the CPU0 in-vector
 //!   dispatcher (`snapshot_0x40`), read at the CPU0 seal.
 use super::super::{report, scratch_blk};
-#[cfg(feature = "v020-production-diagnostic")]
-use super::{EAGAIN, evidence};
 #[cfg(cyxia_startup_catalog)]
 use super::startup_catalog;
-use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "v020-production-diagnostic")]
+use super::{EAGAIN, evidence};
 #[cfg(any(
     feature = "v020-production-diagnostic",
     feature = "v020-production-file-read",
@@ -68,6 +67,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
     feature = "v020-production-fsync-scratch"
 ))]
 use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_contracts::BootInfo;
 #[cfg(any(
     feature = "v020-production-file-read",
@@ -97,6 +97,12 @@ mod reopen;
 mod signed;
 #[cfg(any(feature = "v020-production-media-signed", cyxia_startup_catalog))]
 use cyxia_kernel_core::security::offline_config_v1::VerifiedOfflineConfig;
+#[cfg(cyxia_startup_catalog)]
+use cyxia_kernel_core::security::{
+    boot_epoch_v1::{TlsBootPolicy, TlsBootTransition},
+    network::deployment::KeyManifest,
+    recovery_proof_store::RecoveryProofStore,
+};
 #[cfg(cyxia_signed_scratch_catalog)]
 #[path = "startup_catalog.rs"]
 mod startup_catalog;
@@ -130,6 +136,8 @@ pub(super) struct StagingOutcome {
     pub(super) confirmed_epoch: u64,
     #[cfg(any(cyxia_signed_resident, feature = "v020-production-media-signed"))]
     pub(super) resident_boot: Option<SignedResidentBoot>,
+    #[cfg(cyxia_startup_catalog)]
+    recovery_proof: Option<RecoveryProofStore>,
     #[cfg(feature = "v020-production-diagnostic")]
     pub(super) admission_flow_ok: bool,
     chain_complete: bool,
@@ -164,6 +172,13 @@ pub(super) struct StagedReceiptQuery {
 pub(super) struct SignedResidentBoot {
     epochs: cyxia_kernel_core::security::boot_epoch_v1::BootEpochAuthority,
     config: VerifiedOfflineConfig<'static>,
+}
+
+/// Boot-verified public policy. No previous private credential is present.
+#[cfg(cyxia_startup_catalog)]
+pub(super) struct NetworkPolicy {
+    pub(super) current: Option<KeyManifest>,
+    pub(super) predecessor: Option<(VerifiedOfflineConfig<'static>, Option<KeyManifest>)>,
 }
 
 #[cfg(any(cyxia_signed_resident, feature = "v020-production-media-signed"))]
@@ -257,6 +272,13 @@ struct Disk<'a> {
 }
 
 impl Disk<'_> {
+    #[cfg(cyxia_startup_catalog)]
+    fn checkpoint(&mut self) -> Result<(), SecurityError> {
+        self.checkpoint
+            .as_deref_mut()
+            .ok_or(SecurityError::Unknown)?()
+    }
+
     fn sectors(
         &mut self,
         block: u32,
@@ -346,19 +368,32 @@ pub(super) fn verify_scratch_config() -> Result<VerifiedOfflineConfig<'static>, 
     config.inspect_err(|e| report("V020_W13_CONFIG_ERROR", *e as u64, 0, 0))
 }
 
+#[cfg(cyxia_startup_catalog)]
+pub(super) fn verify_network_predecessor()
+-> Result<Option<(VerifiedOfflineConfig<'static>, Option<KeyManifest>)>, SecurityError> {
+    // SAFETY: CPU0 preflight owns the verifier's same scrubbed scratch
+    // between catalog verification and any role loading.
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(super::COPY_BUFFER.0) };
+    startup_catalog::previous_policy(scratch, |header, _, lists| {
+        signed::verify_lifecycle_payload(header, lists)
+    })
+}
+
 fn run_chain(
     disk: &mut Disk,
     out: &mut StagingOutcome,
-    #[cfg(cyxia_signed_resident)] verified: Option<
-        VerifiedOfflineConfig<'static>,
-    >,
+    #[cfg(cyxia_signed_resident)] verified: Option<VerifiedOfflineConfig<'static>>,
+    #[cfg(cyxia_startup_catalog)] network: NetworkPolicy,
     #[cfg(all(
         feature = "v020-production-fsync-scratch",
         not(cyxia_signed_resident)
     ))]
     file_client: Option<super::file_durable::Client<'_>>,
 ) -> Option<()> {
-    const REOPEN: bool = cfg!(any(cyxia_startup_catalog, feature = "v020-production-media-reopen"));
+    const REOPEN: bool = cfg!(any(
+        cyxia_startup_catalog,
+        feature = "v020-production-media-reopen"
+    ));
     #[cfg(feature = "v020-production-fsync-scratch")]
     const LAYOUT: volume::SnapshotLayout = volume::SnapshotLayout::BaselineFsyncFile;
     #[cfg(not(feature = "v020-production-fsync-scratch"))]
@@ -380,13 +415,31 @@ fn run_chain(
     )) {
         return None;
     }
-    #[cfg(all(
-        feature = "v020-production-media-signed",
-        not(cyxia_signed_resident)
-    ))]
+    #[cfg(all(feature = "v020-production-media-signed", not(cyxia_signed_resident)))]
     let verified = verify_scratch_config().ok()?;
     #[cfg(cyxia_signed_resident)]
     let verified = verified?;
+    #[cfg(cyxia_startup_catalog)]
+    let current = TlsBootPolicy::new(&verified, network.current).ok()?;
+    #[cfg(cyxia_startup_catalog)]
+    let transition = match &network.predecessor {
+        Some((config, manifest)) => {
+            let predecessor = TlsBootPolicy::new(config, *manifest).ok()?;
+            Some(TlsBootTransition::new(predecessor, current).ok()?)
+        }
+        None => None,
+    };
+    #[cfg(cyxia_startup_catalog)]
+    let recovery_locator = {
+        let predecessor = network.predecessor.as_ref().map(|(config, _)| config);
+        match startup_catalog::recovery_store(&verified, predecessor, &mut || disk.checkpoint()) {
+            Ok(locator) => locator,
+            Err(error) => {
+                report("V020_SEC_S_RECOVERY_STORE_REFUSED", 0, error as u64, 0);
+                return None;
+            }
+        }
+    };
     #[cfg(any(feature = "v020-production-media-signed", cyxia_startup_catalog))]
     let config = Some(&verified);
     #[cfg(not(any(feature = "v020-production-media-signed", cyxia_startup_catalog)))]
@@ -396,7 +449,14 @@ fn run_chain(
     // also require recovery if it returns with uncertain media completion.
     out.mount_requires_recovery = REOPEN;
     let sb = if REOPEN {
-        reopen::identify(disk, config)
+        #[cfg(cyxia_startup_catalog)]
+        {
+            reopen::identify_resident(disk, current)
+        }
+        #[cfg(not(cyxia_startup_catalog))]
+        {
+            reopen::identify(disk, config)
+        }
     } else {
         volume::format(disk, config, LAYOUT)
     };
@@ -411,8 +471,41 @@ fn run_chain(
         {
             fsync::recover(disk, sb, &verified)
         }
-        #[cfg(not(feature = "v020-production-fsync-scratch"))]
-        reopen::recover(disk, sb, config, LAYOUT)
+        #[cfg(cyxia_startup_catalog)]
+        {
+            use reopen::BootLogRecovery;
+            let reconciled =
+                reopen::recover_resident_with_reconciliation(disk, sb, current, transition);
+            match &reconciled {
+                Ok((_, mounted, outcome)) => {
+                    let (kind, cleared) = match outcome {
+                        BootLogRecovery::Empty => (0, 0),
+                        BootLogRecovery::Replayed => (1, 0),
+                        BootLogRecovery::RetiredCheckpointed => (2, 0),
+                        BootLogRecovery::DiscardedPreparation { cleared_blocks } => {
+                            (3, u64::from(*cleared_blocks))
+                        }
+                    };
+                    report(
+                        "V020_SEC_D_BOOT_RECONCILE",
+                        mounted.boot.boot_epoch,
+                        kind,
+                        cleared,
+                    );
+                }
+                Err(error) => report(
+                    "V020_SEC_D_BOOT_RECONCILE_REFUSED",
+                    sb.generation,
+                    *error as u64,
+                    0,
+                ),
+            }
+            reconciled.map(|(checkpoint, mounted, _)| (checkpoint, mounted))
+        }
+        #[cfg(not(any(feature = "v020-production-fsync-scratch", cyxia_startup_catalog)))]
+        {
+            reopen::recover(disk, sb, config, LAYOUT)
+        }
     } else {
         volume::mount(disk, sb, config, LAYOUT).map(|mounted| (sb, mounted))
     };
@@ -436,6 +529,36 @@ fn run_chain(
         ];
     }
     out.prior_epoch = mounted.boot.boot_epoch;
+    #[cfg(cyxia_startup_catalog)]
+    if let Some(locator) = recovery_locator {
+        match super::recovery::open_durable(locator, &mounted, disk) {
+            Ok(store) => {
+                disk.checkpoint().ok()?;
+                let (pending, retired) = store.inventory();
+                report("V020_SEC_S_RECOVERY_STORE", out.prior_epoch, pending, retired);
+                out.recovery_proof = Some(store);
+            }
+            Err(error) => {
+                report("V020_SEC_S_RECOVERY_STORE_REFUSED", out.prior_epoch, error as u64, 0);
+                return None;
+            }
+        }
+    }
+    #[cfg(cyxia_startup_catalog)]
+    let install = transition
+        .filter(|t| mounted.security.offline_config_hash == t.previous().config().digest());
+    #[cfg(cyxia_startup_catalog)]
+    let allocated = authority::allocate_boot(
+        disk,
+        checkpoint,
+        &mounted.security,
+        install.map_or(
+            authority::BootUpdate::Tls(current),
+            authority::BootUpdate::Rotate,
+        ),
+        volume::Checkpoints::Resident,
+    );
+    #[cfg(not(cyxia_startup_catalog))]
     let allocated = authority::boot_epoch_owner(disk, checkpoint, &mounted.security, config);
     out.confirmed_epoch = step(
         4,
@@ -451,11 +574,64 @@ fn run_chain(
     let _ = resident_epochs;
     #[cfg(cyxia_startup_catalog)]
     {
-        let committed = authority::verified_pair_state(disk, checkpoint, config).ok()?;
+        let expected = current.resident_state(out.confirmed_epoch).ok()?;
+        let committed = authority::verified_pair_state_for(disk, checkpoint, |state| {
+            if *state != expected {
+                return Err(SecurityError::Conflict);
+            }
+            Ok(())
+        })
+        .ok()?;
         if committed.last_boot_epoch != out.confirmed_epoch {
             return None;
         }
-        report("V020_W12_MEDIA_EPOCH", out.prior_epoch, out.confirmed_epoch, 1);
+        // The paired boot transaction changed only the two boot homes.
+        // Independently rebind the retained receipt/index view to the new
+        // epoch before publishing the authorized mount outcome.
+        match install {
+            Some(transition) => {
+                volume::confirm_tls_receipts(&mounted, &committed, transition).ok()?;
+                // Finish this transition's checkpoint before any new role
+                // starts. A later successor only needs this deployment's
+                // public policy, even if its ordinary boots keep redo live.
+                let (_, replayed) =
+                    reopen::recover_resident_with_tls(disk, checkpoint, current, Some(transition))
+                        .ok()?;
+                if replayed.security != committed || replayed.receipts != mounted.receipts {
+                    return None;
+                }
+                report(
+                    "V020_SEC_N_POLICY_COMMITTED",
+                    committed.offline_config_generation,
+                    committed.key_generation,
+                    u64::from(current.listener_enabled()),
+                );
+            }
+            None => {
+                volume::confirmed_receipt_query_digest(&mounted, &committed, &verified).ok()?;
+            }
+        }
+        disk.checkpoint().ok()?;
+        report(
+            "V020_W12_MEDIA_EPOCH",
+            out.prior_epoch,
+            out.confirmed_epoch,
+            1,
+        );
+        report(
+            "V020_SEC_F_RESIDENT_VOLUME",
+            out.confirmed_epoch,
+            u64::from(mounted.structure.directory_entries),
+            mounted.receipts.occupied as u64,
+        );
+        // Reset severs old DMA access. The confirmed receipt/index view
+        // still owns its original requests and supplies their durable status.
+        report(
+            "V020_SEC_D_FILE_RECEIPTS",
+            out.confirmed_epoch,
+            mounted.receipts.unresolved as u64,
+            (mounted.receipts.occupied - mounted.receipts.unresolved) as u64,
+        );
     }
     #[cfg(feature = "v020-production-media-signed")]
     {
@@ -465,10 +641,7 @@ fn run_chain(
         }
         out.receipt_query_digest =
             Some(volume::confirmed_receipt_query_digest(&mounted, &committed, &verified).ok()?);
-        #[cfg(all(
-            feature = "v020-production-fsync-scratch",
-            not(cyxia_signed_resident)
-        ))]
+        #[cfg(all(feature = "v020-production-fsync-scratch", not(cyxia_signed_resident)))]
         {
             if REOPEN {
                 let view = fsync::readback(disk, checkpoint, &verified, &committed)
@@ -587,6 +760,7 @@ pub(super) fn stage(
 pub(super) fn stage_with_policy(
     info: &BootInfo,
     #[cfg(cyxia_signed_resident)] verified: Option<VerifiedOfflineConfig<'static>>,
+    #[cfg(cyxia_startup_catalog)] network: NetworkPolicy,
     #[cfg(cyxia_startup_catalog)] checkpoint: &mut dyn FnMut() -> Result<(), SecurityError>,
     #[cfg(all(
         feature = "v020-production-fsync-scratch",
@@ -613,6 +787,17 @@ pub(super) fn stage_with_policy(
             return out;
         }
     };
+    #[cfg(cyxia_startup_catalog)]
+    {
+        // Reopening is reachable only after observing a stopped previous
+        // queue before admission of this boot's DMA. Reconcile the old
+        // operation outcomes independently from the durable media below.
+        let Some(observed) = device.initial_mmio_reset_ns() else {
+            out.mount_requires_recovery = true;
+            return out;
+        };
+        report("V020_SEC_D_BLOCK_RESTART_RESET", 2, 0, observed);
+    }
     let mut disk = Disk {
         device,
         #[cfg(cyxia_startup_catalog)]
@@ -633,7 +818,14 @@ pub(super) fn stage_with_policy(
     }
     #[cfg(cyxia_signed_resident)]
     {
-        out.chain_complete = run_chain(&mut disk, &mut out, verified).is_some();
+        out.chain_complete = run_chain(
+            &mut disk,
+            &mut out,
+            verified,
+            #[cfg(cyxia_startup_catalog)]
+            network,
+        )
+        .is_some();
     }
     if super::recovery::contain_terminal_block(out.confirmed_epoch) {
         out.mount_requires_recovery = true;
@@ -642,6 +834,16 @@ pub(super) fn stage_with_policy(
         {
             out.resident_boot = None;
         }
+    }
+    // Console serialization and the final health observations are charged
+    // too. Settle or renew before the post-I/O reports, even if the last
+    // successful block completion arrived near the end of its grant.
+    #[cfg(cyxia_startup_catalog)]
+    if disk.checkpoint().is_err() {
+        out.mount_requires_recovery = true;
+        out.chain_complete = false;
+        out.resident_boot = None;
+        return out;
     }
     #[cfg(any(
         feature = "v020-production-file-read",
@@ -682,6 +884,13 @@ pub(super) fn stage_with_policy(
     report("V020_W11_MEDIA_IO_SLOW_50MS", slow[0], slow[1], slow[2]);
     if let Some((code, sector, site)) = scratch_blk::last_error() {
         report("V020_W11_MEDIA_IO_ERROR", code, sector, site);
+    }
+    #[cfg(cyxia_startup_catalog)]
+    if out.chain_complete
+        && out.resident_boot.is_some()
+        && let Some(store) = out.recovery_proof.take()
+    {
+        super::recovery::install_durable(store, disk.device);
     }
     out
 }

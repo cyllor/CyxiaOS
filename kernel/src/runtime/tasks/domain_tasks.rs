@@ -3,6 +3,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_arch_aarch64::{cpu, mmu, timer, user};
 use cyxia_contracts::PhysAddr;
+use cyxia_kernel_core::frame_meta_v0199::RuntimePool;
 use cyxia_prototype::domains::maintenance::{BackgroundBudgets, CpuDebit};
 use cyxia_prototype::domains::tasks::*;
 use cyxia_prototype::domains::{Action, ApplyId, Error, ObjectKey, PolicyStamp, WINDOW_NS};
@@ -266,7 +267,7 @@ impl Launch {
 #[derive(Clone, Copy)]
 struct Remote {
     key: ObjectKey,
-    leaf: u64,
+    root: u64,
     ended: bool,
 }
 #[derive(Clone, Copy)]
@@ -410,6 +411,7 @@ struct State {
     scheduler: Scheduler,
     admission: SpawnAdmission,
     memory: Memory<PAGES, 512>,
+    frame_meta: Option<RuntimePool<'static>>,
     ipc: Ipc<IPC_BYTES>,
     services: ServiceBatch,
     background: BackgroundBudgets,
@@ -461,6 +463,7 @@ impl State {
             scheduler: Scheduler::new(),
             admission: SpawnAdmission::new(),
             memory: Memory::new(),
+            frame_meta: None,
             ipc: Ipc::new(),
             services: ServiceBatch::new(),
             background: BackgroundBudgets::new(),
@@ -674,6 +677,7 @@ pub fn init() -> Result<(), Error> {
         if crate::memory_fault_capture::PROFILE {
             memory::load_code(MEMORY_ELF, MEMORY_CODE_FRAME, 4)?;
         }
+        s.frame_meta = Some(memory::initialize_frame_meta()?);
         Ok(())
     })?;
     READY.store(true, Ordering::Release);

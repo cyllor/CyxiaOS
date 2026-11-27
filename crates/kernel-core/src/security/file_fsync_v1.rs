@@ -35,11 +35,14 @@ const BOUND: u16 = 2;
 const DONE: u16 = 3;
 const MAX_DATA_HOMES: usize = 120;
 const BLOCKS_PER_BITMAP: u32 = (8 * BLOCK) as u32;
-const BITMAP_PAGES: u32 = INODE_START - BITMAP_START;
+const BITMAP_PAGES: usize = (INODE_START - BITMAP_START) as usize;
+const RECEIPT_CLOSURE_PAGES: usize = 2;
 // Data, both halves of a straddling receipt, its index, and the final inode
-// plus the allocation bitmap page when the file acquires a new data run.
-const MAX_SEGMENT_HOMES: usize = MAX_DATA_HOMES + 5;
-const _: () = assert!(BITMAP_PAGES * BLOCKS_PER_BITMAP == BLOCK_COUNT);
+// plus every bitmap page touched by this segment's allocation.
+const MAX_SEGMENT_HOMES: usize = MAX_DATA_HOMES + RECEIPT_CLOSURE_PAGES + 2 + BITMAP_PAGES;
+const _: () = assert!(MAX_SEGMENT_HOMES <= 128);
+const _: () = assert!(BITMAP_PAGES as u32 * BLOCKS_PER_BITMAP == BLOCK_COUNT);
+const _: () = assert!(RECEIPT_STORE_BYTES == (RECEIPT_CLOSURE_PAGES + BITMAP_PAGES) * BLOCK);
 
 /// The protected file service resolves the caller's live cap to the v1
 /// inode and supplies the authenticated mount and original copied frame.
@@ -53,9 +56,8 @@ pub struct FsyncJob<'a> {
     pub frame: &'a [u8],
     pub key: ReceiptKey,
     /// Bind the new logical size as a little-endian u64 before the pages in
-    /// the frozen digest. Each segment may append a free run described by
-    /// one bitmap page. An unchanged-size job uses the legacy pages-only
-    /// digest.
+    /// the frozen digest. A growth segment may append multiple free runs.
+    /// An unchanged-size job uses the legacy pages-only digest.
     pub grown_size: Option<usize>,
     /// Complete frozen logical file, in order, with zero padding after EOF.
     pub pages: &'a [&'a [u8; BLOCK]],
@@ -65,7 +67,6 @@ pub struct FsyncWorkspace {
     receipts: [u8; RECEIPT_STORE_BYTES],
     inode_page: [u8; BLOCK],
     scratch: [u8; BLOCK],
-    bitmap: [u8; BLOCK],
 }
 
 const _: () = assert!(
@@ -79,7 +80,6 @@ impl FsyncWorkspace {
             receipts: [0; RECEIPT_STORE_BYTES],
             inode_page: [0; BLOCK],
             scratch: [0; BLOCK],
-            bitmap: [0; BLOCK],
         }
     }
 }
@@ -129,63 +129,146 @@ fn first_free_run(bitmap: &[u8; BLOCK], start: u32, end: u32, blocks: u32) -> Op
     None
 }
 
-fn allocate_growth(
-    writer: &mut RedoWriter<'_, impl EpochBlockIo>,
+#[derive(Clone, Copy, Default)]
+struct FreeRun {
+    physical: u32,
+    count: u32,
+}
+
+fn bitmap_page(block: u32) -> usize {
+    (block / BLOCKS_PER_BITMAP) as usize
+}
+
+fn block_free(bitmaps: &[[u8; BLOCK]; BITMAP_PAGES], block: u32) -> bool {
+    let (byte, mask) = bitmap_bit(block);
+    bitmaps[bitmap_page(block)][byte] & mask == 0
+}
+
+fn stage_growth_run(
     inode: &mut Inode,
-    bitmap: &mut [u8; BLOCK],
-    allocation_floor: u32,
-    blocks: u32,
-) -> Result<u32, Error> {
+    bitmaps: &mut [[u8; BLOCK]; BITMAP_PAGES],
+    physical: u32,
+    count: u32,
+) -> u8 {
+    let mut changed = 0;
+    for block in physical..physical + count {
+        let page = bitmap_page(block);
+        let (byte, mask) = bitmap_bit(block);
+        bitmaps[page][byte] |= mask;
+        changed |= 1 << page;
+    }
     let extent_count = usize::from(inode.extents);
     let last = inode.runs[..extent_count].last().copied();
-    let adjacent = last.map(|run| run.physical + run.count);
-    let preferred = (adjacent.unwrap_or(allocation_floor).max(allocation_floor)
-        / BLOCKS_PER_BITMAP)
-        .min(BITMAP_PAGES - 1);
-    let can_append_extent = extent_count < inode.runs.len();
-    let scan_pages = if can_append_extent { BITMAP_PAGES } else { 1 };
-    for offset in 0..scan_pages {
-        let page = (preferred + offset) % BITMAP_PAGES;
-        let first = (page * BLOCKS_PER_BITMAP).max(allocation_floor);
-        let end = (page + 1) * BLOCKS_PER_BITMAP;
-        if first >= end {
-            continue;
-        }
-        let home = BITMAP_START + page;
-        writer.read_committed(home, bitmap)?;
-        // Preserve a contiguous last extent when possible. Otherwise use
-        // the first free run on one verified bitmap page. The mount owner
-        // excludes all competing writes through the eventual commit.
-        let adjacent_free = adjacent.filter(|&start| {
-            let stop = start + blocks;
-            start >= first && stop <= end && first_free_run(bitmap, start, stop, blocks).is_some()
-        });
-        let Some(physical) = adjacent_free.or_else(|| {
-            if can_append_extent {
-                first_free_run(bitmap, first, end, blocks)
-            } else {
-                None
-            }
-        }) else {
-            continue;
+    if last.is_some_and(|run| run.physical + run.count == physical) {
+        inode.runs[extent_count - 1].count += count;
+    } else {
+        inode.runs[extent_count] = Extent {
+            logical: last.map_or(0, |run| run.logical + run.count),
+            physical,
+            count,
         };
-        for block in physical..physical + blocks {
-            let (byte, mask) = bitmap_bit(block);
-            bitmap[byte] |= mask;
-        }
-        if adjacent_free.is_some() {
-            inode.runs[extent_count - 1].count += blocks;
-        } else {
-            inode.runs[extent_count] = Extent {
-                logical: last.map_or(0, |run| run.logical + run.count),
-                physical,
-                count: blocks,
-            };
-            inode.extents += 1;
-        }
-        return Ok(home);
+        inode.extents += 1;
     }
-    Err(Error::Capacity)
+    changed
+}
+
+fn allocate_growth(
+    mut read_bitmap: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
+    inode: &mut Inode,
+    bitmaps: &mut [[u8; BLOCK]; BITMAP_PAGES],
+    allocation_floor: u32,
+    blocks: u32,
+) -> Result<u8, Error> {
+    let extent_count = usize::from(inode.extents);
+    let adjacent = inode.runs[..extent_count]
+        .last()
+        .map(|run| run.physical + run.count)
+        .filter(|&home| (allocation_floor..BLOCK_COUNT).contains(&home));
+    let mut loaded = 0u8;
+    let mut load_bitmap = |page: usize, bitmaps: &mut [[u8; BLOCK]; BITMAP_PAGES]| {
+        if loaded & (1 << page) == 0 {
+            read_bitmap(BITMAP_START + page as u32, &mut bitmaps[page])?;
+            loaded |= 1 << page;
+        }
+        Ok::<(), Error>(())
+    };
+
+    // Extend the existing extent even when it crosses a bitmap page boundary.
+    if let Some(home) = adjacent.filter(|&home| home + blocks <= BLOCK_COUNT) {
+        for page in bitmap_page(home)..=bitmap_page(home + blocks - 1) {
+            load_bitmap(page, bitmaps)?;
+        }
+        if (home..home + blocks).all(|block| block_free(bitmaps, block)) {
+            return Ok(stage_growth_run(inode, bitmaps, home, blocks));
+        }
+    }
+    let new_extents = inode.runs.len() - extent_count;
+    if new_extents == 0 {
+        return Err(Error::Capacity);
+    }
+
+    // Keep the typical fast path to one bitmap page and one new extent.
+    let preferred = bitmap_page(adjacent.unwrap_or(allocation_floor));
+    for offset in 0..BITMAP_PAGES {
+        let page = (preferred + offset) % BITMAP_PAGES;
+        let end = (page as u32 + 1) * BLOCKS_PER_BITMAP;
+        let first = (page as u32 * BLOCKS_PER_BITMAP).max(allocation_floor);
+        if end <= first {
+            continue;
+        }
+        load_bitmap(page, bitmaps)?;
+        if let Some(home) = first_free_run(&bitmaps[page], first, end, blocks) {
+            return Ok(stage_growth_run(inode, bitmaps, home, blocks));
+        }
+    }
+
+    // With every eligible bitmap read, plan a complete allocation before
+    // changing any image. Keep the longest runs that fit the remaining
+    // extent slots. Equal lengths retain their ascending physical order.
+    let mut candidates = inode.runs.map(|_| FreeRun::default());
+    let candidates = &mut candidates[..new_extents];
+    let mut extension = FreeRun::default();
+    let mut run = FreeRun::default();
+    for block in allocation_floor..=BLOCK_COUNT {
+        if block < BLOCK_COUNT && block_free(bitmaps, block) {
+            if run.count == 0 {
+                run.physical = block;
+            }
+            run.count += 1;
+            continue;
+        }
+        if run.count == 0 {
+            continue;
+        }
+        if Some(run.physical) == adjacent {
+            extension = run;
+        } else if run.count > candidates[new_extents - 1].count {
+            let at = candidates
+                .iter()
+                .position(|item| item.count < run.count)
+                .unwrap();
+            candidates.copy_within(at..new_extents - 1, at + 1);
+            candidates[at] = run;
+        }
+        run.count = 0;
+    }
+    let capacity = extension.count + candidates.iter().map(|run| run.count).sum::<u32>();
+    if capacity < blocks {
+        return Err(Error::Capacity);
+    }
+    let mut changed = 0;
+    let mut remaining = blocks;
+    for run in core::iter::once(extension).chain(candidates.iter().copied()) {
+        let count = remaining.min(run.count);
+        if count != 0 {
+            changed |= stage_growth_run(inode, bitmaps, run.physical, count);
+            remaining -= count;
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(changed)
 }
 
 /// Bind an issued ticket or durably advance one FSYNC prefix on baseline
@@ -418,26 +501,34 @@ pub fn commit_segment_with_floor<I: EpochBlockIo>(
     } else {
         published_size.div_ceil(BLOCK)
     };
+    let closure = home_closure(slot).ok_or(Error::Invalid)?;
+    // The full store scan is complete. Move just this record's one or two
+    // home pages down, and reuse the remaining four pages for the bitmaps.
+    let receipt_start = closure.receipt.first * BLOCK;
+    let receipt_end = receipt_start + closure.receipt_block_count * BLOCK;
+    work.receipts.copy_within(receipt_start..receipt_end, 0);
+    let (receipt_images, bitmap_images) = work.receipts.split_at_mut(RECEIPT_CLOSURE_PAGES * BLOCK);
+    let bitmaps: &mut [[u8; BLOCK]; BITMAP_PAGES] =
+        bitmap_images.as_chunks_mut::<BLOCK>().0.try_into().unwrap();
     // Before binding, check space for the first segment without publishing
     // allocation. Recheck under the exclusive writer on every growth commit.
-    let bitmap_home = if checked_pages > old_pages {
-        let home = allocate_growth(
-            writer,
+    let changed_bitmaps = if checked_pages > old_pages {
+        let changed = allocate_growth(
+            |home, bytes| writer.read_committed(home, bytes),
             &mut inode,
-            &mut work.bitmap,
+            bitmaps,
             allocation_floor,
             (checked_pages - old_pages) as u32,
         )?;
-        (!bind).then_some(home)
+        if bind { 0 } else { changed }
     } else {
-        None
+        0
     };
-    let closure = home_closure(slot).ok_or(Error::Invalid)?;
     let count = (end - first)
         + closure.receipt_block_count
         + usize::from(closure.requires_stream_index_block)
         + usize::from(update_inode)
-        + usize::from(bitmap_home.is_some());
+        + changed_bitmaps.count_ones() as usize;
     let plan = writer.prepare(count)?;
     if plan.fs_uuid != boot.fs_uuid
         || plan.log_epoch < receipt.log_epoch
@@ -462,14 +553,13 @@ pub fn commit_segment_with_floor<I: EpochBlockIo>(
     if update_inode {
         let raw = &mut work.inode_page[inode_at..inode_at + INODE_BYTES];
         raw[16..24].copy_from_slice(&(published_size as u64).to_le_bytes());
-        if bitmap_home.is_some() {
-            let extent = usize::from(inode.extents) - 1;
-            let at = 48 + extent * 12;
-            let run = inode.runs[extent];
+        if changed_bitmaps != 0 {
             raw[32..34].copy_from_slice(&inode.extents.to_le_bytes());
-            raw[at..at + 4].copy_from_slice(&run.logical.to_le_bytes());
-            raw[at + 4..at + 8].copy_from_slice(&run.physical.to_le_bytes());
-            raw[at + 8..at + 12].copy_from_slice(&run.count.to_le_bytes());
+            for (bytes, run) in raw[48..240].chunks_exact_mut(12).zip(inode.runs) {
+                bytes[..4].copy_from_slice(&run.logical.to_le_bytes());
+                bytes[4..8].copy_from_slice(&run.physical.to_le_bytes());
+                bytes[8..12].copy_from_slice(&run.count.to_le_bytes());
+            }
         }
         if final_segment {
             raw[24..32].copy_from_slice(&write_seq.to_le_bytes());
@@ -477,8 +567,8 @@ pub fn commit_segment_with_floor<I: EpochBlockIo>(
         let crc = crc32c_zeroed(raw, 252)?;
         raw[252..].copy_from_slice(&crc.to_le_bytes());
     }
-    let offset = slot * RECEIPT_BYTES;
-    work.receipts[offset..offset + RECEIPT_BYTES].copy_from_slice(&receipt.encode()?);
+    let offset = slot * RECEIPT_BYTES % BLOCK;
+    receipt_images[offset..offset + RECEIPT_BYTES].copy_from_slice(&receipt.encode()?);
     let mut images: [RedoImage<'_>; MAX_SEGMENT_HOMES] = core::array::from_fn(|_| RedoImage {
         home: 0,
         contents: &[0; BLOCK],
@@ -495,15 +585,16 @@ pub fn commit_segment_with_floor<I: EpochBlockIo>(
         };
     }
     let mut next = end - first;
-    for block in [Some(closure.receipt.first), closure.receipt.second]
-        .into_iter()
-        .flatten()
+    for (offset, contents) in receipt_images
+        .as_chunks::<BLOCK>()
+        .0
+        .iter()
+        .take(closure.receipt_block_count)
+        .enumerate()
     {
         images[next] = RedoImage {
-            home: receipt_home + block as u32,
-            contents: work.receipts[block * BLOCK..(block + 1) * BLOCK]
-                .try_into()
-                .unwrap(),
+            home: receipt_home + (closure.receipt.first + offset) as u32,
+            contents,
         };
         next += 1;
     }
@@ -515,12 +606,14 @@ pub fn commit_segment_with_floor<I: EpochBlockIo>(
     };
     next += 1;
     if update_inode {
-        if let Some(home) = bitmap_home {
-            images[next] = RedoImage {
-                home,
-                contents: &work.bitmap,
-            };
-            next += 1;
+        for (page, contents) in bitmaps.iter().enumerate() {
+            if changed_bitmaps & (1 << page) != 0 {
+                images[next] = RedoImage {
+                    home: BITMAP_START + page as u32,
+                    contents,
+                };
+                next += 1;
+            }
         }
         images[next] = RedoImage {
             home: inode_home,
@@ -529,4 +622,122 @@ pub fn commit_segment_with_floor<I: EpochBlockIo>(
     }
     let redo = writer.append(plan, &images[..count], reserve)?;
     Ok(FsyncProgress::Committed { receipt, redo })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_inode() -> Inode {
+        Inode {
+            kind: 1,
+            generation: 1,
+            size: 0,
+            durable_write_seq: 0,
+            parent: 0,
+            parent_generation: 1,
+            extents: 0,
+            runs: [Extent {
+                logical: 0,
+                physical: 0,
+                count: 0,
+            }; 16],
+        }
+    }
+
+    fn fragmented_image(home: u32, free: &[u32], out: &mut [u8; BLOCK]) {
+        out.fill(u8::MAX);
+        for &block in free {
+            if home == BITMAP_START + block / BLOCKS_PER_BITMAP {
+                let (byte, mask) = bitmap_bit(block);
+                out[byte] &= !mask;
+            }
+        }
+    }
+
+    #[test]
+    fn reserves_a_contiguous_extent_across_two_bitmap_pages() {
+        let free = [BLOCKS_PER_BITMAP - 1, BLOCKS_PER_BITMAP];
+        let mut inode = empty_inode();
+        let mut bitmaps = [[0; BLOCK]; BITMAP_PAGES];
+        assert_eq!(
+            allocate_growth(
+                |home, out| {
+                    fragmented_image(home, &free, out);
+                    Ok(())
+                },
+                &mut inode,
+                &mut bitmaps,
+                DATA_START,
+                2,
+            ),
+            Ok(0b11)
+        );
+        assert_eq!(inode.extents, 1);
+        assert_eq!(inode.runs[0].physical, free[0]);
+        assert_eq!(inode.runs[0].count, 2);
+        assert!(bitmaps.iter().flatten().all(|&byte| byte == u8::MAX));
+    }
+
+    #[test]
+    fn reserves_multiple_runs_when_the_free_space_is_fragmented() {
+        let free = [DATA_START + 1, BLOCKS_PER_BITMAP, BLOCKS_PER_BITMAP + 1];
+        let mut inode = empty_inode();
+        let mut bitmaps = [[0; BLOCK]; BITMAP_PAGES];
+        assert_eq!(
+            allocate_growth(
+                |home, out| {
+                    fragmented_image(home, &free, out);
+                    Ok(())
+                },
+                &mut inode,
+                &mut bitmaps,
+                DATA_START,
+                3,
+            ),
+            Ok(0b11)
+        );
+        assert_eq!(inode.extents, 2);
+        assert_eq!((inode.runs[0].physical, inode.runs[0].count), (free[1], 2));
+        assert_eq!(
+            inode.runs[1],
+            Extent {
+                logical: 2,
+                physical: free[0],
+                count: 1,
+            }
+        );
+        assert!(bitmaps.iter().flatten().all(|&byte| byte == u8::MAX));
+    }
+
+    #[test]
+    fn exhausted_extent_table_leaves_inode_and_bitmap_bits_untouched() {
+        let free = [DATA_START + 1, BLOCKS_PER_BITMAP, 2 * BLOCKS_PER_BITMAP];
+        let mut inode = empty_inode();
+        inode.extents = 15;
+        for (index, run) in inode.runs[..15].iter_mut().enumerate() {
+            *run = Extent {
+                logical: index as u32,
+                physical: DATA_START + 2 * index as u32 + 10,
+                count: 1,
+            };
+        }
+        let prior = inode;
+        let mut bitmaps = [[0; BLOCK]; BITMAP_PAGES];
+        assert_eq!(
+            allocate_growth(
+                |home, out| {
+                    fragmented_image(home, &free, out);
+                    Ok(())
+                },
+                &mut inode,
+                &mut bitmaps,
+                DATA_START,
+                2,
+            ),
+            Err(Error::Capacity)
+        );
+        assert_eq!(inode, prior);
+        assert!(free.into_iter().all(|block| block_free(&bitmaps, block)));
+    }
 }

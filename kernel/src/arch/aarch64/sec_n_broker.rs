@@ -11,9 +11,10 @@
 //! ADMISSION_RETIRED, both bound to the grant and polled generation.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline 安 0.6 SEC-BUF). Global invariant: the
-//! callers assert cpu::slot()==0 and every function here executes synchronously
-//! in that single CPU0 turn loop; no IRQ handler, DMA or secondary CPU touches
-//! these statics. The EL0 entry mechanism (user::enter_immutable) is
+//! Diagnostic access is serialized on CPU0. Deployment stages the private
+//! roots once on CPU0, then publishes the stopped broker, parser, and signer
+//! to business CPU1 as its exclusive owner. DMA cannot reach these pages.
+//! The EL0 entry mechanism (user::enter_immutable) is
 //! arch-aarch64's registered boundary; this module only calls it.
 //! * GUEST address space (static mut): CPU0-only. Its code/rodata is written once at
 //!   load then sealed RO through the boot direct-map (break-before-make + TLBI);
@@ -41,21 +42,28 @@
 //! * ACTIVE_POLL_TIMER joins the CPU0 foreground wait to its banked PPI
 //!   handler. Only that IRQ, while enabled by the waiter, may rearm it.
 //! * asm!("dsb/tlbi/ic"): bounded TLB/cache maintenance; options(nostack).
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 #[path = "sec_n_broker/ingress.rs"]
 pub(super) mod ingress;
 #[path = "sec_n_broker/receipt.rs"]
 mod receipt;
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(cyxia_resident_net)]
+#[path = "sec_n_broker/resident.rs"]
+pub(super) mod resident;
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 #[path = "sec_n_broker/signer.rs"]
 pub(super) mod signer;
 
 use super::*;
 #[cfg(feature = "v020-production-media-signed")]
 use cyxia_kernel_core::security::durable_role_epoch_v0199::ConfirmedBootPolicy;
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(not(cyxia_resident_net))]
+use cyxia_kernel_core::security::network::ConfirmedTlsBoot;
+use cyxia_kernel_core::security::network::TlsInstallation;
+#[cfg(cyxia_resident_net)]
+use cyxia_kernel_core::security::network::deployment::{AuthorizedNetwork, Listener};
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 use cyxia_kernel_core::security::network::tls_deadline::{Limit, Phase, TlsWindow};
-use cyxia_kernel_core::security::network::{ConfirmedTlsBoot, TlsInstallation};
 use cyxia_net_transport::device::{self, Port};
 
 // Trusted monotonic clocks from the EL1 architectural timer (the same source the
@@ -72,6 +80,7 @@ pub(crate) fn now_ns() -> u64 {
 // (cargo build --release -p cyxia-local-echo --features guest --target
 // aarch64-unknown-none) with the fixed test identity below BEFORE this kernel
 // feature is compiled. The default kernel build never embeds it.
+#[cfg(not(cyxia_resident_net))]
 pub(crate) static GUEST_ELF: &[u8] =
     include_bytes!("../../../../target/aarch64-unknown-none/release/cyxia-local-echo");
 
@@ -92,14 +101,16 @@ pub(crate) const OP_WRITE: u64 = 5;
 pub(crate) const OP_CLOSE: u64 = 6;
 pub(crate) const OP_YIELD: u64 = 12;
 const OP_ADMISSION_GRANTED: u64 = 0x100;
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 const OP_POLL_NORMAL_CLOSE: u64 = 0x101;
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 const OP_ADMISSION_RETIRED: u64 = 0x102;
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 const OP_TLS_CERTIFICATE_VERIFY: u64 = 0x103;
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 const OP_TLS_AUTHENTICATED: u64 = 0x104;
+#[cfg(cyxia_resident_net)]
+const OP_ADMISSION_REJECTED: u64 = 0x105;
 
 const DIRECT_TLS_CIPHERTEXT: u64 = 1;
 // Shared-page field offsets (exact protected layout, see abi.rs const asserts).
@@ -125,25 +136,30 @@ const OFF_MONOTONIC_NS: u64 = 6792;
 // built with the LARGER node b: LOCAL_NODE = node_id(b-test-cert.der) (the guest's
 // own cert/key), PEER_NODE = node_id(a-test-cert.der) provisioned as peer.pin (the
 // pinned client). These are CI type-check material, never production credentials.
+#[cfg(not(cyxia_resident_net))]
 pub(crate) const LOCAL_NODE: [u8; 32] = [
     0xff, 0xff, 0xae, 0x14, 0x28, 0x63, 0xc3, 0x2a, 0xa1, 0xa2, 0x10, 0xc5, 0x41, 0xa2, 0x68, 0x5f,
     0x3f, 0x59, 0x0e, 0x10, 0x9e, 0x15, 0xd2, 0x5e, 0x0d, 0xfc, 0xd5, 0xad, 0x6d, 0x69, 0xb0, 0xdd,
 ];
+#[cfg(not(cyxia_resident_net))]
 const PEER_NODE: [u8; 32] = [
     0xc0, 0x4a, 0xfa, 0x5e, 0xe9, 0x08, 0xe7, 0x7e, 0x04, 0x9a, 0x4b, 0xbf, 0xde, 0x03, 0x2f, 0xf0,
     0x97, 0xeb, 0x54, 0xca, 0xf3, 0xbc, 0x14, 0x77, 0x6a, 0xcd, 0xee, 0x22, 0x07, 0x4b, 0x06, 0xc7,
 ];
 #[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) const SOURCE_IP: u32 = 0x0A00_0202; // 10.0.2.2, trusted native owner observation.
+#[cfg(not(cyxia_resident_net))]
 const UNIX_SECONDS: u64 = 1_700_000_000; // fixed: no time-based handshake timeout.
 
 /// The signed profile borrows the confirmed boot owner through the whole
 /// network turn. Only the standalone diagnostic may use the fixture identity.
+#[cfg(not(cyxia_resident_net))]
 #[derive(Clone, Copy)]
 pub(crate) struct BootIdentity<'a> {
     confirmed: Option<ConfirmedTlsBoot<'a>>,
 }
 
+#[cfg(not(cyxia_resident_net))]
 impl<'a> BootIdentity<'a> {
     #[cfg(any(
         feature = "v0199-sec-n-selftest",
@@ -167,6 +183,10 @@ impl<'a> BootIdentity<'a> {
             .map_or(1, ConfirmedTlsBoot::boot_epoch)
     }
 
+    fn peer_pin(&self) -> [u8; 32] {
+        PEER_NODE
+    }
+
     fn verifier_generation(&self) -> u64 {
         self.confirmed_installation()
             .map_or(1, |installed| installed.verifier_generation)
@@ -176,7 +196,7 @@ impl<'a> BootIdentity<'a> {
         self.confirmed.as_ref().map(ConfirmedTlsBoot::installation)
     }
 
-    #[cfg(feature = "v020-production-authenticated-net")]
+    #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
     fn tls(&self) -> TlsInstallation {
         const FIXTURE: TlsInstallation = TlsInstallation {
             verifier_generation: 1,
@@ -194,7 +214,7 @@ impl<'a> BootIdentity<'a> {
     /// A diagnostic credential qualification, rooted in the public scratch
     /// test boot key. Signed-media callers first authenticate the same
     /// installation against the committed BootEpoch and key catalogue.
-    #[cfg(feature = "v020-production-authenticated-net")]
+    #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
     pub(crate) fn qualify_packages(self) -> Result<(), cyxia_kernel_core::security::Error> {
         // RFC 8032 test vector 1, the existing signed scratch trust root.
         const PUBLIC_KEY: &[u8; 32] = &[
@@ -214,6 +234,59 @@ impl<'a> BootIdentity<'a> {
             installed.key_generation,
         );
         Ok(())
+    }
+}
+
+/// The authenticated boot owner has sealed this deployment to the checked
+/// durable pair before it can be staged or handed to the business CPU.
+#[cfg(cyxia_resident_net)]
+#[derive(Clone, Copy)]
+pub(crate) struct BootIdentity<'a>(AuthorizedNetwork<'a>);
+
+#[cfg(cyxia_resident_net)]
+impl<'a> BootIdentity<'a> {
+    pub(crate) fn from_deployment(deployment: AuthorizedNetwork<'a>) -> Self {
+        Self(deployment)
+    }
+
+    pub(crate) fn boot_epoch(&self) -> u64 {
+        self.0.boot_epoch()
+    }
+
+    pub(crate) fn confirmed_installation(&self) -> Option<TlsInstallation> {
+        Some(self.0.installation())
+    }
+
+    pub(crate) fn local_pin(&self) -> [u8; 32] {
+        self.listener().local_pin
+    }
+
+    fn peer_pin(&self) -> [u8; 32] {
+        self.listener().peer_pin
+    }
+
+    fn verifier_generation(&self) -> u64 {
+        self.tls().verifier_generation
+    }
+
+    pub(crate) fn tls(&self) -> TlsInstallation {
+        self.0.installation()
+    }
+
+    pub(crate) fn listener(&self) -> Listener {
+        self.0.listener()
+    }
+
+    pub(crate) fn verifier_image(&self) -> &'a [u8] {
+        self.0.verifier_image()
+    }
+
+    pub(crate) fn signer_image(&self) -> &'a [u8] {
+        self.0.signer_image()
+    }
+
+    pub(crate) fn ingress_image(&self) -> &'a [u8] {
+        self.0.ingress_image()
     }
 }
 
@@ -279,7 +352,7 @@ struct Memory {
 
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 #[cfg_attr(
-    feature = "v020-production-authenticated-net",
+    any(feature = "v020-production-authenticated-net", cyxia_resident_net),
     unsafe(export_name = "V020_SEC_N_VERIFIER_SPACE")
 )]
 static mut GUEST: AddressSpace<FRAME_CAP, STACK_PAGES> = AddressSpace::ZERO;
@@ -299,7 +372,7 @@ static mut CLOSE_SEEN: bool = false;
 static mut YIELD_RUN: u64 = 0;
 #[cfg(any(
     feature = "v0199-sec-n-selftest",
-    not(feature = "v020-production-authenticated-net")
+    not(any(feature = "v020-production-authenticated-net", cyxia_resident_net))
 ))]
 static mut ENTROPY_STATE: u64 = 0;
 static mut QUIESCENCE_REFUSED: u64 = 0;
@@ -312,21 +385,23 @@ static mut RELAYED_BYTES: u64 = 0;
 static mut STREAM_CLOSED: u64 = 0;
 // CPU0 only, reset when a stream is staged. The staged grant binds these
 // states to the same socket generation and source throughout the relay.
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Retirement {
     Open,
     Closing,
     Quiescent,
     Retired,
+    #[cfg(cyxia_resident_net)]
+    Rejected,
 }
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 static mut RETIREMENT: Retirement = Retirement::Open;
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 static mut TLS_WINDOW: Option<TlsWindow> = None;
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 static mut TLS_AUTHENTICATED_EPOCH: u64 = 0;
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 static mut EMPTY_ACTIVE_READ: bool = false;
 #[cfg(feature = "v020-production-authenticated-net")]
 static ACTIVE_POLL_TIMER: AtomicU64 = AtomicU64::new(0);
@@ -422,11 +497,25 @@ pub(crate) struct Layout {
 /// publish the user page table. Minimal bounded parser: the production PIE
 /// admission contract (pie_image_v0199) deliberately rejects ET_EXEC, so this
 /// loader parses the fixed-address guest directly and never grants capabilities.
+#[cfg(not(cyxia_resident_net))]
 pub(crate) fn load_guest() -> Layout {
     load_image(GUEST_ELF, &guest_memory(), SHARED_PAGES, true)
 }
 
 fn load_image(b: &[u8], memory: &Memory, shared_pages: usize, shared_writable: bool) -> Layout {
+    let loaded: Result<Layout, core::convert::Infallible> =
+        load_image_checkpointed(b, memory, shared_pages, shared_writable, &mut || Ok(()));
+    loaded.unwrap_or_else(|never| match never {})
+}
+
+fn load_image_checkpointed<E>(
+    b: &[u8],
+    memory: &Memory,
+    shared_pages: usize,
+    shared_writable: bool,
+    checkpoint: &mut impl FnMut() -> Result<(), E>,
+) -> Result<Layout, E> {
+    checkpoint()?;
     assert!(b.len() >= 64 && &b[0..4] == b"\x7fELF" && b[4] == 2 && b[5] == 1 && b[6] == 1);
     assert_eq!(le16(b, 16), 2, "guest must be ET_EXEC fixed-address");
     assert_eq!(le16(b, 18), 183, "guest must be AArch64");
@@ -488,6 +577,7 @@ fn load_image(b: &[u8], memory: &Memory, shared_pages: usize, shared_writable: b
             dst.copy_from_slice(&b[off..off + file]);
         }
         for p in 0..pages {
+            checkpoint()?;
             let index = first + p;
             let address = memory.frame_ptr(index) as u64;
             let pa = phys(address);
@@ -519,6 +609,7 @@ fn load_image(b: &[u8], memory: &Memory, shared_pages: usize, shared_writable: b
         memory.map_page(STACK_VA + p as u64 * PAGE as u64, pa, true, false);
     }
     // Publish root -> mid -> leaves.
+    checkpoint()?;
     unsafe {
         let mid_pa = phys(memory.mid as u64);
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*memory.root).0[0]), mid_pa | 3);
@@ -531,12 +622,12 @@ fn load_image(b: &[u8], memory: &Memory, shared_pages: usize, shared_writable: b
         }
     }
     tlbi();
-    Layout {
+    Ok(Layout {
         entry,
         bss_first,
         bss_end,
         used_frames,
-    }
+    })
 }
 
 fn shared_ptr() -> *mut u8 {
@@ -587,11 +678,15 @@ pub(crate) fn stage_connection(
     shared_write(OFF_VERSION, SVC_VERSION);
     shared_write(OFF_BOOT_EPOCH, identity.boot_epoch());
     shared_write(OFF_SERVICE_GEN, identity.verifier_generation());
-    shared_write(OFF_UNIX_SECONDS, UNIX_SECONDS);
+    shared_write(OFF_UNIX_SECONDS, wall_seconds().unwrap_or(0));
     shared_write(OFF_MONOTONIC_MS, now_ms());
-    shared_write(OFF_MONOTONIC_NS, accepted_ns);
     shared_put(OFF_LOCAL_NODE, &local);
-    shared_put(OFF_PEER_NODE, &PEER_NODE);
+    shared_put(OFF_PEER_NODE, &identity.peer_pin());
+    bind_connection(connected, conn_epoch, source, accepted_ns);
+}
+
+fn bind_connection(connected: bool, conn_epoch: u64, source: u32, accepted_ns: u64) {
+    shared_write(OFF_MONOTONIC_NS, accepted_ns);
     shared_write(OFF_CONN_EPOCH, conn_epoch);
     shared_write(OFF_PEER_IPV4, u64::from(source));
     unsafe {
@@ -607,7 +702,7 @@ pub(crate) fn stage_connection(
         ADMISSION_RECEIPT = None;
         RELAYED_BYTES = 0;
         STREAM_CLOSED = 0;
-        #[cfg(feature = "v020-production-authenticated-net")]
+        #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
         {
             RETIREMENT = Retirement::Open;
             TLS_AUTHENTICATED_EPOCH = 0;
@@ -623,6 +718,7 @@ pub(crate) fn stage_connection(
 
 /// Re-zero the guest bss + stack between phases so each phase is a fresh guest
 /// (allocator, NEXT_SESSION atomic and stack state reset). Code/rodata stay sealed.
+#[cfg(not(cyxia_resident_net))]
 pub(crate) fn reset_guest_data(layout: &Layout) {
     let memory = guest_memory();
     for i in layout.bss_first..layout.bss_end {
@@ -657,7 +753,7 @@ pub(crate) fn discard_guest_session(layout: &Layout, boot_epoch: u64) {
     );
 }
 
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 fn discard_role_space(memory: &Memory, layout: &Layout) -> usize {
     // SAFETY: the caller owns this stopped, pinned role root and its
     // writable backing. No subsequent entry can reach its pages.
@@ -688,17 +784,26 @@ fn fresh_context(layout: &Layout) -> user::Context {
 }
 
 /// Independent kernel-side broker allowlist (mirrors the guest broker_surface).
+fn wall_seconds() -> Option<u64> {
+    #[cfg(cyxia_resident_net)]
+    return crate::clock::seconds();
+    #[cfg(not(cyxia_resident_net))]
+    Some(UNIX_SECONDS)
+}
+
 fn allowed(op: u64, len: u64, arg0: u64) -> bool {
     if len > PAYLOAD as u64 {
         return false;
     }
     match op {
         OP_ENTROPY | OP_READ => arg0 == 0,
-        #[cfg(feature = "v020-production-authenticated-net")]
+        #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
         OP_POLL_NORMAL_CLOSE | OP_ADMISSION_RETIRED | OP_TLS_AUTHENTICATED => {
             len == receipt::WIRE_BYTES as u64 && arg0 == 0
         }
-        #[cfg(feature = "v020-production-authenticated-net")]
+        #[cfg(cyxia_resident_net)]
+        OP_ADMISSION_REJECTED => len == receipt::WIRE_BYTES as u64 && arg0 == 0,
+        #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
         OP_TLS_CERTIFICATE_VERIFY => {
             len == cyxia_contracts::tls_signer::SIGNATURE_BYTES as u64 && arg0 == 0
         }
@@ -716,7 +821,7 @@ pub(crate) type EntropyFill<'a> = dyn FnMut(&mut [u8]) -> bool + 'a;
 /// Non-authenticated fixture entropy. The authenticated mode has no fallback.
 #[cfg(any(
     feature = "v0199-sec-n-selftest",
-    not(feature = "v020-production-authenticated-net")
+    not(any(feature = "v020-production-authenticated-net", cyxia_resident_net))
 ))]
 pub(crate) fn fixture_entropy(out: &mut [u8]) -> bool {
     let mut state = unsafe { ENTROPY_STATE };
@@ -743,7 +848,9 @@ fn broker<P: Port>(
     port: &mut P,
     entropy: &mut EntropyFill<'_>,
     close_poll: Option<ClosePoll<P>>,
-    #[cfg(feature = "v020-production-authenticated-net")] signer: Option<&mut signer::Signer<'_>>,
+    #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))] signer: Option<
+        &mut signer::Signer<'_>,
+    >,
 ) {
     let op = shared_read(OFF_OP);
     let len = shared_read(OFF_LEN);
@@ -772,24 +879,29 @@ fn broker<P: Port>(
         OP_TIME => {
             shared_write(OFF_MONOTONIC_MS, now_ms());
             shared_write(OFF_MONOTONIC_NS, now_ns());
-            shared_write(OFF_UNIX_SECONDS, UNIX_SECONDS);
+            let Some(unix) = wall_seconds() else {
+                return reply(0, ST_FAILED);
+            };
+            shared_write(OFF_UNIX_SECONDS, unix);
             reply(0, ST_OK);
         }
         OP_POLL => broker_poll(close_poll.is_some()),
-        #[cfg(feature = "v020-production-authenticated-net")]
+        #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
         OP_POLL_NORMAL_CLOSE | OP_ADMISSION_RETIRED => broker_normal_close(port, close_poll, op),
         #[cfg(feature = "v020-production-authenticated-net")]
         OP_TLS_CERTIFICATE_VERIFY => broker_certificate_verify(signer),
-        #[cfg(feature = "v020-production-authenticated-net")]
+        #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
         OP_TLS_AUTHENTICATED => broker_tls_authenticated(signer),
-        #[cfg(feature = "v020-production-authenticated-net")]
+        #[cfg(cyxia_resident_net)]
+        OP_ADMISSION_REJECTED => broker_pending_rejected(),
+        #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
         OP_READ | OP_WRITE if unsafe { RETIREMENT } != Retirement::Open => reply(0, ST_FAILED),
         OP_ADMISSION_GRANTED => broker_admission_granted(),
         OP_READ | OP_WRITE if !unsafe { CONNECTED } => reply(0, ST_EOF),
         OP_READ => broker_read(
             port,
             len,
-            #[cfg(feature = "v020-production-authenticated-net")]
+            #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
             signer.is_some(),
         ),
         OP_WRITE => broker_write(port, len),
@@ -813,6 +925,20 @@ fn broker<P: Port>(
 
 #[cfg(feature = "v020-production-authenticated-net")]
 fn broker_certificate_verify(signer: Option<&mut signer::Signer<'_>>) {
+    let Some((epoch, deadline_ns, transcript)) = certificate_verify_request() else {
+        return reply(0, ST_FAILED);
+    };
+    certificate_verify_reply(
+        signer.and_then(|signer| signer.certificate_verify(epoch, deadline_ns, transcript)),
+    );
+}
+
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
+fn certificate_verify_request() -> Option<(
+    u64,
+    u64,
+    [u8; cyxia_contracts::tls_signer::TRANSCRIPT_BYTES],
+)> {
     let (connected, epoch, source, grant, state, deadline_ns) = unsafe {
         (
             CONNECTED,
@@ -828,11 +954,16 @@ fn broker_certificate_verify(signer: Option<&mut signer::Signer<'_>>) {
         || state != Retirement::Open
         || unsafe { TLS_AUTHENTICATED_EPOCH } != 0
     {
-        return reply(0, ST_FAILED);
+        return None;
     }
     let mut transcript = [0; cyxia_contracts::tls_signer::TRANSCRIPT_BYTES];
     shared_bytes(OFF_PAYLOAD, &mut transcript);
-    match signer.and_then(|signer| signer.certificate_verify(epoch, deadline_ns, transcript)) {
+    Some((epoch, deadline_ns, transcript))
+}
+
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
+fn certificate_verify_reply(signature: Option<[u8; cyxia_contracts::tls_signer::SIGNATURE_BYTES]>) {
+    match signature {
         Some(signature) => {
             shared_put(OFF_PAYLOAD, &signature);
             shared_write(OFF_ARG0, 0);
@@ -842,7 +973,7 @@ fn broker_certificate_verify(signer: Option<&mut signer::Signer<'_>>) {
     }
 }
 
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 fn broker_tls_authenticated(signer: Option<&mut signer::Signer<'_>>) {
     let mut wire = [0u8; receipt::WIRE_BYTES];
     shared_bytes(OFF_PAYLOAD, &mut wire);
@@ -876,6 +1007,7 @@ fn broker_tls_authenticated(signer: Option<&mut signer::Signer<'_>>) {
         TLS_WINDOW = Some(window);
         TLS_AUTHENTICATED_EPOCH = epoch;
     };
+    #[cfg(not(cyxia_resident_net))]
     report(
         "V020_SEC_N_VERIFIER_AUTHENTICATED",
         epoch,
@@ -919,7 +1051,38 @@ fn broker_admission_granted() {
     reply(0, ST_OK);
 }
 
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(cyxia_resident_net)]
+fn broker_pending_rejected() {
+    let mut wire = [0; receipt::WIRE_BYTES];
+    shared_bytes(OFF_PAYLOAD, &mut wire);
+    let (epoch, polled, source, grant, state, authenticated) = unsafe {
+        (
+            CONN_EPOCH,
+            POLLED_EPOCH,
+            CONN_SOURCE,
+            ADMISSION_RECEIPT,
+            RETIREMENT,
+            TLS_AUTHENTICATED_EPOCH,
+        )
+    };
+    // The trusted, stopped verifier already removed this pending ticket.
+    // Authorize transport drain for its exact original generation on CPU1.
+    if state != Retirement::Open
+        || authenticated != 0
+        || grant != Some((epoch, source))
+        || receipt::validate(&wire, true, epoch, polled, source, false) != grant
+    {
+        return reply(0, ST_FAILED);
+    }
+    unsafe {
+        RETIREMENT = Retirement::Rejected;
+        CONNECTED = false;
+        TLS_WINDOW = None;
+    }
+    reply(0, ST_OK);
+}
+
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 fn broker_normal_close<P: Port>(port: &mut P, close_poll: Option<ClosePoll<P>>, op: u64) {
     let Some(poll) = close_poll else {
         return reply(0, ST_FAILED);
@@ -967,6 +1130,8 @@ fn broker_entropy(len: u64, fill: &mut EntropyFill<'_>) {
         return reply(0, ST_FAILED);
     }
     shared_put(OFF_PAYLOAD, &buf[..n]);
+    #[cfg(cyxia_resident_net)]
+    zeroize::Zeroize::zeroize(&mut buf[..n]);
     reply(n as u64, ST_OK);
 }
 
@@ -988,7 +1153,9 @@ fn broker_poll(normal_close: bool) {
     shared_write(OFF_PEER_IPV4, u64::from(source));
     shared_write(
         OFF_ARG0,
-        u64::from(connected) | (u64::from(normal_close && connected) << 1),
+        u64::from(connected)
+            | (u64::from(normal_close && connected) << 1)
+            | (u64::from(cfg!(cyxia_resident_net)) << 2),
     );
     reply(0, ST_OK);
 }
@@ -1001,7 +1168,8 @@ fn broker_poll(normal_close: bool) {
 fn broker_read<P: Port>(
     port: &mut P,
     len: u64,
-    #[cfg(feature = "v020-production-authenticated-net")] authenticated_profile: bool,
+    #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
+    authenticated_profile: bool,
 ) {
     let limit = len as usize;
     if limit == 0 {
@@ -1010,7 +1178,7 @@ fn broker_read<P: Port>(
     let mut frame = [0u8; device::MTU];
     match port.receive_up_to(&mut frame, limit) {
         Ok(Some(n)) if n != 0 && n <= limit && n <= frame.len() => {
-            #[cfg(feature = "v020-production-authenticated-net")]
+            #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
             if authenticated_profile {
                 let Some(mut window) = (unsafe { TLS_WINDOW }) else {
                     return reply(0, ST_FAILED);
@@ -1030,7 +1198,7 @@ fn broker_read<P: Port>(
             reply(n as u64, ST_OK);
         }
         Ok(None | Some(0)) | Err(device::Error::WouldBlock) => {
-            #[cfg(feature = "v020-production-authenticated-net")]
+            #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
             unsafe {
                 EMPTY_ACTIVE_READ = authenticated_profile && TLS_AUTHENTICATED_EPOCH != 0;
             };
@@ -1041,7 +1209,7 @@ fn broker_read<P: Port>(
 }
 
 fn broker_write<P: Port>(port: &mut P, len: u64) {
-    #[cfg(feature = "v020-production-authenticated-net")]
+    #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
     unsafe {
         EMPTY_ACTIVE_READ = false;
     };
@@ -1055,7 +1223,7 @@ fn broker_write<P: Port>(port: &mut P, len: u64) {
     }
 }
 
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 pub(crate) fn admits_next_transmit() -> bool {
     // The same CPU0 foreground owns both the TCP turn and this snapshot.
     let (connected, retirement, window) = unsafe { (CONNECTED, RETIREMENT, TLS_WINDOW) };
@@ -1136,22 +1304,31 @@ fn wait_after_empty_read() {
 /// execute() but uses the immutable-root entry (no per-SVC global TLBI) because the
 /// guest page-table descriptors never change while it runs.
 fn step(ctx: &mut user::Context, root: u64, asid: u8, latest_tick: u64) {
+    #[cfg(cyxia_resident_net)]
+    if timer::ticks() >= latest_tick {
+        ctx.kind = 9;
+        return;
+    }
     let quantum = (timer::frequency() / 1000).max(1);
+    #[cfg(cyxia_resident_net)]
+    resident::publish_entry(root, asid);
     unsafe {
         timer::arm(timer::ticks().saturating_add(quantum).min(latest_tick));
         user::enter_immutable(ctx, root, asid);
         cpu::disable_timer();
     }
+    #[cfg(cyxia_resident_net)]
+    resident::finish_entry(ctx);
 }
 
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 fn ticks_at_ns(ns: u64) -> u64 {
     (u128::from(ns) * u128::from(timer::frequency()))
         .div_ceil(1_000_000_000)
         .min(u128::from(u64::MAX)) as u64
 }
 
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 fn tls_timeout(window: TlsWindow, observed_ns: u64, dispatched: u64) -> GuestStop {
     let (expires_ns, limit) = window.deadline();
     let code = match (window.phase(), limit) {
@@ -1160,6 +1337,7 @@ fn tls_timeout(window: TlsWindow, observed_ns: u64, dispatched: u64) -> GuestSto
         (Phase::Active, Limit::Lifetime) => 905,
         (Phase::Active, Limit::Idle) => 906,
     };
+    #[cfg(not(cyxia_resident_net))]
     report(
         match window.phase() {
             Phase::Pending => "V020_SEC_N_PENDING_TIMEOUT",
@@ -1169,6 +1347,8 @@ fn tls_timeout(window: TlsWindow, observed_ns: u64, dispatched: u64) -> GuestSto
         expires_ns - window.start_ns(),
         observed_ns - window.start_ns(),
     );
+    #[cfg(cyxia_resident_net)]
+    let _ = (expires_ns, observed_ns);
     GuestStop { code, dispatched }
 }
 
@@ -1181,7 +1361,10 @@ pub(crate) struct GuestStop {
     pub(crate) code: u64,
     /// SVC dispatches performed before the stop (read by production only; the
     /// fixture halts on `code`).
-    #[cfg_attr(not(feature = "v020-production"), allow(dead_code))]
+    #[cfg_attr(
+        any(not(feature = "v020-production"), cyxia_resident_net),
+        allow(dead_code)
+    )]
     pub(crate) dispatched: u64,
 }
 
@@ -1200,7 +1383,7 @@ pub(crate) fn run_until_park<P: Port>(layout: &Layout, port: &mut P, budget: u64
 /// stop instead of halting the boot. Returns the number of SVC dispatches.
 #[cfg(any(
     feature = "v0199-sec-n-selftest",
-    not(feature = "v020-production-authenticated-net")
+    not(any(feature = "v020-production-authenticated-net", cyxia_resident_net))
 ))]
 pub(crate) fn try_run_until_park<P: Port>(
     layout: &Layout,
@@ -1214,20 +1397,20 @@ pub(crate) fn try_run_until_park<P: Port>(
         entropy,
         budget,
         None,
-        #[cfg(feature = "v020-production-authenticated-net")]
+        #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
         None,
     )
 }
 
+#[cfg(not(cyxia_resident_net))]
 pub(crate) fn run_guest<P: Port>(
     layout: &Layout,
     port: &mut P,
     entropy: &mut EntropyFill<'_>,
     budget: u64,
     close_poll: Option<ClosePoll<P>>,
-    #[cfg(feature = "v020-production-authenticated-net")] mut signer: Option<
-        &mut signer::Signer<'_>,
-    >,
+    #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
+    mut signer: Option<&mut signer::Signer<'_>>,
 ) -> Result<u64, GuestStop> {
     struct SavedContext(user::Context);
     impl Drop for SavedContext {
@@ -1244,7 +1427,7 @@ pub(crate) fn run_guest<P: Port>(
     let mut dispatched = 0u64;
     let stop = |code, dispatched| Err(GuestStop { code, dispatched });
     for _ in 0..budget {
-        #[cfg(feature = "v020-production-authenticated-net")]
+        #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
         let (window, latest_tick) =
             if signer.is_some() && unsafe { !CLOSE_SEEN && RETIREMENT == Retirement::Open } {
                 let Some(window) = (unsafe { TLS_WINDOW }) else {
@@ -1259,7 +1442,7 @@ pub(crate) fn run_guest<P: Port>(
             } else {
                 (None, u64::MAX)
             };
-        #[cfg(not(feature = "v020-production-authenticated-net"))]
+        #[cfg(not(any(feature = "v020-production-authenticated-net", cyxia_resident_net)))]
         let latest_tick = u64::MAX;
         step(ctx, root, GUEST_ASID, latest_tick);
         if ctx.kind == 9 {
@@ -1272,7 +1455,7 @@ pub(crate) fn run_guest<P: Port>(
         if iss != 0x43 {
             return stop(901, dispatched); // only SVC 0x43 is admitted for this guest.
         }
-        #[cfg(feature = "v020-production-authenticated-net")]
+        #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
         if let Some(window) = window
             && timer::ticks() >= latest_tick
         {
@@ -1282,7 +1465,7 @@ pub(crate) fn run_guest<P: Port>(
             port,
             entropy,
             close_poll,
-            #[cfg(feature = "v020-production-authenticated-net")]
+            #[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
             signer.as_deref_mut(),
         );
         dispatched += 1;
@@ -1298,21 +1481,21 @@ pub(crate) fn run_guest<P: Port>(
 
 // ---- by-value broker state accessors (no reference to a static escapes) ----
 /// The accepted receipt for this one-shot guest connection.
-#[cfg(feature = "v020-production")]
+#[cfg(feature = "v020-production-diagnostic")]
 pub(crate) fn admission_receipt() -> Option<(u64, u32)> {
     unsafe { ADMISSION_RECEIPT }
 }
-#[cfg(feature = "v020-production-authenticated-net")]
+#[cfg(any(feature = "v020-production-authenticated-net", cyxia_resident_net))]
 pub(crate) fn retired() -> bool {
     unsafe { RETIREMENT == Retirement::Retired }
 }
 /// Ingress bytes delivered to the guest through SVC 0x43 READ.
-#[cfg(feature = "v020-production")]
+#[cfg(feature = "v020-production-diagnostic")]
 pub(crate) fn relayed_bytes() -> u64 {
     unsafe { RELAYED_BYTES }
 }
 /// Closed/reset/failed stream events surfaced to the guest as EOF.
-#[cfg(feature = "v020-production")]
+#[cfg(feature = "v020-production-diagnostic")]
 pub(crate) fn stream_closed() -> u64 {
     unsafe { STREAM_CLOSED }
 }

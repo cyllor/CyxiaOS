@@ -1,5 +1,8 @@
 """Independent replay of the signed scratch CPU0 trace."""
 
+from pathlib import Path
+import struct
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -62,6 +65,20 @@ class SignedBudgetTraceTests(unittest.TestCase):
         with patch("verify_v020_signed_resident.symbol", return_value={"pa": 0x4000, "size": 14}):
             with self.assertRaisesRegex(ValueError, "invalid linked role syscall ABI table"):
                 capture_role_syscall_abi(None, None, b"")
+
+    def test_role_abi_readback_requires_the_expected_retirement(self):
+        class StoppedGuest:
+            def execute(self, command, args):
+                if command == "pmemsave":
+                    Path(args["filename"]).write_bytes(struct.pack("<8H", 0, *([3] * 7)))
+
+        with (tempfile.TemporaryDirectory() as output,
+              patch("verify_v020_signed_resident.symbol", return_value={"pa": 0x4000, "size": 16})):
+            guest = StoppedGuest()
+            result = capture_role_syscall_abi(guest, Path(output), b"", retired_index=0)
+            self.assertEqual(result["role_syscall_abi"][6], 0)
+            with self.assertRaisesRegex(ValueError, "live and retired roles"):
+                capture_role_syscall_abi(guest, Path(output), b"", retired_index=1)
 
     def test_replays_eight_complete_windows_and_all_returned_role_turns(self):
         proof = self.replay()
@@ -148,6 +165,26 @@ class SignedBudgetTraceTests(unittest.TestCase):
         invalid = self.evidence(SIGNED_EARLY_TRACE_BYTES, frame_span=(1, 5))
         with self.assertRaisesRegex(ValueError, "precede policy and media"):
             verify_signed_trace(invalid, *args, media_budget=media, frame_budget=(1, 400, 8_000_000))
+
+    def test_uart_runtime_recovery_must_be_inside_the_sealed_trace(self):
+        self.early_boot(dense=True)
+        raw = self.evidence(SIGNED_EARLY_TRACE_BYTES, frame_span=(1, 3))
+        with self.assertRaisesRegex(ValueError, "runtime Recovery PMU debits"):
+            verify_signed_trace(raw, 2, self.roles, (100, 200, 1_000), self.uart,
+                                media_budget=(1, 300, 8_000_000),
+                                frame_budget=(1, 400, 8_000_000),
+                                runtime_recovery=[(1, 250, 8_000_000)])
+
+    def test_sec_s_load_rejects_a_missing_or_mismatched_terminal_witness(self):
+        self.early_boot(dense=True)
+        raw = self.evidence(SIGNED_EARLY_TRACE_BYTES, frame_span=(1, 3))
+        args = (raw, 2, self.roles, (100, 200, 1_000), self.uart)
+        budgets = {"media_budget": (1, 300, 8_000_000), "frame_budget": (1, 400, 8_000_000)}
+        with self.assertRaisesRegex(ValueError, "requires a terminal dense trace"):
+            verify_signed_trace(*args, **budgets, sec_s_load=True)
+        with self.assertRaisesRegex(ValueError, "differs from the terminal UART witness"):
+            verify_signed_trace(*args, **budgets, sec_s_load=True,
+                                trace_final=(self.header[9] // WINDOW, len(self.rows) + 1, self.header[11]))
 
 
 if __name__ == "__main__":

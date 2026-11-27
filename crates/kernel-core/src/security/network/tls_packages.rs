@@ -19,6 +19,24 @@ impl TlsInstallation {
         verifier: &[u8],
         signer: &[u8],
     ) -> Result<(), Error> {
+        if verifier.is_empty() || signer.is_empty() {
+            return Err(Error::Invalid);
+        }
+        self.qualify_package_hashes(
+            boot_key,
+            signature,
+            Sha256::digest(verifier).into(),
+            Sha256::digest(signer).into(),
+        )
+    }
+
+    pub(super) fn qualify_package_hashes(
+        &self,
+        boot_key: &[u8; 32],
+        signature: &[u8; 64],
+        verifier: [u8; 32],
+        signer: [u8; 32],
+    ) -> Result<(), Error> {
         if [
             self.verifier_generation,
             self.signer_generation,
@@ -26,8 +44,8 @@ impl TlsInstallation {
         ]
         .contains(&0)
             || self.key_manifest_hash == [0; 32]
-            || verifier.is_empty()
-            || signer.is_empty()
+            || verifier == [0; 32]
+            || signer == [0; 32]
         {
             return Err(Error::Invalid);
         }
@@ -38,8 +56,8 @@ impl TlsInstallation {
         fields[8..16].copy_from_slice(&self.signer_generation.to_le_bytes());
         fields[16..24].copy_from_slice(&self.key_generation.to_le_bytes());
         fields[24..56].copy_from_slice(&self.key_manifest_hash);
-        fields[56..88].copy_from_slice(&Sha256::digest(verifier));
-        fields[88..120].copy_from_slice(&Sha256::digest(signer));
+        fields[56..88].copy_from_slice(&verifier);
+        fields[88..120].copy_from_slice(&signer);
         VerifyingKey::from_bytes(boot_key)
             .and_then(|key| key.verify_strict(&message, &Signature::from_bytes(signature)))
             .map_err(|_| Error::Unauthorized)
