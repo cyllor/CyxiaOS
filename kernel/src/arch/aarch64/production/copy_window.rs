@@ -2,7 +2,8 @@
 //! The stack and page tables are pinned in the image for the entire boot.
 
 use super::{
-    EFAULT, NativeRole, Role, cpu, fatal, mmu, phys, role_asid, root_pa, stack_span, trapped_ttbr0,
+    EFAULT, NativeRole, Role, cpu, fatal, frames, mmu, phys, role_asid, root_pa, stack_span,
+    trapped_ttbr0,
 };
 use core::{
     arch::asm,
@@ -65,10 +66,10 @@ impl StackSpan {
             return Err(EFAULT);
         }
         let physical = phys(stack_span(index, address, length, write).ok_or(EFAULT)?);
+        let end = physical.checked_add(length as u64).ok_or(EFAULT)?;
         if physical < cyxia_platform_virt::ENTRY
-            || physical
-                .checked_add(length as u64)
-                .is_none_or(|end| end > cyxia_platform_virt::KERNEL_POOL_END)
+            || end > cyxia_platform_virt::KERNEL_POOL_END
+            || !frames::statically_pinned_control_span(physical..end)
         {
             return Err(EFAULT);
         }

@@ -10,8 +10,9 @@
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
 //! * ROWS_BACKING (static mut): the only `&mut` to it is created once in
 //!   `register_production_statics`, guarded by the REGISTERED swap, on CPU0
-//!   before any secondary CPU or EL0 role runs. The ledger borrowing it is
-//!   dropped before return; nothing else reads or writes the rows.
+//!   before any secondary CPU or EL0 role runs. Copy-window builds retain the
+//!   same ledger in PERMANENT_LEDGER and publish it through REGISTERED_PAGES.
+//!   Later checks take shared references only.
 //! * REGISTERED and the inventory counters (atomics): CPU0 only. REGISTERED
 //!   makes the registration one-shot; the counters carry seal-time evidence.
 //! * `__sec_n_start` / `__sec_n_end` (linker symbols): only their addresses are
@@ -27,6 +28,12 @@ use super::super::{
 use super::{BACKING, Backing, COPY_BUFFER, CopyBuffer, ROLE_COUNT, TABLES, Tables};
 #[cfg(feature = "v020-production-diagnostic")]
 use super::{EXEC_TARGET, ExecTarget, PLAN_POOL, PLAN_POOL_BYTES, evidence};
+#[cfg(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch"
+))]
+use core::mem::MaybeUninit;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind};
@@ -58,6 +65,12 @@ const STATICS: usize = if cfg!(feature = "v020-production-diagnostic") {
 const FATAL_FRAME_META: u64 = 0x5731_1290;
 
 static mut ROWS_BACKING: [FrameMeta; ROWS] = [FrameMeta::ZERO; ROWS];
+#[cfg(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch"
+))]
+static mut PERMANENT_LEDGER: MaybeUninit<Ledger<'static>> = MaybeUninit::uninit();
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static REGISTERED_PAGES: AtomicU64 = AtomicU64::new(0);
 static PERMANENT_ROWS: AtomicU64 = AtomicU64::new(0);
@@ -165,13 +178,37 @@ fn register_production_statics() -> Result<(Inventory, u64), Error> {
     if pages > ROWS {
         return Err(Error::Range);
     }
-    // SAFETY: one-shot (REGISTERED swap above) on CPU0 before secondaries or
-    // EL0 run; this is the only reference ever formed to ROWS_BACKING and the
-    // ledger borrowing it is dropped before return.
+    // SAFETY: one-shot (REGISTERED swap above) on CPU0 before any secondary
+    // or EL0 entry. No other mutable reference can reach the backing.
     let rows = unsafe { &mut (&mut *addr_of_mut!(ROWS_BACKING))[..pages] };
     let ledger = Ledger::initialize_static_sparse(rows, base, &regions).map_err(Error::Ledger)?;
     let inventory = ledger.inventory().map_err(Error::Ledger)?;
+    #[cfg(any(
+        feature = "v020-production-snapshot-catalog",
+        feature = "v020-production-file-read",
+        feature = "v020-production-fsync-scratch"
+    ))]
+    // SAFETY: sole initialization. The caller release-publishes the ledger
+    // only after this succeeds. Later readers never mutate it.
+    unsafe {
+        addr_of_mut!(PERMANENT_LEDGER).write(MaybeUninit::new(ledger));
+    }
     Ok((inventory, service.region.len / PAGE))
+}
+
+#[cfg(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch"
+))]
+pub(super) fn statically_pinned_control_span(span: core::ops::Range<u64>) -> bool {
+    if REGISTERED_PAGES.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    // SAFETY: the acquire observes the one-shot ledger publication. Its
+    // static rows and region records are never modified after publication.
+    let ledger = unsafe { (*addr_of!(PERMANENT_LEDGER)).assume_init_ref() };
+    ledger.statically_pinned(span, StaticClass::Control)
 }
 
 /// Registered static pages: the class tallies, never the unregistered gaps.
