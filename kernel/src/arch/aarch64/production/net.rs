@@ -117,6 +117,12 @@ impl StreamPort<'_, '_> {
 impl Port for StreamPort<'_, '_> {
     fn send(&mut self, bytes: &[u8]) -> Result<(), device::Error> {
         self.turn();
+        // Poll may finish after the broker's last deadline sample. Already
+        // admitted TCP work can progress, but new data must pass the live gate.
+        #[cfg(feature = "v020-production-authenticated-net")]
+        if !sec_n_broker::admits_next_transmit() {
+            return Err(device::Error::WouldBlock);
+        }
         match self.tcp.send_exact(bytes) {
             Ok(()) => Ok(()),
             Err(tcp::Error::WouldBlock) => Err(device::Error::WouldBlock),
@@ -250,6 +256,7 @@ fn open_stream<'a>(
 /// the production boot.
 fn relay(
     stream: &mut Stream<'_>,
+    identity: sec_n_broker::BootIdentity,
     source: u32,
     accepted_ns: u64,
     entropy: &mut sec_n_broker::EntropyFill<'_>,
@@ -262,11 +269,18 @@ fn relay(
         sec_n_broker::GUEST_ELF.len() as u64,
     );
     sec_n_broker::reset_guest_data(&layout);
-    sec_n_broker::stage_connection(sec_n_broker::LOCAL_NODE, true, 1, source, accepted_ns);
+    sec_n_broker::stage_connection(
+        identity,
+        sec_n_broker::LOCAL_NODE,
+        true,
+        1,
+        source,
+        accepted_ns,
+    );
     let mut port = StreamPort { tcp: stream };
     #[cfg(feature = "v020-production-authenticated-net")]
     {
-        let mut signer = sec_n_broker::signer::Signer::load();
+        let mut signer = sec_n_broker::signer::Signer::load(identity);
         sec_n_broker::run_guest(
             &layout,
             &mut port,
@@ -283,7 +297,7 @@ fn relay(
 }
 
 /// One-shot SEC-N service run on CPU0 (after the advice chain).
-pub(super) fn serve(info: &BootInfo) -> NetOutcome {
+pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity) -> NetOutcome {
     // net_device::init is itself one-shot (CLAIMED) and CPU0-only.
     let mut dev = match net_device::init(info) {
         Ok(dev) => dev,
@@ -298,10 +312,10 @@ pub(super) fn serve(info: &BootInfo) -> NetOutcome {
             return NetOutcome::default();
         }
     };
-    let outcome = serve_attached_network(info, &mut dev);
+    let outcome = serve_attached_network(info, &mut dev, identity);
     // The stream and its polling port have been dropped. The exclusive
     // device owner freezes both queues before attempting the MMIO reset.
-    match dev.stop(super::BOOT) {
+    match dev.stop(identity.boot_epoch) {
         Ok(proofs) => {
             for proof in proofs {
                 emit_reset_proof(proof);
@@ -336,9 +350,10 @@ fn serve_attached_network(
     )]
     info: &BootInfo,
     dev: &mut NetDevice,
+    identity: sec_n_broker::BootIdentity,
 ) -> NetOutcome {
     #[cfg(feature = "v020-production-authenticated-net")]
-    let mut rng = match net_entropy::Entropy::attach(info, super::BOOT) {
+    let mut rng = match net_entropy::Entropy::attach(info, identity.boot_epoch) {
         Ok(rng) => rng,
         Err(error) => {
             report("V020_W12_NET_ENTROPY_UNAVAILABLE", error as u64, 0, 0);
@@ -364,7 +379,7 @@ fn serve_attached_network(
     let mut entropy = |out: &mut [u8]| rng.fill(out);
     #[cfg(not(feature = "v020-production-authenticated-net"))]
     let mut entropy = sec_n_broker::fixture_entropy;
-    let outcome = serve_stream(dev, u64::from_le_bytes(seed) | 1, &mut entropy);
+    let outcome = serve_stream(dev, identity, u64::from_le_bytes(seed) | 1, &mut entropy);
     #[cfg(feature = "v020-production-authenticated-net")]
     let outcome = {
         let rng_bytes = rng.supplied - TCP_SEED_BYTES as u64;
@@ -390,6 +405,7 @@ fn serve_attached_network(
 
 fn serve_stream(
     dev: &mut NetDevice,
+    identity: sec_n_broker::BootIdentity,
     random_seed: u64,
     entropy: &mut sec_n_broker::EntropyFill<'_>,
 ) -> NetOutcome {
@@ -419,7 +435,7 @@ fn serve_stream(
             };
         }
     };
-    let (dispatched, stop_code) = match relay(&mut stream, source, accepted_ns, entropy) {
+    let (dispatched, stop_code) = match relay(&mut stream, identity, source, accepted_ns, entropy) {
         Ok(dispatched) => (dispatched, 0),
         Err(stop) => (stop.dispatched, stop.code),
     };

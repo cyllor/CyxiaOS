@@ -1,6 +1,7 @@
 // The frame's first 288 bytes are the Rust ExceptionFrame ABI. The tail
 // holds banked state and the custody needed for one independent nested frame.
 .equ FRAME_BYTES, 512
+.equ FRAME_USER_TRANSLATION, 280
 .equ FRAME_SP_EL0, 288
 .equ FRAME_SP_EL1, 296
 .equ FRAME_TPIDR_EL0, 304
@@ -16,6 +17,21 @@
 .equ SCRATCH_FATAL_SP, 416
 .equ SCRATCH_FATAL_ELR, 424
 .equ SCRATCH_FATAL_FAR, 440
+.equ SCRATCH_FATAL_REASON, 448
+.equ SCRATCH_ACTIVE_TRANSLATION, 456
+.equ SOFTWARE_STOP_KIND, 16
+
+.if {software_pan}
+.macro fence_user_translation
+ mrs x2, ttbr1_el1
+ bic x2, x2, #0xffff000000000000
+ msr ttbr1_el1, x2
+ isb
+ ldr x2, =empty_l1
+ msr ttbr0_el1, x2
+ isb
+.endm
+.endif
 
 .section .text.vectors,"ax"
 .balign 2048
@@ -96,13 +112,37 @@ exception_entry:
  mrs x2, esr_el1
  mrs x3, far_el1
  stp x2, x3, [x0, #264]
- str xzr, [x0, #280]
+ str xzr, [x0, #FRAME_USER_TRANSLATION]
  mrs x2, sp_el0
  mov x3, sp
  stp x2, x3, [x0, #FRAME_SP_EL0]
  mrs x2, tpidr_el0
  stp x2, x1, [x0, #FRAME_TPIDR_EL0]
 
+.if {software_pan}
+ cmp x1, #8
+ b.lo exception_check_kernel_translation
+ // Preserve the actual user translation in trusted scratch. This code and
+ // the scratch pages remain global across both ASID writes.
+ mrs x2, ttbr0_el1
+ mrs x4, ttbr1_el1
+ and x4, x4, #0xffff000000000000
+ orr x2, x2, x4
+ str x2, [x0, #FRAME_USER_TRANSLATION]
+ fence_user_translation
+ b exception_translation_ready
+exception_check_kernel_translation:
+ // An exception while a return is still committing its user translation
+ // is terminal. Ordinary nested EL1 only inherits the empty translation.
+ mrs x2, ttbr1_el1
+ tst x2, #0xffff000000000000
+ b.ne exception_emergency
+ mrs x2, ttbr0_el1
+ ldr x4, =empty_l1
+ cmp x2, x4
+ b.ne exception_emergency
+exception_translation_ready:
+.endif
  ldr x2, =EXCEPTION_ADMISSION_CLOSED
  ldar x2, [x2]
  cbnz x2, exception_stop_observed
@@ -189,6 +229,12 @@ exception_use_stack:
  str x0, [x6, #FRAME_SCRATCH]
  ldp x7, x8, [x0, #SCRATCH_ACTIVE_BASE]
  stp x7, x8, [x6, #FRAME_PRIOR_BASE]
+.if {software_pan}
+ cbnz x2, exception_publish_stack
+ ldr x9, [x6, #FRAME_USER_TRANSLATION]
+ str x9, [x0, #SCRATCH_ACTIVE_TRANSLATION]
+exception_publish_stack:
+.endif
  add x2, x2, #1
  str x2, [x0, #SCRATCH_DEPTH]
  stp x4, x6, [x0, #SCRATCH_ACTIVE_BASE]
@@ -215,6 +261,19 @@ exception_use_stack:
  b exception_restore_status
 exception_restore_user:
  bic x3, x3, #0x200000       // Clear single-step state on EL0 return.
+.if {software_pan}
+ ldr x4, [x30, #FRAME_USER_TRANSLATION]
+ and x5, x4, #0xffff000000000000
+ cbz x5, exception_emergency
+ and x4, x4, #0x0000ffffffffffff
+ msr ttbr0_el1, x4
+ isb
+ mrs x4, ttbr1_el1
+ bic x4, x4, #0xffff000000000000
+ orr x4, x4, x5
+ msr ttbr1_el1, x4
+ isb
+.endif
 exception_restore_status:
  msr elr_el1, x2
  msr spsr_el1, x3
@@ -227,6 +286,11 @@ exception_restore_status:
  ldr x2, [x0, #SCRATCH_DEPTH]
  sub x2, x2, #1
  str x2, [x0, #SCRATCH_DEPTH]
+.if {software_pan}
+ cbnz x2, exception_restore_sp
+ str xzr, [x0, #SCRATCH_ACTIVE_TRANSLATION]
+exception_restore_sp:
+.endif
  mov sp, x3
  ldp x2, x3, [x30, #16]
  ldp x4, x5, [x30, #32]
@@ -261,8 +325,14 @@ exception_busy:
  str x2, [x0, #SCRATCH_FATAL_STATE]
  b exception_close_admission
 exception_emergency:
+ mov x7, xzr
+exception_emergency_with_reason:
  mov x2, #1
  str x2, [x0, #SCRATCH_FATAL_STATE]
+ str x7, [x0, #SCRATCH_FATAL_REASON]
+.if {software_pan}
+ fence_user_translation
+.endif
  mov x3, sp
  cmp x1, #4
  b.hs 1f
@@ -317,23 +387,65 @@ exception_register_stack:
  stp x1, x2, [x3, #SCRATCH_EXEC_BASE]
  ret
 
-.if {stop_selftest}
-.global cyxia_request_quiescent_stop
-cyxia_request_quiescent_stop:
- // The explicit healthy boot fixture takes the same controlled terminal
- // path on a registered CPU, with no deliberately corrupted state.
+.global cyxia_terminal_stop
+.type cyxia_terminal_stop,%function
+cyxia_terminal_stop:
+ // x0 is the trusted software reason. Abandon the current stack before
+ // entering the coordinator, including when called by Rust panic handling.
  msr daifset, #15
+ mov x7, x0
  mrs x2, contextidr_el1
  cmp x2, #4
  b.hs exception_unregistered
+ mrs x3, tpidr_el1
+ cmp x2, x3
+ b.ne exception_unregistered
  ldr x0, =__exception_scratch
  add x0, x0, x2, lsl #12
- ldr x1, [x0, #SCRATCH_BUSY]
- cbnz x1, exception_close_admission
- mov x1, #1
- str x1, [x0, #SCRATCH_BUSY]
- mov x1, #16
- b exception_emergency
+ ldp x4, x5, [x0, #SCRATCH_EXEC_BASE]
+ cbz x4, exception_unregistered
+ cmp x4, x5
+ b.hs exception_unregistered
+ ldr x3, [x0, #SCRATCH_BUSY]
+ cbnz x3, exception_close_admission
+ mov x3, #1
+ str x3, [x0, #SCRATCH_BUSY]
+ mov x1, #SOFTWARE_STOP_KIND
+ ldr x3, =EXCEPTION_ADMISSION_CLOSED
+ ldar x3, [x3]
+ cbz x3, exception_software_stop
+ orr x1, x1, #0x80
+exception_software_stop:
+ b exception_emergency_with_reason
+.size cyxia_terminal_stop, .-cyxia_terminal_stop
+
+.if {software_pan}
+.global cyxia_captured_user_root
+.type cyxia_captured_user_root,%function
+cyxia_captured_user_root:
+ mrs x0, tcr_el1
+ tbz x0, #22, captured_root_unavailable
+ mrs x0, ttbr1_el1
+ tst x0, #0xffff000000000000
+ b.ne captured_root_unavailable
+ mrs x0, ttbr0_el1
+ ldr x1, =empty_l1
+ cmp x0, x1
+ b.ne captured_root_unavailable
+ mrs x0, contextidr_el1
+ cmp x0, #4
+ b.hs captured_root_unavailable
+ ldr x1, =__exception_scratch
+ add x1, x1, x0, lsl #12
+ ldr x0, [x1, #SCRATCH_DEPTH]
+ cmp x0, #1
+ b.ne captured_root_unavailable
+ ldr x0, [x1, #SCRATCH_ACTIVE_TRANSLATION]
+ ret
+captured_root_unavailable:
+ mov x0, xzr
+ ret
+.size cyxia_captured_user_root, .-cyxia_captured_user_root
 .endif
 .ltorg
 

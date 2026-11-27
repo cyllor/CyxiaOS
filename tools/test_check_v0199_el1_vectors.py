@@ -6,7 +6,7 @@ from tools import check_v0199_el1_vectors as checker
 
 
 class VectorChecks(unittest.TestCase):
-    def layout(self):
+    def layout(self, software_pan=False):
         table = 0x8000
         symbols = {
             **dict.fromkeys(checker.STACK_GATE_LABELS, 0),
@@ -22,6 +22,9 @@ class VectorChecks(unittest.TestCase):
             "secondary_high": 0x17100,
             "secondary_high_halt": 0x17150,
         }
+        if software_pan:
+            symbols.update(dict.fromkeys(checker.PAN_VECTOR_LABELS, 0))
+            symbols["empty_l1"] = 0x26000
         route_words = len(checker.vector_route(0, 0, symbols))
         frames = [table + checker.TABLE_BYTES + kind * route_words * 4 for kind in range(checker.VECTOR_COUNT)]
         start = frames[-1] + route_words * 4
@@ -99,12 +102,37 @@ class VectorChecks(unittest.TestCase):
 
     def test_emergency_stack_switch_and_second_entry_stop_are_required(self):
         instructions, _, _, symbols, read_literal = self.layout()
-        instructions[symbols["exception_emergency"] + 48] = "nop"
+        switch = symbols["exception_emergency_with_reason"] + 52
+        instructions[switch] = "nop"
         with self.assertRaisesRegex(ValueError, "expected 'mov sp,x4'"):
             checker.check_stack_gate(instructions, symbols, read_literal)
-        instructions[symbols["exception_emergency"] + 48] = "mov sp,x4"
+        instructions[switch] = "mov sp,x4"
         instructions[symbols["exception_busy"] + 16] = f"b {symbols['exception_entry']:#x}"
         with self.assertRaisesRegex(ValueError, "exception_busy"):
+            checker.check_stack_gate(instructions, symbols, read_literal)
+
+    def test_software_terminal_entry_requires_registration_and_stackless_handoff(self):
+        instructions, _, _, symbols, read_literal = self.layout()
+        registration_check = symbols["cyxia_terminal_stop"] + 28
+        instructions[registration_check] = "nop"
+        with self.assertRaisesRegex(ValueError, "cyxia_terminal_stop"):
+            checker.check_stack_gate(instructions, symbols, read_literal)
+        instructions[registration_check] = f"b.ne {symbols['exception_unregistered']:#x}"
+        instructions[symbols["exception_software_stop"]] = f"b {symbols['exception_quiescent_stop']:#x}"
+        with self.assertRaisesRegex(ValueError, "exception_software_stop"):
+            checker.check_stack_gate(instructions, symbols, read_literal)
+
+    def test_pan_orders_the_asid_and_root_writes_at_entry_and_return(self):
+        instructions, _, _, symbols, read_literal = self.layout(software_pan=True)
+        checker.check_stack_gate(instructions, symbols, read_literal)
+        first_fence = next(pc for pc, op in instructions.items() if op == "msr ttbr1_el1,x2")
+        instructions[first_fence] = "msr ttbr0_el1,x2"
+        with self.assertRaisesRegex(ValueError, "exception_entry"):
+            checker.check_stack_gate(instructions, symbols, read_literal)
+        instructions[first_fence] = "msr ttbr1_el1,x2"
+        restore = symbols["exception_restore_user"] + 20
+        instructions[restore] = "nop"
+        with self.assertRaisesRegex(ValueError, "exception_restore_user"):
             checker.check_stack_gate(instructions, symbols, read_literal)
 
     def test_only_boot_writes_vbar_and_cookie(self):

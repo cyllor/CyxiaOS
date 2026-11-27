@@ -26,15 +26,34 @@ FSYNC_UUID = b"CYX-FSYNC-TEST!!"
 SECURITY_HOME = 4130
 SECURITY_REDO = 3
 REDO_HEADER_BYTES = 64
+FSYNC_LOG_START = 2
+FSYNC_LOG_END = 36
 MOUNT_INVALID = 0
 MOUNT_UNAUTHORIZED = 1
 MOUNT_CONFLICT = 3
 
 
-def verify_signed_disk(path: Path, epoch: int, *, fsync_scratch: bool = False) -> str:
+def count_fsync_retirement_blocks(path: Path) -> int:
+    """Count the occupied blocks in the signed fixture's pre-replay journal."""
+    size = (FSYNC_LOG_END - FSYNC_LOG_START) * BLOCK_BYTES
+    with path.open("rb") as disk:
+        disk.seek(FSYNC_LOG_START * BLOCK_BYTES)
+        log = disk.read(size)
+    require(len(log) == size, "short pre-replay FSYNC journal")
+    zero = bytes(BLOCK_BYTES)
+    return sum(log[offset:offset + BLOCK_BYTES] != zero for offset in range(0, size, BLOCK_BYTES))
+
+
+def verify_signed_disk(path: Path, epoch: int, *, fsync_scratch: bool = False,
+                       expected_policy_sha256: str | None = None) -> str:
     """Check the frozen SecurityState header at home and in the appended redo."""
     uuid = FSYNC_UUID if fsync_scratch else STAGING_UUID
     digest = FSYNC_POLICY_SHA256 if fsync_scratch else SIGNED_POLICY_SHA256
+    if expected_policy_sha256 is not None:
+        require(len(expected_policy_sha256) == 64
+                and all(c in "0123456789abcdef" for c in expected_policy_sha256),
+                "invalid expected signed policy SHA-256")
+        digest = expected_policy_sha256
     with path.open("rb") as disk:
         for offset, expected_epoch in (
             (SECURITY_HOME * BLOCK_BYTES, epoch - 1),
@@ -46,7 +65,7 @@ def verify_signed_disk(path: Path, epoch: int, *, fsync_scratch: bool = False) -
                     and int.from_bytes(state[64:72], "little") == expected_epoch
                     and int.from_bytes(state[80:88], "little") == 1
                     and state[88:120].hex() == digest,
-                    "signed policy digest or epoch in the scratch disk differs from the fixture")
+                    "signed policy digest or epoch in the scratch disk differs from the expected value")
     return digest
 
 

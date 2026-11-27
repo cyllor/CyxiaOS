@@ -136,18 +136,26 @@ def check_inode(raw, index):
         raise SlotError("invalid", "extent coverage differs from inode size")
 
 
-def verify(expected, store_generation, proof, raw, mirror):
+def verify_binding(expected, store_generation, proof, raw):
     if sha256(raw).digest() != proof:
         raise SlotError("conflict", "descriptor digest differs from catalog")
     identity, generation, digest = decode(expected.block(), raw)
     if (identity, generation) != (expected, store_generation):
         raise SlotError("conflict", "descriptor differs from the trusted capture identity")
+    return digest
+
+
+def verify_mirror(digest, mirror):
     if len(mirror) != MIRROR_PAGES * BLOCK_BYTES:
         raise SlotError("invalid", "incorrect business mirror size")
     for index, offset in enumerate(range(0, len(mirror), INODE_BYTES)):
         check_inode(mirror[offset:offset + INODE_BYTES], index)
     if sha256(mirror).digest() != digest:
         raise SlotError("conflict", "entire business mirror digest mismatch")
+
+
+def verify(expected, store_generation, proof, raw, mirror):
+    verify_mirror(verify_binding(expected, store_generation, proof, raw), mirror)
 
 
 def inode(kind=0, generation=0, size=0, physical=0):

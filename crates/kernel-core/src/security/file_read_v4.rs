@@ -185,8 +185,13 @@ enum Effect<'a> {
     },
 }
 
-pub struct FileReadService {
+pub type FileReadService = ScratchFileService<{ SCRATCH_FILE_DATA.len() }>;
+pub type FileBlockService = ScratchFileService<BLOCK_BYTES>;
+
+pub struct ScratchFileService<const CAPACITY: usize> {
     file: StagedFile,
+    data: [u8; CAPACITY],
+    len: usize,
     child_base: u64,
     open_generation: u64,
     handles: [Option<LiveHandle>; MAX_LIVE_HANDLES],
@@ -208,15 +213,32 @@ impl FileReadService {
     pub fn with_multiple_handles(file: StagedFile) -> Self {
         Self::with_handle_limit(file, MAX_LIVE_HANDLES)
     }
+}
 
+impl FileBlockService {
+    /// Used by the mounted FSYNC owner after validating the allocated extent.
+    pub fn new_allocated_block(file: StagedFile) -> Result<Self, ReadError> {
+        if file.owner_rights != SCRATCH_FSYNC_FILE_OWNER_RIGHTS {
+            return Err(ReadError::Unauthorized);
+        }
+        Ok(Self::with_handle_limit(file, 1))
+    }
+}
+
+impl<const CAPACITY: usize> ScratchFileService<CAPACITY> {
     fn with_handle_limit(file: StagedFile, handle_limit: usize) -> Self {
         let mut scope = Sha256::new();
         scope.update(b"CYX/FILE-READ-SELECTOR/v1");
         scope.update(file.boot_epoch.to_le_bytes());
         scope.update(file.owner.id.to_le_bytes());
         scope.update(file.owner.generation.to_le_bytes());
+        let mut data = [0; CAPACITY];
+        let len = file.data.len();
+        data[..len].copy_from_slice(&file.data);
         Self {
             file,
+            data,
+            len,
             child_base: u64::from_le_bytes(field(&scope.finalize(), 0)) & CHILD_MASK,
             open_generation: 0,
             handles: [None; MAX_LIVE_HANDLES],
@@ -254,11 +276,11 @@ impl FileReadService {
         selector: u64,
         through_write_seq: u64,
         dst: &mut [u8; BLOCK_BYTES],
-    ) -> Result<(), ReadError> {
+    ) -> Result<usize, ReadError> {
         self.check_fsync(selector, through_write_seq)?;
         dst.fill(0);
-        dst[..self.file.data.len()].copy_from_slice(&self.file.data);
-        Ok(())
+        dst[..self.len].copy_from_slice(&self.data[..self.len]);
+        Ok(self.len)
     }
 
     /// Read-only preflight before the native owner queues a durable job.
@@ -366,7 +388,8 @@ impl FileReadService {
                 data,
                 sequence,
             } => {
-                self.file.data[range].copy_from_slice(data);
+                self.len = self.len.max(range.end);
+                self.data[range].copy_from_slice(data);
                 self.write_seq = sequence;
             }
         }
@@ -409,19 +432,23 @@ impl FileReadService {
                 self.live_child_slot(selector, SCRATCH_FILE_OWNER_RIGHTS)?;
                 let offset = u64::from_le_bytes(field(p, 0));
                 let requested = u32::from_le_bytes(field(p, 8)) as usize;
-                let data = &self.file.data;
-                let first = offset.min(data.len() as u64) as usize;
-                let end = (first + requested).min(data.len());
-                Ok((0, &data[first..end], Effect::None))
+                let first = offset.min(self.len as u64) as usize;
+                let count = requested
+                    .min(self.len - first)
+                    .min(MAX_REPLY - REPLY_HEADER);
+                Ok((0, &self.data[first..first + count], Effect::None))
             }
             WRITE => {
                 self.live_child_slot(selector, SCRATCH_FILE_WRITE_RIGHTS)?;
                 let data = &p[12..];
                 let start = usize::try_from(u64::from_le_bytes(field(p, 0)))
                     .map_err(|_| ReadError::Format)?;
+                if start > self.len {
+                    return Err(ReadError::Format);
+                }
                 let end = start
                     .checked_add(data.len())
-                    .filter(|&end| end <= self.file.data.len())
+                    .filter(|&end| end <= CAPACITY)
                     .ok_or(ReadError::Format)?;
                 let sequence = self.write_seq.checked_add(1).ok_or(ReadError::Busy)?;
                 Ok((
@@ -627,6 +654,42 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0)
         );
+    }
+
+    #[test]
+    fn allocated_file_freeze_distinguishes_appended_zero_bytes_from_padding() {
+        let file = StagedFile::new_with_owner_rights(
+            EPOCH,
+            OWNER,
+            fixture_dirent(),
+            *SCRATCH_FILE_DATA,
+            SCRATCH_FSYNC_FILE_OWNER_RIGHTS,
+        )
+        .unwrap();
+        let mut service = FileBlockService::new_allocated_block(file).unwrap();
+        let mut wire = [0; MAX_REPLY];
+        let opened = open(1, SCRATCH_FILE_NAME, SCRATCH_FSYNC_FILE_OWNER_RIGHTS);
+        service.serve(ROOT_SELECTOR, &opened, &mut wire).unwrap();
+        let handle = Reply::decode(&wire[..REPLY_HEADER])
+            .unwrap()
+            .new_cap_selector;
+        let initial = SCRATCH_FILE_DATA.len();
+        service
+            .serve(handle, &write(2, 0, SCRATCH_FILE_DATA), &mut wire)
+            .unwrap();
+        let mut before = [0; BLOCK_BYTES];
+        assert_eq!(service.freeze_fsync(handle, 1, &mut before), Ok(initial));
+
+        let append = write(3, initial as u64, &[0; 4]);
+        service.serve(handle, &append, &mut wire).unwrap();
+        assert!(service.serve(handle, &append, &mut wire).unwrap().replay);
+        let mut after = [0; BLOCK_BYTES];
+        assert_eq!(service.freeze_fsync(handle, 2, &mut after), Ok(initial + 4));
+        assert_eq!(before, after);
+        let read = service
+            .serve(handle, &read(4, initial as u64, 128), &mut wire)
+            .unwrap();
+        assert_eq!(Reply::decode(&wire[..read.len]).unwrap().output, &[0; 4]);
     }
 
     fn request(op: u16, id: u64, payload: &[u8]) -> Vec<u8> {

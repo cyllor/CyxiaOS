@@ -81,7 +81,7 @@ fn record_trace(kind: u64, block: u32) {
     }
 }
 struct Disk {
-    device: super::scratch_blk::ScratchBlock,
+    device: &'static mut super::scratch_blk::ScratchBlock,
     reads: u64,
     writes: u64,
     flushes: u64,
@@ -95,10 +95,10 @@ impl Disk {
         write: Option<&[u8; BLOCK_BYTES]>,
         out: &mut [u8; BLOCK_BYTES],
     ) -> Result<(), SecurityError> {
-        super::scratch_blk::sectors(&mut self.device, first, write, out)
+        super::scratch_blk::sectors(self.device, first, write, out)
     }
     fn flush_device(&mut self) -> Result<(), SecurityError> {
-        super::scratch_blk::flush(&mut self.device)
+        super::scratch_blk::flush(self.device)
     }
 }
 impl EpochBlockIo for Disk {

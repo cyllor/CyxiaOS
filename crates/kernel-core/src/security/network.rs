@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 pub mod entropy;
-pub mod pending_tls;
+pub mod tls_deadline;
 
 pub const MAX_SOURCES: usize = 32;
 pub const MAX_PENDING: u8 = 4;

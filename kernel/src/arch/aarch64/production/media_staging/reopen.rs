@@ -39,13 +39,27 @@ pub(super) fn recover(
     config: volume::Config<'_>,
     snapshots: volume::SnapshotLayout,
 ) -> Result<(SuperblockV1, MountEvidence), Error> {
+    recover_boot_pair(disk, sb, config, snapshots, |disk, epoch| {
+        volume::validate_homes(disk, sb, epoch, config, snapshots)
+    })
+}
+
+/// Recover a boot-only journal. The profile validates its own homes on
+/// both sides of the same BootEpoch transition.
+pub(super) fn recover_boot_pair(
+    disk: &mut Disk,
+    sb: SuperblockV1,
+    config: volume::Config<'_>,
+    snapshots: volume::SnapshotLayout,
+    mut validate: impl FnMut(&mut Disk, u64) -> Result<MountEvidence, Error>,
+) -> Result<(SuperblockV1, MountEvidence), Error> {
     // Reject incompatible media, pending obligations and unexpected write
     // targets before the recovery engine is allowed to replay a single home.
     if identify(disk)? != sb {
         return Err(Error::Conflict);
     }
     volume::unified_map(disk, sb, snapshots)?;
-    volume::validate_homes(disk, sb, sb.generation - 1, config, snapshots)?;
+    validate(disk, sb.generation - 1)?;
     let next_log = volume::FIRST_LOG_BLOCK + authority::BOOT_LOG_BLOCKS;
     volume::require_zero_blocks(disk, next_log..BITMAP_START)?;
     let epoch = authority::verify_previous_pair(disk, sb, config)?;
@@ -59,7 +73,7 @@ pub(super) fn recover(
             if current != sb {
                 return Err(Error::Conflict);
             }
-            mounted = Some(volume::validate_homes(disk, sb, epoch, config, snapshots)?);
+            mounted = Some(validate(disk, epoch)?);
             Ok(())
         })?;
     if chain.superblock != sb

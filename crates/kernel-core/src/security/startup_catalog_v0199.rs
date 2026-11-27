@@ -4,7 +4,9 @@
 
 use super::{
     Error,
-    offline_config_v1::{AuthenticatedEnvelope, CatalogBindings},
+    offline_config_v1::{
+        AuthenticatedEnvelope, CatalogBindings, ConfigHeader, Principal, VerifiedOfflineConfig,
+    },
 };
 use crate::control_plane::rule_profile_v2::Profile;
 use sha2::{Digest, Sha256};
@@ -20,11 +22,37 @@ pub struct PinnedStartupCatalog<'a> {
     pub key_generation: u64,
 }
 
-impl PinnedStartupCatalog<'_> {
+impl<'a> PinnedStartupCatalog<'a> {
     /// Check the signed envelope, canonical RuleProfile and exact asset
     /// digests. The SecurityProfile header binds the same rules digest.
     /// This method returns only a verification result for startup diagnostics.
     pub fn authenticate(&self, scratch: &mut [u8]) -> Result<(), Error> {
+        AuthenticatedEnvelope::verify(
+            self.offline_config,
+            self.boot_public_key,
+            self.bindings()?,
+            scratch,
+        )?;
+        Ok(())
+    }
+
+    /// Authenticate the same catalog and require the receiving owner to
+    /// check its policy lists before handing any authority to a mount.
+    pub fn verify_policy(
+        &self,
+        scratch: &mut [u8],
+        verify_payload: impl FnOnce(&ConfigHeader, &[Principal; 16], &[u8]) -> Result<(), Error>,
+    ) -> Result<VerifiedOfflineConfig<'a>, Error> {
+        VerifiedOfflineConfig::verify(
+            self.offline_config,
+            self.boot_public_key,
+            self.bindings()?,
+            scratch,
+            verify_payload,
+        )
+    }
+
+    fn bindings(&self) -> Result<CatalogBindings, Error> {
         let rules = Profile::parse(self.rules).map_err(|_| Error::Invalid)?;
         let rule_hash: [u8; 32] = Sha256::digest(rules.canonical_bytes()).into();
         let security = self.security_profile;
@@ -32,20 +60,14 @@ impl PinnedStartupCatalog<'_> {
         if self.key_generation == 0 || self.key_manifest.is_empty() {
             return Err(Error::Invalid);
         }
-        AuthenticatedEnvelope::verify(
-            self.offline_config,
-            self.boot_public_key,
-            CatalogBindings {
-                rule_generation: rules.generation,
-                security_generation,
-                key_generation: self.key_generation,
-                rule_hash,
-                security_hash: Sha256::digest(security).into(),
-                key_manifest_hash: Sha256::digest(self.key_manifest).into(),
-            },
-            scratch,
-        )?;
-        Ok(())
+        Ok(CatalogBindings {
+            rule_generation: rules.generation,
+            security_generation,
+            key_generation: self.key_generation,
+            rule_hash,
+            security_hash: Sha256::digest(security).into(),
+            key_manifest_hash: Sha256::digest(self.key_manifest).into(),
+        })
     }
 }
 
@@ -106,6 +128,10 @@ mod tests {
         };
         let mut scratch = [0; 1024];
         assert_eq!(catalog.authenticate(&mut scratch), Ok(()));
+        assert!(matches!(
+            catalog.verify_policy(&mut scratch, |_, _, _| Err(Error::Unauthorized)),
+            Err(Error::Unauthorized)
+        ));
 
         let mut widened = security;
         widened[118..120].copy_from_slice(&4000u16.to_le_bytes());

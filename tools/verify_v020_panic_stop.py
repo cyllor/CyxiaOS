@@ -25,6 +25,11 @@ HEADER = 11
 ROW = 6
 UART = HEADER + ROW * 4
 UART_STATUS = {1: "queued", 2: "fifo_full", 3: "unavailable", 4: "deadline", 5: "console_unconfirmed"}
+SCRATCH_FATAL = 400
+SOFTWARE_STOP_KIND = 16
+PAGE = 4096
+RAM_BASE = 0x40000000
+READONLY_RAM_PAGE = 0x0060000000000783
 
 
 def stopped_cpus(qmp, park):
@@ -120,10 +125,29 @@ def validate_uart(data, wire, stop):
     }, b"".join(frames)
 
 
+def check_empty_root(raw, qmp, dump):
+    try:
+        empty = symbol(raw, "empty_l1")["pa"]
+    except ValueError as error:
+        if str(error) == "missing symbol empty_l1":
+            return None
+        raise
+    require(empty >= RAM_BASE and empty % PAGE == 0, "PAN root address is outside aligned RAM")
+    qmp.execute("pmemsave", {"val": empty, "size": PAGE, "filename": str(dump)})
+    require(dump.read_bytes() == bytes(PAGE), "live PAN L1 is not empty")
+    leaf = symbol(raw, "ram_l3")["pa"] + (empty - RAM_BASE) // PAGE * 8
+    qmp.execute("pmemsave", {"val": leaf, "size": 8, "filename": str(dump)})
+    descriptor, = struct.unpack("<Q", dump.read_bytes())
+    require(descriptor == (empty | READONLY_RAM_PAGE), "PAN root has a writable or executable RAM alias")
+    return {"empty_root_pa": f"{empty:#x}", "root_bytes_zero": PAGE, "alias_leaf": f"{descriptor:#x}"}
+
+
 def verify(elf, output, qemu_digest, timeout, late_peer=False):
     require(1 <= timeout <= 120, "invalid test deadline")
     raw = elf.read_bytes()
     symbol(raw, "cyxia_request_quiescent_stop")
+    symbol(raw, "cyxia_terminal_stop")
+    scratch = symbol(raw, "__exception_scratch")
     page, park = symbol(raw, "CYXIA_STOP_EVIDENCE"), symbol(raw, "cyxia_stop_park")
     admission = symbol(raw, "EXCEPTION_ADMISSION_CLOSED")
     require(page["size"] == 4096 and page["pa"] % 4096 == 0 and park["size"] >= 12,
@@ -188,6 +212,15 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
                     require(record[:HEADER * 8] == sealed, "late acknowledgement rewrote owner result")
                 (output / "native-stop-evidence.bin").write_bytes(record)
                 report.update(validate_record(record, late_peer))
+                qmp.execute("pmemsave", {
+                    "val": scratch["pa"] + report["owner"] * PAGE + SCRATCH_FATAL,
+                    "size": 56, "filename": str(data),
+                })
+                state, kind, _, _, _, _, reason = struct.unpack("<7Q", data.read_bytes())
+                require((state, kind, reason) == (2, SOFTWARE_STOP_KIND, 99 if late_peer else 0x5100),
+                        "owner did not seal the expected software terminal origin")
+                report["software_origin"] = {"kind": kind, "reason": reason,
+                                               "entry": "rust_panic" if late_peer else "smp_fatal"}
                 qmp.execute("pmemsave", {"val": admission["pa"], "size": 8, "filename": str(data)})
                 require(data.read_bytes() == (1).to_bytes(8, "little"), "terminal admission latch is open")
                 require(qmp.execute("query-status")["running"], "VM stopped before guest wait-state proof")
@@ -196,6 +229,7 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
                 report["terminal_registers_first"] = stopped_cpus(qmp, park)
                 time.sleep(0.02)
                 report["terminal_registers_second"] = stopped_cpus(qmp, park)
+                report["software_pan_root"] = check_empty_root(raw, qmp, data)
                 read_uart()
                 report["owner_uart"], serial = validate_uart(record, bytes(wire), report)
                 require(elf.read_bytes() == raw, "kernel ELF changed during the run")

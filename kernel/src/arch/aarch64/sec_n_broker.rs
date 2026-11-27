@@ -25,7 +25,8 @@
 //! * Broker state (CONN_EPOCH, CONNECTED, STALL_AFTER_POLL, POLL_COUNT, OP_COUNTS,
 //!   CLOSE_SEEN, YIELD_RUN, ENTROPY_STATE, QUIESCENCE_REFUSED, HANDSHAKE_POLLS,
 //!   CONN_SOURCE, POLLED_EPOCH, ADMISSION_RECEIPT, RELAYED_BYTES,
-//!   STREAM_CLOSED, RETIREMENT, PENDING_TLS, TLS_AUTHENTICATED_EPOCH)
+//!   STREAM_CLOSED, RETIREMENT, TLS_WINDOW, TLS_AUTHENTICATED_EPOCH,
+//!   EMPTY_ACTIVE_READ)
 //!   (static mut): CPU0-only, read/written only by the functions below and the
 //!   by-value accessors; no reference escapes.
 //! * load_guest()/map_page()/seal_page()/sync_code(): raw addr_of! arithmetic over
@@ -35,6 +36,8 @@
 //! * broker(): reads/writes only the dedicated SHARED page (the guest's registered
 //!   0x02000000 broker page) through its checked high-half alias; it never walks the
 //!   guest code/data pages and never trusts guest bytes as kernel pointers.
+//! * ACTIVE_POLL_TIMER joins the CPU0 foreground wait to its banked PPI
+//!   handler. Only that IRQ, while enabled by the waiter, may rearm it.
 //! * asm!("dsb/tlbi/ic"): bounded TLB/cache maintenance; options(nostack).
 #[path = "sec_n_broker/receipt.rs"]
 mod receipt;
@@ -44,7 +47,7 @@ pub(super) mod signer;
 
 use super::*;
 #[cfg(feature = "v020-production-authenticated-net")]
-use cyxia_kernel_core::security::network::pending_tls::{PendingLimit, PendingTls};
+use cyxia_kernel_core::security::network::tls_deadline::{Limit, Phase, TlsWindow};
 use cyxia_net_transport::device::{self, Port};
 
 // Trusted monotonic clocks from the EL1 architectural timer (the same source the
@@ -124,9 +127,52 @@ const PEER_NODE: [u8; 32] = [
 ];
 #[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) const SOURCE_IP: u32 = 0x0A00_0202; // 10.0.2.2, trusted native owner observation.
-const BOOT_EPOCH: u64 = 1;
-const SERVICE_GEN: u64 = 1;
 const UNIX_SECONDS: u64 = 1_700_000_000; // fixed: no time-based handshake timeout.
+
+/// Input from the trusted owner, never from the Verifier's shared page.
+#[derive(Clone, Copy)]
+pub(crate) struct BootIdentity {
+    pub(crate) boot_epoch: u64,
+    verifier_generation: u64,
+    #[cfg(feature = "v020-production-authenticated-net")]
+    key_generation: u64,
+}
+
+impl BootIdentity {
+    #[cfg(any(
+        feature = "v0199-sec-n-selftest",
+        not(feature = "v020-production-media-signed")
+    ))]
+    pub(crate) const FIXTURE: Self = Self {
+        boot_epoch: 1,
+        verifier_generation: 1,
+        #[cfg(feature = "v020-production-authenticated-net")]
+        key_generation: 1,
+    };
+
+    #[cfg(feature = "v020-production-media-signed")]
+    pub(crate) fn from_signed_scratch(
+        state: &cyxia_kernel_core::security::file_index_v0199::SecurityStateStoreV2,
+    ) -> Option<Self> {
+        const VERIFIER_SLOT: usize = 13 - 1;
+        const SIGNER_SLOT: usize = 14 - 1;
+
+        // These diagnostics still use the pinned generation-1 TLS key.
+        // A different persisted key generation requires a provisioned Signer.
+        let verifier_generation = state.service_generations[VERIFIER_SLOT];
+        (state.last_boot_epoch != 0
+            && state.key_generation == 1
+            && verifier_generation != 0
+            && state.service_generations[SIGNER_SLOT] != 0
+            && state.isolated_service_bitmap & ((1 << VERIFIER_SLOT) | (1 << SIGNER_SLOT)) == 0)
+            .then_some(Self {
+                boot_epoch: state.last_boot_epoch,
+                verifier_generation,
+                #[cfg(feature = "v020-production-authenticated-net")]
+                key_generation: state.key_generation,
+            })
+    }
+}
 
 // ---- private address-space layout ----
 const PAGE: usize = 4096;
@@ -230,9 +276,13 @@ enum Retirement {
 #[cfg(feature = "v020-production-authenticated-net")]
 static mut RETIREMENT: Retirement = Retirement::Open;
 #[cfg(feature = "v020-production-authenticated-net")]
-static mut PENDING_TLS: Option<PendingTls> = None;
+static mut TLS_WINDOW: Option<TlsWindow> = None;
 #[cfg(feature = "v020-production-authenticated-net")]
 static mut TLS_AUTHENTICATED_EPOCH: u64 = 0;
+#[cfg(feature = "v020-production-authenticated-net")]
+static mut EMPTY_ACTIVE_READ: bool = false;
+#[cfg(feature = "v020-production-authenticated-net")]
+static ACTIVE_POLL_TIMER: AtomicU64 = AtomicU64::new(0);
 
 fn le16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
@@ -459,10 +509,18 @@ fn shared_put(off: u64, bytes: &[u8]) {
 /// kernel-local node pin presented to the guest (wrong value => identity negative).
 #[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn stage_shared(local: [u8; 32], connected: bool, conn_epoch: u64) {
-    stage_connection(local, connected, conn_epoch, SOURCE_IP, now_ns());
+    stage_connection(
+        BootIdentity::FIXTURE,
+        local,
+        connected,
+        conn_epoch,
+        SOURCE_IP,
+        now_ns(),
+    );
 }
 
 pub(crate) fn stage_connection(
+    identity: BootIdentity,
     local: [u8; 32],
     connected: bool,
     conn_epoch: u64,
@@ -473,8 +531,8 @@ pub(crate) fn stage_connection(
     unsafe { core::ptr::write_bytes(p, 0, SHARED_PAGES * PAGE) };
     shared_write(OFF_MAGIC, SVC_MAGIC);
     shared_write(OFF_VERSION, SVC_VERSION);
-    shared_write(OFF_BOOT_EPOCH, BOOT_EPOCH);
-    shared_write(OFF_SERVICE_GEN, SERVICE_GEN);
+    shared_write(OFF_BOOT_EPOCH, identity.boot_epoch);
+    shared_write(OFF_SERVICE_GEN, identity.verifier_generation);
     shared_write(OFF_UNIX_SECONDS, UNIX_SECONDS);
     shared_write(OFF_MONOTONIC_MS, now_ms());
     shared_write(OFF_MONOTONIC_NS, accepted_ns);
@@ -499,8 +557,9 @@ pub(crate) fn stage_connection(
         {
             RETIREMENT = Retirement::Open;
             TLS_AUTHENTICATED_EPOCH = 0;
-            PENDING_TLS = if connected {
-                PendingTls::new(accepted_ns)
+            EMPTY_ACTIVE_READ = false;
+            TLS_WINDOW = if connected {
+                TlsWindow::new(Phase::Pending, accepted_ns)
             } else {
                 None
             };
@@ -637,7 +696,13 @@ fn broker<P: Port>(
             unsafe { CONNECTED = false };
             reply(0, ST_OK);
         }
-        OP_YIELD => reply(0, ST_OK),
+        OP_YIELD => {
+            #[cfg(feature = "v020-production-authenticated-net")]
+            if signer.is_some() {
+                wait_after_empty_read();
+            }
+            reply(0, ST_OK);
+        }
         _ => {
             shared_write(OFF_STATUS, ST_FAILED);
             shared_write(OFF_LEN, 0);
@@ -654,7 +719,7 @@ fn broker_certificate_verify(signer: Option<&mut signer::Signer>) {
             CONN_SOURCE,
             ADMISSION_RECEIPT,
             RETIREMENT,
-            PENDING_TLS.map_or(0, |pending| pending.deadline().0),
+            TLS_WINDOW.map_or(0, |window| window.deadline().0),
         )
     };
     if !connected
@@ -689,20 +754,27 @@ fn broker_tls_authenticated(signer: Option<&mut signer::Signer>) {
             ADMISSION_RECEIPT,
             RETIREMENT,
             TLS_AUTHENTICATED_EPOCH,
-            PENDING_TLS.map_or(0, |pending| pending.deadline().0),
+            TLS_WINDOW.map_or(0, |window| window.deadline().0),
         )
     };
+    let authenticated_ns = now_ns();
     if state != Retirement::Open
-        || now_ns() >= expires
+        || authenticated_ns >= expires
         || grant != Some((epoch, source))
         || !signer.is_some_and(|signer| signer.issued_for(epoch))
         || receipt::validate(&wire, connected, epoch, polled, source, authenticated != 0) != grant
     {
         return reply(0, ST_FAILED);
     }
-    // This request comes from the sealed TLS verifier after client
-    // CertificateVerify and Finished, not from a transport message.
-    unsafe { TLS_AUTHENTICATED_EPOCH = epoch };
+    let Some(window) = TlsWindow::new(Phase::Active, authenticated_ns) else {
+        return reply(0, ST_FAILED);
+    };
+    // The sealed TLS verifier has confirmed client CertificateVerify and
+    // Finished. Only this transition starts the active connection's lifetime.
+    unsafe {
+        TLS_WINDOW = Some(window);
+        TLS_AUTHENTICATED_EPOCH = epoch;
+    };
     report(
         "V020_SEC_N_VERIFIER_AUTHENTICATED",
         epoch,
@@ -838,27 +910,40 @@ fn broker_read<P: Port>(
     match port.receive_up_to(&mut frame, limit) {
         Ok(Some(n)) if n != 0 && n <= limit && n <= frame.len() => {
             #[cfg(feature = "v020-production-authenticated-net")]
-            if authenticated_profile && unsafe { TLS_AUTHENTICATED_EPOCH } == 0 {
-                let Some(mut pending) = (unsafe { PENDING_TLS }) else {
+            if authenticated_profile {
+                let Some(mut window) = (unsafe { TLS_WINDOW }) else {
                     return reply(0, ST_FAILED);
                 };
                 // The device poll may finish after the timer boundary. Never
                 // publish late input or renew an already expired window.
-                if !pending.record_read(now_ns()) {
+                if !window.record_read(now_ns()) {
                     return reply(0, ST_FAILED);
                 }
-                unsafe { PENDING_TLS = Some(pending) };
+                unsafe {
+                    TLS_WINDOW = Some(window);
+                    EMPTY_ACTIVE_READ = false;
+                };
             }
             shared_put(OFF_PAYLOAD, &frame[..n]);
             unsafe { RELAYED_BYTES += n as u64 };
             reply(n as u64, ST_OK);
         }
-        Ok(None | Some(0)) | Err(device::Error::WouldBlock) => reply(0, ST_AGAIN),
+        Ok(None | Some(0)) | Err(device::Error::WouldBlock) => {
+            #[cfg(feature = "v020-production-authenticated-net")]
+            unsafe {
+                EMPTY_ACTIVE_READ = authenticated_profile && TLS_AUTHENTICATED_EPOCH != 0;
+            };
+            reply(0, ST_AGAIN);
+        }
         Ok(Some(_)) | Err(device::Error::Device | device::Error::Frame) => disconnect(),
     }
 }
 
 fn broker_write<P: Port>(port: &mut P, len: u64) {
+    #[cfg(feature = "v020-production-authenticated-net")]
+    unsafe {
+        EMPTY_ACTIVE_READ = false;
+    };
     let n = len as usize;
     let mut buf = [0u8; PAYLOAD];
     shared_bytes(OFF_PAYLOAD, &mut buf[..n]);
@@ -867,6 +952,12 @@ fn broker_write<P: Port>(port: &mut P, len: u64) {
         Err(device::Error::WouldBlock | device::Error::Frame) => reply(0, ST_AGAIN),
         Err(device::Error::Device) => disconnect(),
     }
+}
+
+#[cfg(feature = "v020-production-authenticated-net")]
+pub(crate) fn admits_next_transmit() -> bool {
+    // The same CPU0 foreground owns both the TCP turn and this snapshot.
+    unsafe { TLS_WINDOW }.is_some_and(|window| window.admits_io_at(now_ns()))
 }
 
 /// The port reported a closed/reset/failed stream: the connection is over.
@@ -878,6 +969,63 @@ fn disconnect() {
         STREAM_CLOSED += 1;
     }
     reply(0, ST_EOF);
+}
+
+/// Called only for CPU0's banked timer PPI from the current-EL IRQ vector.
+#[cfg(feature = "v020-production-authenticated-net")]
+pub(super) fn rearm_active_poll_timer() -> bool {
+    let period = ACTIVE_POLL_TIMER.load(Ordering::Acquire);
+    if period != 0 {
+        // A periodic wake prevents an IRQ just before WFI from stranding the
+        // foreground. The waiter disarms it before returning to EL0.
+        unsafe { timer::arm(timer::ticks().saturating_add(period)) };
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(feature = "v020-production-authenticated-net")]
+fn wait_after_empty_read() {
+    let wait = unsafe {
+        let wait = EMPTY_ACTIVE_READ && CONNECTED && RETIREMENT == Retirement::Open;
+        EMPTY_ACTIVE_READ = false;
+        wait.then_some(TLS_WINDOW).flatten()
+    };
+    let Some(window) = wait else {
+        return;
+    };
+    // Keep recent traffic responsive. After a full quiet second, use a
+    // slower idle cadence so empty polls cannot consume the relay call
+    // budget during a normally sparse session before its lifetime ends.
+    let quiet_ns = now_ns().saturating_sub(window.last_read_ns());
+    let period = (timer::frequency() / if quiet_ns < 1_000_000_000 { 500 } else { 100 }).max(1);
+    let wake = timer::ticks()
+        .saturating_add(period)
+        .min(ticks_at_ns(window.deadline().0));
+    if timer::ticks() >= wake {
+        return;
+    }
+    // SAFETY: CPU0 owns the registered banked timer between stopped EL0
+    // entries. IRQs run on the registered IRQ stack; restore the caller's
+    // IRQ mask and remove the wake source before the next entry.
+    unsafe {
+        let daif: u64;
+        core::arch::asm!(
+            "mrs {}, daif", "msr daifset, #2", "isb",
+            out(reg) daif, options(nostack, preserves_flags)
+        );
+        ACTIVE_POLL_TIMER.store(period, Ordering::Release);
+        timer::arm(wake);
+        timer::enable_irqs();
+        timer::idle();
+        core::arch::asm!("msr daifset, #2", "isb", options(nostack, preserves_flags));
+        cpu::disable_timer();
+        ACTIVE_POLL_TIMER.store(0, Ordering::Release);
+        if daif & (1 << 7) == 0 {
+            timer::enable_irqs();
+        }
+    }
 }
 
 /// One bounded EL0 entry. Returns the trapped context kind/esr. Mirrors smp.rs
@@ -900,17 +1048,22 @@ fn ticks_at_ns(ns: u64) -> u64 {
 }
 
 #[cfg(feature = "v020-production-authenticated-net")]
-fn pending_timeout(pending: PendingTls, observed_ns: u64, dispatched: u64) -> GuestStop {
-    let (expires_ns, limit) = pending.deadline();
-    let code = match limit {
-        PendingLimit::Handshake => 903,
-        PendingLimit::RecordIdle => 904,
+fn tls_timeout(window: TlsWindow, observed_ns: u64, dispatched: u64) -> GuestStop {
+    let (expires_ns, limit) = window.deadline();
+    let code = match (window.phase(), limit) {
+        (Phase::Pending, Limit::Lifetime) => 903,
+        (Phase::Pending, Limit::Idle) => 904,
+        (Phase::Active, Limit::Lifetime) => 905,
+        (Phase::Active, Limit::Idle) => 906,
     };
     report(
-        "V020_SEC_N_PENDING_TIMEOUT",
+        match window.phase() {
+            Phase::Pending => "V020_SEC_N_PENDING_TIMEOUT",
+            Phase::Active => "V020_SEC_N_ACTIVE_TIMEOUT",
+        },
         code,
-        expires_ns - pending.accepted_ns(),
-        observed_ns - pending.accepted_ns(),
+        expires_ns - window.start_ns(),
+        observed_ns - window.start_ns(),
     );
     GuestStop { code, dispatched }
 }
@@ -919,7 +1072,8 @@ fn pending_timeout(pending: PendingTls, observed_ns: u64, dispatched: u64) -> Gu
 #[derive(Clone, Copy)]
 pub(crate) struct GuestStop {
     /// 900 unexpected EL0 fault, 901 non-0x43 SVC, 902 SVC budget exhausted,
-    /// 903 kernel-owned TLS handshake deadline, 904 pending TLS input idle.
+    /// 903 TLS handshake lifetime, 904 pending input idle,
+    /// 905 active TLS lifetime, 906 active input idle.
     pub(crate) code: u64,
     /// SVC dispatches performed before the stop (read by production only; the
     /// fixture halts on `code`).
@@ -975,17 +1129,17 @@ pub(crate) fn run_guest<P: Port>(
     let stop = |code, dispatched| Err(GuestStop { code, dispatched });
     for _ in 0..budget {
         #[cfg(feature = "v020-production-authenticated-net")]
-        let (pending, latest_tick) =
-            if signer.is_some() && unsafe { TLS_AUTHENTICATED_EPOCH == 0 && !CLOSE_SEEN } {
-                let Some(pending) = (unsafe { PENDING_TLS }) else {
+        let (window, latest_tick) =
+            if signer.is_some() && unsafe { !CLOSE_SEEN && RETIREMENT == Retirement::Open } {
+                let Some(window) = (unsafe { TLS_WINDOW }) else {
                     return stop(903, dispatched);
                 };
                 let now = now_ns();
-                let deadline_ns = pending.deadline().0;
+                let deadline_ns = window.deadline().0;
                 if now >= deadline_ns {
-                    return Err(pending_timeout(pending, now, dispatched));
+                    return Err(tls_timeout(window, now, dispatched));
                 }
-                (Some(pending), ticks_at_ns(deadline_ns))
+                (Some(window), ticks_at_ns(deadline_ns))
             } else {
                 (None, u64::MAX)
             };
@@ -1003,10 +1157,10 @@ pub(crate) fn run_guest<P: Port>(
             return stop(901, dispatched); // only SVC 0x43 is admitted for this guest.
         }
         #[cfg(feature = "v020-production-authenticated-net")]
-        if let Some(pending) = pending
+        if let Some(window) = window
             && timer::ticks() >= latest_tick
         {
-            return Err(pending_timeout(pending, now_ns(), dispatched));
+            return Err(tls_timeout(window, now_ns(), dispatched));
         }
         broker(
             port,

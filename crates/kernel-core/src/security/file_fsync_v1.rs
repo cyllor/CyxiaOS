@@ -45,6 +45,10 @@ pub struct FsyncJob<'a> {
     pub cap_selector: u64,
     pub frame: &'a [u8],
     pub key: ReceiptKey,
+    /// For growth within one already allocated block, bind this logical
+    /// size as a little-endian u64 before the pages in the frozen digest.
+    /// An unchanged-size job uses the legacy pages-only digest.
+    pub grown_size: Option<usize>,
     /// Complete frozen logical file, in order, with zero padding after EOF.
     pub pages: &'a [&'a [u8; BLOCK]],
 }
@@ -190,7 +194,18 @@ pub fn commit_segment<I: EpochBlockIo>(
         return Err(Error::Unauthorized);
     }
 
-    let size = inode.size as usize;
+    let current_size = usize::try_from(inode.size).map_err(|_| Error::Invalid)?;
+    let size = job.grown_size.unwrap_or(current_size);
+    if job.grown_size.is_some()
+        && (current_size == 0
+            || size < current_size
+            || size > BLOCK
+            || inode.extents != 1
+            || inode.runs[0].logical != 0
+            || inode.runs[0].count != 1)
+    {
+        return Err(Error::Invalid);
+    }
     if job.pages.len() != size.div_ceil(BLOCK)
         || size % BLOCK != 0
             && job
@@ -204,10 +219,18 @@ pub fn commit_segment<I: EpochBlockIo>(
     for page in job.pages {
         frozen.update(*page);
     }
-    let frozen: [u8; 32] = if job.pages.is_empty() {
+    let output_digest: [u8; 32] = if job.pages.is_empty() {
         [0; 32]
     } else {
         frozen.finalize().into()
+    };
+    let frozen = if job.grown_size.is_some() {
+        let mut digest = Sha256::new();
+        digest.update((size as u64).to_le_bytes());
+        digest.update(job.pages[0]);
+        digest.finalize().into()
+    } else {
+        output_digest
     };
     if frozen != proposal.frozen_data_digest {
         return Err(Error::Conflict);
@@ -255,7 +278,8 @@ pub fn commit_segment<I: EpochBlockIo>(
     if receipt.status == DONE {
         if receipt.completed_prefix as usize != size
             || receipt.result != 0
-            || receipt.output_digest != frozen
+            || receipt.output_digest != output_digest
+            || job.grown_size.is_some() && current_size != size
             || inode.durable_write_seq < write_seq
         {
             return Err(Error::Conflict);
@@ -267,6 +291,9 @@ pub fn commit_segment<I: EpochBlockIo>(
         || inode.durable_write_seq >= write_seq
     {
         return Err(Error::Busy);
+    }
+    if job.grown_size.is_some() && current_size == size {
+        return Err(Error::Conflict);
     }
     let prefix = receipt.completed_prefix as usize;
     if prefix != size && prefix % BLOCK != 0 {
@@ -303,8 +330,11 @@ pub fn commit_segment<I: EpochBlockIo>(
     }
     if final_segment {
         receipt.status = DONE;
-        receipt.output_digest = frozen;
+        receipt.output_digest = output_digest;
         let raw = &mut work.inode_page[inode_at..inode_at + INODE_BYTES];
+        if job.grown_size.is_some() {
+            raw[16..24].copy_from_slice(&(size as u64).to_le_bytes());
+        }
         raw[24..32].copy_from_slice(&write_seq.to_le_bytes());
         let crc = crc32c_zeroed(raw, 252)?;
         raw[252..].copy_from_slice(&crc.to_le_bytes());

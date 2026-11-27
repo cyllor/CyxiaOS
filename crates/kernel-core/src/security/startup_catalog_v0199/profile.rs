@@ -1,7 +1,9 @@
 //! Frozen SecurityProfile v3 structure from V0.19.9 §安0.8.
 //! Generation and the canonical RuleProfile digest are the only variables.
 use super::Error;
-use crate::security::network::pending_tls::{TLS_HANDSHAKE_MS, TLS_RECORD_IDLE_MS};
+use crate::security::network::tls_deadline::{
+    TLS_ACTIVE_IDLE_SECONDS, TLS_HANDSHAKE_MS, TLS_RECORD_IDLE_MS, TLS_SESSION_SECONDS,
+};
 
 pub(super) const BYTES: usize = 256;
 const FIXED: [u8; BYTES] = fixed_profile();
@@ -55,7 +57,7 @@ const fn fixed_profile() -> [u8; BYTES] {
     field(&mut wire, 118, TLS_HANDSHAKE_MS.to_le_bytes());
     field(&mut wire, 120, TLS_RECORD_IDLE_MS.to_le_bytes());
     field(&mut wire, 122, 16645u16.to_le_bytes());
-    field(&mut wire, 124, 300u16.to_le_bytes());
+    field(&mut wire, 124, TLS_SESSION_SECONDS.to_le_bytes());
     field(&mut wire, 126, 1000u16.to_le_bytes());
     field(&mut wire, 128, 1000u16.to_le_bytes());
     field(&mut wire, 130, [32, 16]);
@@ -88,7 +90,7 @@ const fn fixed_profile() -> [u8; BYTES] {
     field(&mut wire, 188, 5u16.to_le_bytes());
     field(&mut wire, 190, 50u16.to_le_bytes());
     field(&mut wire, 192, [4]);
-    field(&mut wire, 193, 30u16.to_le_bytes());
+    field(&mut wire, 193, TLS_ACTIVE_IDLE_SECONDS.to_le_bytes());
     field(&mut wire, 195, [8, 17, 64, 32, 16, 16, 8, 4, 5, 2, 120]);
     field(&mut wire, 206, 1_048_576u32.to_le_bytes());
     field(&mut wire, 210, 17_179_869_184u64.to_le_bytes());

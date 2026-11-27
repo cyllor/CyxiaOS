@@ -7,8 +7,8 @@ use core::ptr::{addr_of, addr_of_mut, copy_nonoverlapping};
 use cyxia_kernel_core::security::{
     Error as SecurityError,
     file_read_v4::{ENDPOINT, MAX_REPLY},
-    file_receipt_query_v4::{FILE_QUERY_RESULT, RECEIPT_KEY_BYTES},
-    file_service_v4::{REPLY_HEADER, REQUEST_HEADER, Reply, Request},
+    file_receipt_query_v4::{FILE_QUERY_RESULT, RECEIPT_KEY_BYTES, encode_receipt_reply},
+    file_service_v4::{REPLY_HEADER, REQUEST_HEADER, Request},
     recovery_proof_v2::EIO,
 };
 use media_staging::StagedReceiptQuery;
@@ -26,7 +26,7 @@ struct Grant {
 #[derive(Clone, Copy)]
 struct Checks {
     pending: bool,
-    recovered: Option<(u64, u64, u64)>,
+    recovered: bool,
     revoked: bool,
 }
 
@@ -39,7 +39,7 @@ static mut STATE: State = State {
     grant: None,
     checks: Checks {
         pending: false,
-        recovered: None,
+        recovered: false,
         revoked: false,
     },
 };
@@ -124,19 +124,14 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
         .view
         .serve(mount.caller, 0, &request, &mut reply)
         .map_err(errno)?;
-    let reply = &reply[..len];
-    let parsed = Reply::decode(reply).map_err(errno)?;
+    // The shared encoder projects a previous boot's retained BOUND record
+    // to UNKNOWN. Confirm the exact reply before publishing that result.
+    if len != REPLY_HEADER || reply != encode_receipt_reply(mount.caller, mount.expected) {
+        return Err(i64::from(EIO));
+    }
     // SAFETY: buffers() checked the independent writable reply span.
     unsafe { copy_nonoverlapping(reply.as_ptr(), dest as *mut u8, len) };
-    if parsed.state == mount.expected.status
-        && parsed.commit_lsn == mount.expected.commit_lsn
-        && parsed.write_seq == mount.expected.write_seq
-        && parsed.completed_prefix == mount.expected.completed_prefix
-        && parsed.result_digest == mount.expected.output_digest
-    {
-        state.checks.recovered =
-            Some((mount.caller.boot_epoch, parsed.commit_lsn, parsed.write_seq));
-    }
+    state.checks.recovered = true;
     Ok(())
 }
 
@@ -163,6 +158,7 @@ pub(super) fn drive(
     };
     let boot = mount.caller.boot_epoch;
     let service = mount.caller.service_generation;
+    let expected = mount.expected;
     let ctx = &mut contexts[index];
     let until = deadline();
     wait_for_role_yield(index, ctx, until, FATAL + 1, || checks().pending);
@@ -174,13 +170,15 @@ pub(super) fn drive(
             mount: Some(mount),
         });
     }
-    wait_for_role_yield(index, ctx, until, FATAL + 2, || {
-        checks().recovered.is_some()
-    });
+    wait_for_role_yield(index, ctx, until, FATAL + 2, || checks().recovered);
     // Keep the holder binding so its next authenticated query observes ESTALE.
     unsafe { (*addr_of_mut!(STATE.grant)).as_mut().unwrap().mount = None };
     wait_for_role_yield(index, ctx, until, FATAL + 3, || checks().revoked);
-    let (epoch, lsn, write_seq) = checks().recovered.expect("checked native receipt result");
-    report("V020_FSYNC_RECOVERED", epoch, lsn, write_seq);
+    let event = if expected.status == 2 {
+        "V020_FSYNC_UNKNOWN_RECOVERED"
+    } else {
+        "V020_FSYNC_RECOVERED"
+    };
+    report(event, boot, expected.commit_lsn, expected.write_seq);
     report("V020_FSYNC_RECEIPT_ABI", boot, holder.actor.id, service);
 }

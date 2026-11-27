@@ -320,6 +320,7 @@ fn staging_acl(
     system: Option<UnifiedSystemKind>,
     snapshots: SnapshotLayout,
     owner: Principal,
+    file_size: usize,
 ) -> Result<(), SecurityError> {
     let allocated_snapshots = if snapshots.allocated() {
         &SNAPSHOTS[..]
@@ -351,7 +352,7 @@ fn staging_acl(
     }
     if file
         && (inode.kind != 1
-            || inode.size != SCRATCH_FILE_DATA.len() as u64
+            || inode.size != file_size as u64
             || inode.extents != 1
             || inode.runs[0]
                 != (Extent {
@@ -512,7 +513,16 @@ pub(super) fn validate_homes(
     // SAFETY: one-shot CPU0 call (module header); the borrow ends on return.
     let w = unsafe { &mut *core::ptr::addr_of_mut!(MOUNT) };
     let principals = principals(config);
-    let policy = |acl, inode, kind| staging_acl(acl, inode, kind, snapshots, principals[0]);
+    let policy = |acl, inode, kind| {
+        staging_acl(
+            acl,
+            inode,
+            kind,
+            snapshots,
+            principals[0],
+            SCRATCH_FILE_DATA.len(),
+        )
+    };
     let e = if snapshots.allocated() {
         file_mount_v1::validate_unified(disk, sb, &SYSTEM, &SNAPSHOTS, &principals, w, policy)?
     } else {
@@ -557,13 +567,15 @@ pub(super) fn validate_homes(
     Ok(e)
 }
 
-/// Validate only the signed diagnostic's post-replay view, after the exact
-/// expected journal homes were verified and replayed by the scratch owner.
+/// Validate the signed FSYNC diagnostic's persisted file and paired epoch.
 #[cfg(feature = "v020-production-fsync-scratch")]
 pub(super) fn validate_fsync_homes(
     disk: &mut Disk,
     checkpoint: SuperblockV1,
     config: &VerifiedOfflineConfig<'_>,
+    epoch: u64,
+    file_size: usize,
+    receipt_bound: bool,
 ) -> Result<MountEvidence, SecurityError> {
     // SAFETY: the one-shot CPU0 mount excludes all other MOUNT borrows.
     let w = unsafe { &mut *core::ptr::addr_of_mut!(MOUNT) };
@@ -575,19 +587,22 @@ pub(super) fn validate_fsync_homes(
                 kind.map(UnifiedSystemKind::from_baseline),
                 SnapshotLayout::BaselineFsyncFile,
                 config.principals()[0],
+                file_size,
             )
         })?;
-    if e.security != expected_state(1, Some(config))?
-        || e.boot.boot_epoch != 1
+    if e.security != expected_state(epoch, Some(config))?
+        || e.boot.boot_epoch != epoch
         || e.structure.live_inodes != 6
         || e.structure.directory_entries != 1
         || e.system_blocks != 13
         || e.structure.data_blocks != 15
         || e.receipts.occupied != 1
-        || e.receipts.unresolved != 0
+        || e.receipts.unresolved != usize::from(receipt_bound)
     {
         return Err(SecurityError::Conflict);
     }
+    let expected = file_format_v1::scratch_file_dirent()?;
+    read_root(disk, &mut [0; BLOCK_BYTES], Some(&expected))?;
     Ok(e)
 }
 
@@ -652,6 +667,10 @@ pub(super) fn read_checkpoint(
     if sb.generation > 1 && (a == b || (sb == a) != (sb.generation % 2 == 1)) {
         return Err(SecurityError::Conflict);
     }
+    #[cfg(feature = "v020-production-fsync-scratch")]
+    if sb.generation > 2 && super::fsync::receipt_lsn(a) != super::fsync::receipt_lsn(b) {
+        return Err(SecurityError::Conflict);
+    }
     if sb != a {
         *raw = other;
     }
@@ -660,13 +679,10 @@ pub(super) fn read_checkpoint(
 
 fn checkpoint_lsn_valid(copy: SuperblockV1) -> bool {
     #[cfg(feature = "v020-production-fsync-scratch")]
-    return match copy.generation {
-        1 => copy.checkpoint_lsn == 0,
-        2 => matches!(
-            copy.checkpoint_lsn,
-            super::fsync::FINAL_LSN | super::fsync::LEGACY_FINAL_LSN
-        ),
-        _ => false,
+    return if copy.generation == 1 {
+        copy.checkpoint_lsn == 0
+    } else {
+        super::fsync::receipt_lsn(copy).is_some()
     };
     #[cfg(not(feature = "v020-production-fsync-scratch"))]
     {

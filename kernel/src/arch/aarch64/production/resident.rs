@@ -5,12 +5,14 @@
 //! inputs were pinned at build time, this path authenticates the signed
 //! envelope before running read-only SECURE_DEGRADED diagnostics.
 
-#[cfg(not(feature = "v020-production-signed-resident"))]
+#[cfg(not(cyxia_signed_resident))]
 use super::bring_up_production;
+#[cfg(cyxia_signed_resident)]
+use super::signed_resident::Sample;
 use super::{
     BootInfo, FAILURES, IRQS, ONLINE, Ordering, STOPPED, TIMER_IRQ, cpu, gic, report_payload, timer,
 };
-#[cfg(not(feature = "v020-production-signed-resident"))]
+#[cfg(not(cyxia_signed_resident))]
 use crate::ExceptionFrame;
 use crate::{UART, machine::enqueue_resident_frame};
 use cyxia_contracts::{PhysAddr, UartResource};
@@ -26,8 +28,7 @@ use cyxia_kernel_core::{
 };
 
 #[cfg(cyxia_startup_catalog)]
-#[path = "startup_catalog.rs"]
-mod startup_catalog;
+use super::startup_catalog;
 
 const STATUS: &[u8] = b"status";
 const DISCARD_LINE: usize = STATUS.len() + 1;
@@ -42,6 +43,8 @@ const CATALOG_RECOVERY_NS: u64 =
 struct ResidentBudget {
     ledger: Cpu0BudgetLedger,
     frequency: u64,
+    #[cfg(cyxia_signed_resident)]
+    native_cursor: Option<Sample>,
 }
 
 impl ResidentBudget {
@@ -50,8 +53,19 @@ impl ResidentBudget {
             .map_err(|_| Error::Clock)
     }
 
+    fn begin(&mut self) -> Result<u64, Error> {
+        #[cfg(cyxia_signed_resident)]
+        if let Some(cursor) = self.native_cursor.as_mut() {
+            // Read-only containment carries the same cursor and ledger.
+            // The ledger still enforces its remaining coordination credit.
+            cursor.account_gap(&mut self.ledger)?;
+            return Ok(cursor.wall);
+        }
+        self.now_ns()
+    }
+
     fn diagnostic_turn(&mut self, work: impl FnOnce()) -> Result<Option<Settlement>, Error> {
-        let start = self.now_ns()?;
+        let start = self.begin()?;
         let reservation =
             self.ledger
                 .reserve_readonly_diagnostic(cpu::slot(), CONSOLE_TURN_NS, start);
@@ -64,6 +78,10 @@ impl ResidentBudget {
     }
 
     fn settle(&mut self, start: u64, grant: Turn) -> Result<Settlement, Error> {
+        #[cfg(cyxia_signed_resident)]
+        if let Some(cursor) = self.native_cursor.as_mut() {
+            return cursor.settle(&mut self.ledger, grant);
+        }
         let end = self.now_ns()?;
         // The generic counter provides a conservative elapsed-time debit
         // for a foreground turn, with one tick of rounding margin.
@@ -77,7 +95,7 @@ impl ResidentBudget {
     #[cfg(cyxia_startup_catalog)]
     fn verify_startup_envelope(&mut self) -> Result<(bool, Settlement), Error> {
         let (started, grant) = loop {
-            let now = self.now_ns()?;
+            let now = self.begin()?;
             match self
                 .ledger
                 .reserve_kernel(cpu::slot(), Class::Recovery, CATALOG_RECOVERY_NS, now)
@@ -96,7 +114,7 @@ pub(super) fn timer_deadline() -> u64 {
     timer::ticks().saturating_add((timer::frequency() / 1_000).max(1))
 }
 
-#[cfg(not(feature = "v020-production-signed-resident"))]
+#[cfg(not(cyxia_signed_resident))]
 pub(crate) fn exception(frame: &mut ExceptionFrame, kind: u64) {
     super::exception(frame, kind);
 }
@@ -149,7 +167,7 @@ pub(super) fn poll_console(
     }
 }
 
-#[cfg(not(feature = "v020-production-signed-resident"))]
+#[cfg(not(cyxia_signed_resident))]
 pub(crate) fn run(info: &BootInfo) -> ! {
     assert_eq!(cpu::slot(), 0);
     bring_up_production(info);
@@ -161,7 +179,15 @@ pub(super) fn serve(
     _startup_override: Option<&'static [u8]>,
     ledger: Cpu0BudgetLedger,
 ) -> ! {
-    serve_with_queue(info, _startup_override, ledger, OutputQueue::new(), None)
+    serve_with_queue(
+        info,
+        _startup_override,
+        ledger,
+        OutputQueue::new(),
+        None,
+        #[cfg(cyxia_signed_resident)]
+        None,
+    )
 }
 
 pub(super) fn attach_console(info: &BootInfo) -> Pl011 {
@@ -180,11 +206,17 @@ pub(super) fn serve_with_queue(
     ledger: Cpu0BudgetLedger,
     mut pending: OutputQueue<128>,
     mut fault: Option<(&'static str, [u64; 3])>,
+    #[cfg(cyxia_signed_resident)] native_cursor: Option<Sample>,
 ) -> ! {
     let mut uart = attach_console(info);
     let frequency = timer::frequency();
     assert_ne!(frequency, 0);
-    let mut budget = ResidentBudget { ledger, frequency };
+    let mut budget = ResidentBudget {
+        ledger,
+        frequency,
+        #[cfg(cyxia_signed_resident)]
+        native_cursor,
+    };
     gic()
         .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
         .expect("CPU0 timer PPI");
@@ -202,14 +234,17 @@ pub(super) fn serve_with_queue(
         budget.ledger.ordinary_closed(),
     );
     #[cfg(cyxia_startup_catalog)]
-    let catalog_check = budget.verify_startup_envelope();
+    let catalog_check = _startup_override
+        .is_none()
+        .then(|| budget.verify_startup_envelope());
     #[cfg(cyxia_startup_catalog)]
-    let (startup_banner, budget_degraded): (&[u8], _) = match &catalog_check {
-        Ok((true, cost)) if !cost.overrun && !cost.crossed_window => (
+    let (startup_banner, budget_degraded): (&[u8], _) = match (_startup_override, &catalog_check) {
+        (Some(banner), _) => (banner, budget.ledger.ordinary_closed()),
+        (None, Some(Ok((true, cost)))) if !cost.overrun && !cost.crossed_window => (
             b"V020_STARTUP state=SECURE_DEGRADED reason=catalog_verified_pending command=status\n",
             false,
         ),
-        Ok((false, cost)) if !cost.overrun && !cost.crossed_window => (
+        (None, Some(Ok((false, cost)))) if !cost.overrun && !cost.crossed_window => (
             b"V020_STARTUP state=SECURE_DEGRADED reason=catalog_rejected command=status\n",
             false,
         ),
@@ -219,7 +254,7 @@ pub(super) fn serve_with_queue(
         ),
     };
     #[cfg(cyxia_startup_catalog)]
-    let mut catalog_cost = catalog_check.ok().map(|(_, cost)| cost);
+    let mut catalog_cost = catalog_check.and_then(Result::ok).map(|(_, cost)| cost);
     let mut startup = Some(startup_banner);
     let mut command = 0;
     let mut last_interrupt = 0;

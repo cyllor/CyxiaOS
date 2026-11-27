@@ -18,6 +18,15 @@ ROLE_GRANTS = (
     (0, 1, 2_000_000), (1, 12, 2_000_000), (2, 1, 250_000), (2, 1, 250_000),
     (5, 0, 500_000), (3, 0, 500_000), (5, 0, 500_000), (3, 0, 500_000),
 )
+SIGNED_CAPACITY = 1024
+SIGNED_HEADER = struct.Struct("<20Q")
+SIGNED_ROW = struct.Struct("<8Q")
+SIGNED_TRACE_BYTES = ((SIGNED_HEADER.size + SIGNED_CAPACITY * SIGNED_ROW.size + 4095) // 4096) * 4096
+SIGNED_MAGIC = 0x4359583253425544
+SIGNED_ROLES = (6, 7, 2, 8, 9, 3, 10, 11)
+SIGNED_ROLE_LIMIT = 2_000_000
+SIGNED_CONSOLE_QUOTA = 1_000_000
+SIGNED_RECOVERY_QUOTA = CLASS_LIMITS[RECOVERY]
 
 
 def require(condition, message):
@@ -39,17 +48,40 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, 
     end_offset = HEADER.size + count * ROW.size
     require(not any(raw[end_offset:]), "unexpected unused CPU0 trace bytes")
 
+    result = _replay_intervals(
+        ROW.iter_unpack(raw[HEADER.size:end_offset]), (wall, counter, before), summary,
+        replacement_roles, recovery_slices, boot_accounting=boot_accounting,
+    )
+    if version == 4:
+        result.update(early_boot_coordination_intervals=boot_intervals,
+                      early_boot_coordination_cpu_ns=boot_cpu_ns)
+    return result
+
+
+def _replay_intervals(intervals, origin, summary, replacement_roles=None, recovery_slices=None,
+                      *, boot_accounting=None, signed_roles=None, opening_recovery=None):
+    wall, counter, before = origin
+    boot_intervals, boot_end, boot_cpu_ns = boot_accounting or (0, 0, 0)
+    signed = signed_roles is not None
+    opening_window, opening_cpu_ns = opening_recovery or (-1, 0)
+    role_limits = [SIGNED_ROLE_LIMIT] * len(ROLE_GRANTS) if signed else ROLE_LIMITS
     start_wall, start_counter = wall, counter
     lifetime = [0] * len(CLASS_LIMITS)
     window = None
     spending = []
     role_spending = []
+    role_returns = []
+    all_role_debits = [0] * len(ROLE_GRANTS)
+    all_role_returns = [0] * len(ROLE_GRANTS)
+    windows = []
+    window_upper = 0
     kernel_coordination = 0
+    kernel_coordination_upper = 0
     operations_seen = set()
     security_count = 0
     decision_spending = []
     crossing_gaps = 0
-    peak = 0
+    peak = opening_cpu_ns
     grants = 0
     role_generations = [0] * len(ROLE_LIMITS)
     reloaded_spending = [0] * len(ROLE_LIMITS)
@@ -57,14 +89,29 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, 
     recovery_count = 0
     largest_recovery = 0
 
+    def finish_window():
+        if signed and window is not None:
+            windows.append({
+                "window": window, "upper_ns": window_upper, "class_cpu_ns": spending,
+                "role_cpu_ns": role_spending, "role_returns": role_returns,
+                "kernel_coordination_cpu_ns": kernel_coordination,
+                "kernel_coordination_upper_ns": kernel_coordination_upper,
+            })
+
     def enter(window_number):
-        nonlocal window, spending, role_spending, kernel_coordination
+        nonlocal window, spending, role_spending, role_returns, window_upper
+        nonlocal kernel_coordination, kernel_coordination_upper
         nonlocal operations_seen, security_count, decision_spending
         if window != window_number:
+            finish_window()
             window = window_number
             spending = [0] * len(CLASS_LIMITS)
-            role_spending = [0] * len(ROLE_LIMITS)
+            spending[RECOVERY] = opening_cpu_ns if window == opening_window else 0
+            window_upper = sum(spending)
+            role_spending = [0] * len(role_limits)
+            role_returns = [0] * len(role_limits)
             kernel_coordination = 0
+            kernel_coordination_upper = 0
             operations_seen = set()
             security_count = 0
             decision_spending = [0] * 16
@@ -74,13 +121,15 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, 
                 and spending[category] + charge <= CLASS_LIMITS[category],
                 "CPU0 class or total window limit exceeded")
         if role is not None:
-            require(role_spending[role] + charge <= ROLE_LIMITS[role], "CPU0 role limit exceeded")
+            require(role_spending[role] + charge <= role_limits[role], "CPU0 role limit exceeded")
         elif category == COORDINATION:
             require(kernel_coordination + charge <= KERNEL_COORDINATION_LIMIT,
                     "EL1 coordination sublimit exceeded")
 
-    for index, row in enumerate(ROW.iter_unpack(raw[HEADER.size:end_offset]), 1):
-        end, tick, quota, deadline, scope, lower = row
+    for index, row in enumerate(intervals, 1):
+        end, tick, quota, deadline, scope, lower, *identity = row
+        actor_id, generation = identity if signed else (0, scope >> 32)
+        returned = scope >> 32 if signed else 0
         require(end >= wall and tick >= counter, "regressed CPU0 counter or wall clock")
         require(before <= lower < end and lower // WINDOW == end // WINDOW,
                 "CPU0 sample straddles a window")
@@ -99,10 +148,13 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, 
         enter(start_window)
         role = None
         if scope == 0:
-            require(quota == deadline == 0, "coordination gap contains a role grant")
+            require(quota == deadline == actor_id == generation == 0,
+                    "coordination gap contains a role grant")
             category = COORDINATION
             check_credit(category, role, actual)
-            peak = max(peak, sum(spending) + actual)
+            window_upper = max(window_upper, sum(spending) + actual)
+            kernel_coordination_upper = max(kernel_coordination_upper, kernel_coordination + actual)
+            peak = max(peak, window_upper)
             if last_window != start_window:
                 # Persist the debit exactly once, while bounding both
                 # touched windows by the independently sampled delta.
@@ -113,18 +165,20 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, 
             category = (scope & 0xff) - 1
             actor = (scope >> 8) & 0xff
             domain = (scope >> 16) & 0xffff
-            generation = scope >> 32
-            require(0 <= category < len(CLASS_LIMITS) and actor <= len(ROLE_LIMITS),
+            require(0 <= category < len(CLASS_LIMITS) and actor <= len(role_limits),
                     "unknown CPU0 grant scope")
             require(0 < quota <= (start_window + 1) * WINDOW - wall
                     and deadline == min((start_window + 1) * WINDOW, wall + 50_000_000)
                     and end <= deadline and last_window == start_window and actual <= quota,
                     "CPU0 grant expiry, window, or measured quota overrun")
             if actor == 0:
-                require(category in (COORDINATION, RECOVERY) and generation == 0,
+                require(category in (COORDINATION, RECOVERY)
+                        and generation == actor_id == returned == 0,
                         "invalid EL1 grant scope")
                 expected = (2_000_000 if category == RECOVERY else
                             KERNEL_COORDINATION_LIMIT - kernel_coordination - 200_000)
+                if signed:
+                    expected = SIGNED_RECOVERY_QUOTA if category == RECOVERY else SIGNED_CONSOLE_QUOTA
                 require(quota == expected, "incorrect EL1 prepayment")
                 if category == RECOVERY:
                     recovery_count += 1
@@ -133,13 +187,20 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, 
                 role = actor - 1
                 require((category, domain, quota) == ROLE_GRANTS[role],
                         "incorrect role grant class, domain, or quota")
-                require(1 <= generation <= 2
-                        and role_generations[role] <= generation <= role_generations[role] + 1,
-                        "skipped or regressed role generation")
-                role_generations[role] = generation
-                if generation == 2:
-                    reloaded_spending[role] += actual
-                    reloaded_turns[role] += 1
+                if signed:
+                    require((role, actor_id, generation) == signed_roles[role],
+                            "signed role identity differs from the durable role table")
+                    require(returned <= (1 if category == 2 else 8)
+                            and (returned == 0 or actual > 0),
+                            "invalid native EL0 return count")
+                else:
+                    require(1 <= generation <= 2
+                            and role_generations[role] <= generation <= role_generations[role] + 1,
+                            "skipped or regressed role generation")
+                    role_generations[role] = generation
+                    if generation == 2:
+                        reloaded_spending[role] += actual
+                        reloaded_turns[role] += 1
             check_credit(category, role, quota)
             if category in (0, 1, 2):
                 require(1 <= domain <= 15, "invalid control-domain grant")
@@ -159,17 +220,23 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, 
             grants += 1
         if role is not None:
             role_spending[role] += actual
+            role_returns[role] += returned
+            all_role_debits[role] += actual
+            all_role_returns[role] += returned
         elif category == COORDINATION:
             kernel_coordination += actual
+            kernel_coordination_upper = max(kernel_coordination_upper, kernel_coordination)
         spending[category] += actual
         lifetime[category] += actual
-        peak = max(peak, sum(spending))
+        window_upper = max(window_upper, sum(spending))
+        peak = max(peak, window_upper)
         wall, counter, before = end, tick, lower
 
+    finish_window()
     elapsed, accounted, upper, gaps, begin_ns, end_ns, *classes = summary
     require((begin_ns, end_ns) == (start_wall, wall), "trace wall endpoints differ from summary")
     require(0 < elapsed == accounted == counter - start_counter == sum(lifetime)
-            and lifetime == classes and peak == upper and gaps == crossing_gaps,
+            and lifetime == classes and peak == upper and (signed or gaps == crossing_gaps),
             "trace does not conserve the reported CPU0 charges")
     if replacement_roles is not None:
         require(all(generation == 2 for generation in role_generations)
@@ -178,12 +245,43 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, 
     if recovery_slices is not None:
         require((recovery_count, largest_recovery) == recovery_slices,
                 "trace recovery slices differ from native evidence")
-    result = {"budget_intervals_replayed": count, "budget_grants_replayed": grants,
+    result = {"budget_intervals_replayed": index, "budget_grants_replayed": grants,
               "budget_max_window_upper_ns": peak, "budget_accounting_replayed": True}
-    if version == 4:
-        result.update(early_boot_coordination_intervals=boot_intervals,
-                      early_boot_coordination_cpu_ns=boot_cpu_ns)
+    if signed:
+        complete = [w["window"] for w in windows if start_wall // WINDOW < w["window"] < wall // WINDOW
+                    and all(w["role_returns"])]
+        require(any(right - left == 7 for left, right in zip(complete, complete[7:])),
+                "fewer than eight consecutive complete windows with eight roles")
+        result.update(budget_crossing_gaps=crossing_gaps, budget_role_returns=all_role_returns,
+                      budget_role_cpu_ns=all_role_debits, budget_window_replay=windows,
+                      budget_kernel_coordination_max_upper_ns=max(
+                          w["kernel_coordination_upper_ns"] for w in windows),
+                      budget_complete_eight_role_windows=complete)
     return result
+
+
+def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget):
+    """Bind a sealed prefix to the durable role inventory and native UART."""
+    require(len(raw) == SIGNED_TRACE_BYTES, "wrong signed CPU0 trace size")
+    (magic, version, count, wall, tick, before, epoch, opening_window, opening_cpu,
+     end_wall, end_tick, charged, peak, idle, *classes) = SIGNED_HEADER.unpack_from(raw)
+    require(magic == SIGNED_MAGIC and version == 1 and 0 < count < SIGNED_CAPACITY,
+            "unsealed signed CPU0 trace")
+    require(epoch == boot_epoch > 0, "signed CPU0 trace differs from the durable BootEpoch")
+    require([(index, actor) for index, actor, _ in roles] == list(enumerate(SIGNED_ROLES))
+            and all(generation > 0 for _, _, generation in roles), "missing signed CPU0 role inventory")
+    require(before < wall and before // WINDOW == wall // WINDOW, "CPU0 sample straddles a window")
+    require(opening_window <= wall // WINDOW and 0 < opening_cpu == recovery[0] <= SIGNED_RECOVERY_QUOTA,
+            "invalid opening signed Recovery debit")
+    elapsed = end_tick - tick
+    require((elapsed, charged, idle) in uart_budget, "trace endpoint differs from the UART CPU0 ledger")
+    end_offset = SIGNED_HEADER.size + count * SIGNED_ROW.size
+    require(not any(raw[end_offset:]), "unexpected unused signed CPU0 trace bytes")
+    return _replay_intervals(
+        SIGNED_ROW.iter_unpack(raw[SIGNED_HEADER.size:end_offset]), (wall, tick, before),
+        (elapsed, charged, peak, None, wall, end_wall, *classes), recovery_slices=(1, recovery[1]),
+        signed_roles=roles, opening_recovery=(opening_window, opening_cpu),
+    )
 
 
 def verify_sustained(raw, windows):

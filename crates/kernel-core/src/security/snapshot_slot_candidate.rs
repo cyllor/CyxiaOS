@@ -27,7 +27,7 @@ pub struct SlotIdentity {
 }
 
 impl SlotIdentity {
-    fn descriptor_block(self) -> Result<u32, Error> {
+    pub(super) fn descriptor_block(self) -> Result<u32, Error> {
         if self.fs_uuid == [0; 16]
             || self.snapshot_id == 0
             || self.slot >= SNAPSHOT_SLOTS

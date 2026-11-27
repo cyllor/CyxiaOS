@@ -16,6 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import v020_production_media as media  # noqa: E402
+import verify_v020_fsync_scratch as fsync  # noqa: E402
 import verify_v020_production as v  # noqa: E402
 
 SVC64 = 0x5600_0000
@@ -95,8 +96,9 @@ def w11_lines(staging: bool = False) -> list:
                             queue, 0, 1, 1, 1, 0, 0, 5_000_000)
         lines.append("V020_SEC_D_NET_RESET_PROOF " + proof.hex())
     if staging:
-        lines += [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
-                  for index, detail in enumerate((1, 5, 151, 1, 1), start=1)]
+        listen = lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0")
+        lines[listen:listen] = [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
+                                for index, detail in enumerate((1, 5, 151, 1, 1), start=1)]
         lines += [f"V020_W11_MEDIA_SNAPSHOT_0X40 a=3 b={v.EAGAIN_RESULT} c=0",
                   "V020_W12_MEDIA_EPOCH a=0 b=1 c=0",
                   "V020_W11_MEDIA_IO a=135359 b=4138 c=6",
@@ -557,6 +559,38 @@ class W11Validation(unittest.TestCase):
         words[182] = 2
         self.rejects("signed scratch verdict and BootEpoch", words=words, lines=lines, staging=True, modes=modes)
 
+    def test_signed_reopen_requires_the_current_network_reset_epoch(self):
+        modes = v.Modes(media_reopen=True, signed_media=True)
+        words = w11_words(staging=True)
+        words[145] = 0
+        words[148] = 2
+        words[162:164] = [1, 1]
+        words[181:188] = [1, 2, 2, 2, 3, 4, 5]
+        lines = w11_lines(staging=True)
+        replacements = {
+            "V020_W11_MEDIA_STEP a=4 b=1 c=1": "V020_W11_MEDIA_STEP a=4 b=1 c=2",
+            "V020_W12_MEDIA_EPOCH a=0 b=1 c=0": "V020_W12_MEDIA_EPOCH a=1 b=2 c=1",
+            "V020_W11_MEDIA_IO a=135359 b=4138 c=6": "V020_W11_MEDIA_IO a=8261 b=15 c=5",
+        }
+        lines = [replacements.get(line, line) for line in lines] + [
+            "V020_W23_RECEIPT_VIEW a=2 b=7 c=2",
+            "V020_W13_SIGNED_SCRATCH a=1 b=2 c=1",
+            "V020_W13_MEDIA_SCOPE test_key=true format_golden=false signed_config=true",
+        ]
+        self.rejects("wrong generation", words=words, lines=lines, staging=True, modes=modes)
+        prefix = "V020_SEC_D_NET_RESET_PROOF "
+        for index, line in enumerate(lines):
+            if line.startswith(prefix):
+                encoded = bytearray.fromhex(line.removeprefix(prefix))
+                struct.pack_into("<Q", encoded, 8, 2)
+                lines[index] = prefix + encoded.hex()
+        self.assertEqual(self.check(words=words, lines=lines, staging=True, modes=modes)
+                         ["native_net_reset_boot_epoch"], 2)
+        listen = "V020_W11_NET_LISTEN a=7 b=0 c=0"
+        lines.remove(listen)
+        lines.insert(0, listen)
+        self.rejects("before durable BootEpoch", words=words, lines=lines, staging=True, modes=modes)
+
     def test_signed_receipt_view_host_disk_hash_rejects_modified_or_short_image(self):
         # Synthetic sparse file, not evidence of a native device run.
         with tempfile.TemporaryDirectory() as tmp:
@@ -759,6 +793,71 @@ class W11Validation(unittest.TestCase):
         words[145] = 0
         lines = [line.replace("b=15 c=5", "b=15 c=0") for line in lines]
         self.rejects("writes and flushes", words=words, lines=lines, staging=True, modes=modes)
+
+    def test_fsync_reopen_counts_nonzero_log_blocks(self):
+        modes = v.Modes(fsync_scratch=True, media_reopen=True)
+        words = w11_words(staging=True)
+        words[145] = 0
+        words[148] = 2
+        words[162:164] = [1, 1]
+        lines = [v.STAGING_MARKER, "V020_W12_MEDIA_EPOCH a=1 b=2 c=1",
+                 f"V020_W11_MEDIA_SNAPSHOT_0X40 a=3 b={v.EAGAIN_RESULT} c=0"]
+        lines += [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
+                  for index, detail in enumerate((1, 6, 151, 2, 1), start=1)]
+        with tempfile.TemporaryDirectory() as temp:
+            disk = Path(temp) / "fsync.raw"
+            for size, seq, lsn, contents, retired in (
+                (29, 7, fsync.LEGACY_FINAL_LSN, fsync.FINAL, 24),
+                (29, 7, fsync.FINAL_LSN, fsync.FINAL, 28),
+                (fsync.BLOCK, 49, fsync.FINAL_LSN, b"x" * fsync.BLOCK, 29),
+            ):
+                with self.subTest(size=size, lsn=lsn):
+                    log = fsync.boot_one_log(lsn, contents, size, seq)
+                    with disk.open("wb") as image:
+                        image.seek(fsync.FIRST * fsync.BLOCK)
+                        image.write(log.ljust(34 * fsync.BLOCK, b"\0"))
+                    pending = media.count_fsync_retirement_blocks(disk)
+                    self.assertEqual(pending, retired)
+                    recovered = lines + [f"V020_FSYNC_RECOVERED a=2 b={lsn} c={seq}"]
+                    io = f"V020_W11_MEDIA_IO a=20950 b={14 + retired} c=5"
+                    v.check_w11_staging(tuple(words), recovered + [io], b"", True, 3, modes,
+                                        pending_fsync_blocks=pending)
+                    off_by_one = f"V020_W11_MEDIA_IO a=20950 b={13 + retired} c=5"
+                    with self.assertRaisesRegex(ValueError, "writes and flushes"):
+                        v.check_w11_staging(tuple(words), recovered + [off_by_one], b"", True,
+                                            3, modes, pending_fsync_blocks=pending)
+
+    def test_fsync_third_boot_keeps_original_receipt(self):
+        modes = v.Modes(fsync_scratch=True, media_reopen=True)
+        words = w11_words(staging=True)
+        words[145:151] = [0, 1, 1, 3, 1, 1]
+        words[162:164] = [1, 2]
+        lines = [v.STAGING_MARKER, "V020_W12_MEDIA_EPOCH a=2 b=3 c=1",
+                 "V020_FSYNC_RECOVERED a=3 b=21 c=49",
+                 "V020_FSYNC_RECEIPT_ABI a=3 b=11 c=1",
+                 "V020_W11_MEDIA_IO a=20950 b=15 c=5",
+                 f"V020_W11_MEDIA_SNAPSHOT_0X40 a=3 b={v.EAGAIN_RESULT} c=0"]
+        lines += [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
+                  for index, detail in enumerate((2, 6, 151, 3, 1), start=1)]
+        result = v.check_w11_staging(tuple(words), lines, b"", True, 3, modes,
+                                     pending_fsync_blocks=4, expected_fsync_epoch=3)
+        self.assertEqual(result["native_file_receipt_query"]["boot_epoch"], 3)
+
+    def test_fsync_bound_reopen_confirms_only_unknown_query(self):
+        modes = v.Modes(fsync_scratch=True, fsync_bound=True, media_reopen=True)
+        words = w11_words(staging=True)
+        words[145:151] = [0, 1, 1, 2, 1, 1]
+        words[162:164] = [1, 1]
+        lines = [v.STAGING_MARKER, "V020_W12_MEDIA_EPOCH a=1 b=2 c=1",
+                 "V020_FSYNC_UNKNOWN_RECOVERED a=2 b=14 c=49",
+                 "V020_FSYNC_RECEIPT_ABI a=2 b=11 c=1",
+                 "V020_W11_MEDIA_IO a=20950 b=30 c=5",
+                 f"V020_W11_MEDIA_SNAPSHOT_0X40 a=3 b={v.EAGAIN_RESULT} c=0"]
+        lines += [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
+                  for index, detail in enumerate((1, 6, 151, 2, 1), start=1)]
+        result = v.check_w11_staging(tuple(words), lines, b"", True, 3, modes,
+                                     pending_fsync_blocks=18, expected_fsync_epoch=2)
+        self.assertEqual(result["native_file_receipt_query"]["boot_epoch"], 2)
 
 
 class FileSessionsEvidence(unittest.TestCase):

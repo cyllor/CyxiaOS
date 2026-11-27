@@ -67,6 +67,9 @@ _start:
  ldr x7, =__guard_phys
  ldr x10, =__exception_stacks_phys
  ldr x11, =__exception_stacks_end_phys
+.if {software_pan}
+ ldr x13, =empty_l1
+.endif
 6: ldr x8, =0x0060000000000703
  cmp x1, x7
  b.eq 10f
@@ -81,6 +84,11 @@ _start:
  cmp x12, #0x5000
  b.eq 10f
 .Lordinary_boot_page:
+.if {software_pan}
+ // The zeroed translation root keeps a read-only, execute-never alias.
+ cmp x1, x13
+ b.eq .Lreadonly_boot_page
+.endif
  ldr x9, ={entry}
  cmp x1, x9
  b.eq 8f
@@ -92,6 +100,7 @@ _start:
  b.lo 9f
  cmp x1, x6
  b.hs 9f
+.Lreadonly_boot_page:
  orr x8, x8, #0x80
  b 9f
 8: ldr x8, =0x0040000000000783
@@ -103,7 +112,12 @@ _start:
  cmp x1, x2
  b.lo 6b
  // 39-bit VA, 4K, WBWA inner-shareable walks, 40-bit PA.
+.if {software_pan}
+ // A1=1, AS=0. TTBR1 supplies the eight-bit ASID.
+ ldr x0, =0x00000002b5593519
+.else
  ldr x0, =0x00000002b5193519
+.endif
  msr tcr_el1, x0
  mov x0, #0xff
  msr mair_el1, x0
@@ -137,6 +151,10 @@ boot_halt:
 low_l1: .skip 4096
 .global high_l1
 high_l1: .skip 4096
+.if {software_pan}
+.global empty_l1
+empty_l1: .skip 4096
+.endif
 dev_l2: .skip 4096
 ram_l2: .skip 4096
 .global ram_l3
@@ -155,11 +173,16 @@ high_entry:
  ldr x0, =exception_vectors
  msr vbar_el1, x0
  isb
- // Disable TTBR0 walks before invalidating all old low translations.
+ // Retire the identity-mapped boot root before ordinary EL1 runs.
+.if {software_pan}
+ ldr x0, =empty_l1
+ msr ttbr0_el1, x0
+.else
  mrs x0, tcr_el1
  orr x0, x0, #0x80
  dsb ishst
  msr tcr_el1, x0
+.endif
  isb
  tlbi vmalle1is
  dsb ish

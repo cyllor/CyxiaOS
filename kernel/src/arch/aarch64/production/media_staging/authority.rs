@@ -31,17 +31,24 @@ use cyxia_kernel_core::security::{
     boot_epoch_v1::{BootEpochAuthority, BootEpochTx, BootPairRedo},
     durable_role_epoch_v0199::SlotBinding,
     epoch_redo_v0199::EpochBlockIo,
+    file_index_v0199::{BLOCK_BYTES, SecurityStateStoreV2},
+    file_media_v0199::SuperblockV1,
+};
+// This file is also compiled directly by kernel-core integration tests.
+// Keep the diagnostic helpers available there without enabling them in a
+// default non-diagnostic kernel.
+#[cfg(any(test, feature = "v020-production-diagnostic"))]
+use cyxia_kernel_core::security::{
     file_admission_flow_v1::{AdmissionFlowInput, FlowOutcome, run_admission_flow},
     file_auth_context_v1::{AdmissionLedgerV1, AuthContextIssuerV1, AuthorityFacts},
     file_auth_v3::{
         AdmitRequestV3, CompleteOutcome, FILE_SERVICE_ROLE, StepThree, TerminalState, Verdict,
     },
-    file_index_v0199::{BLOCK_BYTES, SecurityStateStoreV2},
-    file_media_v0199::SuperblockV1,
     file_service_v4::{REQUEST_HEADER, REQUEST_MAGIC, REQUEST_VERSION},
 };
 
 pub(super) const BOOT_LOG_BLOCKS: u32 = 6;
+#[cfg(any(test, feature = "v020-production-diagnostic"))]
 const EVIDENCE: [u8; 32] = [0x3c; 32];
 
 #[cfg_attr(target_os = "none", unsafe(link_section = ".bss.sec_n"))]
@@ -174,6 +181,7 @@ pub(super) fn boot_epoch_owner(
     Ok((confirmed, authority))
 }
 
+#[cfg(any(test, feature = "v020-production-diagnostic"))]
 fn user_frame(auth_context_id: u64) -> [u8; REQUEST_HEADER + 4] {
     // FileServiceRequest v4, op6 CLOSE, 4-byte payload.
     let mut b = [0; REQUEST_HEADER + 4];
@@ -187,6 +195,7 @@ fn user_frame(auth_context_id: u64) -> [u8; REQUEST_HEADER + 4] {
     b
 }
 
+#[cfg(any(test, feature = "v020-production-diagnostic"))]
 fn input(frame: &[u8]) -> AdmissionFlowInput<'_> {
     AdmissionFlowInput {
         principal: 1,
@@ -222,6 +231,7 @@ fn input(frame: &[u8]) -> AdmissionFlowInput<'_> {
 /// Fresh FILE_AUTH flow under the confirmed epoch reaches a terminal DONE with
 /// the reference released, AND a self-reported nonzero auth_context_id frame
 /// is rejected with nothing registered.
+#[cfg(any(test, feature = "v020-production-diagnostic"))]
 pub(super) fn admission_flow(boot_epoch: u64) -> Result<(), SecurityError> {
     // Negative on its own issuer/ledger: encapsulation still consumes a
     // context id and advances the holder generation, which would make the

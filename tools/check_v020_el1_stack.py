@@ -42,7 +42,7 @@ def stack_change(op, scope):
     return 0
 
 
-def linked_frames(metadata, instructions, require_stack_notes=False):
+def linked_frames(metadata, instructions, require_stack_notes=False, stackless_terminal=None):
     elf64.require(metadata["FileSummary"]["Arch"] == "aarch64", "stack metadata is not AArch64")
     functions = {}
     addresses = {}
@@ -73,6 +73,9 @@ def linked_frames(metadata, instructions, require_stack_notes=False):
                           f"conflicting compiler stack notes for {name}")
             notes[address] = entry["Size"]
     elf64.require(all(root in addresses for root in ROOTS), "missing default EL1 roots")
+    if stackless_terminal is not None:
+        elf64.require(addresses.get("cyxia_terminal_stop") == stackless_terminal,
+                      "stackless terminal entry differs from vector proof")
     if require_stack_notes:
         elf64.require(all(addresses[root] in notes for root in ROOTS),
                       "missing compiler stack notes for default EL1 roots")
@@ -82,6 +85,11 @@ def linked_frames(metadata, instructions, require_stack_notes=False):
             return finished[start]
         name, size = functions[start]["name"], functions[start]["size"]
         elf64.require(start not in active, f"recursive stack path through {name}")
+        if start == stackless_terminal:
+            # The linked vector check verifies its complete handoff before
+            # Rust runs on the separate emergency stack measured below.
+            finished[start] = ({"path": [name], "bytes": 0}, False)
+            return finished[start]
         end = start + size
         operations = {}
         for pc in range(start, end, 4):
@@ -149,7 +157,8 @@ def inspect(raw, metadata, disassembly, require_stack_notes=False):
     vectors = inspect_vectors(raw, disassembly)
     loads = inspect_elf(raw)["loads"]
     instructions = dict(executable_rows(raw, loads, disassembly))
-    roots, count, no_notes = linked_frames(metadata, instructions, require_stack_notes)
+    roots, count, no_notes = linked_frames(metadata, instructions, require_stack_notes,
+                                            int(vectors["software_terminal_va"], 16))
     # The validated vector enters Rust only after reserving 512 bytes. It
     # allows one nested synchronous dispatch and moves IRQs to another stack.
     dispatch = roots["exception_dispatch"]["bytes"]
@@ -168,6 +177,7 @@ def inspect(raw, metadata, disassembly, require_stack_notes=False):
         "secondary_execution_stack_bytes": (LIMIT if vectors["primary_exec_stack_bytes"] == LIMIT
                                             else 64 * 1024),
         "entry_frame_bytes": vectors["frame_bytes"],
+        "software_pan": vectors["software_pan"],
         "nested_dispatch_limit": 2,
         "reachable_functions": count,
         "reachable_functions_with_compiler_note": count - len(no_notes),

@@ -54,9 +54,13 @@ mod v0199_advice_e2e;
 #[cfg(feature = "v020-production-diagnostic")]
 #[path = "production.rs"]
 pub(crate) mod production;
+#[cfg(cyxia_startup_catalog)]
+#[path = "production/authorized.rs"]
+pub(crate) mod production;
 #[cfg(all(
     feature = "v020-production",
-    not(feature = "v020-production-diagnostic")
+    not(feature = "v020-production-diagnostic"),
+    not(cyxia_startup_catalog)
 ))]
 #[path = "production/resident.rs"]
 pub(crate) mod production;
@@ -140,7 +144,8 @@ mod v0199_format_fixture;
 // v020 opt-in media-staging lane (production/media_staging.rs).
 #[cfg(any(
     feature = "v0199-format-selftest",
-    feature = "v020-production-media-staging"
+    feature = "v020-production-media-staging",
+    cyxia_startup_catalog
 ))]
 #[path = "scratch_blk.rs"]
 mod scratch_blk;
@@ -235,6 +240,7 @@ core::arch::global_asm!(
     include_str!("../../../../crates/arch-aarch64/src/secondary.S"),
     max_cpus = const C,
     exec_stack_pages = const EXEC_STACK_BYTES / 4096,
+    software_pan = const cfg!(feature = "v020-production") as u8,
 );
 core::arch::global_asm!(
     include_str!("smp_user.S"),
@@ -353,7 +359,7 @@ unsafe extern "C" {
     #[cfg(feature = "v0199-advice-e2e-selftest")]
     static v0199_advice_user_end: u8;
 }
-#[cfg(not(feature = "v020-production-signed-resident"))]
+#[cfg(not(cyxia_signed_resident))]
 fn index(slot: usize, plane: Plane) -> usize {
     slot * 2 + usize::from(plane == Plane::Control)
 }
@@ -484,6 +490,12 @@ fn record_fault(code: u64, kind: u64, frame: Option<&super::ExceptionFrame>) {
     bank[base].store(code, Ordering::Release);
     bank[0].store(0x4359_534d_5046_4131, Ordering::Release);
 }
+#[cfg(feature = "v020-production")]
+fn stop_failed(code: u64) -> ! {
+    crate::machine::panic_stop::stop(code)
+}
+
+#[cfg(not(feature = "v020-production"))]
 fn stop_failed(code: u64) -> ! {
     if let Some(failure) = cpu::registered_slot().and_then(|slot| FAILURES.get(slot)) {
         failure.store(code, Ordering::Release);
@@ -513,6 +525,8 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
         let ack = gic().acknowledge();
         match ack {
             IrqAck::Active { id, .. } if id as u64 == TIMER_IRQ.load(Ordering::Relaxed) => {
+                #[cfg(feature = "v020-production-authenticated-net")]
+                let active_poll;
                 unsafe {
                     #[cfg(feature = "unified-runtime")]
                     if HEARTBEAT[slot].load(Ordering::Acquire) {
@@ -522,6 +536,10 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
                     }
                     #[cfg(not(feature = "unified-runtime"))]
                     cpu::disable_timer();
+                    #[cfg(feature = "v020-production-authenticated-net")]
+                    {
+                        active_poll = slot == 0 && kind == 5 && sec_n_broker::rearm_active_poll_timer();
+                    }
                     #[cfg(any(
                         feature = "v020-production-signed-resident",
                         all(
@@ -543,6 +561,10 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
                 gic().end(ack);
                 #[cfg(feature = "prototype-runtime")]
                 prototype_runtime::irq_exit(slot);
+                #[cfg(feature = "v020-production-authenticated-net")]
+                if active_poll {
+                    return;
+                }
             }
             #[cfg(feature = "unified-runtime")]
             IrqAck::Active { id: 0, .. } => {
@@ -588,6 +610,12 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
                 )
             ))]
             IrqAck::Spurious if kind == 5 => {}
+            #[cfg(all(
+                feature = "v020-production-authenticated-net",
+                not(feature = "unified-runtime")
+            ))]
+            IrqAck::Spurious
+                if slot == 0 && kind == 5 && sec_n_broker::rearm_active_poll_timer() => return,
             #[cfg(not(feature = "unified-runtime"))]
             _ => fatal(10 + kind),
         }
@@ -738,6 +766,7 @@ pub(super) unsafe fn gic_for_terminal_stop(slot: usize) -> Option<&'static Gic> 
     }
     unsafe { (&*core::ptr::addr_of!(GICS).cast::<Option<Gic>>().add(slot)).as_ref() }
 }
+#[cfg(not(cyxia_startup_catalog))]
 fn context(i: usize) -> user::Context {
     let mut ctx = user::Context::empty();
     ctx.pc = CODE;
@@ -790,6 +819,7 @@ fn builtin_capture_index(slot: usize) -> Option<usize> {
         usize::try_from(encoded).ok()
     }
 }
+#[cfg(not(cyxia_startup_catalog))]
 fn execute(ctx: &mut user::Context, i: usize) {
     let root = unsafe { core::ptr::addr_of!(ROOTS).cast::<Page>().add(i) as u64 };
     let quantum = (timer::frequency() / 1000).max(1);
@@ -869,12 +899,12 @@ fn fixture_context_valid(ctx: &user::Context, i: usize) -> bool {
 }
 #[cfg(all(
     not(feature = "unified-runtime"),
-    not(feature = "v020-production-signed-resident")
+    not(cyxia_signed_resident)
 ))]
 fn fixture_yielded(ctx: &user::Context) -> bool {
     ctx.kind == 9
 }
-#[cfg(not(feature = "v020-production-signed-resident"))]
+#[cfg(not(cyxia_signed_resident))]
 fn probes(slot: usize, i: usize) {
     // Probe an EL1-only address, an unmapped private address, code write, NX data,
     // and the user stack guard. A successful access/SVC is failure, not evidence.

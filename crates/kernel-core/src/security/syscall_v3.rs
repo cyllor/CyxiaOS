@@ -25,6 +25,15 @@ pub struct ValidatedCall {
     pub args: [u64; 6],
 }
 
+/// Frozen ABI v3 result for a rejected register preflight. Endpoint-specific
+/// errors are decided after authenticating the live holder.
+pub const fn preflight_errno(error: Error) -> i64 {
+    match error {
+        Error::Unauthorized => -1, // E_AUTH
+        _ => -2,                   // E_FORMAT
+    }
+}
+
 // Check only register-level arithmetic. Actual user VA ownership, mapping,
 // access permissions and stable copy-in/out remain mandatory in EL1.
 fn span(address: u64, length: u64) -> bool {
@@ -387,6 +396,8 @@ mod tests {
             decode_aarch64_lifecycle_svc_v3(ABI_VERSION, ESR, &regs),
             Err(Error::Invalid)
         );
+        assert_eq!(preflight_errno(Error::Unauthorized), -1);
+        assert_eq!(preflight_errno(Error::Invalid), -2);
     }
 
     #[test]

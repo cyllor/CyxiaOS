@@ -1,21 +1,25 @@
-//! Immutable, public test catalog for the selected repository scratch policy.
-//! The FSYNC profile pins a separate volume and the exact diagnostic owner.
+//! Signed scratch policy. The resident may pin an external empty policy at
+//! build time. The FSYNC profile pins its separate test volume and owner.
 use super::volume::UUID;
-#[cfg(feature = "v020-production-fsync-scratch")]
-use cyxia_kernel_core::security::offline_config_v1::Principal;
+#[cfg(not(any(cyxia_signed_scratch_catalog, cyxia_startup_catalog)))]
+use cyxia_kernel_core::security::offline_config_v1::{CatalogBindings, VerifiedOfflineConfig};
 use cyxia_kernel_core::security::{
     Error,
-    offline_config_v1::{CatalogBindings, VerifiedOfflineConfig},
+    offline_config_v1::{ConfigHeader, Principal},
 };
 
-#[cfg(not(feature = "v020-production-fsync-scratch"))]
+#[cfg(not(any(
+    feature = "v020-production-fsync-scratch",
+    cyxia_signed_scratch_catalog,
+    cyxia_startup_catalog
+)))]
 pub(super) const WIRE: &[u8] =
     include_bytes!("../../../../../../tests/fixtures/v020-signed-scratch/config.bin");
 #[cfg(feature = "v020-production-fsync-scratch")]
 pub(super) const WIRE: &[u8] =
     include_bytes!("../../../../../../tests/fixtures/v020-signed-scratch/fsync-config.bin");
 #[cfg(not(feature = "v020-production-fsync-scratch"))]
-const PAYLOAD: &[u8] = &[0; 12];
+pub(super) const PAYLOAD: &[u8] = &[0; 12];
 #[cfg(feature = "v020-production-fsync-scratch")]
 const PAYLOAD: &[u8] = b"CYX-SCRATCH-FSYNC/v1:inode=1,principal=1";
 #[cfg(feature = "v020-production-fsync-scratch")]
@@ -50,11 +54,16 @@ const FSYNC_CLIENT_DIGEST: [u8; 32] = [
     0x57, 0x76, 0x04, 0xca, 0x9d, 0xcd, 0x0f, 0x7a, 0xb0, 0xd4, 0x77, 0x9f, 0x3e, 0x97, 0x27, 0xef,
 ];
 // RFC 8032 test vector 1, public verifying key.
+#[cfg(not(any(cyxia_signed_scratch_catalog, cyxia_startup_catalog)))]
 const PUBLIC_KEY: [u8; 32] = [
     0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
     0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
 ];
-#[cfg(not(feature = "v020-production-fsync-scratch"))]
+#[cfg(not(any(
+    feature = "v020-production-fsync-scratch",
+    cyxia_signed_scratch_catalog,
+    cyxia_startup_catalog
+)))]
 const WIRE_DIGEST: [u8; 32] = [
     0xff, 0xff, 0x2c, 0x6b, 0x9f, 0xde, 0x3b, 0x53, 0x11, 0xc4, 0xdf, 0x1c, 0x87, 0x1f, 0xf6, 0xb3,
     0x83, 0x08, 0x17, 0xfd, 0x1d, 0x76, 0xe0, 0xa1, 0xfb, 0x4b, 0xc0, 0x7a, 0xaa, 0x36, 0x9b, 0xcf,
@@ -64,6 +73,7 @@ const WIRE_DIGEST: [u8; 32] = [
     0xe9, 0x87, 0xd0, 0x63, 0xb8, 0x3b, 0xff, 0x1c, 0xf6, 0x0b, 0x1d, 0x00, 0x08, 0x45, 0x27, 0x6f,
     0x01, 0x72, 0x59, 0x9f, 0x3e, 0x36, 0xee, 0xc4, 0xff, 0x1a, 0xbf, 0x4c, 0x6e, 0x6c, 0x14, 0xd1,
 ];
+#[cfg(not(any(cyxia_signed_scratch_catalog, cyxia_startup_catalog)))]
 const CATALOG: CatalogBindings = CatalogBindings {
     rule_generation: 1,
     security_generation: 1,
@@ -85,8 +95,8 @@ const CATALOG: CatalogBindings = CatalogBindings {
     ],
 };
 
-/// Accept only the pinned, signed scratch configuration. Its expected wire
-/// digest, public key and catalog bindings are independent of the supplied bytes.
+/// Accept the pinned repository scratch fixture.
+#[cfg(not(any(cyxia_signed_scratch_catalog, cyxia_startup_catalog)))]
 pub(super) fn verify<'a>(
     wire: &'a [u8],
     scratch: &mut [u8],
@@ -94,6 +104,31 @@ pub(super) fn verify<'a>(
     verify_vector(wire, scratch, PAYLOAD, WIRE_DIGEST)
 }
 
+pub(super) fn verify_scratch_payload(
+    header: &ConfigHeader,
+    principals: &[Principal; 16],
+    lists: &[u8],
+    expected: &[u8],
+) -> Result<(), Error> {
+    if header.fs_uuid != UUID
+        || header.generation != 1
+        || header.rule_generation != 1
+        || header.security_generation != 1
+        || header.key_generation != 1
+        || header.mode != 0
+        || header.clear_isolation_bitmap != 0
+        || lists != expected
+        || principals
+            .iter()
+            .enumerate()
+            .any(|(index, p)| p.id != index as u64 + 1 || p.generation != 1)
+    {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(cyxia_signed_scratch_catalog, cyxia_startup_catalog)))]
 fn verify_vector<'a>(
     wire: &'a [u8],
     scratch: &mut [u8],
@@ -105,21 +140,7 @@ fn verify_vector<'a>(
         &PUBLIC_KEY,
         CATALOG,
         scratch,
-        |header, principals, lists| {
-            if header.fs_uuid != UUID
-                || header.generation != 1
-                || header.mode != 0
-                || header.clear_isolation_bitmap != 0
-                || lists != payload
-                || principals
-                    .iter()
-                    .enumerate()
-                    .any(|(index, p)| p.id != index as u64 + 1 || p.generation != 1)
-            {
-                return Err(Error::Unauthorized);
-            }
-            Ok(())
-        },
+        |header, principals, lists| verify_scratch_payload(header, principals, lists, payload),
     )?;
     if config.digest() != digest {
         return Err(Error::Conflict);

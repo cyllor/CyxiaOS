@@ -230,6 +230,7 @@ mod user_heap;
     feature = "prototype-runtime",
     feature = "net-selftest",
     feature = "v020-production-diagnostic",
+    cyxia_startup_catalog,
     feature = "v0199-sec-n-selftest",
     not(feature = "selftest")
 ))]

@@ -14,7 +14,10 @@
 //! trapping only EL1. SVE/SME state is deliberately unsupported and must stay trapped.
 use core::arch::asm;
 use core::sync::atomic::{AtomicPtr, Ordering};
-core::arch::global_asm!(include_str!("user.S"));
+core::arch::global_asm!(
+    include_str!("user.S"),
+    software_pan = const cfg!(feature = "software-pan") as u8,
+);
 #[repr(C, align(16))]
 #[derive(Default)]
 pub struct Context {
@@ -72,12 +75,47 @@ static ACTIVE: [AtomicPtr<Context>; super::cpu::MAX_CPUS] =
 static INTEGER_ONLY: [core::sync::atomic::AtomicBool; super::cpu::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; super::cpu::MAX_CPUS];
 unsafe extern "C" {
-    fn cyxia_enter_user(context: *mut Context, restore_fp: u64, invalidate: u64);
+    // The last word is the packed user root/ASID under software PAN, or the
+    // historical invalidate flag when the bounded legacy transition is built.
+    fn cyxia_enter_user(context: *mut Context, restore_fp: u64, translation: u64);
     fn cyxia_user_return();
+    #[cfg(feature = "software-pan")]
+    fn cyxia_captured_user_root() -> u64;
+}
+
+#[cfg(feature = "software-pan")]
+const FIRST_DYNAMIC_ASID: u8 = 252;
+
+/// ASIDs 252–255 are private to the dynamic loader on each registered CPU.
+#[cfg(feature = "software-pan")]
+pub fn dynamic_asid() -> u8 {
+    FIRST_DYNAMIC_ASID
+        .checked_add(super::cpu::slot() as u8)
+        .expect("CPU slot outside the software PAN ASID reservation")
+}
+
+/// The active first-level EL0 trap's captured root and ASID, or zero.
+#[cfg(feature = "software-pan")]
+pub fn captured_user_root() -> u64 {
+    // SAFETY: the assembly leaf validates the current roots and exception
+    // depth and reads only this registered CPU's protected scratch metadata.
+    unsafe { cyxia_captured_user_root() }
+}
+
+#[cfg(feature = "software-pan")]
+unsafe fn invalidate_dynamic_asid(translation: u64) {
+    let asid = translation & 0xffff_0000_0000_0000;
+    // SAFETY: only this CPU uses its private dynamic ASID. The inner-shareable
+    // invalidation is complete before the caller may reuse the ASID or frames.
+    unsafe {
+        asm!("dsb ishst", "tlbi aside1is, {}", "dsb ish", "isb", in(reg) asid,
+             options(nostack, preserves_flags));
+    }
 }
 /// # Safety
 /// A registered CPU with a private pinned EL1 stack, no nested entry. Context and EL1 stack remain pinned until return. The
-/// supplied TTBR0 must map only this process's validated user pages. IRQs must work.
+/// supplied TTBR0 must map only this process's validated non-global user
+/// pages. IRQs must work.
 /// All EL1 code, including interrupt handlers and memory intrinsics, must be built
 /// for the soft-float ABI with no FP/SIMD instructions outside user.S. Higher ELs
 /// must allow basic Advanced SIMD/FP. The transition traps SVE/SME while the user
@@ -96,6 +134,27 @@ unsafe fn enter_inner(context: &mut Context, root: u64, restore_fp: bool, invali
     context.status &= 0xf0000000; // NZCV only; always EL0t, IRQ enabled, no privileged PSTATE.
     INTEGER_ONLY[slot].store(!restore_fp, Ordering::Relaxed);
     active.store(core::ptr::from_mut(context), Ordering::Relaxed);
+    #[cfg(feature = "software-pan")]
+    unsafe {
+        let translation = if invalidate {
+            let translation = root | (u64::from(dynamic_asid()) << 48);
+            invalidate_dynamic_asid(translation);
+            translation
+        } else {
+            root
+        };
+        // Publish new table writes before the final, masked assembly return.
+        asm!("dsb ishst", options(nostack, preserves_flags));
+        cyxia_enter_user(
+            core::ptr::from_mut(context),
+            u64::from(restore_fp),
+            translation,
+        );
+        if invalidate {
+            invalidate_dynamic_asid(translation);
+        }
+    }
+    #[cfg(not(feature = "software-pan"))]
     unsafe {
         if invalidate {
             asm!("dsb ishst","msr ttbr0_el1, {root}","mrs x9, tcr_el1","bic x9, x9, #0x80","msr tcr_el1, x9","isb","tlbi vmalle1is","dsb ish","isb",root=in(reg)root,out("x9")_);
@@ -125,6 +184,8 @@ unsafe fn enter_inner(context: &mut Context, root: u64, restore_fp: bool, invali
 /// The caller must provide a pinned private context and validated address-space
 /// root, on a registered CPU with no nested entry.
 pub unsafe fn enter(context: &mut Context, root: u64) {
+    #[cfg(feature = "software-pan")]
+    assert!(root != 0 && root >> 48 == 0 && root.is_multiple_of(4096));
     unsafe { enter_inner(context, root, true, true) };
 }
 /// Enter a complete user context whose page-table descriptors remain unchanged
@@ -137,6 +198,13 @@ pub unsafe fn enter(context: &mut Context, root: u64) {
 /// from `root` must remain unchanged, mapped frames must not be reclaimed, and
 /// `asid` must be boot-unique for this root.
 pub unsafe fn enter_immutable(context: &mut Context, root: u64, asid: u8) {
+    #[cfg(feature = "software-pan")]
+    assert!(
+        (1..FIRST_DYNAMIC_ASID).contains(&asid)
+            && root != 0
+            && root >> 48 == 0
+            && root.is_multiple_of(4096)
+    );
     debug_assert!(root >> 48 == 0);
     unsafe { enter_inner(context, root | (u64::from(asid) << 48), true, false) };
 }
@@ -153,6 +221,8 @@ pub unsafe fn enter_immutable(context: &mut Context, root: u64, asid: u8) {
 /// This call does not itself prove retirement or DMA quiescence.
 pub unsafe fn enter_pinned_until_retired(context: &mut Context, root: u64, asid: u8) {
     assert!(asid != 0 && root >> 48 == 0 && root.is_multiple_of(4096));
+    #[cfg(feature = "software-pan")]
+    assert!(asid < FIRST_DYNAMIC_ASID && root != 0);
     unsafe { enter_inner(context, root | (u64::from(asid) << 48), true, false) };
 }
 
@@ -165,10 +235,11 @@ pub unsafe fn enter_pinned_until_retired(context: &mut Context, root: u64, asid:
 /// In addition to [`enter`]'s contract, the entered code must be an audited
 /// integer-only fault probe whose executable range was checked for FP/SIMD.
 pub unsafe fn enter_integer_probe(context: &mut Context, root: u64) {
-    // TCR_EL1.A1=0 and AS=0 in this platform profile, so bits 55:48 carry an
-    // eight-bit TTBR0 ASID. 0x80..0x83 are reserved for the four immutable
-    // per-CPU mapping-probe roots and are never reused by ordinary contexts.
+    // AS=0 in this platform profile. 0x80..0x83 are reserved for the four
+    // immutable per-CPU mapping-probe roots and never used by ordinary contexts.
     let asid = 0x80u64 + super::cpu::slot() as u64;
+    #[cfg(feature = "software-pan")]
+    assert!(root != 0 && root >> 48 == 0 && root.is_multiple_of(4096));
     debug_assert!(asid <= 0xff && root >> 48 == 0);
     unsafe { enter_inner(context, root | (asid << 48), false, false) };
 }

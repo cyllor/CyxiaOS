@@ -35,8 +35,9 @@ mod startup_catalog;
 mod v0199_roles;
 
 pub fn build() {
-    startup_catalog::build();
-    if env::var_os("CARGO_FEATURE_V0199_CONTROL_BRINGUP").is_some()
+    let default_catalog = startup_catalog::build();
+    if default_catalog
+        || env::var_os("CARGO_FEATURE_V0199_CONTROL_BRINGUP").is_some()
         || env::var_os("CARGO_FEATURE_V0199_EPOCH_DISK_SELFTEST").is_some()
         || env::var_os("CARGO_FEATURE_V020_PRODUCTION_DIAGNOSTIC").is_some()
     {
