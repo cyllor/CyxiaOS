@@ -133,18 +133,24 @@ fn allocate_growth(
     writer: &mut RedoWriter<'_, impl EpochBlockIo>,
     inode: &mut Inode,
     bitmap: &mut [u8; BLOCK],
+    allocation_floor: u32,
     blocks: u32,
 ) -> Result<u32, Error> {
     let extent_count = usize::from(inode.extents);
     let last = inode.runs[..extent_count].last().copied();
     let adjacent = last.map(|run| run.physical + run.count);
-    let preferred = (adjacent.unwrap_or(DATA_START) / BLOCKS_PER_BITMAP).min(BITMAP_PAGES - 1);
+    let preferred = (adjacent.unwrap_or(allocation_floor).max(allocation_floor)
+        / BLOCKS_PER_BITMAP)
+        .min(BITMAP_PAGES - 1);
     let can_append_extent = extent_count < inode.runs.len();
     let scan_pages = if can_append_extent { BITMAP_PAGES } else { 1 };
     for offset in 0..scan_pages {
         let page = (preferred + offset) % BITMAP_PAGES;
-        let first = (page * BLOCKS_PER_BITMAP).max(DATA_START);
+        let first = (page * BLOCKS_PER_BITMAP).max(allocation_floor);
         let end = (page + 1) * BLOCKS_PER_BITMAP;
+        if first >= end {
+            continue;
+        }
         let home = BITMAP_START + page;
         writer.read_committed(home, bitmap)?;
         // Preserve a contiguous last extent when possible. Otherwise use
@@ -192,6 +198,21 @@ pub fn commit_segment<I: EpochBlockIo>(
     work: &mut FsyncWorkspace,
     reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
 ) -> Result<FsyncProgress, Error> {
+    commit_segment_with_floor(writer, job, work, DATA_START, reserve)
+}
+
+/// Commit a segment using the verified mount layout's first eligible data
+/// block for new allocation. Existing committed extents retain their homes.
+pub fn commit_segment_with_floor<I: EpochBlockIo>(
+    writer: &mut RedoWriter<'_, I>,
+    job: &FsyncJob<'_>,
+    work: &mut FsyncWorkspace,
+    allocation_floor: u32,
+    reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
+) -> Result<FsyncProgress, Error> {
+    if !(DATA_START..BLOCK_COUNT).contains(&allocation_floor) {
+        return Err(Error::Invalid);
+    }
     let ctx = job.admission.ctx();
     let proposal = job.admission.request();
     let registered = job
@@ -404,6 +425,7 @@ pub fn commit_segment<I: EpochBlockIo>(
             writer,
             &mut inode,
             &mut work.bitmap,
+            allocation_floor,
             (checked_pages - old_pages) as u32,
         )?;
         (!bind).then_some(home)
