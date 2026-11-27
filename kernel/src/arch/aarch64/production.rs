@@ -1577,11 +1577,12 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         )
         .expect("claim apply work");
     let work = ApplyWorkV1::decode(frame.bytes()).expect("apply work");
-    let timing = EXEC_TARGET
+    let target_lock = EXEC_TARGET
         .commit(prepared.expect("reserved target install"))
         .expect("D01 install without waiting");
-    let fault = match timing {
-        Some(t) => {
+    let fault = match target_lock {
+        Some(sample) => {
+            let t = sample.timing;
             report(
                 "V020_SEC_S_TARGET_LOCK",
                 t.work_ns,
@@ -1883,6 +1884,9 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     frames::publish();
     recovery::publish();
     meter::publish();
+    if let Some(sample) = target_lock {
+        sample.publish();
+    }
     net::publish(&net_outcome);
     #[cfg(feature = "v020-production-media-staging")]
     media_staging::publish(&staging_outcome);

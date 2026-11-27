@@ -213,6 +213,8 @@ W11_END = 160
 # Two registrations and two publish attempts enter the meter.
 POLICY_LOCK_METERED_CALLS = 4
 POLICY_LOCK_WORK_BUDGET_NS = 45_000
+# Cortex-A53 in the pinned virt-10.2 machine uses GTIMER_BACKCOMPAT_HZ.
+TARGET_LOCK_COUNTER_HZ = 62_500_000
 RECOVERY_ACCUMULATORS = 4
 RECOVERY_REQUIRED_STATE = 2
 SECONDARY_CPU_MASK = 0b1110
@@ -357,8 +359,17 @@ class Production:
         lock = rows("V020_SEC_S_TARGET_LOCK")
         require(len(lock) == 1, "missing or duplicate D01 target-lock interval")
         work_ns, overhead_ns, irq_off_ns = lock[0]
-        require(irq_off_ns > 0 and work_ns + overhead_ns - irq_off_ns in (0, 1),
-                "invalid D01 target-lock interval")
+        lock_ticks = words[156:W11_END]
+        before, start, end, restored = lock_ticks
+        require(0 < before <= start <= end <= restored and before < restored,
+                "missing or invalid raw D01 target-lock counters")
+        work_ticks = end - start
+        total_ticks = restored - before
+        measured = tuple((ticks * 1_000_000_000 + TARGET_LOCK_COUNTER_HZ - 1)
+                         // TARGET_LOCK_COUNTER_HZ
+                         for ticks in (work_ticks, total_ticks - work_ticks, total_ticks))
+        require((work_ns, overhead_ns, irq_off_ns) == measured,
+                "D01 target-lock durations differ from raw counters")
         # Safety budgets are checked independently from the bridge observation.
         lock_fault = (int(work_ns > 45_000) | (int(overhead_ns > 5_000) << 1)
                       | (int(irq_off_ns > 50_000) << 2))
@@ -456,6 +467,8 @@ class Production:
             "target_lock_work_ns": work_ns,
             "target_lock_overhead_ns": overhead_ns,
             "target_lock_irq_off_ns": irq_off_ns,
+            "target_lock_raw_ticks": lock_ticks,
+            "target_lock_counter_frequency_hz": TARGET_LOCK_COUNTER_HZ,
             "target_lock_closed_new_work": lock_fault != 0,
             "rejected_negatives": words[15],
             "business_progress_turns": progress_total,
@@ -494,7 +507,6 @@ def check_w11_baseline(words: tuple) -> None:
             and (words[155] > POLICY_LOCK_WORK_BUDGET_NS) == (words[154] > 0),
             "policy_lock measured overrun disagrees with the maximum elapsed time")
     require(words[136] + words[154] > 0, "policy_lock requires a settled measurement")
-    require(all(v == 0 for v in words[156:W11_END]), "nonzero wave-11 reserved words")
 
 
 def check_w11_rows(words: tuple, lines: list) -> dict:
