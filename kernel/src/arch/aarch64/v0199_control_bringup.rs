@@ -1210,6 +1210,7 @@ fn exercise_sustained(
     let first_window = now_ns() / WINDOW_NS + 1;
     wait_until(budget, first_window * WINDOW_NS);
     let before_business = business();
+    let mut serviced_in_run = 0;
     for (index, row) in rows.chunks_exact(6).enumerate() {
         let window = first_window + index as u64;
         let (wall, _) = budget.sample_gap();
@@ -1222,11 +1223,13 @@ fn exercise_sustained(
         let mut security_reads = 0;
         for role_index in order {
             let role = &mut roles[role_index];
-            let first_clock = role.clocks;
             let first_call = role.role_calls;
+            let decision = class(manifest.manifest().members[role_index].role).0 == Class::Decision;
             let wanted = if role_index == 1 { 4 } else { 1 };
-            for _ in 0..8 {
-                if role.clocks > first_clock && role.role_calls - first_call >= wanted {
+            // Give both decision roles one prepaid turn per window. They
+            // share 0.5ms and may finish a multi-SVC step in later windows.
+            for _ in 0..if decision { 1 } else { 8 } {
+                if role.role_calls - first_call >= wanted {
                     break;
                 }
                 wait_until(budget, role.wake_ns);
@@ -1242,16 +1245,19 @@ fn exercise_sustained(
                     fatal(693);
                 }
             }
-            if role.clocks == first_clock || role.role_calls - first_call != wanted {
+            let calls = role.role_calls - first_call;
+            if calls == wanted {
+                serviced |= 1 << role_index;
+            } else if !decision || calls != 0 {
                 report("V0199_SUSTAINED_FAIL_SYSCALL", window, role_index as u64,
-                       role.role_calls - first_call);
+                       calls);
                 fatal(693);
             }
-            serviced |= 1 << role_index;
             if role_index == 1 {
-                security_reads = role.role_calls - first_call;
+                security_reads = calls;
             }
         }
+        serviced_in_run |= serviced;
         let mut refused = 0u64;
         for index in [0, 1] {
             // Both real advisors remain eligible to run. The first has
@@ -1282,6 +1288,7 @@ fn exercise_sustained(
         }
         wait_until(budget, (window + 1) * WINDOW_NS);
     }
+    assert_eq!(serviced_in_run, (1 << ROLE_COUNT) - 1);
     let after_business = business();
     for index in 0..3 {
         assert!(after_business[index] > before_business[index]);

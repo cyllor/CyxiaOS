@@ -195,14 +195,22 @@ def verify_sustained(raw, windows):
     previous_end = 0
     totals = [0] * len(ROLE_LIMITS)
     work_cpu_ns = []
+    role_calls = []
+    all_roles = (1 << len(ROLE_LIMITS)) - 1
+    decision_roles = sum(1 << i for i, (category, _, _) in enumerate(ROLE_GRANTS) if category == 2)
+    per_window = all_roles ^ decision_roles
+    serviced_in_run = 0
     for index, (window, begin, end, serviced, refused, security_reads) in enumerate(windows):
         require(window == first_window + index and max(1, previous_end) <= begin < end < count,
                 "nonconsecutive or overlapping sustained accounting windows")
         preceding = trace[begin - 1]
         preceding_wall = preceding[0]
         grants = [0] * len(ROLE_LIMITS)
-        require((serviced, refused, security_reads) == (255, 3, 4),
+        require(serviced & per_window == per_window and serviced & ~all_roles == 0
+                and (refused, security_reads) == (3, 4),
                 "incomplete sustained syscall or slot refusal evidence")
+        serviced_in_run |= serviced
+        role_calls.append(serviced)
         for row in trace[begin:end]:
             end_wall, _, _, _, scope, _ = row
             require(preceding_wall // WINDOW == (end_wall - 1) // WINDOW == window,
@@ -217,7 +225,9 @@ def verify_sustained(raw, windows):
         work_cpu_ns.append(trace[end - 1][1] - preceding[1])
         totals = [total + actual for total, actual in zip(totals, grants)]
         previous_end = end
+    require(serviced_in_run == all_roles, "missing sustained decision or publisher syscall")
     require(trace[-1][0] >= (first_window + len(windows)) * WINDOW,
             "sustained trace ends before the final window closes")
     return {"sustained_windows": len(windows), "sustained_role_grants": totals,
-            "sustained_slot_refusals": 2 * len(windows), "sustained_work_cpu_ns": work_cpu_ns}
+            "sustained_slot_refusals": 2 * len(windows), "sustained_work_cpu_ns": work_cpu_ns,
+            "sustained_role_calls_mask_by_window": role_calls}
