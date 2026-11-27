@@ -26,9 +26,22 @@ FSYNC_UUID = b"CYX-FSYNC-TEST!!"
 SECURITY_HOME = 4130
 SECURITY_REDO = 3
 REDO_HEADER_BYTES = 64
+FSYNC_LOG_START = 2
+FSYNC_LOG_END = 36
 MOUNT_INVALID = 0
 MOUNT_UNAUTHORIZED = 1
 MOUNT_CONFLICT = 3
+
+
+def count_fsync_retirement_blocks(path: Path) -> int:
+    """Count the occupied blocks in the signed fixture's pre-replay journal."""
+    size = (FSYNC_LOG_END - FSYNC_LOG_START) * BLOCK_BYTES
+    with path.open("rb") as disk:
+        disk.seek(FSYNC_LOG_START * BLOCK_BYTES)
+        log = disk.read(size)
+    require(len(log) == size, "short pre-replay FSYNC journal")
+    zero = bytes(BLOCK_BYTES)
+    return sum(log[offset:offset + BLOCK_BYTES] != zero for offset in range(0, size, BLOCK_BYTES))
 
 
 def verify_signed_disk(path: Path, epoch: int, *, fsync_scratch: bool = False,

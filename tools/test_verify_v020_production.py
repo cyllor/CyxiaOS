@@ -16,6 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import v020_production_media as media  # noqa: E402
+import verify_v020_fsync_scratch as fsync  # noqa: E402
 import verify_v020_production as v  # noqa: E402
 
 SVC64 = 0x5600_0000
@@ -759,6 +760,39 @@ class W11Validation(unittest.TestCase):
         words[145] = 0
         lines = [line.replace("b=15 c=5", "b=15 c=0") for line in lines]
         self.rejects("writes and flushes", words=words, lines=lines, staging=True, modes=modes)
+
+    def test_fsync_reopen_counts_nonzero_log_blocks(self):
+        modes = v.Modes(fsync_scratch=True, media_reopen=True)
+        words = w11_words(staging=True)
+        words[145] = 0
+        words[148] = 2
+        words[162:164] = [1, 1]
+        lines = [v.STAGING_MARKER, "V020_W12_MEDIA_EPOCH a=1 b=2 c=1",
+                 f"V020_W11_MEDIA_SNAPSHOT_0X40 a=3 b={v.EAGAIN_RESULT} c=0"]
+        lines += [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
+                  for index, detail in enumerate((1, 6, 151, 2, 1), start=1)]
+        with tempfile.TemporaryDirectory() as temp:
+            disk = Path(temp) / "fsync.raw"
+            for size, seq, lsn, contents, retired in (
+                (29, 7, fsync.LEGACY_FINAL_LSN, fsync.FINAL, 24),
+                (29, 7, fsync.FINAL_LSN, fsync.FINAL, 28),
+                (fsync.BLOCK, 49, fsync.FINAL_LSN, b"x" * fsync.BLOCK, 29),
+            ):
+                with self.subTest(size=size, lsn=lsn):
+                    log = fsync.boot_one_log(lsn, contents, size, seq)
+                    with disk.open("wb") as image:
+                        image.seek(fsync.FIRST * fsync.BLOCK)
+                        image.write(log.ljust(34 * fsync.BLOCK, b"\0"))
+                    pending = media.count_fsync_retirement_blocks(disk)
+                    self.assertEqual(pending, retired)
+                    recovered = lines + [f"V020_FSYNC_RECOVERED a=2 b={lsn} c={seq}"]
+                    io = f"V020_W11_MEDIA_IO a=20950 b={14 + retired} c=5"
+                    v.check_w11_staging(tuple(words), recovered + [io], b"", True, 3, modes,
+                                        pending_fsync_blocks=pending)
+                    off_by_one = f"V020_W11_MEDIA_IO a=20950 b={13 + retired} c=5"
+                    with self.assertRaisesRegex(ValueError, "writes and flushes"):
+                        v.check_w11_staging(tuple(words), recovered + [off_by_one], b"", True,
+                                            3, modes, pending_fsync_blocks=pending)
 
 
 class FileSessionsEvidence(unittest.TestCase):

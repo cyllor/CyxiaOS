@@ -54,7 +54,7 @@ from run_qemu import Qmp
 from qmp_stdio import PipeTransport
 from transport import FrameDecoder
 from v020_production_media import (
-    run_media_reopen, verify_signed_disk, verify_signed_receipt_view,
+    count_fsync_retirement_blocks, run_media_reopen, verify_signed_disk, verify_signed_receipt_view,
 )
 from v020_production_modes import (
     Modes, QEMU_GATEWAY_IPV4, W21_END, authenticated_echo, file_read_evidence, file_sessions_evidence,
@@ -304,7 +304,8 @@ class Production:
             "native_v020_media_staging_boot_verified": self.staging,
         }
 
-    def validate(self, serial: bytes, page: bytes, cpu_count: int) -> dict:
+    def validate(self, serial: bytes, page: bytes, cpu_count: int, *,
+                 pending_fsync_blocks: int | None = None) -> dict:
         require = verify_smp.require
         require(cpu_count == 4, "QMP did not prove four real guest CPUs")
         require(len(page) == 4096, "short native-owned evidence page")
@@ -414,7 +415,8 @@ class Production:
             require(business[slot - 1] == (slot, progress, irqs), "business serial/memory mismatch")
             progress_total += progress
         extensions = validate_extensions(words, lines, self.modes)
-        wave11 = validate_w11(words, lines, serial, self.staging, snapshot_calls, self.modes)
+        wave11 = validate_w11(words, lines, serial, self.staging, snapshot_calls, self.modes,
+                              pending_fsync_blocks=pending_fsync_blocks)
         signed = signed_media_authority(words, lines, self.modes)
         return {
             **wave11,
@@ -550,7 +552,8 @@ def check_w11_net(words: tuple, lines: list, serial: bytes) -> None:
 
 
 def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
-                      snapshot_calls: int, modes: Modes) -> dict:
+                      snapshot_calls: int, modes: Modes, *,
+                      pending_fsync_blocks: int | None = None) -> dict:
     require = verify_smp.require
     if not staging:
         require(all(v == 0 for v in words[144:152]),
@@ -591,11 +594,16 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
             terminal[0][0] == 21 and terminal[0][1] > 0 and 29 <= terminal[0][2] <= 4096
         )
         require(terminal == legacy or current, "media staging FSYNC terminal differs")
-        # Current binding and completion each add the two-block REDO for
-        # the stream index. Reopen retires those four extra journal blocks.
-        closure_writes = 4 if current else 0
-        writes, flushes = (38, 5) if reopen else (4163, 12)
-        expected_io = (writes + closure_writes, flushes)
+        if reopen:
+            # The data REDO's continuation only needs clearing if the final
+            # 64 bytes are nonzero. Archived 29-byte runs have no such block.
+            allowed = (28, 29) if current else (24,)
+            retired = allowed[0] if pending_fsync_blocks is None else pending_fsync_blocks
+            require(retired in allowed, "pre-replay FSYNC journal block count differs")
+            # Seven replay homes, one checkpoint and six new BootEpoch blocks.
+            expected_io = (14 + retired, 5)
+        else:
+            expected_io = (4167 if current else 4163, 12)
     require(len(io) == 1 and io[0][0] > 0 and io[0][1:] == expected_io,
             "media staging device writes and flushes disagree with the selected protocol")
     evidence = {}
@@ -634,13 +642,15 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
 
 
 def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
-                 snapshot_calls: int, modes: Modes) -> dict:
+                 snapshot_calls: int, modes: Modes, *,
+                 pending_fsync_blocks: int | None = None) -> dict:
     """Words 128..160 and the wave-11 serial contract (words 0..127 are checked by the caller)."""
     require = verify_smp.require
     check_w11_baseline(words)
     measured_rows = check_w11_rows(words, lines)
     check_w11_net(words, lines, serial)
-    media_rows = check_w11_staging(words, lines, serial, staging, snapshot_calls, modes)
+    media_rows = check_w11_staging(words, lines, serial, staging, snapshot_calls, modes,
+                                   pending_fsync_blocks=pending_fsync_blocks)
     flags = {
         "frame_meta": words[129] == 1,
         "recovery": (words[131] == RECOVERY_ACCUMULATORS and words[133] == 1
@@ -747,6 +757,7 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="cyx-prod-") as td, (output / "qemu-stderr.log").open("wb") as err:
         scratch = (boot_disk or Path(td) / "scratch.raw") if staging else None
+        pending_fsync_blocks = None
         try:
             location = acceptance.profile(elf.read_bytes())
             binary = shutil.which("qemu-system-aarch64")
@@ -764,6 +775,8 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                 require(scratch.is_file() and not scratch.is_symlink()
                         and scratch.stat().st_size == SCRATCH_BYTES, "invalid staging scratch disk")
                 report["scratch_before_sha256"] = sha(scratch)
+                if modes.media_reopen and modes.fsync_scratch:
+                    pending_fsync_blocks = count_fsync_retirement_blocks(scratch)
             port = free_port()
             path = str(Path(td) / "q.sock")
             args = qemu_args(binary, path, elf, port, scratch=scratch, nic=nic,
@@ -811,7 +824,8 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                     require(decoder.loss == 0 and decoder.corrupt == 0 and not decoder.buffer,
                             "incomplete/corrupt framed UART transport")
                     page = (output / "native-page.bin").read_bytes()
-                    report["observations"] = acceptance.validate(bytes(decoded), page, len(actual_cpus))
+                    report["observations"] = acceptance.validate(
+                        bytes(decoded), page, len(actual_cpus), pending_fsync_blocks=pending_fsync_blocks)
                     relay_bytes = report["observations"]["echo_bytes_relayed"]
                     if modes.authenticated_net:
                         require(peer is not None, "missing authenticated host peer")
