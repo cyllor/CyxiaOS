@@ -34,6 +34,8 @@ use core::{
     num::NonZeroU64,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
+#[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
+use cyxia_driver_virtio::reset::{RESET_PROOF_BYTES, ResetProof};
 use cyxia_driver_virtio::{
     Error as DriverError, Platform, Transport,
     block::{BatchedBlockIo, BlockTerminalCustody, Operation, SECTOR_BYTES},
@@ -71,6 +73,8 @@ pub(crate) struct ScratchTerminalCustody {
     mmio: u64,
     epoch: Option<NonZeroU64>,
     retained: BlockTerminalCustody,
+    #[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
+    reset_proof: Option<ResetProof>,
 }
 
 #[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
@@ -90,6 +94,11 @@ impl ScratchTerminalCustody {
         };
         report("V020_SEC_D_BLOCK_HANDOFF", self.mmio, 2, 0);
         report("V020_SEC_D_BLOCK_RECOVERY", epoch, state, detail);
+        if epoch != 0
+            && let Some(proof) = self.reset_proof
+        {
+            emit_reset_proof(proof);
+        }
         for request in self.retained.requests.iter().flatten() {
             let slot = u64::from(request.token.slot);
             report(
@@ -105,6 +114,22 @@ impl ScratchTerminalCustody {
             };
             report("V020_SEC_D_BLOCK_RECOVERY_OP", slot, kind, sector);
         }
+    }
+}
+
+#[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
+fn emit_reset_proof(proof: ResetProof) {
+    const PREFIX: &[u8] = b"V020_SEC_D_BLOCK_RESET_PROOF ";
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut line = [0; PREFIX.len() + 2 * RESET_PROOF_BYTES + 1];
+    line[..PREFIX.len()].copy_from_slice(PREFIX);
+    for (pair, byte) in line[PREFIX.len()..].chunks_exact_mut(2).zip(proof.encode()) {
+        pair[0] = HEX[usize::from(byte >> 4)];
+        pair[1] = HEX[usize::from(byte & 15)];
+    }
+    line[PREFIX.len() + 2 * RESET_PROOF_BYTES] = b'\n';
+    for fragment in line.chunks(96) {
+        super::super::log(fragment);
     }
 }
 
@@ -132,10 +157,13 @@ fn retain_for_recovery(device: &ScratchBlock) {
     if TERMINAL_STATE.load(Ordering::Relaxed) != EMPTY {
         return;
     }
+    let epoch = NonZeroU64::new(CONFIRMED_EPOCH.load(Ordering::Relaxed));
     let sealed = ScratchTerminalCustody {
         mmio: DEVICE_MMIO.load(Ordering::Relaxed),
-        epoch: NonZeroU64::new(CONFIRMED_EPOCH.load(Ordering::Relaxed)),
+        epoch,
         retained: custody,
+        #[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
+        reset_proof: epoch.and_then(|epoch| device.reset_proof(epoch)),
     };
     // SAFETY: only the one-shot CPU0 owner publishes, before any recovery
     // readback. IRQ handlers and secondaries never access this record.

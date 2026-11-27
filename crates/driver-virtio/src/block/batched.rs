@@ -5,10 +5,12 @@ use super::{FLUSH, Operation, READ_ONLY, SECTOR_BYTES};
 // This sentinel is never a start time and allocates no additional metadata.
 const COMPLETED_RETAINED: u64 = u64::MAX;
 
+use core::num::NonZeroU64;
+
 use crate::{
     Error, Platform, Transport,
     queue::{BatchMemory, BatchQueue, MAX_CHAINS, NotifyStats, Token},
-    reset::DeviceState,
+    reset::{DeviceState, ResetProof},
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockCompletion {
@@ -208,6 +210,19 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
                 })
             }),
         })
+    }
+
+    /// Encode the one-shot block queue's observed DMA stop. The caller
+    /// supplies the current boot's verified epoch. Request and durability
+    /// obligations are unchanged by the proof.
+    pub fn reset_proof(&self, boot_epoch: NonZeroU64) -> Option<ResetProof> {
+        let observed = self.reset?.ok()?;
+        Some(ResetProof::for_first_generation(
+            boot_epoch.get(),
+            2,
+            0,
+            observed,
+        ))
     }
 
     pub fn free(&self) -> usize {
@@ -862,6 +877,44 @@ mod tests {
     }
 
     #[test]
+    fn reset_proof_keeps_the_unconfirmed_write_in_custody() {
+        let (mut block, mut platform, _) = fixture();
+        let operation = Operation::Write(0);
+        let token = block
+            .begin(operation, &[0; 512], true, true, &platform)
+            .unwrap();
+        block.fence_for_recovery();
+        let epoch = core::num::NonZeroU64::new(7).unwrap();
+        assert_eq!(block.reset_proof(epoch), None);
+
+        platform.complete_mmio_reset = true;
+        platform.clock.set(123_000);
+        assert_eq!(block.stop_failed_mmio(&platform), Some(Ok(123_000)));
+        let raw = block.reset_proof(epoch).unwrap().encode();
+        assert_eq!(
+            u32::from_le_bytes(raw[..4].try_into().unwrap()),
+            0x4359_5250
+        );
+        assert_eq!(
+            u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+            epoch.get()
+        );
+        assert_eq!(u32::from_le_bytes(raw[16..20].try_into().unwrap()), 2);
+        assert_eq!(&raw[20..24], &[0; 4]);
+        assert_eq!(u64::from_le_bytes(raw[56..64].try_into().unwrap()), 123_000);
+        assert_eq!(block.reset_proof(epoch).unwrap().encode(), raw);
+        assert_eq!(
+            block.terminal_custody().unwrap().requests[usize::from(token.slot)],
+            Some(RetainedBlock {
+                token,
+                operation,
+                completed: false
+            }),
+        );
+        assert_eq!(block.acknowledge(token), Err(Error::Response));
+    }
+
+    #[test]
     fn reset_checkpoints_can_refuse_before_or_after_the_status_write() {
         for refuse_at in [1, 3] {
             let (mut block, platform, _) = fixture();
@@ -889,6 +942,7 @@ mod tests {
             assert!(block.transport.queue_enabled());
             assert_eq!(block.stop_failed_mmio(&platform), None);
             assert_eq!(block.retained_requests(), (1, 0));
+            assert_eq!(block.reset_proof(core::num::NonZeroU64::MIN), None);
             assert_eq!(
                 block.terminal_custody().unwrap().requests[usize::from(token.slot)],
                 Some(RetainedBlock {
