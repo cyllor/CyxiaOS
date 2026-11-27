@@ -25,6 +25,8 @@ HEADER = 11
 ROW = 6
 UART = HEADER + ROW * 4
 UART_STATUS = {1: "queued", 2: "fifo_full", 3: "unavailable", 4: "deadline", 5: "console_unconfirmed"}
+SCRATCH_FATAL = 400
+SOFTWARE_STOP_KIND = 16
 
 
 def stopped_cpus(qmp, park):
@@ -124,6 +126,8 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
     require(1 <= timeout <= 120, "invalid test deadline")
     raw = elf.read_bytes()
     symbol(raw, "cyxia_request_quiescent_stop")
+    symbol(raw, "cyxia_terminal_stop")
+    scratch = symbol(raw, "__exception_scratch")
     page, park = symbol(raw, "CYXIA_STOP_EVIDENCE"), symbol(raw, "cyxia_stop_park")
     admission = symbol(raw, "EXCEPTION_ADMISSION_CLOSED")
     require(page["size"] == 4096 and page["pa"] % 4096 == 0 and park["size"] >= 12,
@@ -188,6 +192,15 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
                     require(record[:HEADER * 8] == sealed, "late acknowledgement rewrote owner result")
                 (output / "native-stop-evidence.bin").write_bytes(record)
                 report.update(validate_record(record, late_peer))
+                qmp.execute("pmemsave", {
+                    "val": scratch["pa"] + report["owner"] * 4096 + SCRATCH_FATAL,
+                    "size": 56, "filename": str(data),
+                })
+                state, kind, _, _, _, _, reason = struct.unpack("<7Q", data.read_bytes())
+                require((state, kind, reason) == (2, SOFTWARE_STOP_KIND, 99 if late_peer else 0x5100),
+                        "owner did not seal the expected software terminal origin")
+                report["software_origin"] = {"kind": kind, "reason": reason,
+                                               "entry": "rust_panic" if late_peer else "smp_fatal"}
                 qmp.execute("pmemsave", {"val": admission["pa"], "size": 8, "filename": str(data)})
                 require(data.read_bytes() == (1).to_bytes(8, "little"), "terminal admission latch is open")
                 require(qmp.execute("query-status")["running"], "VM stopped before guest wait-state proof")

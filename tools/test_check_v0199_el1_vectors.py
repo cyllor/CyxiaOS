@@ -99,12 +99,24 @@ class VectorChecks(unittest.TestCase):
 
     def test_emergency_stack_switch_and_second_entry_stop_are_required(self):
         instructions, _, _, symbols, read_literal = self.layout()
-        instructions[symbols["exception_emergency"] + 48] = "nop"
+        switch = symbols["exception_emergency_with_reason"] + 52
+        instructions[switch] = "nop"
         with self.assertRaisesRegex(ValueError, "expected 'mov sp,x4'"):
             checker.check_stack_gate(instructions, symbols, read_literal)
-        instructions[symbols["exception_emergency"] + 48] = "mov sp,x4"
+        instructions[switch] = "mov sp,x4"
         instructions[symbols["exception_busy"] + 16] = f"b {symbols['exception_entry']:#x}"
         with self.assertRaisesRegex(ValueError, "exception_busy"):
+            checker.check_stack_gate(instructions, symbols, read_literal)
+
+    def test_software_terminal_entry_requires_registration_and_stackless_handoff(self):
+        instructions, _, _, symbols, read_literal = self.layout()
+        registration_check = symbols["cyxia_terminal_stop"] + 28
+        instructions[registration_check] = "nop"
+        with self.assertRaisesRegex(ValueError, "cyxia_terminal_stop"):
+            checker.check_stack_gate(instructions, symbols, read_literal)
+        instructions[registration_check] = f"b.ne {symbols['exception_unregistered']:#x}"
+        instructions[symbols["exception_software_stop"]] = f"b {symbols['exception_quiescent_stop']:#x}"
+        with self.assertRaisesRegex(ValueError, "exception_software_stop"):
             checker.check_stack_gate(instructions, symbols, read_literal)
 
     def test_only_boot_writes_vbar_and_cookie(self):

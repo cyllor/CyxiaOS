@@ -99,6 +99,7 @@ def stack_gate_sequences(symbols):
     gate = symbols["EXCEPTION_ADMISSION_CLOSED"]
     stacks = symbols["__exception_stacks"]
     emergency = symbols["exception_emergency"]
+    terminal = symbols["exception_emergency_with_reason"]
     observed = symbols["exception_stop_observed"]
     select = symbols["exception_select_stack"]
     copies = [
@@ -160,9 +161,10 @@ def stack_gate_sequences(symbols):
             "ldr x2,[x0,#0x190]", f"cbz x2,{emergency:#x}", "mov x2,#0x3", "str x2,[x0,#0x190]",
             f"b {symbols['exception_unregistered']:#x}",
         ],
-        "exception_emergency": [
-            "mov x2,#0x1", "str x2,[x0,#0x190]", "mov x3,sp", "cmp x1,#0x4",
-            f"b.hs {emergency + 24:#x}", "mrs x3,sp_el0", "mrs x2,contextidr_el1", "msr tpidr_el1,x2",
+        "exception_emergency": ["mov x7,xzr"],
+        "exception_emergency_with_reason": [
+            "mov x2,#0x1", "str x2,[x0,#0x190]", "str x7,[x0,#0x1c0]", "mov x3,sp", "cmp x1,#0x4",
+            f"b.hs {terminal + 28:#x}", "mrs x3,sp_el0", "mrs x2,contextidr_el1", "msr tpidr_el1,x2",
             ("x4", stacks), "add x4,x4,x2,lsl #15", "add x4,x4,#0x8,lsl #12", "msr spsel,#0x1", "mov sp,x4",
             ("x5", gate), "mov x4,#0x1", "stlr x4,[x5]", "str x1,[x0,#0x198]", "str x3,[x0,#0x1a0]",
             "mrs x2,elr_el1", "mrs x3,esr_el1", "stp x2,x3,[x0,#0x1a8]", "mrs x2,far_el1",
@@ -178,14 +180,27 @@ def stack_gate_sequences(symbols):
             "msr contextidr_el1,x0", ("x3", symbols["__exception_scratch"]),
             "add x3,x3,x0,lsl #12", "stp x1,x2,[x3,#0x170]", "ret",
         ],
+        "cyxia_terminal_stop": [
+            "msr daifset,#0xf", "mov x7,x0", "mrs x2,contextidr_el1", "cmp x2,#0x4",
+            f"b.hs {symbols['exception_unregistered']:#x}", "mrs x3,tpidr_el1", "cmp x2,x3",
+            f"b.ne {symbols['exception_unregistered']:#x}", ("x0", symbols["__exception_scratch"]),
+            "add x0,x0,x2,lsl #12", "ldp x4,x5,[x0,#0x170]",
+            f"cbz x4,{symbols['exception_unregistered']:#x}", "cmp x4,x5",
+            f"b.hs {symbols['exception_unregistered']:#x}", "ldr x3,[x0,#0x160]",
+            f"cbnz x3,{symbols['exception_unregistered']:#x}", "mov x3,#0x1", "str x3,[x0,#0x160]",
+            "mov x1,#0x10", ("x3", gate), "ldar x3,[x3]",
+            f"cbz x3,{symbols['exception_software_stop']:#x}", "orr x1,x1,#0x80",
+        ],
+        "exception_software_stop": [f"b {terminal:#x}"],
     }
 
 
 STACK_GATE_LABELS = (
     "exception_entry", "exception_outer", "exception_check_sp", "exception_select_stack",
     "exception_irq_stack", "exception_use_stack", "exception_restore_user", "exception_restore_status",
-    "exception_stop_observed", "exception_busy", "exception_emergency", "exception_unregistered", "exception_stop",
-    "exception_register_stack",
+    "exception_stop_observed", "exception_busy", "exception_emergency", "exception_emergency_with_reason",
+    "exception_unregistered", "exception_stop", "exception_register_stack", "cyxia_terminal_stop",
+    "exception_software_stop",
 )
 
 
@@ -274,6 +289,7 @@ def inspect(raw, disassembly):
         "defined_frame_bytes": 280,
         "vector_table_va": f"{table:#x}",
         "dispatch_va": f"{symbols['exception_dispatch']:#x}",
+        "software_terminal_va": f"{symbols['cyxia_terminal_stop']:#x}",
         "vector_slots": routes,
         "vbar_installations": writers,
         "entry_scratch_bytes_per_cpu": PAGE,

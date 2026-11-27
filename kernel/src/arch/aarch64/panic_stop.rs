@@ -380,14 +380,26 @@ extern "C" fn cyxia_stop_park() -> ! {
     }
 }
 
-#[cfg(feature = "v020-panic-stop-selftest")]
-pub(crate) fn exercise() -> ! {
+#[cfg(feature = "v020-production")]
+#[inline(always)]
+pub(crate) fn stop(reason: u64) -> ! {
     unsafe extern "C" {
-        fn cyxia_request_quiescent_stop() -> !;
+        fn cyxia_terminal_stop(reason: u64) -> !;
     }
-    // SAFETY: isolated four-core EL1 test, after normal healthy SMP startup.
-    // Uses exactly the same terminal stop sequence as the protected vector.
-    unsafe { cyxia_request_quiescent_stop() }
+    // SAFETY: the stackless trampoline only enters the coordinator after
+    // checking the local registration and selecting its emergency stack.
+    unsafe { cyxia_terminal_stop(reason) }
+}
+
+#[cfg(feature = "v020-panic-stop-selftest")]
+#[inline(never)]
+#[unsafe(export_name = "cyxia_request_quiescent_stop")]
+pub(crate) fn exercise() -> ! {
+    // Both deliberate software stops run after a normal four-core bring-up.
+    #[cfg(feature = "v020-panic-stop-late-selftest")]
+    panic!("requested terminal stop");
+    #[cfg(not(feature = "v020-panic-stop-late-selftest"))]
+    crate::smp::fatal(0x5100)
 }
 
 #[cfg(feature = "v020-panic-stop-late-selftest")]

@@ -220,6 +220,13 @@ pub(crate) fn halt() -> ! {
         }
     }
 }
+#[cfg(feature = "v020-production")]
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    smp::fatal(99)
+}
+
+#[cfg(not(feature = "v020-production"))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     #[cfg(feature = "smp-selftest")]

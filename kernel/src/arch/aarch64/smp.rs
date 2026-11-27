@@ -484,6 +484,12 @@ fn record_fault(code: u64, kind: u64, frame: Option<&super::ExceptionFrame>) {
     bank[base].store(code, Ordering::Release);
     bank[0].store(0x4359_534d_5046_4131, Ordering::Release);
 }
+#[cfg(feature = "v020-production")]
+fn stop_failed(code: u64) -> ! {
+    crate::machine::panic_stop::stop(code)
+}
+
+#[cfg(not(feature = "v020-production"))]
 fn stop_failed(code: u64) -> ! {
     if let Some(failure) = cpu::registered_slot().and_then(|slot| FAILURES.get(slot)) {
         failure.store(code, Ordering::Release);

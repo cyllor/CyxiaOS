@@ -16,6 +16,8 @@
 .equ SCRATCH_FATAL_SP, 416
 .equ SCRATCH_FATAL_ELR, 424
 .equ SCRATCH_FATAL_FAR, 440
+.equ SCRATCH_FATAL_REASON, 448
+.equ SOFTWARE_STOP_KIND, 16
 
 .section .text.vectors,"ax"
 .balign 2048
@@ -261,8 +263,11 @@ exception_busy:
  str x2, [x0, #SCRATCH_FATAL_STATE]
  b exception_close_admission
 exception_emergency:
+ mov x7, xzr
+exception_emergency_with_reason:
  mov x2, #1
  str x2, [x0, #SCRATCH_FATAL_STATE]
+ str x7, [x0, #SCRATCH_FATAL_REASON]
  mov x3, sp
  cmp x1, #4
  b.hs 1f
@@ -317,24 +322,37 @@ exception_register_stack:
  stp x1, x2, [x3, #SCRATCH_EXEC_BASE]
  ret
 
-.if {stop_selftest}
-.global cyxia_request_quiescent_stop
-cyxia_request_quiescent_stop:
- // The explicit healthy boot fixture takes the same controlled terminal
- // path on a registered CPU, with no deliberately corrupted state.
+.global cyxia_terminal_stop
+.type cyxia_terminal_stop,%function
+cyxia_terminal_stop:
+ // x0 is the trusted software reason. Abandon the current stack before
+ // entering the coordinator, including when called by Rust panic handling.
  msr daifset, #15
+ mov x7, x0
  mrs x2, contextidr_el1
  cmp x2, #4
  b.hs exception_unregistered
+ mrs x3, tpidr_el1
+ cmp x2, x3
+ b.ne exception_unregistered
  ldr x0, =__exception_scratch
  add x0, x0, x2, lsl #12
- ldr x1, [x0, #SCRATCH_BUSY]
- cbnz x1, exception_close_admission
- mov x1, #1
- str x1, [x0, #SCRATCH_BUSY]
- mov x1, #16
- b exception_emergency
-.endif
+ ldp x4, x5, [x0, #SCRATCH_EXEC_BASE]
+ cbz x4, exception_unregistered
+ cmp x4, x5
+ b.hs exception_unregistered
+ ldr x3, [x0, #SCRATCH_BUSY]
+ cbnz x3, exception_close_admission
+ mov x3, #1
+ str x3, [x0, #SCRATCH_BUSY]
+ mov x1, #SOFTWARE_STOP_KIND
+ ldr x3, =EXCEPTION_ADMISSION_CLOSED
+ ldar x3, [x3]
+ cbz x3, exception_software_stop
+ orr x1, x1, #0x80
+exception_software_stop:
+ b exception_emergency_with_reason
+.size cyxia_terminal_stop, .-cyxia_terminal_stop
 .ltorg
 
 .global probe_read

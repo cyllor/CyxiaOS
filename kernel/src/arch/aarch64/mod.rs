@@ -84,7 +84,6 @@ core::arch::global_asm!(
         feature = "legacy-desktop",
         not(feature = "smp-selftest")
     )) as u8,
-    stop_selftest = const cfg!(feature = "v020-panic-stop-selftest") as u8,
 );
 unsafe extern "C" {
     #[cfg(not(feature = "smp-selftest"))]
