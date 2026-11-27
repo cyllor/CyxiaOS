@@ -79,6 +79,10 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None):
         require(before <= lower < end and lower // WINDOW == end // WINDOW,
                 "CPU0 sample straddles a window")
         actual = tick - counter
+        # The counter reads occurred within their wall brackets. Charge can
+        # never exceed the distance from the earliest possible start to the
+        # latest possible end, even if the PMU samples were near the bounds.
+        require(actual <= end - before, "CPU0 execution exceeds wall-clock bounds")
         start_window = wall // WINDOW
         last_window = max(wall, end - 1) // WINDOW
         enter(start_window)

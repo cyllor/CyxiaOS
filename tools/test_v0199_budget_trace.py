@@ -38,7 +38,7 @@ class BudgetTraceTests(unittest.TestCase):
 
     def test_credit_of_both_gap_endpoint_windows_is_checked(self):
         self.start = WINDOW - 50_000_000
-        self.rows = [(WINDOW - 10, 1_601_000, 0, 0, 0, WINDOW - 26),
+        self.rows = [(WINDOW - 600_010, 1_601_000, 0, 0, 0, WINDOW - 600_026),
                      (WINDOW + 20, 2_101_000, 0, 0, 0, WINDOW + 4)]
         with self.assertRaisesRegex(ValueError, "EL1 coordination sublimit"):
             verify_trace(self.evidence(), self.summary)
@@ -48,6 +48,14 @@ class BudgetTraceTests(unittest.TestCase):
         self.summary[-3] += 50
         with self.assertRaisesRegex(ValueError, "does not conserve"):
             verify_trace(self.evidence(), self.summary)
+
+    def test_balanced_trace_cannot_charge_more_cpu_than_wall_brackets_allow(self):
+        end, _, quota, deadline, scope, lower = self.rows[-1]
+        self.rows[-1] = end, 2_600, quota, deadline, scope, lower
+        self.summary[0:2] = [1_600, 1_600]
+        self.summary[-2] = 500
+        with self.assertRaisesRegex(ValueError, "CPU0 execution exceeds wall-clock bounds"):
+            verify_trace(self.evidence(), self.summary, recovery_slices=(1, 500))
 
     def test_counter_rollback_and_wrong_role_class_are_rejected(self):
         end, counter, quota, deadline, scope, lower = self.rows[1]
