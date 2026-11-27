@@ -365,7 +365,7 @@ pub(crate) fn sectors(
     out: &mut [u8; BLOCK_BYTES],
 ) -> Result<(), SecurityError> {
     let result = transfer(device, first, write, out, &mut || Ok(()));
-    finish_io(device, result)
+    finish_io(device, result, &mut || Ok(()))
 }
 
 #[cfg(cyxia_startup_catalog)]
@@ -401,18 +401,28 @@ fn drive_metered(
         retain_for_recovery(device);
         return result;
     }
-    finish_io(device, result)
+    finish_io(device, result, checkpoint)
 }
 
 fn finish_io(
     device: &mut ScratchBlock,
     result: Result<(), SecurityError>,
+    checkpoint: &mut dyn FnMut() -> Result<(), SecurityError>,
 ) -> Result<(), SecurityError> {
+    let mut budget_refused = false;
     if result.is_err()
         && TERMINAL_STATE.load(Ordering::Relaxed) == EMPTY
-        && let Some(stop) = device.stop_failed_mmio(&Board)
+        && let Some(stop) = device.stop_failed_mmio_with_checkpoint(&Board, || {
+            checkpoint().map_err(|_| {
+                budget_refused = true;
+                DriverError::Busy
+            })
+        })
     {
         retain_for_recovery(device);
+        if budget_refused {
+            return result;
+        }
         let (unknown, completed) = device.retained_requests();
         report(
             "V020_SEC_D_BLOCK_CUSTODY",
@@ -518,7 +528,7 @@ fn complete(
 /// admission or a CPU barrier, may satisfy this call.
 pub(crate) fn flush(device: &mut ScratchBlock) -> Result<(), SecurityError> {
     let result = issue_flush(device, &mut || Ok(()));
-    finish_io(device, result)
+    finish_io(device, result, &mut || Ok(()))
 }
 
 #[cfg(cyxia_startup_catalog)]

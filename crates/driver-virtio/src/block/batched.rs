@@ -251,6 +251,17 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
     /// Completion/FLUSH obligations remain in custody, including after the
     /// device and its old queue read back disabled.
     pub fn stop_failed_mmio(&mut self, p: &impl Platform) -> Option<Result<u64, Error>> {
+        self.stop_failed_mmio_with_checkpoint(p, || Ok(()))
+    }
+
+    /// The serialized recovery owner can renew its grant before the reset
+    /// write and each observation. Refusal consumes the one-shot attempt
+    /// without permitting another MMIO access or releasing any request.
+    pub fn stop_failed_mmio_with_checkpoint(
+        &mut self,
+        p: &impl Platform,
+        checkpoint: impl FnMut() -> Result<(), Error>,
+    ) -> Option<Result<u64, Error>> {
         if !matches!(
             self.state,
             DeviceState::Failed | DeviceState::RecoveryFenced
@@ -259,7 +270,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         }
         self.state = DeviceState::ResetAttempted;
         self.queue.fence();
-        let result = self.transport.observe_mmio_reset(2, &[0], p);
+        let result = self.transport.observe_mmio_reset(2, &[0], p, checkpoint);
         self.reset = Some(result);
         Some(result)
     }
@@ -848,6 +859,68 @@ mod tests {
         assert_eq!(block.stop_failed_mmio(&platform), None);
         assert_eq!(block.terminal_custody(), Some(custody));
         assert_eq!(block.retained_requests(), (0, 1));
+    }
+
+    #[test]
+    fn reset_checkpoints_can_refuse_before_or_after_the_status_write() {
+        for refuse_at in [1, 3] {
+            let (mut block, platform, _) = fixture();
+            let operation = Operation::Write(0);
+            let token = block
+                .begin(operation, &[0; 512], true, false, &platform)
+                .unwrap();
+            block.fence_for_recovery();
+
+            let mut checkpoints = 0;
+            assert_eq!(
+                block.stop_failed_mmio_with_checkpoint(&platform, || {
+                    checkpoints += 1;
+                    if checkpoints == refuse_at {
+                        Err(Error::Busy)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Some(Err(Error::Busy))
+            );
+            assert_eq!(checkpoints, refuse_at);
+            let status = if refuse_at == 1 { 15 } else { 0 };
+            assert_eq!(block.transport.status(), status);
+            assert!(block.transport.queue_enabled());
+            assert_eq!(block.stop_failed_mmio(&platform), None);
+            assert_eq!(block.retained_requests(), (1, 0));
+            assert_eq!(
+                block.terminal_custody().unwrap().requests[usize::from(token.slot)],
+                Some(RetainedBlock {
+                    token,
+                    operation,
+                    completed: false
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn reset_checkpoints_do_not_restart_the_device_deadline() {
+        let (mut block, mut platform, _) = fixture();
+        platform.complete_mmio_reset = true;
+        block.fence_for_recovery();
+
+        let mut checkpoints = 0;
+        assert_eq!(
+            block.stop_failed_mmio_with_checkpoint(&platform, || {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    platform.clock.set(crate::reset::RESET_DEADLINE_NS);
+                }
+                Ok(())
+            }),
+            Some(Err(Error::Timeout))
+        );
+        assert_eq!(checkpoints, 2);
+        assert_eq!(block.transport.status(), 0);
+        assert!(!block.transport.queue_enabled());
+        assert_eq!(block.stop_failed_mmio(&platform), None);
     }
 
     #[test]
