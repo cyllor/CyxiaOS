@@ -15,6 +15,7 @@ on:
       - 'docs/design/baselines/v0.19.9-implementation-spec.txt'
       - 'tools/check_v0199_h04_model.py'
       - 'tools/check_v0199_h05_model.py'
+      - 'tools/check_v0199_sec_f12_model.py'
       - '.github/workflows/v20-g4-bounded-model-replay.yml'
   pull_request:
     branches: [CyxiaOS-V0.20]
@@ -31,6 +32,7 @@ on:
       - 'docs/design/baselines/v0.19.9-implementation-spec.txt'
       - 'tools/check_v0199_h04_model.py'
       - 'tools/check_v0199_h05_model.py'
+      - 'tools/check_v0199_sec_f12_model.py'
       - '.github/workflows/v20-g4-bounded-model-replay.yml'
   workflow_dispatch:
 permissions:
@@ -43,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [h04, h05]
+        case: [h04, h05, sec_f12]
     env:
       RUSTUP_TOOLCHAIN: '1.95.0'
       CASE: ${{ matrix.case }}
@@ -56,7 +58,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          case "$CASE" in h04|h05) ;; *) exit 2 ;; esac
+          case "$CASE" in h04|h05|sec_f12) ;; *) exit 2 ;; esac
           dir="artifacts/g4-bounded-model/$CASE"
           example="v0199_${CASE}_model_check"
           checker="tools/check_v0199_${CASE}_model.py"

@@ -15,6 +15,11 @@ monotonic clock profile.
 
 Upstream tag: `v10.2.2` (`f8ed81651e61d9c2166df6121ce2af0f44f06b3e`).
 
+The V0.20 production-wiring workflow also applies `cyxia-mttcg-cntpct.patch`.
+In real-time MTTCG, AArch64 `CNTPCT_EL0` uses the existing seqlock-protected
+virtual clock without acquiring QEMU's global lock. The workflow records
+both patch hashes and the resulting binary hash.
+
 For the unified native verifier, pass the built binary and its source tree
 explicitly:
 

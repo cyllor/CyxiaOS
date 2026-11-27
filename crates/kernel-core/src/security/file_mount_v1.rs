@@ -446,8 +446,9 @@ mod tests {
     use super::*;
     use crate::security::{
         file_media_unified_v1::{
-            CATALOG_INODE, ENVELOPE_BYTES, RESERVED_INODE_START, SNAPSHOT_CATALOG_BLOCK,
-            SNAPSHOT_PROTECTION_BLOCK, SNAPSHOT_SLOT_START, encode_object_envelope,
+            CANONICAL_BUSINESS_START, CATALOG_INODE, ENVELOPE_BYTES, RESERVED_INODE_START,
+            SNAPSHOT_CATALOG_BLOCK, SNAPSHOT_PROTECTION_BLOCK, SNAPSHOT_SLOT_START,
+            encode_object_envelope,
         },
         file_media_v0199::{BITMAP_START, DATA_START, INODE_START},
         file_structure_v1::{Extent, INODE_BYTES},
@@ -886,19 +887,49 @@ mod tests {
         check_signed_fsync_roundtrip(1, Some(125));
     }
 
+    #[test]
+    fn signed_fsync_first_extent_durably_grows_an_empty_file() {
+        check_signed_fsync_roundtrip(0, Some(2));
+    }
+
+    #[test]
+    fn signed_fsync_first_extent_keeps_only_initialized_prefix_at_checkpoint() {
+        check_signed_fsync_roundtrip(0, Some(122));
+    }
+
+    #[test]
+    fn signed_fsync_business_floor_allocates_first_extent_above_snapshot_reserve() {
+        check_signed_fsync_roundtrip_at(0, Some(122), CANONICAL_BUSINESS_START);
+    }
+
+    #[test]
+    fn signed_fsync_business_floor_allocates_disjoint_growth_above_snapshot_reserve() {
+        check_signed_fsync_roundtrip_at(1, Some(3), CANONICAL_BUSINESS_START);
+    }
+
     fn check_signed_fsync_roundtrip(initial_pages: usize, added_pages: Option<usize>) {
+        check_signed_fsync_roundtrip_at(initial_pages, added_pages, DATA_START);
+    }
+
+    fn check_signed_fsync_roundtrip_at(
+        initial_pages: usize,
+        added_pages: Option<usize>,
+        allocation_floor: u32,
+    ) {
         use crate::security::{
             file_admission_flow_v1::FileAdmissionFlowV1,
             file_auth_context_v1::{AdmissionLedgerV1, AuthContextV1, AuthorityFacts},
             file_auth_v3::{
                 AdmitRequestV3, CompleteRequestV1, FILE_SERVICE_ROLE, TerminalState, Verdict,
             },
-            file_fsync_v1::{FsyncJob, FsyncProgress, FsyncWorkspace, commit_segment},
+            file_fsync_v1::{
+                FsyncJob, FsyncProgress, FsyncWorkspace, commit_segment, commit_segment_with_floor,
+            },
             file_media_v0199::{BLOCK_COUNT, FileReceiptV4, RECEIPT_BYTES},
             file_receipt_query_v4::ReceiptKey,
             file_service_v4::{REQUEST_HEADER, REQUEST_MAGIC, REQUEST_VERSION},
             recovery_v1::{
-                RecoveryWorkspace, RedoWriter, recover_checkpoint_with_evidence,
+                RecoveryWorkspace, RedoTransaction, RedoWriter, recover_checkpoint_with_evidence,
                 retire_checkpointed_log,
             },
         };
@@ -960,7 +991,9 @@ mod tests {
         let target_pages = initial_pages + added_pages.unwrap_or(0);
         let segmented = target_pages > 120;
         let target_size = (target_pages - 1) * BLOCK + 17;
-        let initial_size = if growing {
+        let initial_size = if initial_pages == 0 {
+            0
+        } else if growing {
             (initial_pages - 1) * BLOCK + 8
         } else {
             target_size
@@ -1071,7 +1104,7 @@ mod tests {
         source.0.insert(1, Box::new(superblock(CHECKPOINT)));
 
         let path = std::env::temp_dir().join(std::format!(
-            "cyx-fsync-test-{}-{initial_pages}-{target_pages}.raw",
+            "cyx-fsync-test-{}-{initial_pages}-{target_pages}-{allocation_floor}.raw",
             std::process::id()
         ));
         let file = OpenOptions::new()
@@ -1171,14 +1204,37 @@ mod tests {
         let mut work = FsyncWorkspace::new();
         let mut journal = RecoveryWorkspace::new();
         let mut writer = RedoWriter::open(&mut disk, &mut journal, CHECKPOINT).unwrap();
-        let mut committed = |writer: &mut RedoWriter<'_, FileDisk>, job: &FsyncJob<'_>, blocks| {
-            let FsyncProgress::Committed { receipt, redo } =
-                commit_segment(writer, job, &mut work, |plan| {
-                    assert_eq!(plan.log_blocks, blocks);
-                    Ok(())
+        if allocation_floor == CANONICAL_BUSINESS_START {
+            let before = writer.evidence();
+            for invalid in [DATA_START - 1, BLOCK_COUNT] {
+                assert_eq!(
+                    commit_segment_with_floor(&mut writer, &job, &mut work, invalid, |_| {
+                        panic!("invalid allocation floor reserved redo")
+                    })
+                    .err(),
+                    Some(Error::Invalid)
+                );
+            }
+            assert_eq!(
+                commit_segment_with_floor(&mut writer, &job, &mut work, BLOCK_COUNT - 1, |_| {
+                    panic!("exhausted allocation range reserved redo")
                 })
-                .unwrap()
-            else {
+                .err(),
+                Some(Error::Capacity)
+            );
+            assert_eq!(writer.evidence(), before);
+        }
+        let mut committed = |writer: &mut RedoWriter<'_, FileDisk>, job: &FsyncJob<'_>, blocks| {
+            let reserve = |plan: &RedoTransaction| {
+                assert_eq!(plan.log_blocks, blocks);
+                Ok(())
+            };
+            let result = if allocation_floor == DATA_START {
+                commit_segment(writer, job, &mut work, reserve)
+            } else {
+                commit_segment_with_floor(writer, job, &mut work, allocation_floor, reserve)
+            };
+            let FsyncProgress::Committed { receipt, redo } = result.unwrap() else {
                 panic!("expected durable segment");
             };
             assert_eq!(receipt.commit_lsn, redo.transaction().commit_lsn);
@@ -1191,7 +1247,17 @@ mod tests {
             .unwrap();
         let (bound, _) = committed(&mut writer, &job, 8);
         assert_eq!((bound.status, bound.completed_prefix), (2, 0));
-        writer.read_committed(DATA, &mut raw).unwrap();
+        writer.read_committed(INODE_START, &mut raw).unwrap();
+        let initial = Inode::decode(&raw[256..512]).unwrap();
+        let initial_extents = usize::from(initial_pages != 0);
+        assert_eq!(initial.size, initial_size as u64);
+        assert_eq!(usize::from(initial.extents), initial_extents);
+        let first_candidate = if initial_pages == 0 {
+            allocation_floor
+        } else {
+            DATA
+        };
+        writer.read_committed(first_candidate, &mut raw).unwrap();
         assert!(raw.iter().all(|&byte| byte == 0));
         writer.read_committed(BITMAP_START, &mut raw).unwrap();
         assert_eq!(raw, bitmap_before);
@@ -1211,26 +1277,32 @@ mod tests {
             let current = Inode::decode(&raw[256..512]).unwrap();
             assert_eq!(current.durable_write_seq, 0);
             assert_eq!(current.size, initial_size.max(prefix_size) as u64);
-            assert_eq!(current.extents, 1 + u16::from(prefix_growth != 0));
+            assert_eq!(
+                usize::from(current.extents),
+                initial_extents + usize::from(prefix_growth != 0)
+            );
             if prefix_growth != 0 {
                 assert_eq!(
-                    current.runs[1],
+                    current.runs[initial_extents],
                     Extent {
                         logical: initial_pages as u32,
-                        physical: DATA_START,
+                        physical: allocation_floor,
                         count: prefix_growth as u32,
                     }
                 );
                 writer
                     .read_committed_at(BITMAP_START, prefix.commit_lsn, &mut raw)
                     .unwrap();
-                for block in DATA_START..DATA_START + prefix_growth as u32 {
+                for block in allocation_floor..allocation_floor + prefix_growth as u32 {
                     let bit = block as usize;
                     bitmap_before[bit / 8] |= 1 << (bit % 8);
                     writer
                         .read_committed_at(block, prefix.commit_lsn, &mut raw)
                         .unwrap();
-                    assert_eq!(&raw, pages[initial_pages + (block - DATA_START) as usize]);
+                    assert_eq!(
+                        &raw,
+                        pages[initial_pages + (block - allocation_floor) as usize]
+                    );
                 }
             }
             writer.read_committed(BITMAP_START, &mut raw).unwrap();
@@ -1238,7 +1310,7 @@ mod tests {
             let untouched = if prefix_growth == 0 {
                 DATA + prefix_pages as u32
             } else {
-                DATA_START + prefix_growth as u32
+                allocation_floor + prefix_growth as u32
             };
             writer.read_committed(untouched, &mut raw).unwrap();
             assert!(raw.iter().all(|&byte| byte == 0));
@@ -1273,11 +1345,14 @@ mod tests {
             writer
                 .read_committed_at(BITMAP_START, done.commit_lsn, &mut raw)
                 .unwrap();
-            for block in DATA_START..DATA_START + added_pages.unwrap() as u32 {
+            for block in allocation_floor..allocation_floor + added_pages.unwrap() as u32 {
                 let byte = block as usize / 8;
                 bitmap_before[byte] |= 1 << (block % 8);
             }
-            assert_eq!(raw, bitmap_before);
+            assert!(
+                raw == bitmap_before,
+                "growth allocated outside the expected bitmap range"
+            );
             writer.read_committed(neighbor_block, &mut raw).unwrap();
             assert_eq!(raw, [0xa5; BLOCK]);
         }
@@ -1367,20 +1442,22 @@ mod tests {
                 }
             );
             assert_eq!(neighbor.durable_write_seq, 0);
-            assert_eq!(current.extents, 2);
+            assert_eq!(usize::from(current.extents), initial_extents + 1);
+            if initial_extents != 0 {
+                assert_eq!(
+                    current.runs[0],
+                    Extent {
+                        logical: 0,
+                        physical: DATA,
+                        count: initial_pages as u32
+                    }
+                );
+            }
             assert_eq!(
-                current.runs[0],
-                Extent {
-                    logical: 0,
-                    physical: DATA,
-                    count: initial_pages as u32
-                }
-            );
-            assert_eq!(
-                current.runs[1],
+                current.runs[initial_extents],
                 Extent {
                     logical: initial_pages as u32,
-                    physical: DATA_START,
+                    physical: allocation_floor,
                     count: added_pages.unwrap() as u32
                 }
             );
@@ -1400,6 +1477,12 @@ mod tests {
         }
         assert_eq!(logical, target_pages);
         assert_eq!(&contents.finalize()[..], &done.output_digest);
+        if allocation_floor == CANONICAL_BUSINESS_START {
+            for block in SNAPSHOT_CATALOG_BLOCK..CANONICAL_BUSINESS_START {
+                disk.read(block, &mut raw).unwrap();
+                assert!(raw.iter().all(|&byte| byte == 0));
+            }
+        }
         let mut receipt = [0; RECEIPT_BYTES];
         disk.read(RECEIPTS, &mut raw).unwrap();
         receipt[..BLOCK - receipt_at].copy_from_slice(&raw[receipt_at..]);

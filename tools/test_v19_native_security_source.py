@@ -806,6 +806,29 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertLess(quantum.index("ACTIVE_ROLE_TTBR0.swap(0, Ordering::AcqRel)"),
                         quantum.index("task.trap(syscall_abi)"))
 
+    def test_signed_lifecycle_exit_retires_the_root_with_prepaid_recovery(self):
+        arm = ROOT / "kernel/src/arch/aarch64/production"
+        signed = source(arm / "signed_resident.rs")
+        turn = signed.split("fn turn(", 1)[1].split("fn run_quantum(", 1)[0]
+        ordered = [
+            "budget.settle(grant, start, returned)?",
+            "if let Some(status) = result?",
+            "budget.ledger.close_ordinary()",
+            "budget.reserve_recovery()?",
+            "retire_stopped_role(index, member.ttbr0_root)",
+            "budget.settle(recovery_grant, recovery_start, 0)?",
+            "retirement?;",
+            "return Err(Fault::RoleExit",
+        ]
+        for step in ordered:
+            self.assertIn(step, turn)
+        positions = [turn.index(step) for step in ordered]
+        self.assertEqual(positions, sorted(positions))
+        loader = source(arm / "role_loader.rs")
+        retire = loader.split("pub(super) fn retire_stopped_role(", 1)[1].split("\n}\n", 1)[0]
+        self.assertLess(retire.index("root.write_volatile(0)"), retire.index("tlbi();"))
+        self.assertLess(retire.index("tlbi();"), retire.index("PIE_SYSCALL_ABI[index].store(0"))
+
     def test_v020_live_pie_dispatch_checks_trapped_identity(self):
         arm = ROOT / "kernel/src/arch/aarch64"
         prod = source(arm / "production.rs")

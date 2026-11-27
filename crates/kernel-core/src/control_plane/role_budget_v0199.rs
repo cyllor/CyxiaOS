@@ -187,6 +187,12 @@ impl Cpu0BudgetLedger {
     pub fn ordinary_closed(&self) -> bool {
         self.ordinary_closed
     }
+
+    /// Permanently close ordinary admission while preserving existing charges,
+    /// recovery quotas and the read-only diagnostic budget.
+    pub fn close_ordinary(&mut self) {
+        self.ordinary_closed = true;
+    }
     pub fn kernel_coordination_spent(&self) -> u64 {
         self.kernel_coordination_spent
     }
@@ -1600,6 +1606,39 @@ mod tests {
         );
         assert_eq!(q.spent(Class::Recovery), 0);
     }
+    #[test]
+    fn explicit_admission_closure_keeps_settlement_and_recovery_available() {
+        let m = manifest();
+        let actor = m.members[0].actor;
+        let mut q = Cpu0BudgetLedger::new();
+        let role = q
+            .reserve_role(&m, actor, 0, Class::Operations, 1, 100, 0)
+            .unwrap();
+        q.close_ordinary();
+        assert!(!q.settle(0, role, 60, 60).unwrap().overrun);
+        assert_eq!(q.lifetime_spent(Class::Operations), 60);
+        assert_eq!(
+            q.reserve_role(&m, actor, 0, Class::Operations, 1, 100, WINDOW_NS),
+            Err(Error::Denied)
+        );
+
+        let recovery = q
+            .reserve_kernel(0, Class::Recovery, 100, WINDOW_NS)
+            .unwrap();
+        assert!(!q.settle(0, recovery, 30, WINDOW_NS + 30).unwrap().overrun);
+        let diagnostic = q
+            .reserve_readonly_diagnostic(0, 100, WINDOW_NS + 30)
+            .unwrap();
+        assert!(!q.settle(0, diagnostic, 40, WINDOW_NS + 70).unwrap().overrun);
+        assert_eq!(q.lifetime_spent(Class::Recovery), 30);
+        assert_eq!(q.lifetime_total(), Ok(130));
+        assert!(q.ordinary_closed());
+        assert_eq!(
+            q.reserve_kernel(0, Class::Coordination, 1, 2 * WINDOW_NS),
+            Err(Error::Denied)
+        );
+    }
+
     #[test]
     fn actual_overrun_and_late_copy_never_refill_ordinary_budget() {
         let m = manifest();

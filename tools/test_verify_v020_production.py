@@ -1343,6 +1343,48 @@ class Argv(unittest.TestCase):
         self.assertEqual(len(v.PEER_SAMPLE), 512)
         self.assertEqual(v.PEER_SAMPLE, bytes((i * 7 + 3) & 0xFF for i in range(512)))
 
+    def test_qemu_pin_rejects_wrong_executable_before_any_process_starts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            elf = root / "kernel.elf"
+            elf.write_bytes(b"fixture kernel")
+            binary = root / "qemu-system-aarch64"
+            binary.write_bytes(b"fixture QEMU executable")
+            expected = hashlib.sha256(b"different QEMU build").hexdigest()
+            with (patch.object(v.Production, "profile", return_value={}),
+                  patch.object(v.shutil, "which", return_value=str(binary)),
+                  patch.object(v.subprocess, "check_output") as version,
+                  patch.object(v.subprocess, "Popen") as launch):
+                report = v.run(elf, root / "evidence", expected_qemu_sha256=expected)
+            self.assertEqual(report["status"], "FAIL")
+            self.assertIn("wrong QEMU executable", report["error"])
+            self.assertEqual(report["qemu_sha256"], v.sha(binary))
+            self.assertEqual(report["expected_qemu_sha256"], expected)
+            version.assert_not_called()
+            launch.assert_not_called()
+
+    def test_media_reopen_retains_the_same_qemu_pin_for_every_boot(self):
+        pin = hashlib.sha256(b"locked QEMU image").hexdigest()
+        argv = ["verify_v020_production.py", "--output", "/out", "--media-reopen",
+                "--fresh-elf", "/first.elf", "--elf", "/reopen.elf", "--qmp-stdio"]
+
+        def pair(boot, fresh, reopen, output, timeout, modes, unsigned):
+            for elf in (fresh, reopen):
+                boot(elf, output, timeout)
+            return {"status": "PASS"}
+
+        with (patch.object(sys, "argv", argv),
+              patch.dict("os.environ", {"CYXIA_V020_QEMU_SHA256": pin}),
+              patch.object(v, "run", return_value={"status": "PASS"}) as run,
+              patch.object(v, "run_media_reopen", side_effect=pair),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(v.main(), 0)
+        self.assertEqual([call.args[0] for call in run.call_args_list],
+                         [Path("/first.elf"), Path("/reopen.elf")])
+        self.assertTrue(all(call.kwargs["qmp_stdio"] for call in run.call_args_list))
+        self.assertEqual([call.kwargs["expected_qemu_sha256"] for call in run.call_args_list],
+                         [pin, pin])
+
     def test_snapshot_read_requires_a_staging_or_reopen_run(self):
         argv = ["verify_v020_production.py", "--output", "/out", "--snapshot-read"]
         with patch.object(sys, "argv", argv), redirect_stderr(io.StringIO()) as errors:

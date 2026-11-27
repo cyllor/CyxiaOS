@@ -9,7 +9,7 @@
 //! one continuous CPU0 cursor from early boot through the durable media
 //! handoff and the resident roles.
 
-use super::role_loader::{RoleLaunch, pie_syscall_abi};
+use super::role_loader::{RoleLaunch, pie_syscall_abi, retire_stopped_role};
 use super::{
     BootInfo, E_AUTH, Error, ExceptionFrame, IRQS, Identity, NativeRole, NativeRoleManifest,
     Ordering, ROLE_COUNT, ROLES, Role, TIMER_IRQ, bring_up_production, cpu, frames, gic,
@@ -552,8 +552,13 @@ fn turn(
     };
     budget.settle(grant, start, returned)?;
     if let Some(status) = result? {
-        // The full cohort owns startup readiness. An orderly exit stops its
-        // admission after settlement and retains the private backing.
+        // The full cohort owns startup readiness. Close its admission before
+        // waiting for the recovery grant that retires this stopped role.
+        budget.ledger.close_ordinary();
+        let (recovery_start, recovery_grant) = budget.reserve_recovery()?;
+        let retirement = retire_stopped_role(index, member.ttbr0_root);
+        budget.settle(recovery_grant, recovery_start, 0)?;
+        retirement?;
         return Err(Fault::RoleExit {
             actor: member.actor,
             status,

@@ -19,8 +19,9 @@ use cyxia_kernel_core::security::{
         SCRATCH_FILE_BLOCK, SCRATCH_FILE_DATA, SCRATCH_FILE_FSYNC_RIGHTS, SCRATCH_FILE_GENERATION,
         SCRATCH_FILE_INODE, baseline_fsync_genesis_metadata,
     },
-    file_fsync_v1::{FsyncJob, FsyncProgress, FsyncWorkspace, commit_segment},
+    file_fsync_v1::{FsyncJob, FsyncProgress, FsyncWorkspace, commit_segment_with_floor},
     file_index_v0199::{BLOCK_BYTES as BLOCK, FileStreamIndexV4, SecurityStateStoreV2},
+    file_media_unified_v1::CANONICAL_BUSINESS_START,
     file_media_v0199::{
         BITMAP_START, FileReceiptV4, INODE_START, RECEIPT_BYTES, SuperblockV1, crc32c_zeroed,
     },
@@ -350,7 +351,7 @@ pub(super) fn execute(
         pages,
     };
     let FsyncProgress::Committed { receipt: bound, .. } =
-        commit_segment(&mut writer, &job, work, |p| {
+        commit_segment_with_floor(&mut writer, &job, work, CANONICAL_BUSINESS_START, |p| {
             reserve(p, BIND_START, 8, 3, BOUND_LSN)
         })?
     else {
@@ -371,7 +372,7 @@ pub(super) fn execute(
         (SINGLE_LOG_END - FINAL_START, FINAL_LSN)
     };
     let FsyncProgress::Committed { receipt, redo } =
-        commit_segment(&mut writer, &job, work, |p| {
+        commit_segment_with_floor(&mut writer, &job, work, CANONICAL_BUSINESS_START, |p| {
             reserve(p, FINAL_START, final_blocks, 4, final_lsn)
         })?
     else {
@@ -380,7 +381,9 @@ pub(super) fn execute(
     if receipt.status != 3
         || receipt.completed_prefix as usize != size
         || receipt.commit_lsn != final_lsn
-        || !matches!(commit_segment(&mut writer, &job, work, |_| Err(Error::Conflict))?,
+        || !matches!(commit_segment_with_floor(
+            &mut writer, &job, work, CANONICAL_BUSINESS_START, |_| Err(Error::Conflict),
+        )?,
                      FsyncProgress::AlreadyDone(same) if same == receipt)
     {
         return Err(Error::Conflict);
