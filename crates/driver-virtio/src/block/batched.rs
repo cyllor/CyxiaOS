@@ -8,6 +8,7 @@ const COMPLETED_RETAINED: u64 = u64::MAX;
 use crate::{
     Error, Platform, Transport,
     queue::{BatchMemory, BatchQueue, MAX_CHAINS, NotifyStats, Token},
+    reset::DeviceState,
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockCompletion {
@@ -24,13 +25,32 @@ pub struct BatchedBlockIo<const BYTES: usize> {
     transport: Transport,
     queue: BatchQueue,
     sectors: u64,
+    config_generation: u32,
     read_only: bool,
     pending: [Option<(Token, Operation, u64)>; MAX_CHAINS],
-    failed: bool,
+    state: DeviceState,
     last_completed: u64,
 }
 impl<const BYTES: usize> BatchedBlockIo<BYTES> {
     pub fn attach(
+        t: Transport,
+        memory: &'static mut BatchMemory,
+        p: &impl Platform,
+    ) -> Result<Self, Error> {
+        Self::attach_inner::<false>(t, memory, p)
+    }
+
+    /// Attach a writable device using only VERSION_1 and FLUSH. A read-only
+    /// advertisement is rejected before the driver publishes features or a queue.
+    pub fn attach_writable(
+        t: Transport,
+        memory: &'static mut BatchMemory,
+        p: &impl Platform,
+    ) -> Result<Self, Error> {
+        Self::attach_inner::<true>(t, memory, p)
+    }
+
+    fn attach_inner<const WRITABLE_ONLY: bool>(
         mut t: Transport,
         memory: &'static mut BatchMemory,
         p: &impl Platform,
@@ -56,12 +76,17 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         t.select_device_features(0);
         p.barrier();
         let features = t.device_features();
-        if !modern || features & FLUSH == 0 {
+        let read_only = features & READ_ONLY != 0;
+        if !modern || features & FLUSH == 0 || (WRITABLE_ONLY && read_only) {
             t.fail();
             return Err(Error::Features);
         }
         t.select_driver_features(0);
-        t.set_driver_features(features & (FLUSH | READ_ONLY));
+        t.set_driver_features(if WRITABLE_ONLY {
+            FLUSH
+        } else {
+            features & (FLUSH | READ_ONLY)
+        });
         t.select_driver_features(1);
         t.set_driver_features(1);
         t.set_status(11);
@@ -70,27 +95,24 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
             t.fail();
             return Err(Error::Features);
         }
-        let mut sectors = None;
-        for _ in 0..8 {
-            let before = t.config_generation();
-            let lo = t.read_config_u32(0)?;
-            let hi = t.read_config_u32(4)?;
-            p.barrier();
-            if t.config_generation() == before {
-                sectors = Some(u64::from(lo) | (u64::from(hi) << 32));
-                break;
+        let (config_generation, sectors) = match Self::read_capacity(&t, p) {
+            Ok(config) => config,
+            Err(error) => {
+                t.fail();
+                p.barrier();
+                return Err(error);
             }
-        }
-        let sectors = sectors.filter(|n| *n != 0).ok_or(Error::Device)?;
+        };
         let queue = BatchQueue::configure(&mut t, memory, 0, p)?;
         t.start(p)?;
         Ok(Self {
             transport: t,
             queue,
             sectors,
-            read_only: features & READ_ONLY != 0,
+            config_generation,
+            read_only,
             pending: [None; MAX_CHAINS],
-            failed: false,
+            state: DeviceState::Live,
             last_completed: 0,
         })
     }
@@ -104,7 +126,9 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         self.queue.capacity()
     }
     pub fn is_quiescent(&self) -> bool {
-        !self.failed && self.pending.iter().all(Option::is_none) && self.queue.is_quiescent()
+        self.state == DeviceState::Live
+            && self.pending.iter().all(Option::is_none)
+            && self.queue.is_quiescent()
     }
     pub fn free(&self) -> usize {
         self.queue.free()
@@ -130,8 +154,49 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         self.queue.set_completion_interrupts(enabled, p);
     }
     fn fail(&mut self, p: &impl Platform) {
-        self.failed = true;
+        self.state = DeviceState::Failed;
         self.queue.poison(&mut self.transport, p);
+    }
+
+    /// Best-effort terminal stop under the existing exclusive MMIO owner.
+    /// Completion/FLUSH obligations remain in custody, including after the
+    /// device and its old queue read back disabled.
+    pub fn stop_failed_mmio(&mut self, p: &impl Platform) -> Option<Result<u64, Error>> {
+        if self.state != DeviceState::Failed {
+            return None;
+        }
+        self.state = DeviceState::ResetAttempted;
+        self.queue.fence();
+        Some(self.transport.observe_mmio_reset(2, &[0], p))
+    }
+    fn read_capacity(t: &Transport, p: &impl Platform) -> Result<(u32, u64), Error> {
+        for _ in 0..8 {
+            let before = t.config_generation();
+            p.barrier();
+            let lo = t.read_config_u32(0)?;
+            let hi = t.read_config_u32(4)?;
+            p.barrier();
+            let sectors = u64::from(lo) | (u64::from(hi) << 32);
+            if t.config_generation() == before && sectors != 0 {
+                return Ok((before, sectors));
+            }
+        }
+        Err(Error::Device)
+    }
+    fn require_capacity(&mut self, p: &impl Platform) -> Result<(), Error> {
+        if self.state != DeviceState::Live {
+            return Err(Error::Device);
+        }
+        if self.transport.status() != 15
+            || Self::read_capacity(&self.transport, p) != Ok((self.config_generation, self.sectors))
+        {
+            // Freeze new publications, including previously private batches.
+            // Keep unresolved completions pinned; even unchanged capacity
+            // after a generation change needs recovery-owner reconciliation.
+            self.fail(p);
+            return Err(Error::Device);
+        }
+        Ok(())
     }
     pub fn begin(
         &mut self,
@@ -141,9 +206,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         isolated: bool,
         p: &impl Platform,
     ) -> Result<Token, Error> {
-        if self.failed {
-            return Err(Error::Device);
-        }
+        self.require_capacity(p)?;
         let (kind, sector) = match operation {
             Operation::Read(s) => (0u32, s),
             Operation::Write(s) if !self.read_only => (1, s),
@@ -192,16 +255,19 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         Ok(token)
     }
     pub fn drain(&mut self, p: &impl Platform) -> Result<(), Error> {
-        self.queue.drain(&mut self.transport, p)
+        self.require_capacity(p)?;
+        let result = self.queue.drain(&mut self.transport, p);
+        if result.is_err() {
+            self.fail(p);
+        }
+        result
     }
     pub fn poll(
         &mut self,
         out: &mut [u8; BYTES],
         p: &impl Platform,
     ) -> Result<Option<BlockCompletion>, Error> {
-        if self.failed {
-            return Err(Error::Device);
-        }
+        self.require_capacity(p)?;
         // Sample the deadline before acquiring the used ring. An empty
         // observation made before the deadline cannot justify timing out after
         // a slow IRQ ACK/deschedule: the device may have completed meanwhile.
@@ -223,10 +289,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
             // The queue acquires DMA and acknowledges the interrupt after its
             // initial status check. A reset in that interval cannot certify a
             // block result or authorize releasing its pinned buffers.
-            if self.transport.status() != 15 {
-                self.fail(p);
-                return Err(Error::Device);
-            }
+            self.require_capacity(p)?;
             let Some((token, operation, _)) = self.pending[usize::from(c.token.slot)] else {
                 self.fail(p);
                 return Err(Error::Queue);
@@ -293,6 +356,9 @@ mod tests {
         idle_clock: Cell<Option<u64>>,
         mmio: usize,
         reset_on_completion_ack: Cell<bool>,
+        feature_banks: Option<[u32; 2]>,
+        reject_features: bool,
+        complete_mmio_reset: bool,
     }
     unsafe impl Platform for Host {
         fn diagnostic_stage(&self, stage: u64) {
@@ -318,7 +384,25 @@ mod tests {
             Ok(a as u64)
         }
         unsafe fn sync(&self, _: usize, _: usize) {}
-        fn barrier(&self) {}
+        fn barrier(&self) {
+            if self.feature_banks.is_some() || self.complete_mmio_reset {
+                // Advancing a selector barrier exposes the selected device bank.
+                let reg = |offset| (self.mmio + offset) as *mut u32;
+                unsafe {
+                    match read_volatile(reg(0x70)) {
+                        3 => {
+                            if let Some(banks) = self.feature_banks {
+                                let bank = read_volatile(reg(0x14)) as usize;
+                                write_volatile(reg(0x10), banks[bank]);
+                            }
+                        }
+                        0 if self.complete_mmio_reset => write_volatile(reg(0x44), 0),
+                        11 if self.reject_features => write_volatile(reg(0x70), 3),
+                        _ => {}
+                    }
+                }
+            }
+        }
         fn now_ms(&self) -> u64 {
             self.clock.get() / 1_000_000
         }
@@ -337,12 +421,16 @@ mod tests {
             idle_clock: Cell::new(None),
             mmio: mmio.address(),
             reset_on_completion_ack: Cell::new(false),
+            feature_banks: None,
+            reject_features: false,
+            complete_mmio_reset: false,
         };
         mmio.put32(0, 0x74726976);
         mmio.put32(4, 2);
         mmio.put32(8, 2);
         mmio.put32(0x34, 16);
         mmio.put32(0x70, 15);
+        mmio.put32(0x100, 4096);
         let mut t = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
         let m = Box::leak(Box::new(BatchMemory::zeroed()));
         let base = m as *mut _ as usize;
@@ -352,14 +440,141 @@ mod tests {
                 transport: t,
                 queue: q,
                 sectors: 4096,
+                config_generation: 0,
                 read_only: false,
                 pending: [None; 8],
-                failed: false,
+                state: DeviceState::Live,
                 last_completed: 0,
             },
             p,
             base,
         )
+    }
+
+    fn attach_fixture(
+        low: u32,
+        reject_features: bool,
+    ) -> (&'static Page, Host, &'static mut BatchMemory) {
+        let mmio = Box::leak(Box::new(Page::zeroed()));
+        mmio.put32(0, 0x74726976);
+        mmio.put32(4, 2);
+        mmio.put32(8, 2);
+        mmio.put32(0x34, 16);
+        mmio.put32(0x100, 4096);
+        let platform = Host {
+            clock: Cell::new(0),
+            idle_completion: Cell::new(None),
+            idle_clock: Cell::new(None),
+            mmio: mmio.address(),
+            reset_on_completion_ack: Cell::new(false),
+            feature_banks: Some([low, 1]),
+            reject_features,
+            complete_mmio_reset: false,
+        };
+        (mmio, platform, Box::leak(Box::new(BatchMemory::zeroed())))
+    }
+
+    #[test]
+    fn writable_attach_rejects_read_only_before_publishing_features_or_a_queue() {
+        let (mmio, platform, memory) = attach_fixture(FLUSH | READ_ONLY, false);
+        mmio.put32(0x20, 0xdead_beef);
+        mmio.put32(0x24, 0x1122_3344);
+        let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+
+        assert!(matches!(
+            BatchedBlock::attach_writable(transport, memory, &platform),
+            Err(Error::Features)
+        ));
+        assert_eq!(mmio.get32(0x70), 3 | 128);
+        assert_eq!(mmio.get32(0x20), 0xdead_beef);
+        assert_eq!(mmio.get32(0x24), 0x1122_3344);
+        assert_eq!(mmio.get32(0x44), 0);
+        assert_eq!(mmio.get32(0x80), 0);
+    }
+
+    #[test]
+    fn writable_attach_waits_for_features_ok_before_queue_enable_and_driver_ok() {
+        for reject in [false, true] {
+            let (mmio, platform, memory) = attach_fixture(u32::MAX & !READ_ONLY, reject);
+            let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+            let result = BatchedBlock::attach_writable(transport, memory, &platform);
+            if reject {
+                assert!(matches!(result, Err(Error::Features)));
+                assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (3 | 128, 0));
+            } else {
+                assert!(!result.unwrap().read_only());
+                assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (15, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_batched_attach_still_supports_read_only_io() {
+        let (mmio, platform, memory) = attach_fixture(FLUSH | READ_ONLY, false);
+        let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+        let mut block = BatchedBlock::attach(transport, memory, &platform).unwrap();
+        assert!(block.read_only());
+        assert_eq!(
+            block.begin(Operation::Write(0), &[0; 512], true, true, &platform),
+            Err(Error::Unsupported)
+        );
+        assert!(
+            block
+                .begin(Operation::Read(0), &[0; 512], true, true, &platform)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn capacity_change_stops_dispatch_and_retains_unreconciled_dma() {
+        let (mmio, mut platform, memory) = attach_fixture(FLUSH, false);
+        let base = memory as *mut _ as usize;
+        let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+        let mut block = BatchedBlock::attach_writable(transport, memory, &platform).unwrap();
+        let token = block
+            .begin(Operation::Write(0), &[0; 512], true, false, &platform)
+            .unwrap();
+        let published = block.notify_stats().published;
+        mmio.put32(0x100, 2048);
+        mmio.put32(0xfc, 1);
+        assert_eq!(
+            block.begin(Operation::Read(1), &[0; 512], true, false, &platform),
+            Err(Error::Device)
+        );
+        assert_eq!(block.drain(&platform), Err(Error::Device));
+        assert_eq!(block.poll(&mut [0; 512], &platform), Err(Error::Device));
+        assert_eq!(block.acknowledge(token), Err(Error::Response));
+        assert_eq!(block.notify_stats().published, published);
+        assert_eq!(block.free(), block.capacity() - 1);
+        assert!(!block.is_quiescent());
+        assert_ne!(mmio.get32(0x70) & 128, 0);
+        assert_eq!(
+            unsafe { read_volatile((base + 4098) as *const u16) },
+            1u16.to_le()
+        );
+        platform.complete_mmio_reset = true;
+        platform.clock.set(123_000);
+        assert_eq!(block.stop_failed_mmio(&platform), Some(Ok(123_000)));
+        assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (0, 0));
+        assert_eq!(block.stop_failed_mmio(&platform), None);
+        assert_eq!(block.acknowledge(token), Err(Error::Response));
+        assert_eq!(block.free(), block.capacity() - 1);
+    }
+
+    #[test]
+    fn config_change_prevents_publication_of_a_private_batch_even_at_same_capacity() {
+        let (mmio, platform, memory) = attach_fixture(FLUSH, false);
+        let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+        let mut block = BatchedBlock::attach_writable(transport, memory, &platform).unwrap();
+        block.set_notify_policy(2, 1, 1_000_000, 0).unwrap();
+        block
+            .begin(Operation::Write(0), &[0; 512], false, false, &platform)
+            .unwrap();
+        assert_eq!(block.notify_stats().published, 0);
+        mmio.put32(0xfc, 1);
+        assert_eq!(block.drain(&platform), Err(Error::Device));
+        assert_eq!(block.notify_stats().published, 0);
+        assert!(!block.is_quiescent());
     }
     unsafe fn complete(base: usize, slot: u8, read: bool, status: u8) {
         unsafe { complete_with_status(base, slot, read, Some(status)) }

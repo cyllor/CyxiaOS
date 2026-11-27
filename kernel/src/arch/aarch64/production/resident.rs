@@ -15,11 +15,13 @@ use crate::ExceptionFrame;
 use crate::{UART, machine::enqueue_resident_frame};
 use cyxia_contracts::{PhysAddr, UartResource};
 use cyxia_driver_pl011::Pl011;
+#[cfg(cyxia_startup_catalog)]
+use cyxia_kernel_core::control_plane::role_budget_v0199::Class;
 use cyxia_kernel_core::{
     console::OutputQueue,
     control_plane::{
         Error,
-        role_budget_v0199::{Class, Cpu0BudgetLedger, Settlement, Turn},
+        role_budget_v0199::{Cpu0BudgetLedger, Settlement, Turn},
     },
 };
 
@@ -48,16 +50,11 @@ impl ResidentBudget {
             .map_err(|_| Error::Clock)
     }
 
-    fn turn(&mut self, degraded: bool, work: impl FnOnce()) -> Result<Option<Settlement>, Error> {
-        let cpu = cpu::slot();
+    fn diagnostic_turn(&mut self, work: impl FnOnce()) -> Result<Option<Settlement>, Error> {
         let start = self.now_ns()?;
-        let reservation = if degraded {
+        let reservation =
             self.ledger
-                .reserve_readonly_diagnostic(cpu, CONSOLE_TURN_NS, start)
-        } else {
-            self.ledger
-                .reserve_kernel(cpu, Class::Coordination, CONSOLE_TURN_NS, start)
-        };
+                .reserve_readonly_diagnostic(cpu::slot(), CONSOLE_TURN_NS, start);
         let grant = match reservation {
             Err(Error::Exhausted) => return Ok(None),
             result => result?,
@@ -106,7 +103,7 @@ pub(crate) fn exception(frame: &mut ExceptionFrame, kind: u64) {
 
 // CPU0 owns UART RX/TX after startup. The timer IRQ only rearms the timer
 // and increments its counter. Foreground consumes at most one command per turn.
-fn poll_console(
+pub(super) fn poll_console(
     uart: &mut Pl011,
     pending: &mut OutputQueue<128>,
     command: &mut usize,
@@ -234,7 +231,7 @@ pub(super) fn serve_with_queue(
         let interval = if degraded { DEGRADED_POLL_INTERVAL } else { 1 };
         if !accounting_fault && interrupts.wrapping_sub(last_interrupt) >= interval {
             last_interrupt = interrupts;
-            let result = budget.turn(degraded, || {
+            let result = budget.diagnostic_turn(|| {
                 if pending.pending() == 0 {
                     if let Some((label, [a, b, c])) = fault.take() {
                         let mut text = [0; 96];

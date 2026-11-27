@@ -128,6 +128,29 @@ pub fn admission_retired(generation: u64, source: u32) -> Result<(), Error> {
     connection_receipt(allowed::ADMISSION_RETIRED, generation, source)
 }
 
+pub fn tls_authenticated(
+    _ticket: &cyxia_net_transport::admission::ActiveTicket,
+    generation: u64,
+    source: u32,
+) -> Result<(), Error> {
+    connection_receipt(allowed::TLS_AUTHENTICATED, generation, source)
+}
+
+pub fn certificate_verify(
+    transcript: &[u8; cyxia_contracts::tls_signer::TRANSCRIPT_BYTES],
+) -> Result<[u8; cyxia_contracts::tls_signer::SIGNATURE_BYTES], Error> {
+    let mut signature = [0; cyxia_contracts::tls_signer::SIGNATURE_BYTES];
+    match request(
+        allowed::TLS_CERTIFICATE_VERIFY,
+        transcript,
+        &mut signature,
+        0,
+    )? {
+        (cyxia_contracts::tls_signer::SIGNATURE_BYTES, 0) => Ok(signature),
+        _ => Err(Error::Invalid),
+    }
+}
+
 fn connection_receipt(op: u64, generation: u64, source: u32) -> Result<(), Error> {
     let mut receipt = [0u8; allowed::ADMISSION_RECEIPT_BYTES];
     receipt[..8].copy_from_slice(&generation.to_le_bytes());

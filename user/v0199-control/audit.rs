@@ -115,9 +115,11 @@ pub(super) fn run(cap: u64, boot: u64, generation: u64) -> ! {
             if seq == 8 && cursor == 0 {
                 #[cfg(file_read_probe)]
                 super::file_read::probe_supervisor();
-                #[cfg(snapshot_catalog_probe)]
+                #[cfg(file_receipt_query_probe)]
+                super::file_receipt::run();
+                #[cfg(all(not(file_receipt_query_probe), snapshot_catalog_probe))]
                 super::catalog::probe_supervisor();
-                #[cfg(not(snapshot_catalog_probe))]
+                #[cfg(not(any(file_receipt_query_probe, snapshot_catalog_probe)))]
                 loop {
                     yield_now();
                 }

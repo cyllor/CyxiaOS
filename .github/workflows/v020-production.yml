@@ -170,10 +170,11 @@ jobs:
           cargo test --locked --offline -p cyxia-driver-virtio --lib 2>&1 | tee artifacts/v020-production/driver-virtio-tests.log
           cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat 2>&1 | tee artifacts/v020-production/build-resident.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel-resident.elf
-          # The kernel include_bytes!-embeds the fixture-identity local-echo guest:
-          # build it first with the exact helper verify_v0199_sec_n.py uses.
-          python3 -B -c 'import sys; sys.path.insert(0, "tools"); import verify_v0199_sec_n as s; s.build_guest()' 2>&1 | tee artifacts/v020-production/build-guest.log
+          # Build the Echo verifier and the separate fixture signer before
+          # compiling the authenticated kernel profiles that embed them.
+          python3 -B -c 'import sys; sys.path.insert(0, "tools"); import verify_v0199_sec_n as s; s.build_guest(isolated_signer=True)' 2>&1 | tee artifacts/v020-production/build-guest.log
           sha256sum target/aarch64-unknown-none/release/cyxia-local-echo > artifacts/v020-production/guest.sha256
+          sha256sum target/aarch64-unknown-none/release/cyxia-echo-signer > artifacts/v020-production/signer.sha256
           cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v020-production-diagnostic 2>&1 | tee artifacts/v020-production/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/v020-production/kernel.elf
           # Opt-in staging profile (prototype-memory, RAM_MIB 1024).

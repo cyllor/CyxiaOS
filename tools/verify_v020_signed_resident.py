@@ -105,6 +105,18 @@ def boot(binary: str, elf: Path, output: Path, timeout: float,
                 require(lines.index(f"V020_W11_MEDIA_STEP a=4 b=1 c={epoch}")
                         < lines.index(f"V020_SIGNED_RESIDENT_BOOT a={epoch} b={len(ROLES)} c=0"),
                         "native startup preceded durable BootEpoch confirmation")
+                status_label = "V020_RESIDENT_STATUS"
+                for count in (1, 2):
+                    proc.stdin.write(b"status\n")
+                    proc.stdin.flush()
+                    wait_until(lambda: len(rows(lines, status_label)) >= count)
+                status = rows(lines, status_label)
+                require(len(status) == 2 and all(row[:2] == (15, 0) for row in status)
+                        and 0 < status[0][2] < status[1][2],
+                        "signed resident console did not sustain read-only status")
+                progress_count = len(rows(lines, "V020_SIGNED_RESIDENT_PROGRESS"))
+                wait_until(lambda: len(rows(lines, "V020_SIGNED_RESIDENT_PROGRESS"))
+                           > progress_count)
                 progress = rows(lines, "V020_SIGNED_RESIDENT_PROGRESS")
                 require(len(progress) >= 5 and all(row[1:] == COMPLETE_PROGRESS for row in progress)
                         and all(right[0] - left[0] >= 4 for left, right in zip(progress, progress[1:])),
@@ -116,7 +128,7 @@ def boot(binary: str, elf: Path, output: Path, timeout: float,
                 require(not any(line.startswith("V020_STARTUP ") for line in lines),
                         "resident roles entered the fenced state")
                 result.update(epoch=epoch, roles=rows(lines, "V020_SIGNED_RESIDENT_ROLE"),
-                              progress=progress, recovery=recovery)
+                              progress=progress, recovery=recovery, status_replies=status)
             require(rows(lines, "SMP_BOOT_OK") == [(4, 15, 0)], "SMP startup failed")
             require(not any(line.startswith(("V020_PROD_", "FAIL", "PANIC")) for line in lines),
                     "legacy role authority or hardware failure")

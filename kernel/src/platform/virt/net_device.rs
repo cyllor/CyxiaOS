@@ -19,20 +19,20 @@
 //!   secondary CPU touches the queues).
 //! * The pools are permanently pinned and never reclaimed, including on
 //!   initialization failure (a FAILED device is not proof DMA stopped).
-//! * The device is NEVER reset: dropping `NetDevice` at the end of
-//!   `net::serve` neither releases the pools nor quiesces the device. It stays
-//!   live and DMA-capable for the rest of the boot (including the opt-in media
-//!   staging run): the host may keep DMA-ing received frames into the RX pool
-//!   after `serve` returns. Nothing reads or writes RX/TX after that, so those
-//!   writes land only in pinned, otherwise unused memory.
+//! * The foreground owner explicitly fences and resets both queues when its
+//!   one-shot TCP stream ends. Both pools stay pinned, including on reset
+//!   timeout or unproven credit retirement. Drop alone changes no custody.
 use crate::virtio_platform::Board;
 use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_contracts::BootInfo;
-use cyxia_driver_virtio::{Error, Transport, net::BatchedNet, queue::BatchMemory};
+use cyxia_driver_virtio::{
+    Error, Transport, net::BatchedNet, queue::BatchMemory, reset::ResetProof,
+};
 
 /// Board VirtIO MMIO window decoded from the DTB.
 const VIRTIO_WINDOW_START: u64 = 0x0a00_0000;
 const VIRTIO_WINDOW_END: u64 = 0x0a20_0000;
+const NATIVE_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
 static CLAIMED: AtomicBool = AtomicBool::new(false);
 // The statically registered production arena includes both pinned DMA pools.
@@ -45,6 +45,22 @@ static mut TX: BatchMemory = BatchMemory::zeroed();
 /// dropping this handle never releases the pages or resets the device.
 pub struct NetDevice {
     pub net: BatchedNet,
+    terminal_reset: Option<(u64, Result<[ResetProof; 2], Error>)>,
+}
+
+impl NetDevice {
+    pub(crate) fn stop(&mut self, boot_epoch: u64) -> Result<[ResetProof; 2], Error> {
+        if let Some((epoch, result)) = self.terminal_reset {
+            return if epoch == boot_epoch {
+                result
+            } else {
+                Err(Error::Response)
+            };
+        }
+        let result = self.net.stop_native(boot_epoch, &Board);
+        self.terminal_reset = Some((boot_epoch, result));
+        result
+    }
 }
 
 /// Probe the DTB for the single VirtIO-net function and initialize the real
@@ -59,14 +75,18 @@ pub fn init(info: &BootInfo) -> Result<NetDevice, Error> {
     // SAFETY: single CPU0 foreground owner; the static pools are exclusively
     // borrowed here and stay pinned through every error path.
     let net = unsafe {
-        BatchedNet::initialize(
+        BatchedNet::initialize_native(
             transport,
             &mut *core::ptr::addr_of_mut!(RX),
             &mut *core::ptr::addr_of_mut!(TX),
+            NATIVE_MAC,
             &Board,
         )
     }?;
-    Ok(NetDevice { net })
+    Ok(NetDevice {
+        net,
+        terminal_reset: None,
+    })
 }
 
 /// Find one transport of the expected device type in the board window.

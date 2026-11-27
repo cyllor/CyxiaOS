@@ -190,6 +190,12 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
     };
     let frame = &frame[..buffers.request_len];
     let parsed = Request::decode(frame, args[3]);
+    if matches!(args[3], ROOT_SELECTOR | 0)
+        && parsed.is_ok()
+        && let Some(error) = media_staging::ordinary_file_refusal()
+    {
+        return Err(error);
+    }
     let Some(grant) = &mut state.grant else {
         if args[3] == ROOT_SELECTOR
             && parsed.is_ok_and(|request| request.op == READDIR && request.request_id == 1)

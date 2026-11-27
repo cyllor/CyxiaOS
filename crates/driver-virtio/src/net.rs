@@ -6,6 +6,8 @@ pub use batched::{BatchedNet, TxReceipt};
 pub const MAX_FRAME: usize = 1514;
 const HEADER: usize = 12;
 const BUFFER: usize = HEADER + MAX_FRAME;
+const MAC_FEATURE: u32 = 1 << 5;
+const MERGEABLE_RX_FEATURE: u32 = 1 << 15;
 
 struct Ring {
     memory: &'static mut QueueMemory,
@@ -186,14 +188,18 @@ impl Net {
         tx: &'static mut QueueMemory,
         p: &impl Platform,
     ) -> Result<([u8; 6], Ring, Ring), Error> {
-        Self::negotiate(t, p)?;
+        Self::negotiate(t, p, true)?;
         let mac = Self::read_mac(t, p)?;
         let rx = Ring::configure(t, rx, 0, p)?;
         let tx = Ring::configure(t, tx, 1, p)?;
         Ok((mac, rx, tx))
     }
 
-    fn negotiate(t: &mut Transport, p: &impl Platform) -> Result<(), Error> {
+    fn negotiate(
+        t: &mut Transport,
+        p: &impl Platform,
+        allow_mergeable_rx: bool,
+    ) -> Result<(), Error> {
         let result = (|| {
             t.set_status(0);
             p.barrier();
@@ -208,7 +214,7 @@ impl Net {
             t.select_device_features(0);
             p.barrier();
             let low_features = t.device_features();
-            if low_features & 32 == 0 {
+            if low_features & MAC_FEATURE == 0 {
                 return Err(Error::Features);
             }
             t.select_device_features(1);
@@ -216,12 +222,12 @@ impl Net {
             if t.device_features() & 1 == 0 {
                 return Err(Error::Features);
             }
-            // Optional MRG_RXBUF makes modern devices publish num_buffers.
-            // Only one MTU-sized RX buffer is posted; multi-buffer packets are
-            // still outside this bounded profile and are rejected. No checksum,
-            // GSO/control/MQ/event-index/indirect features are accepted.
+            let mut allowed = MAC_FEATURE;
+            if allow_mergeable_rx {
+                allowed |= MERGEABLE_RX_FEATURE;
+            }
             t.select_driver_features(0);
-            t.set_driver_features(32 | (low_features & (1 << 15)));
+            t.set_driver_features(low_features & allowed);
             p.barrier();
             t.select_driver_features(1);
             t.set_driver_features(1);
@@ -409,6 +415,7 @@ mod tests {
         saw_driver_ok: Cell<bool>,
         early_notify: Cell<bool>,
         clock: Cell<u64>,
+        keep_rx_ready_on_reset: bool,
     }
     // SAFETY: tests serialize a fake device with driver accesses to pinned pages.
     // DMA is emulated only through volatile accesses at valid descriptor addresses.
@@ -455,6 +462,12 @@ mod tests {
                     self.selected.set(selected);
                     m.put32(0x44, self.ready.borrow()[selected as usize]);
                 }
+                if self.saw_driver_ok.get() && m.get32(0x70) == 0 {
+                    let ready = [u32::from(self.keep_rx_ready_on_reset), 0];
+                    *self.ready.borrow_mut() = ready;
+                    m.put32(0x44, ready[selected as usize]);
+                    self.clock.set(self.clock.get() + 1);
+                }
                 m.put32(0x34, if selected == 1 { self.tx_max } else { 8 });
                 if m.get32(0x44) == 1 {
                     self.queue_desc.borrow_mut()[selected as usize] =
@@ -487,6 +500,7 @@ mod tests {
             saw_driver_ok: Cell::new(false),
             early_notify: Cell::new(false),
             clock: Cell::new(0),
+            keep_rx_ready_on_reset: false,
         }
     }
     fn initialize(h: &Host) -> Result<Net, Error> {
@@ -502,6 +516,103 @@ mod tests {
         let h = host((1 << 32) | (1 << 5) | (1 << 15) | (1 << 0));
         let n = initialize(&h).unwrap();
         (n, h)
+    }
+
+    #[test]
+    fn native_net_negotiates_only_mac_and_version_one() {
+        let mut h = host(u64::MAX);
+        h.tx_max = 16;
+        let t = unsafe { Transport::attach(h.mmio.address(), 4096).unwrap() };
+        let mac = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let net = BatchedNet::initialize_native(
+            t,
+            Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+            Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+            mac,
+            &h,
+        )
+        .unwrap();
+        assert_eq!(net.mac(), mac);
+        assert!(h.negotiated.borrow().contains(&(0, 1 << 5)));
+        assert!(!h.negotiated.borrow().contains(&(0, (1 << 15) | (1 << 5))));
+        assert_eq!(h.mmio.get32(0x70), 15);
+    }
+
+    #[test]
+    fn native_net_rejects_a_mac_other_than_the_configured_value_before_queues() {
+        let h = host(u64::MAX);
+        let t = unsafe { Transport::attach(h.mmio.address(), 4096).unwrap() };
+        assert!(matches!(
+            BatchedNet::initialize_native(
+                t,
+                Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+                Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+                [2, 0, 0, 0, 0, 1],
+                &h,
+            ),
+            Err(Error::Device)
+        ));
+        assert_eq!(*h.queue_desc.borrow(), [0; 2]);
+        assert_ne!(h.mmio.get32(0x70) & 128, 0);
+    }
+
+    #[test]
+    fn native_stop_proves_both_queues_and_keeps_inflight_dma_accounted() {
+        let mac = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let h = host(u64::MAX);
+        let t = unsafe { Transport::attach(h.mmio.address(), 4096).unwrap() };
+        let mut net = BatchedNet::initialize_native(
+            t,
+            Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+            Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+            mac,
+            &h,
+        )
+        .unwrap();
+        net.send(&[0; 14], &h).unwrap();
+        let owned = net.notify_stats().inflight;
+        let proofs = net.stop_native(19, &h).unwrap();
+        assert_eq!(*h.ready.borrow(), [0, 0]);
+        assert_eq!(h.mmio.get32(0x70), 0);
+        for (index, proof) in proofs.iter().enumerate() {
+            let wire = proof.encode();
+            assert_eq!(&wire[..8], &[0x50, 0x52, 0x59, 0x43, 1, 0, 64, 0]);
+            assert_eq!(&wire[8..16], &19u64.to_le_bytes());
+            assert_eq!(&wire[16..20], &1u32.to_le_bytes());
+            assert_eq!(&wire[20..22], &(index as u16).to_le_bytes());
+            assert_eq!(&wire[48..56], &[0; 8]);
+        }
+        h.clock.set(200);
+        assert_eq!(net.stop_native(19, &h), Err(Error::Busy));
+        assert_eq!(h.clock.get(), 200);
+        assert_eq!(net.stop_native(20, &h), Err(Error::Busy));
+        assert_eq!(net.send(&[0; 14], &h), Err(Error::Device));
+        assert_eq!(net.notify_stats().inflight, owned);
+        assert!(!net.tx_quiescent());
+    }
+
+    #[test]
+    fn native_stop_requires_queueready_from_every_queue_before_deadline() {
+        let mac = [2, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let mut h = host(u64::MAX);
+        h.keep_rx_ready_on_reset = true;
+        let t = unsafe { Transport::attach(h.mmio.address(), 4096).unwrap() };
+        let mut net = BatchedNet::initialize_native(
+            t,
+            Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+            Box::leak(Box::new(crate::queue::BatchMemory::zeroed())),
+            mac,
+            &h,
+        )
+        .unwrap();
+        let inflight = net.notify_stats().inflight;
+        assert_eq!(net.stop_native(19, &h), Err(Error::Timeout));
+        assert_eq!(h.mmio.get32(0x70), 0);
+        assert_eq!(*h.ready.borrow(), [1, 0]);
+        h.keep_rx_ready_on_reset = false;
+        assert_eq!(net.stop_native(19, &h), Err(Error::Busy));
+        assert_eq!(net.notify_stats().inflight, inflight);
+        assert_eq!(net.poll_rx(&h), Err(Error::Device));
     }
     fn complete(r: &Ring, id: u32, length: u32, advance: u16) {
         let at = 4 + usize::from(r.used % 8) * 8;

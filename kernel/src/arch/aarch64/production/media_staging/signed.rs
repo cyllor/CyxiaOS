@@ -1,6 +1,8 @@
 //! Immutable, public test catalog for the selected repository scratch policy.
 //! The FSYNC profile pins a separate volume and the exact diagnostic owner.
 use super::volume::UUID;
+#[cfg(feature = "v020-production-fsync-scratch")]
+use cyxia_kernel_core::security::offline_config_v1::Principal;
 use cyxia_kernel_core::security::{
     Error,
     offline_config_v1::{CatalogBindings, VerifiedOfflineConfig},
@@ -16,6 +18,21 @@ pub(super) const WIRE: &[u8] =
 const PAYLOAD: &[u8] = &[0; 12];
 #[cfg(feature = "v020-production-fsync-scratch")]
 const PAYLOAD: &[u8] = b"CYX-SCRATCH-FSYNC/v1:inode=1,principal=1";
+#[cfg(feature = "v020-production-fsync-scratch")]
+const RECEIPT_QUERY_WIRE: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/v020-signed-scratch/fsync-receipt-query.bin");
+#[cfg(feature = "v020-production-fsync-scratch")]
+const RECEIPT_QUERY_PAYLOAD: &[u8] = concat!(
+    "CYX-SCRATCH-FILE-RECEIPT-QUERY/v1:",
+    "fsync=e987d063b83bff1cf60b1d000845276f0172599f3e36eec4ff1abf4c6e6c14d1,",
+    "principal=1,generation=1,holder_role=11,file_service=12,ipc_send=1",
+)
+.as_bytes();
+#[cfg(feature = "v020-production-fsync-scratch")]
+const RECEIPT_QUERY_DIGEST: [u8; 32] = [
+    0xd0, 0x45, 0xb7, 0x17, 0x23, 0x81, 0xdd, 0xd1, 0x73, 0x0b, 0x9d, 0x44, 0x72, 0x29, 0x9d, 0x26,
+    0x37, 0x81, 0x33, 0xbf, 0xa5, 0xb9, 0xb8, 0x29, 0x9e, 0xca, 0x39, 0x66, 0xba, 0x5a, 0x9d, 0x40,
+];
 // RFC 8032 test vector 1, public verifying key.
 const PUBLIC_KEY: [u8; 32] = [
     0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
@@ -58,6 +75,15 @@ pub(super) fn verify<'a>(
     wire: &'a [u8],
     scratch: &mut [u8],
 ) -> Result<VerifiedOfflineConfig<'a>, Error> {
+    verify_vector(wire, scratch, PAYLOAD, WIRE_DIGEST)
+}
+
+fn verify_vector<'a>(
+    wire: &'a [u8],
+    scratch: &mut [u8],
+    payload: &[u8],
+    digest: [u8; 32],
+) -> Result<VerifiedOfflineConfig<'a>, Error> {
     let config = VerifiedOfflineConfig::verify(
         wire,
         &PUBLIC_KEY,
@@ -68,7 +94,7 @@ pub(super) fn verify<'a>(
                 || header.generation != 1
                 || header.mode != 0
                 || header.clear_isolation_bitmap != 0
-                || lists != PAYLOAD
+                || lists != payload
                 || principals
                     .iter()
                     .enumerate()
@@ -79,8 +105,28 @@ pub(super) fn verify<'a>(
             Ok(())
         },
     )?;
-    if config.digest() != WIRE_DIGEST {
+    if config.digest() != digest {
         return Err(Error::Conflict);
     }
     Ok(config)
+}
+
+/// Explicit test-only FILE_RECEIPT_QUERY and IPC_SEND qualification for role 11
+/// on this exact FSYNC policy. It neither changes the existing media policy
+/// hash nor grants any authority over another volume or service.
+#[cfg(feature = "v020-production-fsync-scratch")]
+pub(super) fn receipt_query_principal(
+    mounted: &VerifiedOfflineConfig<'_>,
+    scratch: &mut [u8],
+) -> Result<Principal, Error> {
+    let query = verify_vector(
+        RECEIPT_QUERY_WIRE,
+        scratch,
+        RECEIPT_QUERY_PAYLOAD,
+        RECEIPT_QUERY_DIGEST,
+    )?;
+    if mounted.digest() != WIRE_DIGEST || mounted.principals() != query.principals() {
+        return Err(Error::Unauthorized);
+    }
+    Ok(query.principals()[0])
 }

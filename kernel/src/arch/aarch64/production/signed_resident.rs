@@ -8,19 +8,25 @@
 //! timer enforces separate wall deadlines.
 
 use super::{
-    BootInfo, E_AUTH, E_FORMAT, Error, Identity, NativeRoleManifest, Ordering, ROLE_COUNT, ROLES,
-    Role, TIMER_IRQ, bring_up_production, cpu, decode_aarch64_svc_v3, frames, gic,
-    load_role_with_identity, media_staging, now_ns, ns_from_ticks, pie_context, profile, report,
-    report_payload, resident, role_asid, timer, user,
+    BootInfo, E_AUTH, E_FORMAT, Error, ExceptionFrame, IRQS, Identity, NativeRole,
+    NativeRoleManifest, Ordering, ROLE_COUNT, ROLES, Role, TIMER_IRQ, bring_up_production, cpu,
+    frames, gic, load_role_with_identity, media_staging, now_ns, ns_from_ticks, pie_context,
+    profile, recovery, report, report_payload, resident, role_asid, timer, trapped_ttbr0, user,
 };
 use crate::machine::enqueue_resident_frame;
+use core::sync::atomic::AtomicU64;
 use cyxia_kernel_core::{
     console::OutputQueue,
     control_plane::{
         role_budget_v0199::{CLASS_LIMITS, Class, Cpu0BudgetLedger, Turn, WINDOW_NS},
         role_manifest_v0199::ValidatedRoleManifest,
     },
-    security::{durable_role_epoch_v0199::ConfirmedBootPolicy, syscall::Syscall},
+    security::{
+        Error as SvcError,
+        durable_role_epoch_v0199::ConfirmedBootPolicy,
+        syscall::Syscall,
+        syscall_v3::{ABI_VERSION, decode_aarch64_lifecycle_svc_v3},
+    },
 };
 
 const CLOCK: u16 = 1;
@@ -30,12 +36,24 @@ const DENIED: u16 = 1 << 3;
 const EVIDENCE_WINDOWS: u64 = 4;
 const RECOVERY_NS: u64 = CLASS_LIMITS[Class::Recovery as usize];
 const CONSOLE_TURN_NS: u64 = 1_000_000;
-const TX_BYTES_PER_TURN: usize = 16;
 const MAX_WALL_NS: u64 = 50_000_000;
+const FATAL_ROLE_CONTEXT: u64 = 0x5731_1340;
 const NO_MEDIA: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=signed_media_unavailable command=status\n";
 const FENCED: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=signed_roles_fenced command=status\n";
+// CPU0 publishes the expected root/ASID for the exclusive running turn.
+// The vector verifies the live EL0 context before handing control back.
+static ACTIVE_ROLE_TTBR0: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn verify_captured_role(frame: &ExceptionFrame, kind: u64) {
+    if cpu::slot() == 0 && matches!(kind, 8 | 9) {
+        let expected = ACTIVE_ROLE_TTBR0.load(Ordering::Acquire);
+        if expected == 0 || frame.spsr & 0x1f != 0 || trapped_ttbr0() != expected {
+            super::fatal(FATAL_ROLE_CONTEXT);
+        }
+    }
+}
 
 struct Task {
     context: user::Context,
@@ -90,19 +108,20 @@ impl Task {
         if ctx.kind == 9 {
             return Ok(true);
         }
-        if ctx.kind != 8 || ctx.esr != 0x5600_0000 {
+        if ctx.kind != 8 || ctx.esr >> 26 != 0x15 {
             return Err(Error::Denied);
         }
-        // Both services require an installed capability. Reject before
-        // inspecting EL0 pointers or interpreting subprotocol bytes.
-        if matches!(ctx.regs[8], 0x40 | 0x50) {
-            ctx.regs[0] = E_AUTH as u64;
-            self.activity |= DENIED;
-            return Ok(false);
-        }
-        let Ok(call) = decode_aarch64_svc_v3(3, ctx.esr, &ctx.regs) else {
-            ctx.regs[0] = E_FORMAT as u64;
-            return Ok(false);
+        let call = match decode_aarch64_lifecycle_svc_v3(ABI_VERSION, ctx.esr, &ctx.regs) {
+            Ok(call) => call,
+            Err(SvcError::Unauthorized) => {
+                ctx.regs[0] = E_AUTH as u64;
+                self.activity |= DENIED;
+                return Ok(false);
+            }
+            Err(_) => {
+                ctx.regs[0] = E_FORMAT as u64;
+                return Ok(false);
+            }
         };
         ctx.regs[0] = 0;
         match call.operation {
@@ -190,6 +209,7 @@ fn startup_work<T>(
 }
 
 fn turn(
+    policy: &ConfirmedBootPolicy<'_>,
     manifest: &ValidatedRoleManifest<'_>,
     index: usize,
     task: &mut Task,
@@ -216,53 +236,69 @@ fn turn(
         Err(Error::Exhausted) => return Ok(()),
         Err(error) => return Err(error.into()),
     };
+    // Recheck the persisted authority inside the prepaid turn. No role is
+    // entered using a generation or address space from its own request.
+    let result = if policy.service_generation(member.role) == Ok(member.actor.generation) {
+        run_quantum(member, index, task, grant, &start)
+    } else {
+        Err(Error::Denied)
+    };
+    settle(ledger, grant, &start)?;
+    result.map_err(Into::into)
+}
+
+fn run_quantum(
+    member: NativeRole,
+    index: usize,
+    task: &mut Task,
+    grant: Turn,
+    start: &Sample,
+) -> Result<(), Error> {
     // A separate physical timer forces return before the prepaid bound
     // expires. Reserve exit/settlement margin using the native fixture's
     // role limits. Clock, rejection and waiting cannot refill a grant.
-    let exit_margin_ns = if class == Class::Decision {
-        150_000
-    } else {
-        100_000
-    };
-    let trap_limit = if class == Class::Decision { 1 } else { 8 };
-    let mut result = Ok(());
+    let decision = grant.accounting_scope().0 == Class::Decision;
+    let exit_margin_ns = if decision { 150_000 } else { 100_000 };
+    let trap_limit = if decision { 1 } else { 8 };
+    let asid = role_asid(index);
+    let ttbr0 = member.ttbr0_root | (u64::from(asid) << 48);
     for _ in 0..trap_limit {
         let wall_ticks = timer::ticks();
         let wall_left = grant
             .deadline_ns()
             .saturating_sub(ns_from_ticks(wall_ticks));
-        let cpu_left = quota.saturating_sub(start.cpu_elapsed()?);
+        let cpu_left = grant.reserved_ns().saturating_sub(start.cpu_elapsed()?);
         let remaining = cpu_left.min(wall_left).saturating_sub(exit_margin_ns);
         let ticks = (u128::from(remaining) * u128::from(timer::frequency()) / 1_000_000_000) as u64;
         if ticks == 0 {
             break;
         }
+        let deadline = wall_ticks.checked_add(ticks).ok_or(Error::Clock)?;
+        ACTIVE_ROLE_TTBR0.store(ttbr0, Ordering::Release);
         // SAFETY: CPU0 is the sole owner of each verified, pinned root and
         // context. Its ASID is private and its mappings are retained for boot.
         unsafe {
-            timer::arm(wall_ticks.checked_add(ticks).ok_or(Error::Clock)?);
-            user::enter_pinned_until_retired(
-                &mut task.context,
-                member.ttbr0_root,
-                role_asid(index),
-            );
+            timer::arm(deadline);
+            user::enter_pinned_until_retired(&mut task.context, member.ttbr0_root, asid);
             cpu::disable_timer();
         }
+        ACTIVE_ROLE_TTBR0.store(0, Ordering::Release);
         match task.trap() {
             Ok(false) => {}
             Ok(true) => break,
             Err(error) => {
-                result = Err(error);
-                break;
+                recovery::record_role_failure(member.actor, task.context.esr, task.context.far)
+                    .map_err(|_| Error::Denied)?;
+                return Err(error);
             }
         }
     }
-    settle(ledger, grant, &start)?;
-    result.map_err(Into::into)
+    Ok(())
 }
 
 fn run_tasks(
     info: &BootInfo,
+    policy: &ConfirmedBootPolicy<'_>,
     manifest: &ValidatedRoleManifest<'_>,
     ledger: &mut Cpu0BudgetLedger,
     pending: &mut OutputQueue<128>,
@@ -275,15 +311,17 @@ fn run_tasks(
     });
     let mut next_window = now_ns() / WINDOW_NS;
     let mut proof_window = next_window + EVIDENCE_WINDOWS;
+    let mut console_window = next_window;
+    let mut command = 0;
     loop {
         let window = now_ns() / WINDOW_NS;
         if window >= next_window {
             next_window = window + 1;
             for (index, task) in tasks.iter_mut().enumerate() {
-                turn(manifest, index, task, ledger)?;
+                turn(policy, manifest, index, task, ledger)?;
             }
         }
-        if window >= proof_window || pending.pending() != 0 {
+        if window >= console_window || pending.pending() != 0 {
             let start = Sample::now();
             match ledger.reserve_kernel_with_wall(
                 0,
@@ -293,15 +331,21 @@ fn run_tasks(
                 start.wall,
             ) {
                 Ok(grant) => {
-                    let result = if pending.pending() == 0 {
+                    console_window = window + 1;
+                    let result = if pending.pending() == 0 && window >= proof_window {
                         proof_window = window + EVIDENCE_WINDOWS;
                         queue_progress(&mut tasks, window, pending)
                     } else {
-                        pending
-                            .drain(&mut uart, TX_BYTES_PER_TURN)
-                            .map(|_| ())
-                            .map_err(|_| Error::Denied)
+                        Ok(())
                     };
+                    if result.is_ok() {
+                        resident::poll_console(
+                            &mut uart,
+                            pending,
+                            &mut command,
+                            IRQS[0].load(Ordering::Acquire),
+                        );
+                    }
                     settle(ledger, grant, &start)?;
                     result?;
                 }
@@ -422,6 +466,9 @@ pub(super) fn run(info: &BootInfo) -> ! {
     let Ok(actors) = identities(&policy) else {
         resident::serve(info, Some(FENCED), ledger);
     };
+    if recovery::init_signed(&policy).is_err() {
+        resident::serve(info, Some(FENCED), ledger);
+    }
     let members = match startup_work(&mut ledger, 2, || {
         core::array::from_fn(|index| load_role_with_identity(index, actors[index].generation, 0, 0))
     }) {
@@ -455,7 +502,7 @@ pub(super) fn run(info: &BootInfo) -> ! {
         );
     }
     let mut pending = OutputQueue::new();
-    match run_tasks(info, &manifest, &mut ledger, &mut pending) {
+    match run_tasks(info, &policy, &manifest, &mut ledger, &mut pending) {
         Err(fault) => fence(info, ledger, pending, fault),
         Ok(()) => resident::serve(info, Some(FENCED), ledger),
     }

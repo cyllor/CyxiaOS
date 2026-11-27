@@ -28,7 +28,8 @@ ROOT = 4269
 DATA = 4270
 RECEIPT_AT = 21 * 192
 REQUEST_ID = 0x0100_0000_0000_0001
-FINAL_LSN = 19
+FINAL_LSN = 21
+LEGACY_FINAL_LSN = 19
 FIRST = 2
 LOG_END = 4098
 INITIAL = b"CyxiaOS V0.20 signed scratch\n".ljust(BLOCK, b"\0")
@@ -88,11 +89,12 @@ def operation_digest():
                   + sha256(request).digest() + proposal).digest()
 
 
-def receipts(status):
+def receipts(status, final_lsn):
     store = bytearray(6 * BLOCK)
     if status == 0:
         return bytes(store)
-    binding = {1: (0, 0, 0, 0), 2: (1, 3, 13, 7), 3: (1, 4, FINAL_LSN, 7)}[status]
+    bound_lsn = 13 if final_lsn == LEGACY_FINAL_LSN else 14
+    binding = {1: (0, 0, 0, 0), 2: (1, 3, bound_lsn, 7), 3: (1, 4, final_lsn, 7)}[status]
     raw = bytearray(192)
     put(raw, 0, 'IHH16sQII7Q', 0x43595243, 4, 192, FSYNC_UUID, 1, 0, 1, 0, 1, 1, *binding)
     put(raw, 96, 'HH i I', status, 0, 0, 29 if status == 3 else 0)
@@ -129,17 +131,21 @@ def boot_tx(epoch, begin_lsn):
     return tx(epoch, epoch, begin_lsn, [(SECURITY, security_home(epoch)), (BOOT, boot_home(epoch))])
 
 
-def receipt_blocks(status):
-    store = receipts(status)
+def receipt_blocks(status, final_lsn):
+    store = receipts(status, final_lsn)
     return [(RECEIPT, store[:BLOCK]), (RECEIPT + 1, store[BLOCK:2 * BLOCK])]
 
 
-def boot_one_log():
+def boot_one_log(final_lsn=FINAL_LSN):
+    legacy = final_lsn == LEGACY_FINAL_LSN
+    index = [(INDEX, index_page(True))]
+    segment_index = [] if legacy else index
     return b''.join((
         boot_tx(1, 1),
-        tx(2, 1, 5, receipt_blocks(1) + [(INDEX, index_page(True))]),
-        tx(3, 1, 10, receipt_blocks(2)),
-        tx(4, 1, 14, [(DATA, FINAL)] + receipt_blocks(3) + [(INODE, inode_page(True))]),
+        tx(2, 1, 5, receipt_blocks(1, final_lsn) + index),
+        tx(3, 1, 10, receipt_blocks(2, final_lsn) + segment_index),
+        tx(4, 1, 14 if legacy else 15, [(DATA, FINAL)] + receipt_blocks(3, final_lsn)
+           + segment_index + [(INODE, inode_page(True))]),
     ))
 
 
@@ -150,12 +156,13 @@ def read(disk, block, size=BLOCK):
     return raw
 
 
-def verify_disk(path, reopened):
-    expected = boot_tx(2, FINAL_LSN + 1) if reopened else boot_one_log()
+def verify_disk(path, reopened, final_lsn=FINAL_LSN):
+    require(final_lsn in (FINAL_LSN, LEGACY_FINAL_LSN), "unrecognized FSYNC redo closure")
+    expected = boot_tx(2, final_lsn + 1) if reopened else boot_one_log(final_lsn)
     done = reopened
     with path.open("rb") as disk:
         require(read(disk, 0) == checkpoint(1, 0)
-                and read(disk, 1) == (checkpoint(2, FINAL_LSN) if done else checkpoint(1, 0)),
+                and read(disk, 1) == (checkpoint(2, final_lsn) if done else checkpoint(1, 0)),
                 "FSYNC checkpoint pair differs from the independently expected state")
         log = read(disk, FIRST, (LOG_END - FIRST) * BLOCK)
         require(log.startswith(expected) and not any(log[len(expected):]),
@@ -166,7 +173,7 @@ def verify_disk(path, reopened):
         require(read(disk, INODE) == inode_page(done)
                 and read(disk, DATA) == (FINAL if done else INITIAL),
                 "FSYNC inode write sequence or visible data differs")
-        require(read(disk, RECEIPT, 6 * BLOCK) == receipts(3 if done else 0)
+        require(read(disk, RECEIPT, 6 * BLOCK) == receipts(3 if done else 0, final_lsn)
                 and read(disk, INDEX) == index_page(done),
                 "FSYNC receipt or stream index homes differ")
         acl = read(disk, ACL)[64:128]

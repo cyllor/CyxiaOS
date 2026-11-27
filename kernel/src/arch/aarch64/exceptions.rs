@@ -7,6 +7,7 @@ static EXPECTED_PC: AtomicU64 = AtomicU64::new(0);
 static EXPECTED_FAR: AtomicU64 = AtomicU64::new(0);
 #[cfg(all(feature = "legacy-desktop", not(feature = "smp-selftest")))]
 pub(super) static FAULT_COUNT: AtomicU64 = AtomicU64::new(0);
+
 #[repr(C)]
 pub struct ExceptionFrame {
     pub(crate) regs: [u64; 31],
@@ -16,13 +17,25 @@ pub struct ExceptionFrame {
     pub(crate) far: u64,
     pub(crate) pad: u64,
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<ExceptionFrame>() == 288);
+    assert!(core::mem::offset_of!(ExceptionFrame, elr) == 248);
+    assert!(core::mem::offset_of!(ExceptionFrame, spsr) == 256);
+    assert!(core::mem::offset_of!(ExceptionFrame, esr) == 264);
+    assert!(core::mem::offset_of!(ExceptionFrame, far) == 272);
+};
+
 #[unsafe(no_mangle)]
 extern "C" fn exception_dispatch(f: &mut ExceptionFrame, kind: u64) {
     // The diagnostic build adds the ABI3 trap path and per-CPU EL0 fault
     // evidence. The resident startup profile services its architectural IRQs.
     #[cfg(feature = "smp-selftest")]
     {
-        #[cfg(feature = "v020-production-diagnostic")]
+        #[cfg(all(
+            feature = "v020-production-diagnostic",
+            not(feature = "v020-production-signed-resident")
+        ))]
         {
             // A lower-EL AArch64 synchronous fault, including a permission abort,
             // enters its CPU's summary. SVCs are requests; ESR and FAR come from

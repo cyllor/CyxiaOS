@@ -220,7 +220,8 @@ const PRIVATE_SPACES: usize = C * 2
     } else {
         0
     };
-const STACK_BYTES: usize = 4096 + 65536;
+const EXEC_STACK_BYTES: usize = crate::machine::SMP_EXEC_STACK_BYTES;
+const STACK_BYTES: usize = 4096 + EXEC_STACK_BYTES;
 const CODE: u64 = 0x10000;
 const DATA: u64 = 0x20000;
 const STACK: u64 = 0x30000;
@@ -230,7 +231,11 @@ const STACK: u64 = 0x30000;
 static CYXIA_SMP_PROFILE: [u64; 6] = [1, 4, 8, 1, 0, 0];
 const REQUIRED: usize = 4; // Test configuration only; never an AI core-count rule.
 
-core::arch::global_asm!(include_str!("../../../../crates/arch-aarch64/src/secondary.S"), max_cpus=const C);
+core::arch::global_asm!(
+    include_str!("../../../../crates/arch-aarch64/src/secondary.S"),
+    max_cpus = const C,
+    exec_stack_pages = const EXEC_STACK_BYTES / 4096,
+);
 core::arch::global_asm!(
     include_str!("smp_user.S"),
     d02_enabled = const cfg!(feature = "v0199-epoch-disk-selftest") as u8,
@@ -386,23 +391,28 @@ pub(crate) fn gic() -> &'static Gic {
     }
 }
 fn report_payload<'a>(data: &'a mut [u8], label: &str, a: u64, b: u64, c: u64) -> &'a [u8] {
-    use core::fmt::Write;
-    struct Text<'a> {
-        data: &'a mut [u8],
-        n: usize,
-    }
-    impl Write for Text<'_> {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let end = self.n + s.len();
-            let out = self.data.get_mut(self.n..end).ok_or(core::fmt::Error)?;
-            out.copy_from_slice(s.as_bytes());
-            self.n = end;
-            Ok(())
+    // All resident reports use this fixed decimal format. Direct writes
+    // keep the EL1 telemetry call graph independent of formatter vtables.
+    let mut used = label.len();
+    data[..used].copy_from_slice(label.as_bytes());
+    for (prefix, mut value) in [(b" a=", a), (b" b=", b), (b" c=", c)] {
+        let mut decimal = [0; 20];
+        let mut start = decimal.len();
+        loop {
+            start -= 1;
+            decimal[start] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
         }
+        let after_prefix = used + prefix.len();
+        data[used..after_prefix].copy_from_slice(prefix);
+        used = after_prefix + decimal.len() - start;
+        data[after_prefix..used].copy_from_slice(&decimal[start..]);
     }
-    let mut text = Text { data, n: 0 };
-    writeln!(&mut text, "{label} a={a} b={b} c={c}").unwrap();
-    &text.data[..text.n]
+    data[used] = b'\n';
+    &data[..=used]
 }
 fn report(label: &str, a: u64, b: u64, c: u64) {
     // CPU0 alone owns the framed UART writer; secondary CPUs publish atomics.
@@ -475,8 +485,9 @@ fn record_fault(code: u64, kind: u64, frame: Option<&super::ExceptionFrame>) {
     bank[0].store(0x4359_534d_5046_4131, Ordering::Release);
 }
 fn stop_failed(code: u64) -> ! {
-    let slot = cpu::slot();
-    FAILURES[slot].store(code, Ordering::Release);
+    if let Some(failure) = cpu::registered_slot().and_then(|slot| FAILURES.get(slot)) {
+        failure.store(code, Ordering::Release);
+    }
     super::halt()
 }
 /// Handle only this profile's private timer and EL0 traps. No production global

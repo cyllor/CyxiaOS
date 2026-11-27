@@ -31,7 +31,8 @@ const ISSUED: u16 = 1;
 const BOUND: u16 = 2;
 const DONE: u16 = 3;
 const MAX_DATA_HOMES: usize = 120;
-const MAX_SEGMENT_HOMES: usize = MAX_DATA_HOMES + 3;
+// Data, both halves of a straddling receipt, its index, and the final inode.
+const MAX_SEGMENT_HOMES: usize = MAX_DATA_HOMES + 4;
 
 /// The protected file service resolves the caller's live cap to the v1
 /// inode and supplies the authenticated mount and original copied frame.
@@ -279,7 +280,10 @@ pub fn commit_segment<I: EpochBlockIo>(
     };
     let final_segment = !bind && end == job.pages.len();
     let closure = home_closure(slot).ok_or(Error::Invalid)?;
-    let count = (end - first) + closure.receipt_block_count + usize::from(final_segment);
+    let count = (end - first)
+        + closure.receipt_block_count
+        + usize::from(closure.requires_stream_index_block)
+        + usize::from(final_segment);
     let plan = writer.prepare(count)?;
     if plan.fs_uuid != boot.fs_uuid
         || plan.log_epoch < receipt.log_epoch
@@ -335,6 +339,13 @@ pub fn commit_segment<I: EpochBlockIo>(
         };
         next += 1;
     }
+    // Even unchanged index bytes belong to the receipt's redo closure.
+    // A recovered segment must prove the complete jointly committed view.
+    images[next] = RedoImage {
+        home: receipt_home + 6,
+        contents: &work.scratch,
+    };
+    next += 1;
     if final_segment {
         images[next] = RedoImage {
             home: inode_home,

@@ -14,6 +14,7 @@ use super::{
 pub const FILE_QUERY_RESULT: u16 = 11;
 pub const RECEIPT_KEY_BYTES: usize = 56;
 const RECEIPT_KEY_OFFSET: usize = 8;
+const BOUND: u16 = 2;
 const UNKNOWN: u16 = 5;
 const E_TIMEOUT: i32 = -6;
 
@@ -177,15 +178,21 @@ impl<'a> MountedReceiptQuery<'a> {
         reply
             .get_mut(..REPLY_HEADER)
             .ok_or(Error::Capacity)?
-            .copy_from_slice(&encode_reply(caller.service_generation, receipt));
+            .copy_from_slice(&encode_reply(caller, receipt));
         Ok(REPLY_HEADER)
     }
 }
 
-fn encode_reply(service_generation: u64, receipt: FileReceiptV4) -> [u8; REPLY_HEADER] {
-    // Reply v3 requires a nonzero result for UNKNOWN. Preserve the stored
-    // status and evidence when uncertainty has no recorded errno.
-    let result = if receipt.status == UNKNOWN && receipt.result == 0 {
+fn encode_reply(caller: ReceiptQueryCaller, receipt: FileReceiptV4) -> [u8; REPLY_HEADER] {
+    // A prior boot cannot finish an admission with its old frozen pages.
+    // Keep the on-disk BOUND record and reply with uncertainty until the
+    // recovery owner reconciles it and durably proves a terminal outcome.
+    let status = if receipt.status == BOUND && receipt.issued_boot_epoch < caller.boot_epoch {
+        UNKNOWN
+    } else {
+        receipt.status
+    };
+    let result = if status == UNKNOWN && receipt.result == 0 {
         E_TIMEOUT
     } else {
         receipt.result
@@ -195,8 +202,8 @@ fn encode_reply(service_generation: u64, receipt: FileReceiptV4) -> [u8; REPLY_H
     wire[4..6].copy_from_slice(&REPLY_VERSION.to_le_bytes());
     wire[6..8].copy_from_slice(&(REPLY_HEADER as u16).to_le_bytes());
     wire[8..16].copy_from_slice(&receipt.request_id.to_le_bytes());
-    wire[16..24].copy_from_slice(&service_generation.to_le_bytes());
-    wire[24..26].copy_from_slice(&receipt.status.to_le_bytes());
+    wire[16..24].copy_from_slice(&caller.service_generation.to_le_bytes());
+    wire[24..26].copy_from_slice(&status.to_le_bytes());
     wire[28..32].copy_from_slice(&result.to_le_bytes());
     wire[32..36].copy_from_slice(&receipt.completed_prefix.to_le_bytes());
     wire[40..48].copy_from_slice(&receipt.commit_lsn.to_le_bytes());
@@ -593,5 +600,18 @@ mod tests {
             assert_eq!(decoded.result_digest, [0x31; 32]);
             assert_eq!(decoded.receipt_ref, REQUEST_ID);
         }
+    }
+
+    #[test]
+    fn earlier_boot_bound_receipt_requires_reconciliation() {
+        let (receipts, index) = mounted_image(2, 0);
+        let view = mounted_view(&receipts, &index, UUID, CALLER.boot_epoch).unwrap();
+        let mut reply = [0; REPLY_HEADER];
+        view.serve(CALLER, 0, &QUERY, &mut reply).unwrap();
+        let decoded = Reply::decode(&reply).unwrap();
+        assert_eq!((decoded.state, decoded.result), (UNKNOWN, E_TIMEOUT));
+        assert_eq!(decoded.completed_prefix, 0x0001_2345);
+        assert_eq!(decoded.commit_lsn, 0x0007_0605);
+        assert_eq!(decoded.receipt_ref, REQUEST_ID);
     }
 }

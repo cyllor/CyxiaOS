@@ -614,14 +614,17 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertNotIn("fn broker(", fixture)
         self.assertNotIn("fn run_until_park(", fixture)
         broker = source(arm / "sec_n_broker.rs")
-        self.assertIn("fn broker<P: Port>(port: &mut P, entropy: &mut EntropyFill<'_>, close_poll: Option<ClosePoll<P>>)", broker)
-        self.assertIn("broker(port, entropy, close_poll);", broker)
+        dispatch = broker.split("fn broker<P: Port>(", 1)[1].split("fn reply(", 1)[0]
+        self.assertIn("OP_TLS_CERTIFICATE_VERIFY => broker_certificate_verify(signer)", dispatch)
+        guest = broker.split("pub(crate) fn run_guest<P: Port>(", 1)[1]
+        self.assertLess(guest.index("if iss != 0x43"), guest.index("broker("))
+        self.assertIn("signer.as_deref_mut()", guest)
         self.assertIn("pub(crate) fn run_until_park<P: Port>(", broker)
         self.assertIn('link_section = ".bss.sec_n', broker)
 
     def test_v020_wave12_modes_are_explicit(self):
         manifest = source(ROOT / "kernel/Cargo.toml")
-        self.assertIn('v020-production-authenticated-net = ["v020-production-diagnostic"]', manifest)
+        self.assertIn('v020-production-authenticated-net = ["v020-production-diagnostic", "dep:zeroize"]', manifest)
         self.assertIn('v020-production-live-control = ["v020-production-diagnostic"]', manifest)
         self.assertIn('v020-production-media-reopen = ["v020-production-media-staging"]', manifest)
         self.assertIn('v020-production-media-signed = ["v020-production-media-staging"]', manifest)
@@ -673,7 +676,8 @@ class NativeSecurityWiring(unittest.TestCase):
         # W11 segment up to word 160 with honest labels.
         verifier = source(ROOT / "tools/verify_v020_production.py")
         qemu = source(ROOT / "tools/v020_production_qemu.py")
-        self.assertIn('"virtio-net-device,netdev=n0"', qemu)
+        self.assertIn('f"virtio-net-device,netdev=n0,mac={NATIVE_MAC}"', qemu)
+        self.assertIn('NATIVE_MAC = "52:54:00:12:34:56"', qemu)
         self.assertIn('"virtio-mmio.force-legacy=false"', qemu)
         self.assertIn('"virtio-rng-device,rng=rng0"', qemu)
         self.assertIn("W11_END = 160", verifier)
@@ -685,7 +689,8 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn('"golden_vector_pending": True', verifier)
         self.assertIn("if NET_ABSENT in serial", verifier)
         workflow = source(ROOT / ".github/workflows/v020-production.yml")
-        self.assertIn("s.build_guest()", workflow)
+        self.assertIn("s.build_guest(isolated_signer=True)", workflow)
+        self.assertIn("signer.sha256", workflow)
         self.assertIn("--no-nic; then", workflow)
         self.assertIn('ValueError: guest reported V020_W11_NET_ABSENT:', workflow)
         self.assertIn('--no-peer; then', workflow)
@@ -730,9 +735,10 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertEqual(prod.count("meter::metered("), 2)
         # EL0 aborts feed the faulting CPU's accumulator in the vector.
         exc = source(arm / "exceptions.rs")
-        prod_block = exc.split('#[cfg(feature = "v020-production-diagnostic")]', 1)[1].split(
+        prod_block = exc.split('feature = "v020-production-diagnostic",', 1)[1].split(
             '#[cfg(feature = "v020-production")]', 1)[0]
         self.assertIn("smp::production::recovery::record_fault(", prod_block)
+        self.assertIn('not(feature = "v020-production-signed-resident")', prod_block)
         # The callees are the real implementations, not stubs.
         frames = source(arm / "production/frames.rs")
         self.assertRegex(frames, r"fn register_or_fatal\(\) \{\s*match register_production_statics\(\)")

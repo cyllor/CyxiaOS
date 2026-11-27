@@ -11,6 +11,8 @@ mod audit;
 mod catalog;
 #[cfg(all(file_read_probe, any(control_role = "6", control_role = "11")))]
 mod file_read;
+#[cfg(all(file_receipt_query_probe, control_role = "11"))]
+mod file_receipt;
 #[cfg(model_operator_probe)]
 #[path="../../crates/control-model/src/native_v0199.rs"]
 mod brain;
@@ -150,7 +152,7 @@ fn role_step(_cap:u64,_target:u64,_generation:u64,now:u64){
     // No authorized replay/feedback or candidate memory allocation.
     let _=call(3,[now.saturating_add(4_000_000),0,0,0,0,0]);
 }
-#[cfg(control_role="11")]
+#[cfg(all(control_role="11", not(file_receipt_query_probe)))]
 fn role_step(cap:u64,_target:u64,generation:u64,now:u64){
     // Canonical AUDIT_READ op1. Read is non-consuming; an unready boot
     // has no durable audit identity. No fabricated ACK or cursor advance.
@@ -184,6 +186,9 @@ extern "C" fn _start(arg_va:u64,args_len:u64)->!{
     catalog::probe_operations(cap, target);
     #[cfg(control_role="11")]
     if target != 0 { audit::run(cap,target,generation); }
+    #[cfg(all(file_receipt_query_probe, control_role = "11"))]
+    file_receipt::run();
+    #[cfg(not(all(file_receipt_query_probe, control_role = "11")))]
     loop{
         let now=clock();
         if now>=0 {role_step(cap,target,generation,now as u64);}

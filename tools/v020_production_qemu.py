@@ -18,6 +18,7 @@ GA_RAM = "256M"
 # The staging feature enables prototype-memory (RAM_MIB = 1024; task-6 ruling).
 STAGING_RAM = "1024M"
 SCRATCH_BYTES = 512 * 1024 * 1024
+NATIVE_MAC = "52:54:00:12:34:56"
 
 
 
@@ -47,7 +48,7 @@ def qemu_args(binary: str, qmp_path: str, elf: Path, port: int,
         # `-nic user,model=virtio-net-device` is not created on virt, and the
         # driver accepts modern (version 2) virtio-mmio only (task-5 ruling).
         args += ["-netdev", f"user,id=n0,hostfwd=tcp:127.0.0.1:{port}-:7",
-                 "-device", "virtio-net-device,netdev=n0"]
+                 "-device", f"virtio-net-device,netdev=n0,mac={NATIVE_MAC}"]
     else:
         args += ["-nic", "none"]
     if nic or rng or scratch is not None:

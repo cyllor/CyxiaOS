@@ -50,8 +50,7 @@ pub(crate) fn try_log(s: &[u8]) -> Result<(), PlatformError> {
             base: PhysAddr(a),
             len: 4096,
         })
-    }
-    .unwrap();
+    }?;
     use cyxia_kernel_core::console::{TransmitError, write_frame};
     match write_frame(&mut uart, 1, seq, s) {
         Ok(written) => {
@@ -147,6 +146,10 @@ pub(crate) fn halt() -> ! {
 }
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    #[cfg(feature = "smp-selftest")]
+    let Some(slot) = cyxia_arch_aarch64::cpu::registered_slot() else {
+        halt()
+    };
     #[cfg(feature = "unified-runtime")]
     {
         // Panic diagnostics never need the ordinary console/task/policy gate.
@@ -172,17 +175,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
                     hash,
                 )
             });
-            for (i, value) in [
-                cyxia_arch_aarch64::cpu::slot() as u64,
-                line,
-                column,
-                file,
-                elr,
-                esr,
-                far,
-            ]
-            .into_iter()
-            .enumerate()
+            for (i, value) in [slot as u64, line, column, file, elr, esr, far]
+                .into_iter()
+                .enumerate()
             {
                 PANIC_EVIDENCE.words[i + 1].store(value, Ordering::Relaxed);
             }
@@ -192,7 +187,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     #[cfg(not(feature = "unified-runtime"))]
     let _ = info;
     #[cfg(feature = "smp-selftest")]
-    if cyxia_arch_aarch64::cpu::slot() != 0 {
+    if slot != 0 {
         smp::fatal(99);
     }
     #[cfg(not(feature = "unified-runtime"))]

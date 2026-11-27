@@ -106,18 +106,62 @@ def net_entropy(words: tuple, lines: list, enabled: bool) -> dict:
     count = words[160]
     unavailable = rows(lines, "V020_W12_NET_ENTROPY_UNAVAILABLE")
     supplied = rows(lines, "V020_W12_NET_ENTROPY")
+    generated = rows(lines, "V020_SEC_N_DRBG")
     if not enabled:
-        require(count == 0 and not unavailable and not supplied, "unexpected authenticated RNG evidence")
+        require(count == 0 and not (unavailable or supplied or generated),
+                "unexpected authenticated RNG evidence")
         return {}
     if unavailable:
-        require(len(unavailable) == 1 and not supplied and not count
+        require(len(unavailable) == 1 and not (supplied or generated or count)
                 and words[138] == 1 and not any(words[139:143])
                 and not rows(lines, "V020_W11_NET_LISTEN"),
                 "inconsistent refusal of the authenticated network without entropy")
         raise ValueError("V020_W12_NET_ENTROPY_UNAVAILABLE: authenticated relay stopped before listen")
     require(count >= 32 and supplied == [(8, count, 0)],
             "authenticated relay requires matching VirtIO RNG evidence")
-    return {"virtio_rng_guest_bytes": count}
+    require(len(generated) == 1 and generated[0][0] > 0
+            and generated[0][1:] == (1024 * generated[0][0], count),
+            "authenticated relay requires seeded DRBG evidence")
+    key_epoch, samples, _ = generated[0]
+    return {"tls_drbg_guest_bytes": count, "tls_drbg_key_epoch": key_epoch,
+            "virtio_rng_health_samples": samples}
+
+
+def net_signer(lines: list, enabled: bool) -> dict:
+    spaces = rows(lines, "V020_SEC_N_SIGNER_SPACE")
+    replies = rows(lines, "V020_SEC_N_SIGNER_REPLY")
+    authenticated = rows(lines, "V020_SEC_N_VERIFIER_AUTHENTICATED")
+    if not enabled:
+        require(not (spaces or replies or authenticated), "unexpected isolated signer evidence")
+        return {}
+    require(len(spaces) == 1 and spaces[0][0] == 0x41
+            and 0 < spaces[0][1] <= 64 and spaces[0][2] == 0,
+            "missing bounded independent Signer address space")
+    grants = rows(lines, "V020_W11_NET_ADMISSION")
+    require(grants == [(1, QEMU_GATEWAY_IPV4, 1)] and replies == [(grants[0][0], 1, 1)],
+            "missing connection-bound CertificateVerify signer reply")
+    require(authenticated == grants, "missing connection-bound TLS verifier completion")
+    sign_at = lines.index("V020_SEC_N_SIGNER_REPLY a=1 b=1 c=1")
+    auth_at = lines.index(f"V020_SEC_N_VERIFIER_AUTHENTICATED a=1 b={QEMU_GATEWAY_IPV4} c=1")
+    require(sign_at < auth_at, "TLS verifier completed before its signer reply")
+    return {"native_signer_asid": spaces[0][0], "native_signer_certificate_verifies": len(replies),
+            "native_verifier_authenticated_connections": len(authenticated)}
+
+
+def net_reset_proofs(lines: list) -> dict:
+    prefix = "V020_SEC_D_NET_RESET_PROOF "
+    encoded = [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
+    unconfirmed = rows(lines, "V020_SEC_D_NET_RESET_UNCONFIRMED")
+    require(len(encoded) == 2 and not unconfirmed, "native net reset proof is incomplete")
+    observations = []
+    for queue_id, value in enumerate(encoded):
+        require(re.fullmatch("[0-9a-f]{128}", value), "malformed ResetProof v1 bytes")
+        fields = struct.unpack("<IHHQIHHQQQIIQ", bytes.fromhex(value))
+        require(fields[:-1] == (0x43595250, 1, 64, 1, 1, queue_id, 0, 1, 1, 1, 0, 0)
+                and fields[-1] > 0, "native net ResetProof v1 has the wrong generation or readback")
+        observations.append(fields[-1])
+    require(observations[0] == observations[1], "net queues were not proved in one device reset")
+    return {"native_net_reset_queue_ids": [0, 1], "native_net_reset_observed_ns": observations[0]}
 
 
 def control_observations(words: tuple, lines: list, enabled: bool) -> dict:
@@ -152,6 +196,7 @@ def validate_extensions(words: tuple, lines: list, modes: Modes) -> dict:
         require(not any(words[162:164]), "unexpected media reopen evidence")
     return {
         **net_entropy(words, lines, modes.authenticated_net),
+        **net_signer(lines, modes.authenticated_net),
         **control_observations(words, lines, modes.live_control),
         **net_retirement(words, lines, modes),
         **audit_session(words, lines, modes.live_control),

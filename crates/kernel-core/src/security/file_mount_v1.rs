@@ -1120,11 +1120,11 @@ mod tests {
             (receipt, redo.ordered_digest())
         };
         let mut raw = [0; BLOCK];
-        let (bound, _) = committed(&mut writer, &job, 6);
+        let (bound, _) = committed(&mut writer, &job, 8);
         assert_eq!((bound.status, bound.completed_prefix), (2, 0));
         writer.read_committed(DATA, &mut raw).unwrap();
         assert!(raw.iter().all(|&byte| byte == 0));
-        let (prefix, _) = committed(&mut writer, &job, 246);
+        let (prefix, _) = committed(&mut writer, &job, 248);
         assert_eq!(
             (prefix.status, prefix.completed_prefix as usize),
             (2, 120 * BLOCK)
@@ -1147,7 +1147,7 @@ mod tests {
         assert_eq!(checkpoint.checkpoint_lsn, prefix.commit_lsn);
         assert!(retire_checkpointed_log(&mut disk, &mut journal, checkpoint).unwrap() > 0);
         let mut writer = RedoWriter::open(&mut disk, &mut journal, checkpoint).unwrap();
-        let (done, committed_digest) = committed(&mut writer, &job, 10);
+        let (done, committed_digest) = committed(&mut writer, &job, 12);
         assert_eq!(done.log_epoch, prefix.log_epoch + 1);
         assert_eq!(
             (done.status, done.completed_prefix as usize, done.write_seq),

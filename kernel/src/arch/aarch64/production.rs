@@ -62,8 +62,9 @@
 //!   caller index BEFORE user::enter and clears it AFTER return; the in-vector
 //!   dispatcher reads it to authenticate the caller from EL1 state, never from
 //!   EL0 bytes. Only CPU0 enters production roles.
-//! * EXEC_TARGET (static mut): bounded fixture executor; apply writes word 0,
-//!   settlement re-reads it, both on CPU0 in the same synchronous loop.
+//! * EXEC_TARGET: bounded D01 executor root. CPU0 prepares exact registered
+//!   work, installs the version and weight inside the measured target lock,
+//!   and re-reads the atomic root for terminal/observation verification.
 //! * copy_address()/read_bytes()/write_bytes(): bounded raw addr_of! arithmetic
 //!   over the advice spaces, re-checked against this profile's own tables and
 //!   mmu::checked_user_leaf_span before any high-half alias is dereferenced.
@@ -80,7 +81,8 @@ use cyxia_kernel_core::control_plane::{
     advice_envelope_v1::{ADVICE_BYTES, AdviceEnvelopeV1, TrustedAdviceScope},
     advice_ledger_v0199::EvidenceLedger,
     apply_report_v1::{
-        ActionStatus, ApplyReportV1, BoundReport, ExecutorBindingV1, ReportOrigin,
+        ActionStatus, ApplyReportV1, BoundReport, ExecutorBindingV1, MAX_APPLY_REPORT_BYTES,
+        ReportOrigin,
         TrustedApplyScope,
     },
     apply_work_v1::ApplyWorkV1,
@@ -112,6 +114,12 @@ mod evidence;
 #[cfg(feature = "v020-production-file-read")]
 #[path = "production/file_read.rs"]
 mod file_read;
+#[cfg(all(
+    feature = "v020-production-fsync-scratch",
+    feature = "v020-production-media-reopen"
+))]
+#[path = "production/file_receipt.rs"]
+mod file_receipt;
 #[path = "production/frames.rs"]
 mod frames;
 #[cfg(feature = "v020-production-media-staging")]
@@ -119,6 +127,7 @@ mod frames;
 mod media_staging;
 #[path = "production/meter.rs"]
 mod meter;
+use meter::ExecTarget;
 #[path = "production/net.rs"]
 mod net;
 #[cfg(feature = "v020-production-live-control")]
@@ -246,10 +255,7 @@ static SVC_OUT: [AtomicU64; 2 * ROLE_COUNT] = [const { AtomicU64::new(0) }; 2 * 
 static PIE_CLOCKS: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
 static PIE_YIELDS: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
 static PIE_ROLE_CALLS: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
-// Bounded fixture executor "device": one EL1-owned target word.
-#[repr(C, align(4096))]
-struct ExecTarget(Page);
-static mut EXEC_TARGET: ExecTarget = ExecTarget(Page::ZERO);
+static EXEC_TARGET: ExecTarget = ExecTarget::new();
 // Large control-plane guards in static storage (never the bounded EL1 stack).
 static mut LEDGER: MaybeUninit<EvidenceLedger> = MaybeUninit::uninit();
 static mut GATE: MaybeUninit<RegisteredDecisionGate<'static>> = MaybeUninit::uninit();
@@ -577,26 +583,6 @@ fn disposition_bytes(advice: &[u8], rec: &[u8], rules: &[u8]) -> [u8; DISPOSITIO
     b[144..176].copy_from_slice(&sha(advice));
     b[176..208].copy_from_slice(&sha(rec));
     b[208..240].copy_from_slice(&sha(rules));
-    b
-}
-fn report_bytes() -> [u8; 98] {
-    let mut b = [0u8; 98];
-    for (at, v) in [
-        (0, BOOT),
-        (8, CTRL_EPOCH),
-        (16, PLAN_SEQ),
-        (32, TARGET.id),
-        (40, TARGET.generation),
-        (48, EXEC_GEN),
-        (56, PLAN_VERSION),
-        (72, COMPLETED_NS),
-    ] {
-        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
-    }
-    b[26..28].copy_from_slice(&1u16.to_le_bytes());
-    b[28..30].copy_from_slice(&1u16.to_le_bytes());
-    b[68..72].copy_from_slice(&2u32.to_le_bytes());
-    b[96..98].copy_from_slice(&[4u8, 0]);
     b
 }
 fn binding() -> ExecutorBindingV1 {
@@ -934,6 +920,9 @@ fn svc_dispatch(f: &mut ExceptionFrame) -> Option<u64> {
     if caller == CALLER_NONE {
         return None;
     }
+    if caller >= SVC_OUT.len() as u64 {
+        return Some(E_AUTH as u64);
+    }
     let x8 = f.regs[8];
     let args = match decode_aarch64_svc_v3(3, f.esr, &f.regs) {
         Ok(call) => call.args,
@@ -941,7 +930,11 @@ fn svc_dispatch(f: &mut ExceptionFrame) -> Option<u64> {
             // A failed ABI check can report a refusal for the recognized endpoint.
             #[cfg(any(
                 feature = "v020-production-snapshot-catalog",
-                feature = "v020-production-file-read"
+                feature = "v020-production-file-read",
+                all(
+                    feature = "v020-production-fsync-scratch",
+                    feature = "v020-production-media-reopen"
+                )
             ))]
             if f.esr == 0x5600_0000 && caller < ROLE_COUNT as u64 && x8 == 0x50 {
                 let index = caller as usize;
@@ -980,7 +973,11 @@ fn pie_member(index: usize) -> NativeRole {
 
 #[cfg(any(
     feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read"
+    feature = "v020-production-file-read",
+    all(
+        feature = "v020-production-fsync-scratch",
+        feature = "v020-production-media-reopen"
+    )
 ))]
 fn reject_service_preflight(index: usize, args: [u64; 6]) -> Option<u64> {
     match args[0] {
@@ -991,6 +988,14 @@ fn reject_service_preflight(index: usize, args: [u64; 6]) -> Option<u64> {
         #[cfg(feature = "v020-production-file-read")]
         cyxia_kernel_core::security::file_read_v4::ENDPOINT => {
             Some(file_read::reject_preflight(index, pie_member(index), args))
+        }
+        #[cfg(all(
+            not(feature = "v020-production-file-read"),
+            feature = "v020-production-fsync-scratch",
+            feature = "v020-production-media-reopen"
+        ))]
+        cyxia_kernel_core::security::file_read_v4::ENDPOINT => {
+            Some(file_receipt::reject_preflight(index, pie_member(index), args))
         }
         _ => None,
     }
@@ -1012,19 +1017,30 @@ fn trapped_pie_cap(index: usize, member: NativeRole) -> Result<u64, i64> {
         return Err(E_AUTH);
     }
     let cap = registered_pie_cap(index, member).ok_or(E_AUTH)?;
-    let ttbr0: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags));
-    }
-    if ttbr0 != (member.ttbr0_root | (u64::from(role_asid(index)) << 48)) {
+    if trapped_ttbr0() != (member.ttbr0_root | (u64::from(role_asid(index)) << 48)) {
         return Err(E_AUTH);
     }
     Ok(cap)
 }
 
+/// EL1 state from the current lower-EL exception, before capture switches
+/// away from the user address space.
+fn trapped_ttbr0() -> u64 {
+    let ttbr0: u64;
+    // SAFETY: this vector handler reads its current architectural context.
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags));
+    }
+    ttbr0
+}
+
 #[cfg(any(
     feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read"
+    feature = "v020-production-file-read",
+    all(
+        feature = "v020-production-fsync-scratch",
+        feature = "v020-production-media-reopen"
+    )
 ))]
 fn wait_for_role_yield(
     index: usize,
@@ -1103,6 +1119,17 @@ fn pie_dispatch(index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u
         0x50 if args[0] == cyxia_kernel_core::security::file_read_v4::ENDPOINT => {
             file_read::dispatch(index, member, args)
         }
+        #[cfg(all(
+            feature = "v020-production-fsync-scratch",
+            feature = "v020-production-media-reopen"
+        ))]
+        0x50 if args[0] == cyxia_kernel_core::security::file_read_v4::ENDPOINT => {
+            let result = file_receipt::dispatch(index, member, args);
+            if result == EAGAIN as u64 {
+                PIE_ROLE_CALLS[index].fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        }
         0x50 if args[2] == 64
             || (cfg!(feature = "v020-production-live-control") && args[2] == 96) =>
         {
@@ -1143,6 +1170,9 @@ fn advice_dispatch(role_index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFra
         )
     };
     let cpu = cpu::slot();
+    if cpu != 0 || member.ttbr0_root == 0 || trapped_ttbr0() != member.ttbr0_root {
+        return E_AUTH as u64;
+    }
     match x8 {
         0x50 if args[2] == ADVICE_BYTES as u64 => {
             // Advice intake glue (no SvcV3Bridge submit entry exists).
@@ -1314,8 +1344,11 @@ fn with_bundle(f: impl FnOnce(&FrozenNativePlan<'_>, &AssistedScope<'_>) -> u64)
 /// Production exception entry: dispatch the ABI-v3 production subset in-vector,
 /// fall through to the proven smp path for everything else.
 pub(crate) fn exception(f: &mut ExceptionFrame, kind: u64) {
+    #[cfg(feature = "v020-production-signed-resident")]
+    signed_resident::verify_captured_role(f, kind);
     if !cfg!(feature = "v020-production-signed-resident")
         && kind == 8
+        && f.spsr & 0x1f == 0
         && f.esr >> 26 == 0x15
         && let Some(outcome) = svc_dispatch(f)
     {
@@ -1450,6 +1483,12 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         other_protected_pool_bytes + snapshot_catalog::protected_bytes();
     #[cfg(feature = "v020-production-file-read")]
     let other_protected_pool_bytes = other_protected_pool_bytes + file_read::protected_bytes();
+    #[cfg(all(
+        feature = "v020-production-fsync-scratch",
+        feature = "v020-production-media-reopen"
+    ))]
+    let other_protected_pool_bytes =
+        other_protected_pool_bytes + file_receipt::protected_bytes();
     let pie_manifest = NativeRoleManifest {
         online_mask: profile::ONLINE,
         members: pie_members,
@@ -1778,6 +1817,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         plan_version: PLAN_VERSION,
         now_ns: NOW_NS,
     };
+    let mut prepared = None;
     let frame = unsafe { &mut *gate_ptr() }
         .claim_apply_work(
             &plan,
@@ -1785,23 +1825,77 @@ pub(crate) fn run(info: &BootInfo) -> ! {
             claim_scope,
             binding(),
             ReportOrigin::Kernel,
-            |_| Ok(()),
+            |work| {
+                prepared = Some(EXEC_TARGET.prepare(work)?);
+                Ok(())
+            },
         )
         .expect("claim apply work");
     let work = ApplyWorkV1::decode(frame.bytes()).expect("apply work");
-    assert_eq!(work.payload, &[4, 0]);
-    unsafe {
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(EXEC_TARGET.0.0[0]), 4);
+    let timing = EXEC_TARGET
+        .commit(prepared.expect("reserved target install"))
+        .expect("D01 install without waiting");
+    let fault = match timing {
+        Some(t) => {
+            report("V020_SEC_S_TARGET_LOCK", t.work_ns, t.overhead_ns, t.total_ns);
+            u64::from(t.exceeded())
+        }
+        None => 8, // unmeasured; close new work while retaining the installed root
+    };
+    let weight = EXEC_TARGET
+        .installed_weight(work.plan_version)
+        .expect("installed target version");
+    if fault != 0 {
+        // SAFETY: synchronous CPU0 owns the gate. The retained exact claim
+        // remains available for terminal settlement after fencing new work.
+        let gate = unsafe { &mut *gate_ptr() };
+        gate.fence(SUPER).expect("meter fault closes publication");
+        assert!(matches!(EXEC_TARGET.prepare(&work), Err(Error::NotReady)));
+        assert_eq!(
+            gate.claim_apply_work(
+                &plan,
+                0,
+                claim_scope,
+                binding(),
+                ReportOrigin::Kernel,
+                |_| Err(Error::Denied),
+            )
+            .err(),
+            Some(Error::NotReady),
+            "budget fault closes the native claim entry before another effect"
+        );
     }
-    let report_wire = report_bytes();
-    let parsed_report = ApplyReportV1::decode(&report_wire).expect("apply report");
+    report(
+        "V020_SEC_S_TARGET_INSTALL",
+        work.plan_version,
+        u64::from(weight),
+        fault,
+    );
+    let action = weight.to_le_bytes();
+    let mut report_buffer = [0; MAX_APPLY_REPORT_BYTES];
+    let report_len = ApplyReportV1 {
+        key: work.key,
+        action_index: work.action_index,
+        domain_id: work.domain,
+        state: ActionStatus::Applied,
+        target: work.target,
+        executor_generation: work.executor_generation,
+        plan_version: work.plan_version,
+        result: 0,
+        completed_ns: COMPLETED_NS,
+        action: &action,
+    }
+    .encode(&mut report_buffer)
+    .expect("encode installed target result");
+    let report_wire = &report_buffer[..report_len];
+    let parsed_report = ApplyReportV1::decode(report_wire).expect("apply report");
     assert_eq!(parsed_report.state, ActionStatus::Applied);
     assert!(work.matches_report(parsed_report));
-    report("V020_PROD_APPLY", PLAN_SEQ, COMPLETED_NS, 4);
+    report("V020_PROD_APPLY", PLAN_SEQ, COMPLETED_NS, u64::from(weight));
 
     // (8) Supervisor terminal settlement with the exact causal sidecar.
     let bound = [BoundReport {
-        bytes: &report_wire,
+        bytes: report_wire,
         origin: ReportOrigin::Kernel,
     }];
     let pair = CausalPair {
@@ -1822,9 +1916,10 @@ pub(crate) fn run(info: &BootInfo) -> ! {
             settle_scope,
             Some(pair),
             |_, r| {
-                let actual =
-                    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(EXEC_TARGET.0.0[0])) };
-                if r.state == ActionStatus::Applied && actual == 4 {
+                if r.state == ActionStatus::Applied
+                    && EXEC_TARGET.installed_weight(r.plan_version)
+                        .is_some_and(|actual| actual.to_le_bytes() == r.action)
+                {
                     Ok(())
                 } else {
                     Err(Error::Denied)
@@ -2029,6 +2124,13 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     #[cfg(feature = "v020-production-file-read")]
     if staging_outcome.services_ready() && let Some(view) = staging_outcome.file_read {
         file_read::drive(&mut pie_ctx, &pie_manifest, view);
+    }
+    #[cfg(all(
+        feature = "v020-production-fsync-scratch",
+        feature = "v020-production-media-reopen"
+    ))]
+    if staging_outcome.services_ready() && let Some(view) = staging_outcome.file_receipts {
+        file_receipt::drive(&mut pie_ctx, &pie_manifest, view);
     }
     #[cfg(feature = "v020-production-snapshot-catalog")]
     if staging_outcome.services_ready() && let Some(view) = staging_outcome.snapshot_catalog {

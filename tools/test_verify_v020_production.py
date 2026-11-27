@@ -66,6 +66,8 @@ def wave10_lines() -> list:
         f"V020_PROD_PUBLISH a=8 b={SVC64} c=1",
         "V020_PROD_PUBLISH_REPLAY a=8 b=2 c=1",
         f"V020_PROD_RECOVERY_REJECT a=8 b={v.E_AUTH_RESULT} c=1",
+        "V020_SEC_S_TARGET_LOCK a=200 b=500 c=700",
+        "V020_SEC_S_TARGET_INSTALL a=7 b=4 c=0",
         "V020_PROD_APPLY a=1 b=180 c=4",
         "V020_PROD_SETTLE a=1 b=1 c=2",
         "V020_PROD_CHAIN a=1 b=1 c=1",
@@ -88,6 +90,10 @@ def w11_lines(staging: bool = False) -> list:
               "V020_W11_NET_GUEST_END a=0 b=0 c=0",
               f"V020_W11_NET_ADMISSION a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
               "V020_W11_NET_RELAY a=71 b=1 c=512"]
+    for queue in (0, 1):
+        proof = struct.pack("<IHHQIHHQQQIIQ", 0x43595250, 1, 64, 1, 1,
+                            queue, 0, 1, 1, 1, 0, 0, 5_000_000)
+        lines.append("V020_SEC_D_NET_RESET_PROOF " + proof.hex())
     if staging:
         lines += [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
                   for index, detail in enumerate((1, 5, 151, 1, 1), start=1)]
@@ -143,8 +149,28 @@ class W11Validation(unittest.TestCase):
         self.assertEqual(obs["recovery_writer_takeovers"], 3)
         self.assertEqual(obs["policy_lock_measured_overruns"], 1)
         self.assertEqual(obs["policy_lock_unmeasured"], 3)
+        self.assertEqual(obs["target_lock_irq_off_ns"], 700)
+        self.assertFalse(obs["target_lock_closed_new_work"])
         self.assertEqual(obs["admission_leases"], 1)
         self.assertTrue(obs["w11_completion_marker"].endswith("staging_ok=0"))
+
+    def test_requires_target_lock_sample_and_enforced_overrun_flags(self):
+        lines = w11_lines()
+        self.rejects("target-lock interval", lines=[
+            line for line in lines if not line.startswith("V020_SEC_S_TARGET_LOCK ")
+        ])
+        late = [
+            "V020_SEC_S_TARGET_LOCK a=200 b=6000 c=6200"
+            if line.startswith("V020_SEC_S_TARGET_LOCK ") else line
+            for line in lines
+        ]
+        self.rejects("target install did not enforce measured budgets", lines=late)
+        closed = [
+            "V020_SEC_S_TARGET_INSTALL a=7 b=4 c=2"
+            if line.startswith("V020_SEC_S_TARGET_INSTALL ") else line
+            for line in late
+        ]
+        self.assertTrue(self.check(lines=closed)["target_lock_closed_new_work"])
 
     def test_rejects_missing_net_device(self):
         words = w11_words()
@@ -190,6 +216,16 @@ class W11Validation(unittest.TestCase):
     def test_requires_direct_admission_receipt(self):
         lines = [line for line in w11_lines() if not line.startswith("V020_W11_NET_ADMISSION")]
         self.rejects("Admission receipt", lines=lines)
+
+    def test_native_net_requires_both_reset_records_in_one_generation(self):
+        prefix = "V020_SEC_D_NET_RESET_PROOF "
+        lines = w11_lines()
+        self.assertEqual(self.check(lines=lines)["native_net_reset_queue_ids"], [0, 1])
+        proof_positions = [index for index, line in enumerate(lines) if line.startswith(prefix)]
+        receive, transmit = proof_positions
+        self.rejects("reset proof is incomplete", lines=lines[:transmit] + lines[transmit + 1:])
+        lines[transmit] = lines[receive]
+        self.rejects("wrong generation or readback", lines=lines)
 
     def test_requires_policy_lock_accounting_consistent(self):
         for at, value in ((135, 0), (137, 3), (136, 1)):
@@ -405,13 +441,28 @@ class W11Validation(unittest.TestCase):
         words[176] = 1
         lines = w11_lines() + [
             "V020_W12_NET_ENTROPY a=8 b=96 c=0",
+            "V020_SEC_N_DRBG a=1 b=1024 c=96",
+            "V020_SEC_N_SIGNER_SPACE a=65 b=17 c=0",
+            "V020_SEC_N_SIGNER_REPLY a=1 b=1 c=1",
+            f"V020_SEC_N_VERIFIER_AUTHENTICATED a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
             f"V020_W13_NET_RETIRE a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
         ]
         obs = self.check(words=words, lines=lines, modes=modes)
-        self.assertEqual(obs["virtio_rng_guest_bytes"], 96)
+        self.assertEqual(obs["tls_drbg_guest_bytes"], 96)
+        self.assertEqual(obs["virtio_rng_health_samples"], 1024)
+        self.assertEqual(obs["tls_drbg_key_epoch"], 1)
         self.assertEqual(obs["native_admission_retirements"], 1)
+        self.assertEqual(obs["native_signer_asid"], 65)
+        self.assertEqual(obs["native_signer_certificate_verifies"], 1)
+        self.assertEqual(obs["native_verifier_authenticated_connections"], 1)
         self.assertFalse(obs["tls_echo_turn_verified"], "page evidence alone cannot prove TLS")
         self.rejects("unexpected authenticated RNG", words=words, lines=lines)
+        self.rejects("seeded DRBG evidence", words=words,
+                     lines=[line for line in lines if "SEC_N_DRBG" not in line], modes=modes)
+        self.rejects("CertificateVerify signer reply", words=words,
+                     lines=[line for line in lines if "SIGNER_REPLY" not in line], modes=modes)
+        self.rejects("TLS verifier completion", words=words,
+                     lines=[line for line in lines if "VERIFIER_AUTHENTICATED" not in line], modes=modes)
 
     def test_authenticated_rng_rejects_unsealed_or_inconsistent_delivery(self):
         modes = v.Modes(authenticated_net=True)
@@ -436,7 +487,13 @@ class W11Validation(unittest.TestCase):
             "V020_W11_NET_GUEST_END a=0 b=1 c=0"
             if line.startswith("V020_W11_NET_GUEST_END") else line
             for line in w11_lines()
-        ] + ["V020_W12_NET_ENTROPY a=8 b=96 c=0"]
+        ] + [
+            "V020_W12_NET_ENTROPY a=8 b=96 c=0",
+            "V020_SEC_N_DRBG a=1 b=1024 c=96",
+            "V020_SEC_N_SIGNER_SPACE a=65 b=17 c=0",
+            "V020_SEC_N_SIGNER_REPLY a=1 b=1 c=1",
+            f"V020_SEC_N_VERIFIER_AUTHENTICATED a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
+        ]
         modes = v.Modes(authenticated_net=True, orderly_close=False)
         self.assertEqual(self.check(words=words, lines=lines, modes=modes)["native_admission_retirements"], 0)
         self.rejects("retirement proof", words=words, lines=lines, modes=v.Modes(authenticated_net=True))
@@ -1008,7 +1065,7 @@ class Argv(unittest.TestCase):
         self.assertNotIn("-nic", a)
         self.assertEqual(a[a.index("-m") + 1], "256M")
         self.assertIn("user,id=n0,hostfwd=tcp:127.0.0.1:4242-:7", a)
-        self.assertIn("virtio-net-device,netdev=n0", a)
+        self.assertIn("virtio-net-device,netdev=n0,mac=52:54:00:12:34:56", a)
         self.assertIn("virtio-mmio.force-legacy=false", a)
         self.assertFalse(any("virtio-blk" in x for x in a))
         self.assertIn("virt-10.2,gic-version=2,secure=off,virtualization=off", a)
@@ -1023,7 +1080,7 @@ class Argv(unittest.TestCase):
         a = self.args(scratch=Path("/s.raw"))
         self.assertEqual(a[a.index("-m") + 1], "1024M")
         self.assertIn("virtio-blk-device,drive=scratch", a)
-        self.assertIn("virtio-net-device,netdev=n0", a)
+        self.assertIn("virtio-net-device,netdev=n0,mac=52:54:00:12:34:56", a)
 
     def test_no_nic_negative_argv(self):
         a = self.args(nic=False)

@@ -67,6 +67,9 @@ cyxia_enter_user:
  msr spsr_el1, x9
  ldr x9, [x30, #264]
  msr sp_el0, x9
+ ldr x9, =EXCEPTION_ADMISSION_CLOSED
+ ldar x9, [x9]
+ cbnz x9, .Luser_admission_closed
  ldp x0, x1, [x30, #0]
  ldp x2, x3, [x30, #16]
  ldp x4, x5, [x30, #32]
@@ -84,6 +87,9 @@ cyxia_enter_user:
  ldp x28, x29, [x30, #224]
  ldr x30, [x30, #240]
  eret
+.Luser_admission_closed:
+ wfe
+ b .Luser_admission_closed
 .size cyxia_enter_user, .-cyxia_enter_user
 .global cyxia_user_return
 .type cyxia_user_return, %function

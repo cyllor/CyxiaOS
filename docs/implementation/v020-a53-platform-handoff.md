@@ -1,5 +1,7 @@
 # Cortex-A53 实体平台取证交接
 
+本交接用于单独发起的 G5-ARCH 实体平台验收。V0.20 标准验收使用 Cortex-A53 QEMU 的 G4-QEMU。[V0.20 验收约束](../design/v0.20-native-local-system.md#7-验收与发布)
+
 平台锁由有权操作者事先认证。校验器核对原始清单字节的 SHA-256 和归档文件，再把锁定的 CPU、RAM 与设备记录和 DTB 对照。输出 `STRUCTURE_VALID` 代表结构和文件绑定通过，`ARCH_A53` 仍为 `NOT_RUN`。实体发布还需 G4-QEMU 通过，并审查锁定板卡、勘误适用性、逐核寄存器读回和 26 项实体证明。 [V0.19.9 §11.5、安§7.2 与安§7.4](../design/baselines/v0.19.9-implementation-spec.txt#L5315)
 
 ## 已认证清单

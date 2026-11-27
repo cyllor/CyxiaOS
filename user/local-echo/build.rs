@@ -15,7 +15,11 @@ fn main() {
             .expect("provision the local-only Echo service identity directory"),
     );
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    for name in ["cert.der", "key.der", "peer.pin"] {
+    let signer = env::var_os("CARGO_FEATURE_GUEST_SIGNER").is_some();
+    for name in ["cert.der", "peer.pin"]
+        .into_iter()
+        .chain(signer.then_some("key.der"))
+    {
         let source = root.join(name);
         println!("cargo:rerun-if-changed={}", source.display());
         let meta = fs::symlink_metadata(&source).expect("missing provisioned TLS identity");
@@ -36,4 +40,8 @@ fn main() {
     let dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     println!("cargo:rustc-link-arg-bin=cyxia-local-echo=-T{dir}/linker.ld");
     println!("cargo:rustc-link-arg-bin=cyxia-local-echo=-zmax-page-size=4096");
+    if signer {
+        println!("cargo:rustc-link-arg-bin=cyxia-echo-signer=-T{dir}/linker.ld");
+        println!("cargo:rustc-link-arg-bin=cyxia-echo-signer=-zmax-page-size=4096");
+    }
 }

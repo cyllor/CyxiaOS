@@ -136,9 +136,9 @@ pub(crate) enum AttachError {
     Absent = 1,
     /// More than one block device: the scratch target is ambiguous.
     Ambiguous = 2,
-    /// Not a modern VirtIO device with FLUSH.
+    /// Not a writable modern VirtIO device with FLUSH.
     Device = 3,
-    /// Not exactly 512 MiB, or read-only.
+    /// Not exactly 512 MiB.
     Geometry = 4,
     /// The bounded batch notify policy was refused.
     Policy = 5,
@@ -183,8 +183,8 @@ pub(crate) fn attach(info: &BootInfo) -> Result<ScratchBlock, AttachError> {
     // this is the only &mut to QUEUE and it moves into the device.
     let queue = unsafe { &mut *core::ptr::addr_of_mut!(QUEUE) };
     let mut device =
-        ScratchBlock::attach(transport, queue, &Board).map_err(|_| AttachError::Device)?;
-    if device.sectors() != u64::from(BLOCK_COUNT) * SECTORS_PER_BLOCK || device.read_only() {
+        ScratchBlock::attach_writable(transport, queue, &Board).map_err(|_| AttachError::Device)?;
+    if device.sectors() != u64::from(BLOCK_COUNT) * SECTORS_PER_BLOCK {
         return Err(AttachError::Geometry);
     }
     // Bounded fixture notify policy: batch both requests for one block.
@@ -209,6 +209,33 @@ fn operation(first: u64, i: usize, write: bool) -> Operation {
 // Validate the whole block before publishing either request. The transfer
 // counts as complete only after both used records have been acknowledged.
 pub(crate) fn sectors(
+    device: &mut ScratchBlock,
+    first: u64,
+    write: Option<&[u8; BLOCK_BYTES]>,
+    out: &mut [u8; BLOCK_BYTES],
+) -> Result<(), SecurityError> {
+    let result = transfer(device, first, write, out);
+    finish_io(device, result)
+}
+
+fn finish_io(
+    device: &mut ScratchBlock,
+    result: Result<(), SecurityError>,
+) -> Result<(), SecurityError> {
+    if result.is_err()
+        && let Some(stop) = device.stop_failed_mmio(&Board)
+    {
+        // An early media error might precede a verified BootEpoch. Report
+        // the device observation without claiming a bound durable receipt.
+        match stop {
+            Ok(observed) => report("V020_SEC_D_BLOCK_MMIO_STOPPED", 2, 0, observed),
+            Err(error) => report("V020_SEC_D_BLOCK_MMIO_UNKNOWN", 2, 0, error as u64),
+        }
+    }
+    result
+}
+
+fn transfer(
     device: &mut ScratchBlock,
     first: u64,
     write: Option<&[u8; BLOCK_BYTES]>,
@@ -290,6 +317,11 @@ fn complete(
 /// Synchronous isolated FLUSH: only the actual device completion, not queue
 /// admission or a CPU barrier, may satisfy this call.
 pub(crate) fn flush(device: &mut ScratchBlock) -> Result<(), SecurityError> {
+    let result = issue_flush(device);
+    finish_io(device, result)
+}
+
+fn issue_flush(device: &mut ScratchBlock) -> Result<(), SecurityError> {
     let token = device
         .begin(Operation::Flush, &EMPTY_INPUT, true, true, &Board)
         .map_err(driver(0, KIND_FLUSH, PHASE_BEGIN))?;

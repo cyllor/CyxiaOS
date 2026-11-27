@@ -16,6 +16,8 @@ pub const MAX_PLAN_BYTES: usize = 6464;
 pub const MAX_DECISIONS: usize = 16;
 pub const DECISION_RECORD_BYTES: usize = 256;
 pub const MAX_APPLY_REPORT_BYTES: usize = 96 + 256;
+// EC=SVC64 (0x15), IL=1 (32-bit instruction), ISS immediate=0, RES0.
+const AARCH64_SVC: u64 = 0x5600_0000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ValidatedCall {
@@ -46,8 +48,7 @@ pub fn decode_aarch64_svc_v3(
     esr: u64,
     regs: &[u64; 31],
 ) -> Result<ValidatedCall, Error> {
-    // EC=SVC64 (0x15), IL=1 (32-bit instruction), ISS immediate=0, RES0.
-    if esr != 0x5600_0000 {
+    if esr != AARCH64_SVC {
         return Err(Error::Invalid);
     }
     decode_v3(
@@ -56,6 +57,26 @@ pub fn decode_aarch64_svc_v3(
         [regs[0], regs[1], regs[2], regs[3], regs[4], regs[5]],
     )
 }
+
+/// Lifecycle admission for an authenticated bootstrap task with no installed
+/// capabilities. Protected calls have a uniform refusal before EL1 examines
+/// any arguments. Process or service backends must not use this as a grant.
+pub fn decode_aarch64_lifecycle_svc_v3(
+    verified_package_abi: u16,
+    esr: u64,
+    regs: &[u64; 31],
+) -> Result<ValidatedCall, Error> {
+    if verified_package_abi != ABI_VERSION || esr != AARCH64_SVC {
+        return Err(Error::Invalid);
+    }
+    match decode_syscall(regs[8])? {
+        Syscall::Exit | Syscall::Yield | Syscall::Sleep | Syscall::Clock => {
+            decode_aarch64_svc_v3(verified_package_abi, esr, regs)
+        }
+        _ => Err(Error::Unauthorized),
+    }
+}
+
 fn vector_shape(input_len: u64, output_cap: u64) -> bool {
     if !(44..=464).contains(&input_len) || !(input_len - 16).is_multiple_of(28) {
         return false;
@@ -323,6 +344,51 @@ mod tests {
         }
         assert_eq!(decode_syscall(0x51), Err(Error::Invalid));
     }
+    #[test]
+    fn lifecycle_without_grants_uses_the_same_abi_and_refuses_all_protected_calls() {
+        const ESR: u64 = 0x5600_0000;
+        let mut regs = [0; 31];
+        for (number, operation) in [
+            (0x01, Syscall::Exit),
+            (0x02, Syscall::Yield),
+            (0x03, Syscall::Sleep),
+            (0x04, Syscall::Clock),
+        ] {
+            regs[8] = number;
+            let call = decode_aarch64_lifecycle_svc_v3(ABI_VERSION, ESR, &regs).unwrap();
+            assert_eq!(call.operation, operation);
+            assert_eq!(decode_aarch64_svc_v3(ABI_VERSION, ESR, &regs), Ok(call));
+        }
+        regs[5] = 1;
+        assert_eq!(
+            decode_aarch64_lifecycle_svc_v3(ABI_VERSION, ESR, &regs),
+            Err(Error::Invalid)
+        );
+        for number in [
+            0x10, 0x11, 0x12, 0x13, 0x20, 0x21, 0x22, 0x30, 0x31, 0x32, 0x40, 0x41, 0x42, 0x43,
+            0x50,
+        ] {
+            regs[8] = number;
+            assert_eq!(
+                decode_aarch64_lifecycle_svc_v3(ABI_VERSION, ESR, &regs),
+                Err(Error::Unauthorized)
+            );
+            assert_eq!(
+                decode_aarch64_lifecycle_svc_v3(1, ESR, &regs),
+                Err(Error::Invalid)
+            );
+        }
+        assert_eq!(
+            decode_aarch64_lifecycle_svc_v3(ABI_VERSION, ESR | 1, &regs),
+            Err(Error::Invalid)
+        );
+        regs[8] = 0x51;
+        assert_eq!(
+            decode_aarch64_lifecycle_svc_v3(ABI_VERSION, ESR, &regs),
+            Err(Error::Invalid)
+        );
+    }
+
     #[test]
     fn v1_abi_or_svc_immediate_cannot_silently_become_v3() {
         assert_eq!(decode_v3(1, 0x02, [0; 6]), Err(Error::Invalid));

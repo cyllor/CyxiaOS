@@ -644,9 +644,7 @@ pub(super) fn read_checkpoint(
     // The formatter writes identical generation 1 headers. Later checkpoints
     // alternate copies and each fixture checks its exact committed boundary.
     for copy in [a, b] {
-        if copy.fs_uuid != UUID
-            || copy.log_epoch != copy.generation
-            || expected_checkpoint_lsn(copy.generation) != Some(copy.checkpoint_lsn)
+        if copy.fs_uuid != UUID || copy.log_epoch != copy.generation || !checkpoint_lsn_valid(copy)
         {
             return Err(SecurityError::Conflict);
         }
@@ -660,15 +658,20 @@ pub(super) fn read_checkpoint(
     Ok(sb)
 }
 
-fn expected_checkpoint_lsn(generation: u64) -> Option<u64> {
+fn checkpoint_lsn_valid(copy: SuperblockV1) -> bool {
     #[cfg(feature = "v020-production-fsync-scratch")]
-    return match generation {
-        1 => Some(0),
-        2 => Some(super::fsync::FINAL_LSN),
-        _ => None,
+    return match copy.generation {
+        1 => copy.checkpoint_lsn == 0,
+        2 => matches!(
+            copy.checkpoint_lsn,
+            super::fsync::FINAL_LSN | super::fsync::LEGACY_FINAL_LSN
+        ),
+        _ => false,
     };
     #[cfg(not(feature = "v020-production-fsync-scratch"))]
-    (generation - 1).checked_mul(4)
+    {
+        (copy.generation - 1).checked_mul(4) == Some(copy.checkpoint_lsn)
+    }
 }
 
 /// Check the N=8 manifest geometry and each mode's snapshot bytes.

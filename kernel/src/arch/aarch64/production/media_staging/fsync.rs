@@ -1,9 +1,10 @@
 //! One sealed native baseline-v1 FSYNC diagnostic. CPU0 owns the device,
 //! signed test policy and frozen input after the other cores have stopped.
-//! No EL0 endpoint or role capability is granted by this profile.
+//! Cold reopen exports a verified read-only receipt view to its qualified
+//! native client. Only the staging owner accesses the device.
 
 use super::{
-    Disk, authority, reopen, report,
+    Disk, StagedReceiptQuery, authority, reopen, report, signed,
     volume::{self, RECEIPTS_HOME, SnapshotLayout},
 };
 use cyxia_kernel_core::security::{
@@ -22,9 +23,7 @@ use cyxia_kernel_core::security::{
     file_mount_v1::MountEvidence,
     file_receipt_query_v4::{MountedReceiptQuery, ReceiptKey, ReceiptQueryCaller},
     file_receipt_store_v0199::RECEIPT_STORE_BYTES,
-    file_service_v4::{
-        REPLY_HEADER, REQUEST_HEADER, REQUEST_MAGIC, REQUEST_VERSION, Reply, Request,
-    },
+    file_service_v4::{REQUEST_HEADER, REQUEST_MAGIC, REQUEST_VERSION, Request},
     file_structure_v1::{INODE_BYTES, Inode},
     offline_config_v1::VerifiedOfflineConfig,
     recovery_v1::{
@@ -41,9 +40,11 @@ const SLOT: usize = 21;
 const RECEIPT_AT: usize = SLOT * RECEIPT_BYTES;
 const ISSUE_START: u32 = 8;
 const BIND_START: u32 = 16;
-const FINAL_START: u32 = 22;
-const LOG_END: u32 = 32;
-pub(super) const FINAL_LSN: u64 = 19;
+const FINAL_START: u32 = 24;
+const LOG_END: u32 = 36;
+const LEGACY_LOG_END: u32 = 32;
+pub(super) const FINAL_LSN: u64 = 21;
+pub(super) const LEGACY_FINAL_LSN: u64 = 19;
 const KEY: ReceiptKey = ReceiptKey {
     fs_uuid: volume::UUID,
     issued_boot_epoch: 1,
@@ -265,7 +266,7 @@ pub(super) fn execute(
     };
     let FsyncProgress::Committed { receipt: bound, .. } =
         commit_segment(&mut writer, &job, work, |p| {
-            reserve(p, BIND_START, 6, 3, 13)
+            reserve(p, BIND_START, 8, 3, 14)
         })?
     else {
         return Err(Error::Conflict);
@@ -275,7 +276,7 @@ pub(super) fn execute(
     }
     let FsyncProgress::Committed { receipt, redo } =
         commit_segment(&mut writer, &job, work, |p| {
-            reserve(p, FINAL_START, 10, 4, FINAL_LSN)
+            reserve(p, FINAL_START, 12, 4, FINAL_LSN)
         })?
     else {
         return Err(Error::Conflict);
@@ -313,13 +314,13 @@ pub(super) fn execute(
     Ok(())
 }
 
-fn final_receipt(data: &[u8; BLOCK]) -> Result<FileReceiptV4, Error> {
+fn final_receipt(data: &[u8; BLOCK], commit_lsn: u64) -> Result<FileReceiptV4, Error> {
     let frame = fsync_frame();
     let frozen = freeze(&mut AuthContextIssuerV1::new(1)?, &frame, data)?;
     Ok(FileReceiptV4 {
         log_epoch: 1,
         txid: 4,
-        commit_lsn: FINAL_LSN,
+        commit_lsn,
         write_seq: WRITE_SEQ,
         status: 3,
         completed_prefix: FILE_BYTES.len() as u32,
@@ -371,21 +372,23 @@ pub(super) fn recover(
     file[252..].copy_from_slice(&crc.to_le_bytes());
     issued_index(&mut index)?;
     let data = frozen_file();
-    let receipt = final_receipt(&data)?;
     // SAFETY: the second CPU0 boot borrows the same exclusive static areas.
     let workspace = unsafe { reopen::workspace() };
     let image = unsafe { &mut *core::ptr::addr_of_mut!(RECEIPTS) };
     image.fill(0);
-    image[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES].copy_from_slice(&receipt.encode()?);
-    {
+    let final_lsn = {
         let mut writer = RedoWriter::open(disk, workspace, checkpoint)?;
         let summary = writer.evidence().ok_or(Error::Conflict)?;
+        // Keep cold readback for the previous, exact signed test-media cut.
+        // Newly written FSYNC segments include the unchanged stream index.
         if summary.transactions != 4
             || summary.distinct_home_blocks != 7
-            || summary.last_commit_lsn != FINAL_LSN
+            || !matches!(summary.last_commit_lsn, FINAL_LSN | LEGACY_FINAL_LSN)
         {
             return Err(Error::Conflict);
         }
+        let receipt = final_receipt(&data, summary.last_commit_lsn)?;
+        image[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES].copy_from_slice(&receipt.encode()?);
         // All seven expected homes actually change from the strictly checked
         // genesis view. Exact equality plus the union count excludes any
         // other target before replay is allowed to write.
@@ -412,6 +415,10 @@ pub(super) fn recover(
             image[BLOCK..2 * BLOCK].try_into().unwrap(),
         )?;
         verify_block(&mut writer, RECEIPTS_HOME + 6, &index)?;
+        summary.last_commit_lsn
+    };
+    if final_lsn == LEGACY_FINAL_LSN {
+        volume::require_zero_blocks(disk, LEGACY_LOG_END..LOG_END)?;
     }
     let mut mounted = None;
     let (chain, next) = recover_checkpoint_with_evidence(disk, workspace, |disk, selected| {
@@ -421,7 +428,7 @@ pub(super) fn recover(
         mounted = Some(volume::validate_fsync_homes(disk, selected, config)?);
         Ok(())
     })?;
-    if chain.transactions != 4 || next.checkpoint_lsn != FINAL_LSN {
+    if chain.transactions != 4 || next.checkpoint_lsn != final_lsn {
         return Err(Error::Conflict);
     }
     retire_checkpointed_log(disk, workspace, next)?;
@@ -430,10 +437,13 @@ pub(super) fn recover(
 
 pub(super) fn readback(
     disk: &mut Disk,
+    checkpoint: SuperblockV1,
     config: &VerifiedOfflineConfig<'_>,
     state: &SecurityStateStoreV2,
-) -> Result<(), Error> {
-    if state.last_boot_epoch != 2 {
+) -> Result<StagedReceiptQuery, Error> {
+    if state.last_boot_epoch != 2
+        || !matches!(checkpoint.checkpoint_lsn, FINAL_LSN | LEGACY_FINAL_LSN)
+    {
         return Err(Error::Stale);
     }
     let mut raw = [0; BLOCK];
@@ -441,45 +451,38 @@ pub(super) fn readback(
     if raw != frozen_file() {
         return Err(Error::Conflict);
     }
-    let expected = final_receipt(&raw)?;
-    // SAFETY: no concurrent user of this readback workspace exists on CPU0.
-    let image = unsafe { &mut *core::ptr::addr_of_mut!(RECEIPTS) };
-    for (block, output) in image.chunks_exact_mut(BLOCK).enumerate() {
+    let expected = final_receipt(&raw, checkpoint.checkpoint_lsn)?;
+    // Derive the static query qualification separately from the signed media
+    // policy. Both are pinned to the identical persistent principal.
+    // SAFETY: only the CPU0 staging owner borrows the role load scratch,
+    // and the loaded executable images no longer depend on those bytes.
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(super::super::COPY_BUFFER.0) };
+    let principal = signed::receipt_query_principal(config, scratch)?;
+    let service_slot = (FILE_SERVICE_ROLE - 1) as usize;
+    let service_generation = state.service_generations[service_slot];
+    if service_generation == 0 || state.isolated_service_bitmap & (1 << service_slot) != 0 {
+        return Err(Error::Unauthorized);
+    }
+
+    // SAFETY: the one-shot CPU0 staging owner is the only writer. Reopen
+    // has finished measuring and modifying the journal before this borrow.
+    // No reachable operation mutates RECEIPTS after the view is published.
+    let receipts = unsafe { &mut *core::ptr::addr_of_mut!(RECEIPTS) };
+    for (block, output) in receipts.chunks_exact_mut(BLOCK).enumerate() {
         disk.read(RECEIPTS_HOME + block as u32, output.try_into().unwrap())?;
     }
     disk.read(RECEIPTS_HOME + 6, &mut raw)?;
-    let view = MountedReceiptQuery::new(image, &raw, config, state)?;
-    let mut query = [0; REQUEST_HEADER + 56];
-    request_header(&mut query, 11, REQUEST_ID);
-    query[REQUEST_HEADER..REQUEST_HEADER + 56].copy_from_slice(&expected.encode()?[8..64]);
-    let mut reply = [0; REPLY_HEADER];
-    view.serve(
-        ReceiptQueryCaller {
-            principal_id: config.principals()[0].id,
-            boot_epoch: state.last_boot_epoch,
-            service_generation: 1,
-        },
-        0,
-        &query,
-        &mut reply,
-    )?;
-    let reply = Reply::decode(&reply)?;
-    if (
-        reply.state,
-        reply.result,
-        reply.commit_lsn,
-        reply.write_seq,
-        reply.result_digest,
-    ) != (3, 0, FINAL_LSN, WRITE_SEQ, expected.output_digest)
-        || reply.completed_prefix as usize != FILE_BYTES.len()
-    {
+    if FileReceiptV4::decode(&receipts[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES])? != expected {
         return Err(Error::Conflict);
     }
-    report(
-        "V020_FSYNC_RECOVERED",
-        state.last_boot_epoch,
-        reply.commit_lsn,
-        reply.write_seq,
-    );
-    Ok(())
+    let view = MountedReceiptQuery::new(receipts, &raw, config, state)?;
+    Ok(StagedReceiptQuery {
+        view,
+        caller: ReceiptQueryCaller {
+            principal_id: principal.id,
+            boot_epoch: state.last_boot_epoch,
+            service_generation,
+        },
+        expected,
+    })
 }

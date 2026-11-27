@@ -226,6 +226,9 @@ impl BatchQueue {
         Ok(())
     }
     pub fn set_completion_interrupts(&mut self, enabled: bool, p: &impl Platform) {
+        if self.poisoned {
+            return;
+        }
         self.memory.avail.put16(0, if enabled { 0 } else { 1 });
         unsafe { p.sync(self.memory.avail.address(), 2) };
         p.barrier();
@@ -237,6 +240,10 @@ impl BatchQueue {
         self.poisoned = true;
         t.fail();
         p.barrier();
+    }
+    /// Close every publication path while keeping old DMA and completion custody.
+    pub(crate) fn fence(&mut self) {
+        self.poisoned = true;
     }
     fn slot(&self, t: Token) -> Result<&Slot, Error> {
         self.slots

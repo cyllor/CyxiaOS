@@ -65,9 +65,22 @@ _start:
  ldr x5, =__ro_phys_start
  ldr x6, =__ro_phys_end
  ldr x7, =__guard_phys
+ ldr x10, =__exception_stacks_phys
+ ldr x11, =__exception_stacks_end_phys
 6: ldr x8, =0x0060000000000703
  cmp x1, x7
  b.eq 10f
+ // The shared low/high RAM leaves omit both guards in every exception bank.
+ cmp x1, x10
+ b.lo .Lordinary_boot_page
+ cmp x1, x11
+ b.hs .Lordinary_boot_page
+ sub x12, x1, x10
+ and x12, x12, #0x7fff
+ cbz x12, 10f
+ cmp x12, #0x5000
+ b.eq 10f
+.Lordinary_boot_page:
  ldr x9, ={entry}
  cmp x1, x9
  b.eq 8f
@@ -128,8 +141,17 @@ dev_l2: .skip 4096
 ram_l2: .skip 4096
 .global ram_l3
 ram_l3: .skip {ram_tables_bytes}
+
+// The linker places an unmapped guard page immediately below this range.
+.section .stack.primary,"aw",%nobits
+.skip {exec_stack_bytes}
+
 .section .text.highentry,"ax"
 high_entry:
+ mov x0, #0
+ ldr x1, =__stack_base
+ ldr x2, =__stack_top
+ bl exception_register_stack
  ldr x0, =exception_vectors
  msr vbar_el1, x0
  isb
