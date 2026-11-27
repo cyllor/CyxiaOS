@@ -37,6 +37,11 @@ pub(crate) use exceptions::ExceptionFrame;
 pub(crate) use exceptions::hex;
 
 pub(crate) const HIGH: u64 = cyxia_platform_virt::HIGH_BASE;
+pub(crate) const SUPERVISOR_COPY_WINDOW: u8 = cfg!(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch"
+)) as u8;
 // The default release resident path is covered by check_v020_el1_stack.py.
 // Catalog verification, diagnostics and debug builds have separate frames.
 const BOUNDED_DEFAULT_STACKS: bool = cfg!(all(
@@ -68,6 +73,7 @@ core::arch::global_asm!(
     ram_tables_bytes = const cyxia_platform_virt::RAM_MIB / 2 * 4096,
     exec_stack_bytes = const BOOT_EXEC_STACK_BYTES,
     software_pan = const cfg!(feature = "v020-production") as u8,
+    supervisor_copy = const SUPERVISOR_COPY_WINDOW,
 );
 // Versioned loader contract, retained in the ELF's read-only load segment.
 #[used]

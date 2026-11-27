@@ -28,6 +28,17 @@ pub struct Token {
     pub slot: u8,
     pub generation: u64,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetainedState {
+    Private,
+    Published,
+    Complete,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedChain {
+    pub token: Token,
+    pub state: RetainedState,
+}
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum State {
     Free,
@@ -244,6 +255,25 @@ impl BatchQueue {
     /// Close every publication path while keeping old DMA and completion custody.
     pub(crate) fn fence(&mut self) {
         self.poisoned = true;
+    }
+    /// Read the frozen chain table without polling DMA or releasing a slot.
+    pub(crate) fn retained_chains(&self) -> [Option<RetainedChain>; MAX_CHAINS] {
+        core::array::from_fn(|index| {
+            let slot = &self.slots[index];
+            let state = match slot.state {
+                State::Free => return None,
+                State::Private => RetainedState::Private,
+                State::Published => RetainedState::Published,
+                State::Complete => RetainedState::Complete,
+            };
+            Some(RetainedChain {
+                token: Token {
+                    slot: index as u8,
+                    generation: slot.generation,
+                },
+                state,
+            })
+        })
     }
     fn slot(&self, t: Token) -> Result<&Slot, Error> {
         self.slots

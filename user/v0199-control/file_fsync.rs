@@ -13,6 +13,7 @@ const RESULT_DIGEST: &[u8; 32] =
 const REPLY_MAGIC: [u8; 8] = [0x52, 0x46, 0x59, 0x43, 3, 0, 128, 0];
 const WRITE_HEADER: usize = 44;
 const MAX_WRITE: usize = 128 - WRITE_HEADER;
+const COMMIT_LSN: u64 = if CONTENTS.len() > 4096 { 23 } else { 21 };
 
 fn header<const BYTES: usize>(op: u16, id: u64) -> [u8; BYTES] {
     let mut wire = [0; BYTES];
@@ -126,7 +127,7 @@ pub(super) fn run() {
     let reply = service::<128>(&fsync, handle);
     if !receipt_is_committed(&reply)
         || reply[80..112] != *RESULT_DIGEST
-        || field(&reply, 40) != 21
+        || field(&reply, 40) != COMMIT_LSN
         || field(&reply, 32) != CONTENTS.len() as u64
         || field(&reply, 120) != write_count as u64
         || service::<128>(&fsync, handle) != reply

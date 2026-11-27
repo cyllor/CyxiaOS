@@ -26,14 +26,19 @@ use super::Error;
 use super::file_media_v0199::{SnapshotMediaKind, crc32c_zeroed, probe_snapshot_media_pair};
 use super::file_structure_v1::{INODE_BYTES, INODES, SystemKind, SystemObject};
 
-#[cfg(not(target_os = "none"))]
+// Nonempty readers are available for host tests and explicitly selected
+// candidate builds. The production mount always uses the empty decoder.
+#[cfg(any(not(target_os = "none"), feature = "snapshot-history-candidate"))]
 #[path = "snapshot_catalog_candidate.rs"]
 pub mod catalog_candidate;
 #[path = "snapshot_protection_candidate.rs"]
 pub mod protection_candidate;
-#[cfg(not(target_os = "none"))]
+#[cfg(any(not(target_os = "none"), feature = "snapshot-history-candidate"))]
 #[path = "snapshot_slot_candidate.rs"]
 pub mod slot_candidate;
+#[cfg(feature = "snapshot-history-candidate")]
+#[path = "snapshot_history_candidate.rs"]
+pub mod history_candidate;
 
 // Baseline-frozen layout constants, re-exported as the unified contract's
 // single source (never re-derived here).

@@ -3,7 +3,8 @@
 //! disk and sealed only after the current durable BootEpoch was confirmed.
 
 use super::*;
-use core::ptr::{addr_of, addr_of_mut, copy_nonoverlapping};
+use copy_window::StackSpan;
+use core::ptr::{addr_of, addr_of_mut};
 use cyxia_kernel_core::security::{
     Error as SecurityError,
     file_read_v4::{ENDPOINT, MAX_REPLY},
@@ -55,7 +56,11 @@ fn caller(index: usize, member: NativeRole, args: [u64; 6]) -> Result<u64, i64> 
     trapped_pie_cap(index, member)
 }
 
-fn buffers(index: usize, args: [u64; 6]) -> Result<(u64, u64), i64> {
+fn buffers(
+    index: usize,
+    member: NativeRole,
+    args: [u64; 6],
+) -> Result<(StackSpan, StackSpan), i64> {
     if args[2] != FRAME_BYTES as u64 {
         return Err(E_FORMAT);
     }
@@ -63,8 +68,8 @@ fn buffers(index: usize, args: [u64; 6]) -> Result<(u64, u64), i64> {
     if !(REPLY_HEADER..=MAX_REPLY).contains(&capacity) {
         return Err(EFAULT);
     }
-    let source = stack_span(index, args[1], FRAME_BYTES, false).ok_or(EFAULT)?;
-    let dest = stack_span(index, args[4], capacity, true).ok_or(EFAULT)?;
+    let source = StackSpan::verify(index, member, args[1], FRAME_BYTES, false)?;
+    let dest = StackSpan::verify(index, member, args[4], capacity, true)?;
     // stack_span has checked that both additions stay within the private span.
     if args[1] < args[4] + args[5] && args[4] < args[1] + args[2] {
         return Err(EFAULT);
@@ -74,7 +79,7 @@ fn buffers(index: usize, args: [u64; 6]) -> Result<(u64, u64), i64> {
 
 pub(super) fn reject_preflight(index: usize, member: NativeRole, args: [u64; 6]) -> u64 {
     caller(index, member, args)
-        .and_then(|_| buffers(index, args))
+        .and_then(|_| buffers(index, member, args))
         .err()
         .unwrap_or(EFAULT) as u64
 }
@@ -95,13 +100,12 @@ fn errno(error: SecurityError) -> i64 {
 
 fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
     let cap = caller(index, member, args)?;
-    let (source, dest) = buffers(index, args)?;
+    let (source, dest) = buffers(index, member, args)?;
     // SAFETY: only the trapped, registered CPU0 role reaches this point.
     // The foreground driver holds no STATE borrow while running the role.
     let state = unsafe { &mut *addr_of_mut!(STATE) };
     let mut request = [0; FRAME_BYTES];
-    // SAFETY: the checked EL1 alias covers the stopped role's complete input.
-    unsafe { copy_nonoverlapping(source as *const u8, request.as_mut_ptr(), FRAME_BYTES) };
+    source.copy_in(&mut request)?;
     if Request::decode(&request, 0).map_err(errno)?.op != FILE_QUERY_RESULT {
         return Err(E_FORMAT);
     }
@@ -129,8 +133,9 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
     if len != REPLY_HEADER || reply != encode_receipt_reply(mount.caller, mount.expected) {
         return Err(i64::from(EIO));
     }
-    // SAFETY: buffers() checked the independent writable reply span.
-    unsafe { copy_nonoverlapping(reply.as_ptr(), dest as *mut u8, len) };
+    if !dest.copy_out_and_check(&reply[..len])? {
+        fatal(FATAL + 4);
+    }
     state.checks.recovered = true;
     Ok(())
 }

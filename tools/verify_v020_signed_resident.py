@@ -17,7 +17,7 @@ import time
 from check_elf import symbol
 from run_qemu import Qmp
 from transport import FrameDecoder
-from v0199_budget_trace import SIGNED_TRACE_BYTES, verify_signed_trace
+from v0199_budget_trace import SIGNED_EARLY_TRACE_BYTES, SIGNED_TRACE_BYTES, verify_signed_trace
 from v020_production_media import (
     BLOCK_BYTES, REDO_HEADER_BYTES, SECURITY_REDO, STAGING_UUID, verify_signed_disk,
 )
@@ -69,7 +69,8 @@ def verify_disk(path: Path, epoch: int, roles: list, *, expected_policy_sha256: 
 
 def capture_budget_trace(socket_path: Path, elf: Path, output: Path, deadline: float) -> dict:
     location = symbol(elf.read_bytes(), "V020_SIGNED_CPU_BUDGET_TRACE")
-    require(location["size"] == SIGNED_TRACE_BYTES and location["pa"] % 4096 == 0,
+    require(location["size"] in (SIGNED_TRACE_BYTES, SIGNED_EARLY_TRACE_BYTES)
+            and location["pa"] % 4096 == 0,
             "invalid linked signed CPU0 trace extent")
     path = output / TRACE_FILE
     with socket.socket(socket.AF_UNIX) as sock:
@@ -172,9 +173,21 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
                         and all(right[0] - left[0] >= 4 for left, right in zip(progress, progress[1:])),
                         "all eight roles did not sustain authorized lifecycle progress")
                 recovery = rows(lines, "V020_SIGNED_RESIDENT_RECOVERY")
-                require([step for step, _, _ in recovery] == [1, 2]
+                media_budget = rows(lines, "V020_SIGNED_MEDIA_BUDGET")
+                trace_size = symbol(elf.read_bytes(), "V020_SIGNED_CPU_BUDGET_TRACE")["size"]
+                early_boot = trace_size == SIGNED_EARLY_TRACE_BYTES
+                require(trace_size in (SIGNED_TRACE_BYTES, SIGNED_EARLY_TRACE_BYTES)
+                        and [step for step, _, _ in recovery] == ([0, 1, 2] if early_boot else [1, 2])
                         and all(0 < used <= quota == RECOVERY_NS for _, used, quota in recovery),
-                        "signed verification or package loading lacks a Recovery settlement")
+                        "signed startup lacks a Recovery settlement")
+                require(len(media_budget) == int(early_boot), "missing or unexpected media Recovery settlement")
+                if early_boot:
+                    batches, used, quota = media_budget[0]
+                    io = rows(lines, "V020_W11_MEDIA_IO")
+                    require(batches > 0 and 0 < used <= batches * quota and quota == RECOVERY_NS
+                            and len(io) == 1 and all(counter > 0 for counter in io[0]),
+                            "missing read/write/FLUSH or invalid media Recovery settlement")
+                    result.update(media_budget=media_budget[0], media_io=io[0])
                 require(not any(line.startswith("V020_STARTUP ") for line in lines),
                         "resident roles entered the fenced state")
                 result.update(epoch=epoch, roles=rows(lines, "V020_SIGNED_RESIDENT_ROLE"),
@@ -263,6 +276,7 @@ def main() -> int:
                         run.update(verify_signed_trace(
                             trace, epoch, run["roles"], [row[1] for row in run["recovery"]],
                             run["cpu0_pmu_ledger_idle_ns"],
+                            media_budget=run.get("media_budget"),
                         ))
         summary["status"] = "PASS"
     except (ValueError, OSError, struct.error) as error:

@@ -3,7 +3,7 @@
 import unittest
 
 from v0199_budget_trace import (
-    ROLE_GRANTS, SIGNED_HEADER, SIGNED_MAGIC, SIGNED_ROW, SIGNED_TRACE_BYTES,
+    ROLE_GRANTS, SIGNED_EARLY_TRACE_BYTES, SIGNED_HEADER, SIGNED_MAGIC, SIGNED_ROW, SIGNED_TRACE_BYTES,
     WINDOW, verify_signed_trace,
 )
 
@@ -38,8 +38,8 @@ class SignedBudgetTraceTests(unittest.TestCase):
                        1_100, 500, *lifetime]
         self.uart = [(tick - initial_tick, tick - initial_tick, 500)]
 
-    def evidence(self):
-        raw = bytearray(SIGNED_TRACE_BYTES)
+    def evidence(self, size=SIGNED_TRACE_BYTES):
+        raw = bytearray(size)
         SIGNED_HEADER.pack_into(raw, 0, *self.header)
         for index, row in enumerate(self.rows):
             SIGNED_ROW.pack_into(raw, SIGNED_HEADER.size + index * SIGNED_ROW.size, *row)
@@ -72,6 +72,44 @@ class SignedBudgetTraceTests(unittest.TestCase):
         self.header[7] = 1
         with self.assertRaisesRegex(ValueError, "class or total window limit"):
             self.replay()
+
+    def test_replays_boot_and_media_before_the_existing_role_windows(self):
+        initial_tick = self.header[4]
+        prefix = []
+        wall = self.origin
+        tick = initial_tick
+        for step, used in enumerate((100, 200, 300)):
+            if step:
+                wall = (step + 1) * WINDOW + 32
+                tick += 10
+                prefix.append((wall, tick, 0, 0, 0, wall - 16, 0, 0))
+            tick += used
+            prefix.append((wall + 1_000, tick, 8_000_000, wall + 50_000_000, 5,
+                           wall + 984, 0, 0))
+        wall = 4 * WINDOW + 32
+        tick += 10
+        prefix.append((wall, tick, 0, 0, 0, wall - 16, 0, 0))
+        shift = tick - initial_tick
+        self.rows = prefix + [(end + 3 * WINDOW, end_tick + shift, quota,
+                               deadline + 3 * WINDOW if deadline else 0,
+                               scope, lower + 3 * WINDOW, actor, generation)
+                              for end, end_tick, quota, deadline, scope, lower, actor,
+                              generation in self.rows]
+        self.header[1:3] = (2, len(self.rows))
+        self.header[7:9] = (3, 5)
+        self.header[9] += 3 * WINDOW
+        self.header[10] += shift
+        self.header[11] += shift
+        self.header[12] += 10
+        self.header[17] += 30
+        self.header[18] += 600
+        self.uart = [(self.header[11], self.header[11], 500)]
+        raw = self.evidence(SIGNED_EARLY_TRACE_BYTES)
+        result = verify_signed_trace(raw, 2, self.roles, (100, 200, 1_000), self.uart,
+                                     media_budget=(1, 300, 8_000_000))
+        self.assertEqual(result["early_boot_recovery_cpu_ns"], 100)
+        self.assertEqual(result["boot_media_recovery_cpu_ns"], 300)
+        self.assertEqual(result["budget_complete_eight_role_windows"], list(range(5, 13)))
 
 
 if __name__ == "__main__":

@@ -33,9 +33,24 @@ _start:
  str x0, [x1, #8]
  ldr x1, =high_l1
  str x0, [x1, #2056]
+.if {supervisor_copy}
+ ldr x2, =__copy_secondary_l1
+ str x0, [x2, #2056]
+.endif
  ldr x0, =dev_l2
  orr x0, x0, #3
  str x0, [x1, #2048]
+.if {supervisor_copy}
+ str x0, [x2, #2048]
+ // HIGH + 2 GiB is L1 slot 258, beyond the 1 GiB RAM alias.
+ // All secondaries use the parallel root with this slot still invalid.
+ ldr x0, =__copy_window_l2
+ orr x3, x0, #3
+ str x3, [x1, #2064]
+ ldr x3, =__copy_window_l3
+ orr x3, x3, #3
+ str x3, [x0]
+.endif
  // Device blocks, PXN + UXN, AF, AttrIndx 1. No normal-memory alias.
  ldr x0, =dev_l2
  ldr x1, ={gic_base}
@@ -70,6 +85,10 @@ _start:
 .if {software_pan}
  ldr x13, =empty_l1
 .endif
+.if {supervisor_copy}
+ ldr x14, =__copy_secondary_l1
+ ldr x15, =__copy_window_l2
+.endif
 6: ldr x8, =0x0060000000000703
  cmp x1, x7
  b.eq 10f
@@ -87,6 +106,12 @@ _start:
 .if {software_pan}
  // The zeroed translation root keeps a read-only, execute-never alias.
  cmp x1, x13
+ b.eq .Lreadonly_boot_page
+.endif
+.if {supervisor_copy}
+ cmp x1, x14
+ b.eq .Lreadonly_boot_page
+ cmp x1, x15
  b.eq .Lreadonly_boot_page
 .endif
  ldr x9, ={entry}
@@ -154,6 +179,14 @@ high_l1: .skip 4096
 .if {software_pan}
 .global empty_l1
 empty_l1: .skip 4096
+.endif
+.if {supervisor_copy}
+.global __copy_secondary_l1
+__copy_secondary_l1: .skip 4096
+.global __copy_window_l2
+__copy_window_l2: .skip 4096
+.global __copy_window_l3
+__copy_window_l3: .skip 4096
 .endif
 dev_l2: .skip 4096
 ram_l2: .skip 4096

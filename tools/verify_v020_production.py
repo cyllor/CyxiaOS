@@ -50,6 +50,7 @@ import tempfile
 import time
 
 import verify_smp
+from check_elf import symbol
 from run_qemu import Qmp
 from qmp_stdio import PipeTransport
 from transport import FrameDecoder
@@ -114,6 +115,7 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/observations/audit_record.rs",
     "kernel/src/arch/aarch64/production/observations/audit_rpc.rs",
     "kernel/src/arch/aarch64/production/snapshot_catalog.rs",
+    "kernel/src/arch/aarch64/production/copy_window.rs",
     "kernel/src/platform/virt/net_device.rs",
     "crates/arch-aarch64/src/entry.S",
     "crates/arch-aarch64/src/secondary.S",
@@ -152,6 +154,7 @@ PRODUCTION_SOURCES = [
     "crates/kernel-core/src/security/file_read_v4.rs",
     "crates/kernel-core/src/security/snapshot_list_v4.rs",
     "crates/kernel-core/src/security/snapshot_read_v4.rs",
+    "crates/kernel-core/src/security/memory.rs",
     "crates/kernel-core/src/security/syscall_v3.rs",
     "crates/kernel-core/src/frame_meta_v0199.rs",
     "crates/kernel-core/src/frames.rs",
@@ -618,9 +621,12 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
         event = "V020_FSYNC_RECOVERED" if reopen else "V020_FSYNC_COMMITTED"
         terminal = w11_rows(lines, event)
         legacy = [(epoch, 19, 7)] if reopen else [(19, 7, 29)]
+        commit = terminal[0][1 if reopen else 0] if len(terminal) == 1 else 0
+        growth = commit == 23
+        low, high = (4097, 8192) if growth else (29, 4096)
         current = len(terminal) == 1 and (
-            terminal[0][:2] == (epoch, 21) and terminal[0][2] > 0 if reopen else
-            terminal[0][0] == 21 and terminal[0][1] > 0 and 29 <= terminal[0][2] <= 4096
+            terminal[0][0] == epoch and commit in (21, 23) and terminal[0][2] > 0 if reopen else
+            commit in (21, 23) and terminal[0][1] > 0 and low <= terminal[0][2] <= high
         )
         require(terminal == legacy or current, "media staging FSYNC terminal differs")
         if reopen and epoch > 2:
@@ -631,13 +637,13 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
         elif reopen:
             # The data REDO's continuation only needs clearing if the final
             # 64 bytes are nonzero. Archived 29-byte runs have no such block.
-            allowed = (28, 29) if current else (24,)
+            allowed = (30, 31, 32) if growth else ((28, 29) if current else (24,))
             retired = allowed[0] if pending_fsync_blocks is None else pending_fsync_blocks
             require(retired in allowed, "pre-replay FSYNC journal block count differs")
-            # Seven replay homes, one checkpoint and six new BootEpoch blocks.
-            expected_io = (14 + retired, 5)
+            # Growth adds a data home and its bitmap to the legacy closure.
+            expected_io = (14 + retired + 2 * growth, 5)
         else:
-            expected_io = (4167 if current else 4163, 12)
+            expected_io = (4171 if growth else (4167 if current else 4163), 12)
     require(len(io) == 1 and io[0][0] > 0 and io[0][1:] == expected_io,
             "media staging device writes and flushes disagree with the selected protocol")
     evidence = {}
@@ -734,6 +740,60 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
         "staging_previous_epoch": words[163] if staging else None,
         "staging_reopened": modes.media_reopen,
         "w11_completion_marker": expected,
+    }
+
+
+def supervisor_copy_windows(elf, qmp, output, lines, *, snapshot_lists=None, file_copy=False):
+    window = symbol(elf, "__copy_window_l3")
+    require = verify_smp.require
+    counts = {}
+    if snapshot_lists is not None:
+        witnessed = w11_rows(lines, "V020_SEC_M_COPY_WINDOW")
+        require(len(witnessed) == 1, "missing one Supervisor snapshot copy-window witness")
+        reads, writes, closed = witnessed[0]
+        require(snapshot_lists > 0 and writes == 2 * snapshot_lists and reads >= writes and closed == 1,
+                "cross-page snapshot copy-window close counts differ")
+        counts["snapshot_copy_window"] = (reads, writes)
+    if file_copy:
+        witnessed = w11_rows(lines, "V020_SEC_M_FILE_COPY_WINDOW")
+        require(len(witnessed) == 1, "missing one Supervisor file copy-window witness")
+        reads, writes, closed = witnessed[0]
+        require(reads > 0 and writes > 0 and closed == 1, "invalid file copy-window close counts")
+        counts["file_copy_window"] = (reads, writes)
+    page = 4096
+    root_index = 258
+
+    def read_table(label, address):
+        require(address % page == 0, "unaligned copy table")
+        path = output / ("copy-" + label + ".bin")
+        qmp.execute("pmemsave", {"val": address, "size": page, "filename": str(path)})
+        raw = path.read_bytes()
+        require(len(raw) == page, "incomplete copy table readback")
+        return struct.unpack("<512Q", raw)
+
+    cpu0 = symbol(elf, "high_l1")["pa"]
+    secondary = symbol(elf, "__copy_secondary_l1")["pa"]
+    mid = symbol(elf, "__copy_window_l2")["pa"]
+    leaf = window["pa"]
+    require(len({cpu0, secondary, mid, leaf}) == 4, "copy table pages alias")
+    primary = read_table("primary-l1", cpu0)
+    common = read_table("secondary-l1", secondary)
+    require(primary[root_index] == (mid | 3) and common[root_index] == 0,
+            "copy L2 is not exclusive to the CPU0 root")
+    require(primary[:root_index] == common[:root_index]
+            and primary[root_index + 1:] == common[root_index + 1:],
+            "secondary root differs outside the copy slot")
+    branch = read_table("l2", mid)
+    require(branch[0] == (leaf | 3) and not any(branch[1:]), "copy window has multiple branches")
+    require(not any(read_table("l3", leaf)), "temporary copy translation remained valid")
+    readback = {
+        "cpu0_root_pa": hex(cpu0), "secondary_root_pa": hex(secondary),
+        "copy_l2_pa": hex(mid), "copy_l3_pa": hex(leaf),
+        "copy_leaf_invalid": True, "secondary_copy_branch_absent": True,
+    }
+    return {
+        scope: dict(readback, read_only_fragments_closed=reads, writable_fragments_closed=writes)
+        for scope, (reads, writes) in counts.items()
     }
 
 
@@ -869,6 +929,13 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                     report["observations"] = acceptance.validate(
                         bytes(decoded), page, len(actual_cpus), pending_fsync_blocks=pending_fsync_blocks,
                         expected_fsync_epoch=expected_fsync_epoch)
+                    if modes.snapshot_catalog or modes.file_read or modes.fsync_scratch:
+                        report.update(supervisor_copy_windows(
+                            elf.read_bytes(), qmp, output, decoded.decode("ascii").splitlines(),
+                            snapshot_lists=(report["observations"]["snapshot_catalog_lists"]
+                                            if modes.snapshot_catalog else None),
+                            file_copy=modes.file_read or modes.fsync_scratch,
+                        ))
                     relay_bytes = report["observations"]["echo_bytes_relayed"]
                     if modes.authenticated_net:
                         require(peer is not None, "missing authenticated host peer")

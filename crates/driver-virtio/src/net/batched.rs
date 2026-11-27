@@ -2,7 +2,10 @@
 use super::{BUFFER, HEADER, MAX_FRAME, Net};
 use crate::{
     DiagnosticStage as Stage, Error, Platform, Transport,
-    queue::{BatchMemory, BatchQueue, NotifyFeedback, NotifyRequest, NotifyStats, Token},
+    queue::{
+        BatchMemory, BatchQueue, MAX_CHAINS, NotifyFeedback, NotifyRequest, NotifyStats,
+        RetainedChain, Token,
+    },
     reset::{DeviceState, ResetProof},
 };
 /// Exactly one device-verified TX used-ring completion retained by the
@@ -158,6 +161,12 @@ impl BatchedNet {
             .map(|observed| {
                 [0, 1].map(|id| ResetProof::for_first_generation(boot_epoch, 1, id, observed))
             })
+    }
+    /// Return RX and TX custody in queue-ID order after the terminal reset
+    /// attempt. A published chain has no verified completion at this point.
+    pub fn stopped_chains(&self) -> Option<[[Option<RetainedChain>; MAX_CHAINS]; 2]> {
+        (self.state == DeviceState::ResetAttempted)
+            .then(|| [self.rx.retained_chains(), self.tx.retained_chains()])
     }
     /// Conservative device TX settle witness, only after every used-ring
     /// completion was validated and every matching token acknowledged.

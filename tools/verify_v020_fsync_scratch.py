@@ -18,6 +18,7 @@ from v020_production_modes import Modes, rows
 from v020_production_qemu import create_scratch
 
 BLOCK = 4096
+BITMAP = 4098
 BOOT = 4118
 RECEIPT = 4119
 INDEX = RECEIPT + 6
@@ -29,6 +30,7 @@ DATA = 4270
 RECEIPT_AT = 21 * 192
 REQUEST_ID = 0x0100_0000_0000_0001
 FINAL_LSN = 21
+GROWTH_FINAL_LSN = 23
 LEGACY_FINAL_LSN = 19
 BOUND_LSN = 14
 FIRST = 2
@@ -75,12 +77,20 @@ def index_page(issued):
 
 
 def inode_page(done, size=29, write_seq=7):
-    file = bytearray(inode(1, 1, size if done else 29, DATA, 1))
+    pages = (size + BLOCK - 1) // BLOCK if done else 1
+    file = bytearray(inode(1, 1, size if done else 29, DATA, pages))
     if done:
         put(file, 24, 'Q', write_seq)
         put(file, 252, 'I', 0)
         put(file, 252, 'I', crc(file))
     return inode(2, 1, 128, ROOT, 1) + bytes(file) + inode() * 14
+
+
+def allocation_bitmap(file_pages):
+    bitmap = bytearray(4 * BLOCK)
+    for block in [*range(SECURITY + 1), ROOT, *range(DATA, DATA + file_pages)]:
+        bitmap[block // 8] |= 1 << (block % 8)
+    return bytes(bitmap)
 
 
 def operation_digest(contents=FINAL, size=29, write_seq=7):
@@ -150,9 +160,12 @@ def boot_one_log(final_lsn=FINAL_LSN, contents=FINAL, size=29, write_seq=7):
     ))
     if final_lsn == BOUND_LSN:
         return bound
-    return bound + tx(4, 1, 14 if legacy else 15, [(DATA, contents)]
+    data = [(DATA + offset // BLOCK, contents[offset:offset + BLOCK])
+            for offset in range(0, len(contents), BLOCK)]
+    bitmap = [(BITMAP, allocation_bitmap(2)[:BLOCK])] if final_lsn == GROWTH_FINAL_LSN else []
+    return bound + tx(4, 1, 14 if legacy else 15, data
                       + receipt_blocks(3, final_lsn, contents, size, write_seq)
-                      + segment_index + [(INODE, inode_page(True, size, write_seq))])
+                      + segment_index + bitmap + [(INODE, inode_page(True, size, write_seq))])
 
 
 def read(disk, block, size=BLOCK):
@@ -168,10 +181,13 @@ def checkpoint_lsn(epoch, final_lsn):
 
 def verify_disk(path, reopened, final_lsn=FINAL_LSN, *, contents=FINAL, size=29, write_seq=7,
                 boot_epoch=None):
-    require(final_lsn in (FINAL_LSN, LEGACY_FINAL_LSN, BOUND_LSN), "unrecognized FSYNC redo closure")
-    require(29 <= size <= BLOCK and len(contents) == BLOCK and not any(contents[size:])
-            and write_seq > 0 and (final_lsn != LEGACY_FINAL_LSN or (size, write_seq) == (29, 7)),
-            "expected caller content must fit one allocated file block")
+    require(final_lsn in (GROWTH_FINAL_LSN, FINAL_LSN, LEGACY_FINAL_LSN, BOUND_LSN),
+            "unrecognized FSYNC redo closure")
+    pages = (size + BLOCK - 1) // BLOCK
+    require(29 <= size <= 2 * BLOCK and len(contents) == pages * BLOCK and not any(contents[size:])
+            and write_seq > 0 and (final_lsn != LEGACY_FINAL_LSN or (size, write_seq) == (29, 7))
+            and (final_lsn == BOUND_LSN or (final_lsn == GROWTH_FINAL_LSN) == (pages == 2)),
+            "expected caller content does not match the selected FSYNC closure")
     epoch = boot_epoch if boot_epoch is not None else 1 + reopened
     require(epoch >= 1 and reopened == (epoch > 1), "invalid FSYNC checkpoint epoch")
     expected = (boot_tx(epoch, checkpoint_lsn(epoch, final_lsn) + 1) if reopened else
@@ -191,8 +207,11 @@ def verify_disk(path, reopened, final_lsn=FINAL_LSN, *, contents=FINAL, size=29,
                 and read(disk, SECURITY) == security_home(epoch - 1),
                 "FSYNC BootEpoch or signed policy homes differ")
         require(read(disk, INODE) == inode_page(done, size, write_seq)
-                and read(disk, DATA) == (contents if done else INITIAL),
+                and read(disk, DATA, len(contents) if done else BLOCK) == (contents if done else INITIAL),
                 "FSYNC inode size, write sequence or visible data differs")
+        require(read(disk, BITMAP, 4 * BLOCK) == allocation_bitmap(pages if done else 1)
+                and (done and pages == 2 or read(disk, DATA + 1) == ZERO),
+                "FSYNC new data block and allocation bitmap differ")
         require(read(disk, RECEIPT, 6 * BLOCK)
                 == receipts(status, final_lsn, contents, size, write_seq)
                 and read(disk, INDEX) == index_page(reopened),
@@ -207,14 +226,15 @@ def verify_disk(path, reopened, final_lsn=FINAL_LSN, *, contents=FINAL, size=29,
 def run_healthy_boots(fresh, reopen, output, timeout, qmp_stdio, boot_count, content=FINAL[:29],
                       *, bound_only=False):
     """Run repeated independent QEMU boots on the same healthy signed volume."""
-    require(boot_count >= 2 and 29 <= len(content) <= BLOCK, "invalid FSYNC healthy boot fixture")
+    require(boot_count >= 2 and 29 <= len(content) <= 2 * BLOCK, "invalid FSYNC healthy boot fixture")
     output.mkdir(parents=True, exist_ok=False)
     fresh_modes = Modes(authenticated_net=True, fsync_scratch=True, fsync_bound=bound_only)
     reopen_modes = replace(fresh_modes, media_reopen=True)
     size = len(content)
-    padded = content.ljust(BLOCK, b"\0")
+    pages = (size + BLOCK - 1) // BLOCK
+    padded = content.ljust(pages * BLOCK, b"\0")
     write_seq = max(7, (size + 83) // 84)
-    receipt_lsn = BOUND_LSN if bound_only else FINAL_LSN
+    receipt_lsn = BOUND_LSN if bound_only else (GROWTH_FINAL_LSN if pages == 2 else FINAL_LSN)
     retained_digest = sha256(receipts(2 if bound_only else 3, receipt_lsn, padded, size, write_seq)
                              + index_page(True)).hexdigest()
     boots = []
@@ -272,7 +292,8 @@ def run_healthy_boots(fresh, reopen, output, timeout, qmp_stdio, boot_count, con
                        "later_query_status": "UNKNOWN", "later_query_errno": -6})
     else:
         report.update({"file_bytes": size, "file_write_seq": write_seq,
-                       "file_commit_lsn": receipt_lsn, "file_sha256": sha256(content).hexdigest()})
+                       "file_commit_lsn": receipt_lsn, "file_sha256": sha256(content).hexdigest(),
+                       "physical_data_blocks": list(range(DATA, DATA + pages))})
     (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 

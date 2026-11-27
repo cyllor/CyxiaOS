@@ -33,27 +33,26 @@ fn digest(path: &Path) -> [u8; 32] {
 fn build_fsync_client_fixture(out: &Path) {
     const DEFAULT: &[u8; 29] = b"CyxiaOS V0.20 durable fsync!\n";
     const BLOCK_BYTES: usize = 4096;
+    const MAX_BYTES: usize = 2 * BLOCK_BYTES;
     const TEST_INPUT: &str = "CYXIA_FSYNC_TEST_CONTENT";
     println!("cargo:rerun-if-env-changed={TEST_INPUT}");
     let contents = if let Some(path) = env::var_os(TEST_INPUT) {
         let path = PathBuf::from(path);
         println!("cargo:rerun-if-changed={}", path.display());
         let meta = fs::metadata(&path).expect("FSYNC client fixture metadata");
-        assert!(
-            meta.is_file() && (DEFAULT.len() as u64..=BLOCK_BYTES as u64).contains(&meta.len())
-        );
+        assert!(meta.is_file() && (DEFAULT.len() as u64..=MAX_BYTES as u64).contains(&meta.len()));
         fs::read(path).expect("FSYNC client fixture input")
     } else {
         DEFAULT.to_vec()
     };
     assert!(
-        (DEFAULT.len()..=BLOCK_BYTES).contains(&contents.len()),
+        (DEFAULT.len()..=MAX_BYTES).contains(&contents.len()),
         "FSYNC client file length"
     );
-    let mut page = [0; BLOCK_BYTES];
-    page[..contents.len()].copy_from_slice(&contents);
+    let mut pages = contents.clone();
+    pages.resize(contents.len().div_ceil(BLOCK_BYTES) * BLOCK_BYTES, 0);
     let padded = out.join("fsync-client-page.bin");
-    fs::write(&padded, page).unwrap();
+    fs::write(&padded, pages).unwrap();
     fs::write(out.join("fsync-client-content.bin"), contents).unwrap();
     fs::write(out.join("fsync-client-digest.bin"), digest(&padded)).unwrap();
 }

@@ -5,7 +5,12 @@ use super::{Sample, WINDOW_NS};
 use core::sync::atomic::{AtomicU64, Ordering};
 use cyxia_kernel_core::control_plane::role_budget_v0199::{Class, Cpu0BudgetLedger, Turn};
 
-const CAPACITY: usize = 1024;
+const CAPACITY: usize = if cfg!(cyxia_startup_catalog) {
+    4096
+} else {
+    1024
+};
+const VERSION: u64 = if cfg!(cyxia_startup_catalog) { 2 } else { 1 };
 const MAGIC: u64 = 0x4359_5832_5342_5544;
 const HEADER_WORDS: usize = 20;
 const ROW_WORDS: usize = 8;
@@ -61,6 +66,20 @@ impl Trace {
             opening_recovery,
             sealed: false,
         }
+    }
+
+    #[cfg(cyxia_startup_catalog)]
+    pub(super) fn begin_media(&self) {
+        // Version 2 begins at early startup. These two fields instead index
+        // the contiguous span that owns exclusive use of the boot disk.
+        V020_SIGNED_CPU_BUDGET_TRACE.header[7].store(self.next as u64, Ordering::Relaxed);
+    }
+
+    #[cfg(cyxia_startup_catalog)]
+    pub(super) fn finish_media(&self, boot_epoch: u64) {
+        let header = &V020_SIGNED_CPU_BUDGET_TRACE.header;
+        header[6].store(boot_epoch, Ordering::Relaxed);
+        header[8].store(self.next as u64, Ordering::Relaxed);
     }
 
     pub(super) fn record(&mut self, end: Sample, grant: Option<Turn>, returned: u64) {
@@ -136,7 +155,7 @@ impl Trace {
             cell.store(debit, Ordering::Relaxed);
         }
         header[0].store(MAGIC, Ordering::Relaxed);
-        header[1].store(1, Ordering::Relaxed);
+        header[1].store(VERSION, Ordering::Relaxed);
         header[2].store(self.next as u64, Ordering::Release);
         self.sealed = true;
     }

@@ -1,4 +1,4 @@
-//! Host-side D7 candidate for the 15-block populated slot. The mount still
+//! D7 candidate for the 15-block populated slot. The production mount still
 //! accepts only the empty D1.5 envelope and zero continuation blocks.
 
 use sha2::{Digest, Sha256};

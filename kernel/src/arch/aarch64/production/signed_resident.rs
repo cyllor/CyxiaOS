@@ -5,8 +5,9 @@
 //! the disk's boot/security pair is confirmed. No service capability is
 //! installed and protected calls never reach the legacy diagnostic bridge.
 //! The locked per-vCPU QEMU PMU provides CPU debits, while the physical
-//! timer enforces separate wall deadlines. After the durable media handoff,
-//! one continuous CPU0 cursor covers both prepaid turns and EL1 coordination.
+//! timer enforces separate wall deadlines. The default catalog path keeps
+//! one continuous CPU0 cursor from early boot through the durable media
+//! handoff and the resident roles.
 
 use super::{
     BootInfo, E_AUTH, Error, ExceptionFrame, IRQS, Identity, NativeRole, NativeRoleManifest,
@@ -42,6 +43,8 @@ const RECOVERY_NS: u64 = CLASS_LIMITS[Class::Recovery as usize];
 const CONSOLE_TURN_NS: u64 = 1_000_000;
 const CONSOLE_RETRY_NS: u64 = 1_000_000;
 const MAX_WALL_NS: u64 = 50_000_000;
+#[cfg(cyxia_startup_catalog)]
+const MEDIA_OPERATION_MARGIN_NS: u64 = 2_000_000;
 const FATAL_ROLE_CONTEXT: u64 = 0x5731_1340;
 const NO_MEDIA: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=signed_media_unavailable command=status\n";
@@ -177,6 +180,29 @@ struct Budget {
 }
 
 impl Budget {
+    #[cfg(cyxia_startup_catalog)]
+    fn begin_boot(&mut self) -> Result<(Sample, Turn), Error> {
+        let cursor = Sample::now()?;
+        self.ledger
+            .start_continuous(cpu::slot(), cursor.wall, || Ok(()))?;
+        let grant = self.ledger.reserve_kernel_with_wall(
+            cpu::slot(),
+            Class::Recovery,
+            RECOVERY_NS,
+            MAX_WALL_NS,
+            cursor.wall,
+        )?;
+        self.continuous = Some(Continuous {
+            cursor,
+            initial_tick: cursor.cpu_tick,
+            initial_spent: 0,
+            idle_ns: 0,
+            trace: budget_trace::Trace::new(cursor, 0, 0, 0),
+        });
+        Ok((cursor, grant))
+    }
+
+    #[cfg(not(cyxia_startup_catalog))]
     fn begin_continuous(&mut self, boot_epoch: u64) -> Result<(), Error> {
         let cursor = Sample::now()?;
         let initial_spent = self.ledger.lifetime_total()?;
@@ -191,6 +217,28 @@ impl Budget {
             trace: budget_trace::Trace::new(cursor, boot_epoch, opening_window, initial_spent),
         });
         Ok(())
+    }
+
+    fn reserve_recovery(&mut self) -> Result<(Sample, Turn), Fault> {
+        loop {
+            let start = self.sample_gap()?;
+            let next = next_boundary(start.wall)?;
+            if next - start.wall < MAX_WALL_NS {
+                self.idle_until(next)?;
+                continue;
+            }
+            match self.ledger.reserve_kernel_with_wall(
+                cpu::slot(),
+                Class::Recovery,
+                RECOVERY_NS,
+                MAX_WALL_NS,
+                start.wall,
+            ) {
+                Ok(grant) => return Ok((start, grant)),
+                Err(Error::Exhausted) => self.idle_until(next)?,
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     fn sample_gap(&mut self) -> Result<Sample, Fault> {
@@ -274,6 +322,74 @@ impl Budget {
     }
 }
 
+/// Prepay bounded media batches before issuing transport operations. The
+/// active slice also pays for the filesystem work between I/O boundaries.
+#[cfg(cyxia_startup_catalog)]
+struct MediaBudget<'a> {
+    budget: &'a mut Budget,
+    active: Option<(Sample, Turn)>,
+    fault: Option<Fault>,
+    batches: u64,
+    charged: u64,
+}
+
+#[cfg(cyxia_startup_catalog)]
+impl MediaBudget<'_> {
+    fn settle_batch(&mut self) -> Result<(), Fault> {
+        if let Some((start, grant)) = self.active.take() {
+            let used = self.budget.settle(grant, start, 0)?;
+            self.batches += 1;
+            self.charged = self.charged.checked_add(used).ok_or(Error::Exhausted)?;
+        }
+        Ok(())
+    }
+
+    fn next_operation(&mut self) -> Result<(), Fault> {
+        if let Some((start, grant)) = self.active {
+            let elapsed = timer::cpu_ticks()
+                .checked_sub(start.cpu_tick)
+                .map(timer::cpu_ns)
+                .ok_or(Error::Clock)?;
+            if elapsed < grant.reserved_ns() - MEDIA_OPERATION_MARGIN_NS
+                && now_ns().saturating_add(MEDIA_OPERATION_MARGIN_NS) < grant.deadline_ns()
+            {
+                return Ok(());
+            }
+            self.settle_batch()?;
+        }
+        self.active = Some(self.budget.reserve_recovery()?);
+        Ok(())
+    }
+
+    fn checkpoint(&mut self) -> Result<(), SvcError> {
+        if self.fault.is_some() {
+            return Err(SvcError::Unknown);
+        }
+        self.next_operation().map_err(|fault| {
+            self.fault = Some(fault);
+            SvcError::Unknown
+        })
+    }
+
+    fn finish(mut self, confirmed_epoch: u64) -> Result<(), Fault> {
+        self.settle_batch()?;
+        if let Some(fault) = self.fault {
+            return Err(fault);
+        }
+        if confirmed_epoch != 0 {
+            let continuous = self.budget.continuous.as_mut().ok_or(Error::NotReady)?;
+            continuous.trace.finish_media(confirmed_epoch);
+            report(
+                "V020_SIGNED_MEDIA_BUDGET",
+                self.batches,
+                self.charged,
+                RECOVERY_NS,
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Task {
     fn trap(&mut self) -> Result<TaskAction, Error> {
         let ctx = &mut self.context;
@@ -329,25 +445,7 @@ fn reservation(role: Role) -> (Class, u16, u64) {
 }
 
 fn startup_work<T>(budget: &mut Budget, step: u64, work: impl FnOnce() -> T) -> Result<T, Fault> {
-    let (start, grant) = loop {
-        let start = budget.sample_gap()?;
-        let next = next_boundary(start.wall)?;
-        if WINDOW_NS - start.wall % WINDOW_NS < MAX_WALL_NS {
-            budget.idle_until(next)?;
-            continue;
-        }
-        match budget.ledger.reserve_kernel_with_wall(
-            0,
-            Class::Recovery,
-            RECOVERY_NS,
-            MAX_WALL_NS,
-            start.wall,
-        ) {
-            Ok(grant) => break (start, grant),
-            Err(Error::Exhausted) => budget.idle_until(next)?,
-            Err(error) => return Err(error.into()),
-        }
-    };
+    let (start, grant) = budget.reserve_recovery()?;
     let result = work();
     let used = budget.settle(grant, start, 0)?;
     if used == 0 {
@@ -665,43 +763,86 @@ fn fence(info: &BootInfo, budget: Budget, pending: OutputQueue<128>, fault: Faul
     )
 }
 
+fn degraded(info: &BootInfo, budget: Budget, reason: Option<&'static [u8]>) -> ! {
+    resident::serve_with_queue(
+        info,
+        reason,
+        budget.ledger,
+        OutputQueue::new(),
+        None,
+        budget.continuous.map(|continuous| continuous.cursor),
+    )
+}
+
 pub(super) fn run(info: &BootInfo) -> ! {
     assert_eq!(cpu::slot(), 0);
     // SAFETY: this opt-in diagnostic requires the pinned MTTCG PMU backend.
     // CPU0 owns its counter from EL1 and the verifier checks the host hashes.
     unsafe { timer::init_cpu_accounting() };
+    let mut budget = Budget {
+        ledger: Cpu0BudgetLedger::new(),
+        continuous: None,
+    };
+    #[cfg(cyxia_startup_catalog)]
+    let (early_start, early_grant) = budget.begin_boot().expect("early Recovery budget");
     frames::register_or_fatal();
     bring_up_production(info);
     gic()
         .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
         .expect("CPU0 timer PPI");
-    let mut budget = Budget {
-        ledger: Cpu0BudgetLedger::new(),
-        continuous: None,
-    };
+    #[cfg(cyxia_startup_catalog)]
+    match budget.settle(early_grant, early_start, 0) {
+        Ok(used) => report("V020_SIGNED_RESIDENT_RECOVERY", 0, used, RECOVERY_NS),
+        Err(fault) => fence(info, budget, OutputQueue::new(), fault),
+    }
     let config = match startup_work(&mut budget, 1, media_staging::verify_scratch_config) {
         Ok(Ok(config)) => config,
         // A valid catalog for a different policy can still be inspected by
         // the read-only diagnostics. It cannot reach the SIM mount or EL0.
         #[cfg(cyxia_startup_catalog)]
-        Ok(Err(_)) => resident::serve(info, None, budget.ledger),
+        Ok(Err(_)) => degraded(info, budget, None),
         #[cfg(not(cyxia_startup_catalog))]
-        Ok(Err(_)) => resident::serve(info, Some(FENCED), budget.ledger),
+        Ok(Err(_)) => degraded(info, budget, Some(FENCED)),
         Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     };
-    // This existing scratch formatter and paired BootEpoch transport owns
-    // its per-request I/O deadlines. It is a pre-admission diagnostic, with
-    // no role or service grant outstanding.
+    #[cfg(cyxia_startup_catalog)]
+    let mut staged = {
+        budget
+            .continuous
+            .as_mut()
+            .expect("active boot meter")
+            .trace
+            .begin_media();
+        let mut media = MediaBudget {
+            budget: &mut budget,
+            active: None,
+            fault: None,
+            batches: 0,
+            charged: 0,
+        };
+        let staged =
+            media_staging::stage_with_policy(info, Some(config), &mut || media.checkpoint());
+        let confirmed_epoch = staged
+            .resident_boot
+            .as_ref()
+            .map_or(0, |_| staged.confirmed_epoch);
+        if let Err(fault) = media.finish(confirmed_epoch) {
+            fence(info, budget, OutputQueue::new(), fault);
+        }
+        staged
+    };
+    #[cfg(not(cyxia_startup_catalog))]
     let mut staged = media_staging::stage_with_policy(info, Some(config));
     let Some(boot) = staged.resident_boot.take() else {
-        resident::serve(info, Some(NO_MEDIA), budget.ledger);
+        degraded(info, budget, Some(NO_MEDIA));
     };
     let Ok(policy) = boot.policy() else {
-        resident::serve(info, Some(FENCED), budget.ledger);
+        degraded(info, budget, Some(FENCED));
     };
     if policy.boot_epoch() != staged.confirmed_epoch {
-        resident::serve(info, Some(FENCED), budget.ledger);
+        degraded(info, budget, Some(FENCED));
     }
+    #[cfg(not(cyxia_startup_catalog))]
     if let Err(error) = budget.begin_continuous(policy.boot_epoch()) {
         fence(info, budget, OutputQueue::new(), error.into());
     }

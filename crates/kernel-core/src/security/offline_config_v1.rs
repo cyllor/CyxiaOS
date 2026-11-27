@@ -358,6 +358,54 @@ mod tests {
         assert_eq!(v.check_committed(&state), Err(Error::Busy));
     }
     #[test]
+    fn tls_boot_requires_the_committed_key_catalog_and_both_installed_generations() {
+        use super::super::network::TlsInstallation;
+
+        let (wire, catalog) = fixture();
+        let config = parsed(&wire, catalog).unwrap();
+        let mut state = SecurityStateStoreV2 {
+            fs_uuid: config.header().fs_uuid,
+            state_generation: 1,
+            rule_min_generation: catalog.rule_generation,
+            security_min_generation: catalog.security_generation,
+            key_generation: catalog.key_generation,
+            isolated_service_bitmap: 0,
+            last_boot_epoch: 4,
+            offline_config_generation: config.header().generation,
+            offline_config_hash: config.digest(),
+            service_generations: [1; 16],
+        };
+        let mut installed = TlsInstallation {
+            verifier_generation: 1,
+            signer_generation: 1,
+            key_generation: catalog.key_generation,
+            key_manifest_hash: catalog.key_manifest_hash,
+        };
+        assert_eq!(installed.authorize(&config, &state), Ok(4));
+        installed.key_manifest_hash = [3; 32];
+        assert_eq!(
+            installed.authorize(&config, &state),
+            Err(Error::Unauthorized)
+        );
+        installed.key_manifest_hash = catalog.key_manifest_hash;
+        installed.key_generation -= 1;
+        assert_eq!(installed.authorize(&config, &state), Err(Error::Stale));
+        installed.key_generation = catalog.key_generation;
+        for slot in [12, 13] {
+            state.service_generations[slot] += 1;
+            assert_eq!(installed.authorize(&config, &state), Err(Error::Stale));
+            state.service_generations[slot] -= 1;
+            state.isolated_service_bitmap = 1 << slot;
+            assert_eq!(
+                installed.authorize(&config, &state),
+                Err(Error::Unauthorized)
+            );
+            state.isolated_service_bitmap = 0;
+        }
+        state.offline_config_hash = [9; 32];
+        assert_eq!(installed.authorize(&config, &state), Err(Error::Conflict));
+    }
+    #[test]
     fn real_ed25519_signature_binds_exact_config_and_domain_label() {
         use ed25519_dalek::{Signer, SigningKey};
         let (mut b, c) = fixture();

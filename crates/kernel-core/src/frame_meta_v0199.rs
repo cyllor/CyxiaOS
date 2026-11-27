@@ -413,6 +413,33 @@ impl<'a> Ledger<'a> {
         l.inventory()?;
         Ok(l)
     }
+
+    /// Check that a byte span fits one registered static region of the
+    /// required class and that every touched row is permanently pinned.
+    /// A gap row is permanent too, but it conveys no backing authority.
+    pub fn statically_pinned(&self, span: core::ops::Range<u64>, class: StaticClass) -> bool {
+        if !self.static_mode || span.start >= span.end || span.start < self.base {
+            return false;
+        }
+        if !self.fixed[..self.fixed_count]
+            .iter()
+            .zip(&self.classes)
+            .any(|(region, registered)| {
+                *registered == class
+                    && region.start.0 <= span.start
+                    && region.end().is_ok_and(|end| span.end <= end)
+            })
+        {
+            return false;
+        }
+        let first = ((span.start - self.base) / PAGE) as usize;
+        let last = ((span.end - 1 - self.base) / PAGE) as usize;
+        self.rows.get(first..=last).is_some_and(|rows| {
+            rows.iter()
+                .all(|row| *row == FrameMeta::unowned(PERMANENT, 0))
+        })
+    }
+
     /// Bounded pool-accounting initialization: mirror a historical
     /// [`crate::frames::FramePool`] geometry into a FrameMeta table so pool
     /// transitions can be recorded through [`PoolBridge`]. RAM pages the
@@ -1281,7 +1308,8 @@ mod tests {
     fn sparse_gaps_are_permanent_but_unregistered() {
         // Window 12 rows; registered 2+1+3+2 = 8; gaps rows 2, 4..6, 9 = 4.
         let mut rows = std::vec![FrameMeta::ZERO;12];
-        let l = Ledger::initialize_static_sparse(&mut rows, 0x40000000, &sparse_shape()).unwrap();
+        let base = 0x40000000;
+        let l = Ledger::initialize_static_sparse(&mut rows, base, &sparse_shape()).unwrap();
         let inv = l.inventory().unwrap();
         assert_eq!(inv.permanent, 12);
         assert_eq!(inv.free, 0);
@@ -1290,6 +1318,10 @@ mod tests {
         assert_eq!(inv.arena + inv.firmware_extra + inv.progress, 0);
         let registered = inv.arena + inv.firmware_extra + inv.metadata + inv.control + inv.progress;
         assert_eq!(registered, 8);
+        assert!(l.statically_pinned(base + P - 1..base + P + 1, StaticClass::Control));
+        assert!(!l.statically_pinned(base + 2 * P - 1..base + 2 * P + 1, StaticClass::Control));
+        assert!(!l.statically_pinned(base + 6 * P..base + 6 * P + 1, StaticClass::Control));
+        assert!(!l.statically_pinned(base..base, StaticClass::Control));
         drop(l);
         // Every row, gap or registered, is unowned PERMANENT.
         assert!(rows.iter().all(|r| *r == FrameMeta::unowned(PERMANENT, 0)));

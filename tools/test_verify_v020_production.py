@@ -95,6 +95,8 @@ def w11_lines(staging: bool = False) -> list:
         proof = struct.pack("<IHHQIHHQQQIIQ", 0x43595250, 1, 64, 1, 1,
                             queue, 0, 1, 1, 1, 0, 0, 5_000_000)
         lines.append("V020_SEC_D_NET_RESET_PROOF " + proof.hex())
+    lines += ["V020_SEC_D_NET_RESET_CUSTODY a=1 b=1 c=0",
+              "V020_SEC_D_NET_RESET_CHAIN_PUBLISHED a=0 b=0 c=1"]
     if staging:
         listen = lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0")
         lines[listen:listen] = [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
@@ -121,6 +123,18 @@ def volatile_write_fixture(epoch: int) -> tuple[list, list]:
              "V020_W21_WRITE_READBACK a=2 b=2 c=1",
              "V020_W21_WRITE_CHECKS a=9 b=15 c=0"]
     return words, lines
+
+
+class CopyWindowEvidence(unittest.TestCase):
+    def test_snapshot_requires_linked_window(self):
+        with patch.object(v, "symbol", side_effect=ValueError("missing symbol __copy_window_l3")):
+            with self.assertRaisesRegex(ValueError, "missing symbol __copy_window_l3"):
+                v.supervisor_copy_windows(b"", None, None, [], snapshot_lists=2)
+
+    def test_file_path_requires_window_witness(self):
+        with patch.object(v, "symbol", return_value={"pa": 4096}):
+            with self.assertRaisesRegex(ValueError, "missing one Supervisor file copy-window witness"):
+                v.supervisor_copy_windows(b"", None, None, [], file_copy=True)
 
 
 class W11Validation(unittest.TestCase):
@@ -228,6 +242,17 @@ class W11Validation(unittest.TestCase):
         self.rejects("reset proof is incomplete", lines=lines[:transmit] + lines[transmit + 1:])
         lines[transmit] = lines[receive]
         self.rejects("wrong generation or readback", lines=lines)
+
+    def test_native_net_requires_terminal_chain_custody_after_reset(self):
+        lines = w11_lines()
+        self.assertEqual(
+            self.check(lines=lines)["native_net_retained_chains"],
+            [{"queue_id": 0, "slot": 0, "generation": 1, "state": "published"}],
+        )
+        row = "V020_SEC_D_NET_RESET_CHAIN_PUBLISHED a=0 b=0 c=1"
+        self.rejects("retained chain counts", lines=[line for line in lines if line != row])
+        at = lines.index(row)
+        self.rejects("retained chain identity", lines=lines[:at] + [row] + lines[at:])
 
     def test_requires_policy_lock_accounting_consistent(self):
         for at, value in ((135, 0), (137, 3), (136, 1)):
@@ -584,6 +609,8 @@ class W11Validation(unittest.TestCase):
                 encoded = bytearray.fromhex(line.removeprefix(prefix))
                 struct.pack_into("<Q", encoded, 8, 2)
                 lines[index] = prefix + encoded.hex()
+            elif line.startswith("V020_SEC_D_NET_RESET_CUSTODY "):
+                lines[index] = "V020_SEC_D_NET_RESET_CUSTODY a=2 b=1 c=0"
         self.assertEqual(self.check(words=words, lines=lines, staging=True, modes=modes)
                          ["native_net_reset_boot_epoch"], 2)
         listen = "V020_W11_NET_LISTEN a=7 b=0 c=0"
@@ -810,19 +837,23 @@ class W11Validation(unittest.TestCase):
                 (29, 7, fsync.LEGACY_FINAL_LSN, fsync.FINAL, 24),
                 (29, 7, fsync.FINAL_LSN, fsync.FINAL, 28),
                 (fsync.BLOCK, 49, fsync.FINAL_LSN, b"x" * fsync.BLOCK, 29),
+                (fsync.BLOCK + 1, 49, fsync.GROWTH_FINAL_LSN,
+                 (b"x" * (fsync.BLOCK + 1)).ljust(2 * fsync.BLOCK, b"\0"), 31),
             ):
                 with self.subTest(size=size, lsn=lsn):
                     log = fsync.boot_one_log(lsn, contents, size, seq)
                     with disk.open("wb") as image:
                         image.seek(fsync.FIRST * fsync.BLOCK)
-                        image.write(log.ljust(34 * fsync.BLOCK, b"\0"))
+                        span = (media.FSYNC_LOG_END - fsync.FIRST) * fsync.BLOCK
+                        image.write(log.ljust(span, b"\0"))
                     pending = media.count_fsync_retirement_blocks(disk)
                     self.assertEqual(pending, retired)
                     recovered = lines + [f"V020_FSYNC_RECOVERED a=2 b={lsn} c={seq}"]
-                    io = f"V020_W11_MEDIA_IO a=20950 b={14 + retired} c=5"
+                    writes = 14 + retired + 2 * (lsn == fsync.GROWTH_FINAL_LSN)
+                    io = f"V020_W11_MEDIA_IO a=20950 b={writes} c=5"
                     v.check_w11_staging(tuple(words), recovered + [io], b"", True, 3, modes,
                                         pending_fsync_blocks=pending)
-                    off_by_one = f"V020_W11_MEDIA_IO a=20950 b={13 + retired} c=5"
+                    off_by_one = f"V020_W11_MEDIA_IO a=20950 b={writes - 1} c=5"
                     with self.assertRaisesRegex(ValueError, "writes and flushes"):
                         v.check_w11_staging(tuple(words), recovered + [off_by_one], b"", True,
                                             3, modes, pending_fsync_blocks=pending)

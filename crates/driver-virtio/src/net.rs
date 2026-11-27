@@ -571,7 +571,24 @@ mod tests {
         .unwrap();
         net.send(&[0; 14], &h).unwrap();
         let owned = net.notify_stats().inflight;
+        assert!(net.stopped_chains().is_none());
         let proofs = net.stop_native(19, &h).unwrap();
+        let custody = net.stopped_chains().unwrap();
+        assert_eq!(
+            custody.iter().flatten().flatten().count(),
+            usize::from(owned)
+        );
+        for (slot, chain) in custody[0].iter().flatten().enumerate() {
+            assert_eq!(
+                chain.token,
+                crate::queue::Token {
+                    slot: slot as u8,
+                    generation: 1
+                }
+            );
+            assert_eq!(chain.state, crate::queue::RetainedState::Published);
+        }
+        assert_eq!(custody[1][0].unwrap().token.generation, 1);
         assert_eq!(*h.ready.borrow(), [0, 0]);
         assert_eq!(h.mmio.get32(0x70), 0);
         for (index, proof) in proofs.iter().enumerate() {
@@ -588,6 +605,7 @@ mod tests {
         assert_eq!(net.stop_native(20, &h), Err(Error::Busy));
         assert_eq!(net.send(&[0; 14], &h), Err(Error::Device));
         assert_eq!(net.notify_stats().inflight, owned);
+        assert_eq!(net.stopped_chains(), Some(custody));
         assert!(!net.tx_quiescent());
     }
 

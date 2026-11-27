@@ -25,14 +25,14 @@ use cyxia_kernel_core::security::{
         BITMAP_START, FileReceiptV4, INODE_START, RECEIPT_BYTES, SuperblockV1, crc32c_zeroed,
     },
     file_mount_v1::MountEvidence,
-    file_read_v4::StagedFile,
+    file_read_v4::{FSYNC_SCRATCH_MAX_BYTES, StagedFile},
     file_receipt_query_v4::{
         MountedReceiptQuery, RECEIPT_KEY_BYTES, ReceiptKey, ReceiptQueryCaller,
         encode_receipt_reply,
     },
     file_receipt_store_v0199::RECEIPT_STORE_BYTES,
     file_service_v4::{REPLY_HEADER, REQUEST_HEADER, REQUEST_MAGIC, REQUEST_VERSION, Request},
-    file_structure_v1::{INODE_BYTES, Inode},
+    file_structure_v1::{Extent, INODE_BYTES, Inode},
     offline_config_v1::VerifiedOfflineConfig,
     recovery_v1::{RedoImage, RedoTransaction, RedoWriter, retire_checkpointed_log},
 };
@@ -40,7 +40,7 @@ use sha2::{Digest, Sha256};
 
 const FILE_LEN: usize = SCRATCH_FILE_DATA.len();
 const SIZE_BYTES: usize = 8;
-const FROZEN_BYTES: usize = SIZE_BYTES + BLOCK;
+const FROZEN_BYTES: usize = SIZE_BYTES + FSYNC_SCRATCH_MAX_BYTES;
 const INODE_AT: usize = SCRATCH_FILE_INODE as usize * INODE_BYTES;
 const TEST_CAP: u64 = 1;
 const SLOT: usize = 21;
@@ -48,13 +48,15 @@ const RECEIPT_AT: usize = SLOT * RECEIPT_BYTES;
 const ISSUE_START: u32 = 8;
 const BIND_START: u32 = 16;
 const FINAL_START: u32 = 24;
-const LOG_END: u32 = 36;
+const LOG_END: u32 = 40;
+const SINGLE_LOG_END: u32 = 36;
 const LEGACY_LOG_END: u32 = 32;
 const BOOT_COMMIT_LSN: u64 = 4;
 const ISSUE_COMMIT_LSN: u64 = 9;
 const BOUND_LSN: u64 = 14;
 const BOUND_STATUS: u16 = 2;
 pub(super) const FINAL_LSN: u64 = 21;
+const GROWTH_FINAL_LSN: u64 = 23;
 const LEGACY_FINAL_LSN: u64 = 19;
 const KEY: ReceiptKey = ReceiptKey {
     fs_uuid: volume::UUID,
@@ -72,13 +74,19 @@ const REQUEST_ID: u64 = 0x0100_0000_0000_0001;
 pub(super) fn receipt_lsn(checkpoint: SuperblockV1) -> Option<u64> {
     let boot_lsns = checkpoint.generation.checked_sub(2)?.checked_mul(4)?;
     let original = checkpoint.checkpoint_lsn.checked_sub(boot_lsns)?;
-    matches!(original, FINAL_LSN | LEGACY_FINAL_LSN | BOUND_LSN).then_some(original)
+    matches!(
+        original,
+        GROWTH_FINAL_LSN | FINAL_LSN | LEGACY_FINAL_LSN | BOUND_LSN
+    )
+    .then_some(original)
 }
 
 #[cfg_attr(target_os = "none", unsafe(link_section = ".bss.sec_n"))]
 static mut WORK: FsyncWorkspace = FsyncWorkspace::new();
 #[cfg_attr(target_os = "none", unsafe(link_section = ".bss.sec_n"))]
 static mut RECEIPTS: [u8; RECEIPT_STORE_BYTES] = [0; RECEIPT_STORE_BYTES];
+#[cfg_attr(target_os = "none", unsafe(link_section = ".bss.sec_n"))]
+static mut FROZEN: [u8; FROZEN_BYTES] = [0; FROZEN_BYTES];
 
 fn request_header(raw: &mut [u8], op: u16, id: u64) {
     let length = (raw.len() - REQUEST_HEADER) as u32;
@@ -98,11 +106,12 @@ fn fsync_frame(write_seq: u64) -> [u8; REQUEST_HEADER + 8] {
 }
 
 fn frozen_material(snapshot: &mut [u8; FROZEN_BYTES], size: usize) -> &[u8] {
+    let end = SIZE_BYTES + size.div_ceil(BLOCK) * BLOCK;
     if size == FILE_LEN {
-        &snapshot[SIZE_BYTES..]
+        &snapshot[SIZE_BYTES..end]
     } else {
         snapshot[..SIZE_BYTES].copy_from_slice(&(size as u64).to_le_bytes());
-        snapshot
+        &snapshot[..end]
     }
 }
 
@@ -297,7 +306,8 @@ pub(super) fn execute(
             .try_into()
             .map_err(|_| Error::Invalid)?,
     );
-    let mut snapshot = [0; FROZEN_BYTES];
+    // SAFETY: this CPU0 staging operation is the sole borrower.
+    let snapshot = unsafe { &mut *core::ptr::addr_of_mut!(FROZEN) };
     let size = client.freeze(
         request,
         write_seq,
@@ -308,7 +318,7 @@ pub(super) fn execute(
         &mut issuer,
         request.bytes(),
         request.selector,
-        frozen_material(&mut snapshot, size),
+        frozen_material(snapshot, size),
     )?;
     let mut ledger = AdmissionLedgerV1::new(1)?;
     flow.admit(
@@ -321,8 +331,9 @@ pub(super) fn execute(
         },
     )?;
     flow.execute(&mut ledger, flow.request().prepared_version, true)?;
-    let data: &[u8; BLOCK] = snapshot[SIZE_BYTES..].try_into().unwrap();
-    let pages = [data];
+    let (data, _) = snapshot[SIZE_BYTES..].as_chunks::<BLOCK>();
+    let page_refs = [&data[0], &data[1]];
+    let pages = &page_refs[..size.div_ceil(BLOCK)];
     let job = FsyncJob {
         config,
         mounted,
@@ -333,7 +344,7 @@ pub(super) fn execute(
         frame: request.bytes(),
         key: KEY,
         grown_size: (size > FILE_LEN).then_some(size),
-        pages: &pages,
+        pages,
     };
     let FsyncProgress::Committed { receipt: bound, .. } =
         commit_segment(&mut writer, &job, work, |p| {
@@ -351,25 +362,33 @@ pub(super) fn execute(
         report("V020_FSYNC_BOUND", bound.commit_lsn, bound.write_seq, 0);
         return Ok(());
     }
+    let (final_blocks, final_lsn) = if pages.len() == 2 {
+        (LOG_END - FINAL_START, GROWTH_FINAL_LSN)
+    } else {
+        (SINGLE_LOG_END - FINAL_START, FINAL_LSN)
+    };
     let FsyncProgress::Committed { receipt, redo } =
         commit_segment(&mut writer, &job, work, |p| {
-            reserve(p, FINAL_START, 12, 4, FINAL_LSN)
+            reserve(p, FINAL_START, final_blocks, 4, final_lsn)
         })?
     else {
         return Err(Error::Conflict);
     };
     if receipt.status != 3
         || receipt.completed_prefix as usize != size
-        || receipt.commit_lsn != FINAL_LSN
+        || receipt.commit_lsn != final_lsn
         || !matches!(commit_segment(&mut writer, &job, work, |_| Err(Error::Conflict))?,
                      FsyncProgress::AlreadyDone(same) if same == receipt)
     {
         return Err(Error::Conflict);
     }
-    let mut reread = [0; BLOCK];
-    writer.read_committed(SCRATCH_FILE_BLOCK, &mut reread)?;
-    if &reread != data {
-        return Err(Error::Conflict);
+    for (index, page) in pages.iter().enumerate() {
+        verify_block(
+            &mut writer,
+            SCRATCH_FILE_BLOCK + index as u32,
+            final_lsn,
+            page,
+        )?;
     }
     let admission = flow.admission_id();
     flow.complete(
@@ -402,7 +421,16 @@ pub(super) fn execute(
 fn recovered_version(inode_block: &[u8; BLOCK], commit_lsn: u64) -> Result<(usize, u64), Error> {
     let inode = Inode::decode(&inode_block[INODE_AT..INODE_AT + INODE_BYTES])?;
     let size = usize::try_from(inode.size).map_err(|_| Error::Conflict)?;
-    if !(FILE_LEN..=BLOCK).contains(&size)
+    let pages = size.div_ceil(BLOCK);
+    if !(FILE_LEN..=FSYNC_SCRATCH_MAX_BYTES).contains(&size)
+        || pages != if commit_lsn == GROWTH_FINAL_LSN { 2 } else { 1 }
+        || inode.extents != 1
+        || inode.runs[0]
+            != (Extent {
+                logical: 0,
+                physical: SCRATCH_FILE_BLOCK,
+                count: pages as u32,
+            })
         || inode.durable_write_seq == 0
         || commit_lsn == LEGACY_FINAL_LSN && (size, inode.durable_write_seq) != (FILE_LEN, 7)
     {
@@ -417,7 +445,11 @@ fn final_receipt(
     write_seq: u64,
     commit_lsn: u64,
 ) -> Result<FileReceiptV4, Error> {
-    if snapshot[SIZE_BYTES + size..].iter().any(|&byte| byte != 0) {
+    let end = SIZE_BYTES + size.div_ceil(BLOCK) * BLOCK;
+    if snapshot[SIZE_BYTES + size..end]
+        .iter()
+        .any(|&byte| byte != 0)
+    {
         return Err(Error::Conflict);
     }
     let frame = fsync_frame(write_seq);
@@ -435,7 +467,7 @@ fn final_receipt(
         status: 3,
         completed_prefix: size as u32,
         operation_digest: frozen.request().operation_digest,
-        output_digest: Sha256::digest(&snapshot[SIZE_BYTES..]).into(),
+        output_digest: Sha256::digest(&snapshot[SIZE_BYTES..end]).into(),
         ..issued_receipt()
     })
 }
@@ -503,18 +535,27 @@ pub(super) fn recover(
     volume::unified_map(disk, checkpoint, mode)?;
     volume::validate_homes(disk, checkpoint, 0, Some(config), mode)?;
     volume::require_zero_blocks(disk, LOG_END..BITMAP_START)?;
-    let legacy_tail_blank = match volume::require_zero_blocks(disk, LEGACY_LOG_END..LOG_END) {
-        Ok(()) => true,
-        Err(Error::Conflict) => false,
-        Err(error) => return Err(error),
-    };
     let state = authority::verified_pair_state(disk, checkpoint, Some(config))?;
 
     // Build exact intended after-images from the sealed genesis view.
     let mut inode = [0; BLOCK];
     let mut index = [0; BLOCK];
+    let mut bitmap = [0; BLOCK];
     disk.read(INODE_START, &mut inode)?;
     disk.read(RECEIPTS_HOME + 6, &mut index)?;
+    disk.read(BITMAP_START, &mut bitmap)?;
+    let mut tail = [0; BLOCK];
+    // Read both possible legacy tails before taking the exclusive redo view.
+    let mut single_tail_blank = true;
+    let mut legacy_tail_blank = true;
+    for home in LEGACY_LOG_END..LOG_END {
+        disk.read(home, &mut tail)?;
+        let empty = tail.iter().all(|&byte| byte == 0);
+        legacy_tail_blank &= empty;
+        if home >= SINGLE_LOG_END {
+            single_tail_blank &= empty;
+        }
+    }
     let file = &mut inode[INODE_AT..INODE_AT + INODE_BYTES];
     if Inode::decode(file)?.durable_write_seq != 0 {
         return Err(Error::Conflict);
@@ -528,10 +569,11 @@ pub(super) fn recover(
     let summary = writer.evidence().ok_or(Error::Conflict)?;
     let final_lsn = summary.last_commit_lsn;
     let (transactions, homes, index_lsn) = match final_lsn {
-        FINAL_LSN => (4, 7, FINAL_LSN),
+        GROWTH_FINAL_LSN => (4, 9, GROWTH_FINAL_LSN),
+        FINAL_LSN if single_tail_blank => (4, 7, FINAL_LSN),
         // The legacy segment did not repeat the unchanged issued index.
         LEGACY_FINAL_LSN if legacy_tail_blank => (4, 7, ISSUE_COMMIT_LSN),
-        BOUND_LSN => (3, 5, BOUND_LSN),
+        BOUND_LSN if legacy_tail_blank => (3, 5, BOUND_LSN),
         _ => return Err(Error::Conflict),
     };
     if summary.incomplete_tail
@@ -555,19 +597,39 @@ pub(super) fn recover(
         image.fill(0);
         bound
     } else {
-        let mut snapshot = [0; FROZEN_BYTES];
-        let block: &mut [u8; BLOCK] = (&mut snapshot[SIZE_BYTES..]).try_into().unwrap();
+        // SAFETY: CPU0 owns recovery exclusively before publishing a view.
+        let snapshot = unsafe { &mut *core::ptr::addr_of_mut!(FROZEN) };
+        let block: &mut [u8; BLOCK] = (&mut snapshot[SIZE_BYTES..SIZE_BYTES + BLOCK])
+            .try_into()
+            .unwrap();
         writer.read_committed_at(INODE_START, final_lsn, block)?;
         let (size, write_seq) = recovered_version(block, final_lsn)?;
+        let pages = size.div_ceil(BLOCK);
         file[16..24].copy_from_slice(&(size as u64).to_le_bytes());
         file[24..32].copy_from_slice(&write_seq.to_le_bytes());
+        file[56..60].copy_from_slice(&(pages as u32).to_le_bytes());
         let crc = crc32c_zeroed(file, 252)?;
         file[252..].copy_from_slice(&crc.to_le_bytes());
         if *block != inode {
             return Err(Error::Conflict);
         }
-        writer.read_committed_at(SCRATCH_FILE_BLOCK, final_lsn, block)?;
-        final_receipt(&mut snapshot, size, write_seq, final_lsn)?
+        if pages == 2 {
+            // Both fixture data blocks are in the first canonical bitmap page.
+            let bit = (SCRATCH_FILE_BLOCK + 1) as usize;
+            let mask = 1 << (bit % 8);
+            if bitmap[bit / 8] & mask != 0 {
+                return Err(Error::Conflict);
+            }
+            bitmap[bit / 8] |= mask;
+            verify_block(&mut writer, BITMAP_START, final_lsn, &bitmap)?;
+        }
+        for (index, page) in snapshot[SIZE_BYTES..].as_chunks_mut::<BLOCK>().0[..pages]
+            .iter_mut()
+            .enumerate()
+        {
+            writer.read_committed_at(SCRATCH_FILE_BLOCK + index as u32, final_lsn, page)?;
+        }
+        final_receipt(snapshot, size, write_seq, final_lsn)?
     };
     if writer.prepare(1)?.txid != receipt.txid + 1 {
         return Err(Error::Conflict);
@@ -651,12 +713,15 @@ fn read_retained_receipt(
         return verify_binding(retained);
     }
     let (size, write_seq) = recovered_version(&raw, commit_lsn)?;
-    let mut snapshot = [0; FROZEN_BYTES];
-    disk.read(
-        SCRATCH_FILE_BLOCK,
-        (&mut snapshot[SIZE_BYTES..]).try_into().unwrap(),
-    )?;
-    let expected = final_receipt(&mut snapshot, size, write_seq, commit_lsn)?;
+    // SAFETY: the one-shot native owner holds no other frozen-data borrow.
+    let snapshot = unsafe { &mut *core::ptr::addr_of_mut!(FROZEN) };
+    for (index, page) in snapshot[SIZE_BYTES..].as_chunks_mut::<BLOCK>().0[..size.div_ceil(BLOCK)]
+        .iter_mut()
+        .enumerate()
+    {
+        disk.read(SCRATCH_FILE_BLOCK + index as u32, page)?;
+    }
+    let expected = final_receipt(snapshot, size, write_seq, commit_lsn)?;
     if retained != expected {
         return Err(Error::Conflict);
     }

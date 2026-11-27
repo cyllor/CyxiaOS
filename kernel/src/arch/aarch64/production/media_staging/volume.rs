@@ -178,13 +178,13 @@ pub(super) fn security(config: Config<'_>) -> SecurityStateStoreV2 {
 
 /// Include the D1.5 heads in the formatter's first metadata flush. The full
 /// zero scan has passed and the baseline superblocks are still unpublished.
-struct EnvelopeFormatDisk<'a> {
-    disk: &'a mut Disk,
+struct EnvelopeFormatDisk<'a, 'meter> {
+    disk: &'a mut Disk<'meter>,
     fs_uuid: [u8; 16],
     pending: bool,
 }
 
-impl EpochBlockIo for EnvelopeFormatDisk<'_> {
+impl EpochBlockIo for EnvelopeFormatDisk<'_, '_> {
     fn read(&mut self, block: u32, out: &mut [u8; BLOCK_BYTES]) -> Result<(), SecurityError> {
         self.disk.read(block, out)
     }
@@ -358,7 +358,7 @@ fn staging_acl(
                 != (Extent {
                     logical: 0,
                     physical: SCRATCH_FILE_BLOCK,
-                    count: 1,
+                    count: file_size.div_ceil(BLOCK_BYTES) as u32,
                 }))
     {
         return Err(SecurityError::Conflict);
@@ -595,7 +595,7 @@ pub(super) fn validate_fsync_homes(
         || e.structure.live_inodes != 6
         || e.structure.directory_entries != 1
         || e.system_blocks != 13
-        || e.structure.data_blocks != 15
+        || e.structure.data_blocks != 14 + file_size.div_ceil(BLOCK_BYTES) as u32
         || e.receipts.occupied != 1
         || e.receipts.unresolved != usize::from(receipt_bound)
     {

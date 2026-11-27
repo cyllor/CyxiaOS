@@ -174,7 +174,8 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     serve(info, None, Cpu0BudgetLedger::new())
 }
 
-pub(super) fn serve(
+#[cfg(not(cyxia_signed_resident))]
+fn serve(
     info: &BootInfo,
     _startup_override: Option<&'static [u8]>,
     ledger: Cpu0BudgetLedger,
@@ -184,8 +185,6 @@ pub(super) fn serve(
         _startup_override,
         ledger,
         OutputQueue::new(),
-        None,
-        #[cfg(cyxia_signed_resident)]
         None,
     )
 }

@@ -5,6 +5,7 @@ use super::volume::UUID;
 use cyxia_kernel_core::security::offline_config_v1::{CatalogBindings, VerifiedOfflineConfig};
 use cyxia_kernel_core::security::{
     Error,
+    network::TlsInstallation,
     offline_config_v1::{ConfigHeader, Principal},
 };
 
@@ -88,6 +89,14 @@ const CATALOG: CatalogBindings = CatalogBindings {
         0x72, 0xb1, 0x40, 0xe1, 0xb0, 0x51, 0x08, 0x62, 0xe3, 0x56, 0x5e, 0xb6, 0xcd, 0x81, 0x95,
         0xb1, 0xff,
     ],
+    key_manifest_hash: FIXTURE_TLS.key_manifest_hash,
+};
+
+// These images embed the generation-1 verifier and signer packages.
+pub(super) const FIXTURE_TLS: TlsInstallation = TlsInstallation {
+    verifier_generation: 1,
+    signer_generation: 1,
+    key_generation: 1,
     key_manifest_hash: [
         0xb0, 0x01, 0x79, 0xae, 0x6e, 0xd2, 0xc6, 0xad, 0x68, 0x4f, 0x29, 0x5f, 0x30, 0x83, 0x21,
         0x9c, 0x57, 0xa6, 0x75, 0x0b, 0x58, 0xd0, 0xf5, 0x55, 0x0d, 0x6f, 0x71, 0x68, 0x64, 0x66,

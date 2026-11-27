@@ -3,7 +3,8 @@
 //! the grant and the volatile reply slots.
 
 use super::*;
-use core::ptr::{addr_of, addr_of_mut, copy_nonoverlapping};
+use copy_window::StackSpan;
+use core::ptr::{addr_of, addr_of_mut};
 use cyxia_kernel_core::security::{
     file_read_v4::{FileReadService, MAX_FRAME, MAX_REPLY, ROOT_SELECTOR, StagedFile},
     file_service_v4::{REPLY_HEADER, REQUEST_HEADER, Request},
@@ -112,14 +113,14 @@ fn authorize(state: &mut State, member: NativeRole, cap: u64, selector: u64) -> 
 }
 
 struct Buffers {
-    source: u64,
-    dest: u64,
+    source: StackSpan,
+    dest: StackSpan,
     request_len: usize,
     reply_cap: usize,
     overlap: bool,
 }
 
-fn checked_buffers(index: usize, args: [u64; 6]) -> Result<Buffers, i64> {
+fn checked_buffers(index: usize, member: NativeRole, args: [u64; 6]) -> Result<Buffers, i64> {
     let request_len = usize::try_from(args[2]).map_err(|_| E_FORMAT)?;
     if !(REQUEST_HEADER..=MAX_FRAME).contains(&request_len) {
         return Err(E_FORMAT);
@@ -128,8 +129,8 @@ fn checked_buffers(index: usize, args: [u64; 6]) -> Result<Buffers, i64> {
     if !(REPLY_HEADER..=MAX_REPLY).contains(&reply_cap) {
         return Err(EFAULT);
     }
-    let source = stack_span(index, args[1], request_len, false).ok_or(EFAULT)?;
-    let dest = stack_span(index, args[4], reply_cap, true).ok_or(EFAULT)?;
+    let source = StackSpan::verify(index, member, args[1], request_len, false)?;
+    let dest = StackSpan::verify(index, member, args[4], reply_cap, true)?;
     // stack_span proved both checked half-open ends and the role's page ownership.
     let overlap = args[1] < args[4] + args[5] && args[4] < args[1] + args[2];
     Ok(Buffers {
@@ -161,7 +162,7 @@ pub(super) fn reject_preflight(index: usize, member: NativeRole, args: [u64; 6])
         // Only CPU0 can call either entry point, from the trapped role's turn.
         let state = unsafe { &mut *addr_of_mut!(STATE) };
         authorize(state, member, cap, args[3])?;
-        let buffers = checked_buffers(index, args)?;
+        let buffers = checked_buffers(index, member, args)?;
         reject_overlap(state, &buffers)
     })() {
         Err(error) => error as u64,
@@ -177,17 +178,10 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
     let cap = trapped_pie_cap(index, member)?;
     let state = unsafe { &mut *addr_of_mut!(STATE) };
     authorize(state, member, cap, args[3])?;
-    let buffers = checked_buffers(index, args)?;
+    let buffers = checked_buffers(index, member, args)?;
     reject_overlap(state, &buffers)?;
     let mut frame = [0; MAX_FRAME];
-    // The role is stopped and both spans are private. No user reference escapes this trap.
-    unsafe {
-        copy_nonoverlapping(
-            buffers.source as *const u8,
-            frame.as_mut_ptr(),
-            buffers.request_len,
-        )
-    };
+    buffers.source.copy_in(&mut frame[..buffers.request_len])?;
     let frame = &frame[..buffers.request_len];
     let parsed = Request::decode(frame, args[3]);
     if matches!(args[3], ROOT_SELECTOR | 0)
@@ -250,13 +244,7 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
         }
     };
     let wire = &reply[..served.len];
-    let dest = buffers.dest as *mut u8;
-    unsafe { copy_nonoverlapping(wire.as_ptr(), dest, wire.len()) };
-    if !wire
-        .iter()
-        .enumerate()
-        .all(|(i, &byte)| unsafe { dest.add(i).read_volatile() } == byte)
-    {
+    if !buffers.dest.copy_out_and_check(wire)? {
         fatal(FATAL + 5);
     }
     let op = parsed.expect("successful file operation was decoded").op;

@@ -3,11 +3,14 @@
 //! journal work and publishes a result for exact replay.
 
 use super::*;
-use core::ptr::{addr_of_mut, copy_nonoverlapping};
+use copy_window::StackSpan;
+use core::ptr::addr_of_mut;
 use cyxia_kernel_core::security::{
     Error as SecurityError,
-    file_index_v0199::BLOCK_BYTES,
-    file_read_v4::{ENDPOINT, FileBlockService, MAX_FRAME, MAX_REPLY, ReadError, StagedFile},
+    file_read_v4::{
+        ENDPOINT, FSYNC_SCRATCH_MAX_BYTES, FileFsyncService, MAX_FRAME, MAX_REPLY, ReadError,
+        StagedFile,
+    },
     file_receipt_query_v4::{RECEIPT_KEY_BYTES, ReceiptKey},
     file_service_v4::{REPLY_HEADER, REQUEST_HEADER, Request},
 };
@@ -39,7 +42,7 @@ struct Job {
 struct Grant {
     holder: NativeRole,
     pie_cap: u64,
-    service: FileBlockService,
+    service: FileFsyncService,
     key: ReceiptKey,
     jobs: [Option<Job>; 2],
 }
@@ -65,7 +68,11 @@ fn authenticate(index: usize, member: NativeRole, endpoint: u64) -> Result<u64, 
     trapped_pie_cap(index, member)
 }
 
-fn buffers(index: usize, args: [u64; 6]) -> Result<(u64, u64, usize, usize), i64> {
+fn buffers(
+    index: usize,
+    member: NativeRole,
+    args: [u64; 6],
+) -> Result<(StackSpan, StackSpan, usize, usize), i64> {
     let len = usize::try_from(args[2]).map_err(|_| E_FORMAT)?;
     if !(REQUEST_HEADER..=MAX_FRAME).contains(&len) {
         return Err(E_FORMAT);
@@ -74,8 +81,8 @@ fn buffers(index: usize, args: [u64; 6]) -> Result<(u64, u64, usize, usize), i64
     if !(REPLY_HEADER..=MAX_REPLY).contains(&capacity) {
         return Err(EFAULT);
     }
-    let source = stack_span(index, args[1], len, false).ok_or(EFAULT)?;
-    let dest = stack_span(index, args[4], capacity, true).ok_or(EFAULT)?;
+    let source = StackSpan::verify(index, member, args[1], len, false)?;
+    let dest = StackSpan::verify(index, member, args[4], capacity, true)?;
     if args[1] < args[4] + args[5] && args[4] < args[1] + args[2] {
         return Err(EFAULT);
     }
@@ -84,7 +91,7 @@ fn buffers(index: usize, args: [u64; 6]) -> Result<(u64, u64, usize, usize), i64
 
 pub(super) fn reject_preflight(index: usize, member: NativeRole, args: [u64; 6]) -> u64 {
     authenticate(index, member, args[0])
-        .and_then(|_| buffers(index, args))
+        .and_then(|_| buffers(index, member, args))
         .err()
         .unwrap_or(EFAULT) as u64
 }
@@ -95,15 +102,13 @@ pub(super) fn dispatch(index: usize, member: NativeRole, args: [u64; 6]) -> u64 
 
 fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
     let cap = authenticate(index, member, args[0])?;
-    let (source, dest, len, capacity) = buffers(index, args)?;
+    let (source, dest, len, capacity) = buffers(index, member, args)?;
     let mut frame = Frame {
         selector: args[3],
         len,
         bytes: [0; MAX_FRAME],
     };
-    // SAFETY: source and destination were independently checked against the
-    // current holder's writable page tables. EL0 is stopped in this trap.
-    unsafe { copy_nonoverlapping(source as *const u8, frame.bytes.as_mut_ptr(), len) };
+    source.copy_in(&mut frame.bytes[..len])?;
     let request = Request::decode(frame.bytes(), frame.selector).map_err(|e| {
         if e == SecurityError::Unauthorized {
             E_AUTH
@@ -139,7 +144,9 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
                 .service
                 .serve(frame.selector, frame.bytes(), &mut reply[..capacity])
                 .map_err(ReadError::errno)?;
-            unsafe { copy_nonoverlapping(reply.as_ptr(), dest as *mut u8, served.len) };
+            if !dest.copy_out_and_check(&reply[..served.len])? {
+                fatal(FATAL + 5);
+            }
             return Ok(());
         }
     };
@@ -154,7 +161,9 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
         if job.len == 0 {
             return Err(EAGAIN);
         }
-        unsafe { copy_nonoverlapping(job.reply.as_ptr(), dest as *mut u8, job.len) };
+        if !dest.copy_out_and_check(&job.reply[..job.len])? {
+            fatal(FATAL + 5);
+        }
         job.deliveries = job.deliveries.saturating_add(1);
         return Ok(());
     }
@@ -220,7 +229,7 @@ impl<'a> Client<'a> {
 
     pub(super) fn start(&mut self, file: StagedFile, key: ReceiptKey) -> Result<(), SecurityError> {
         let service =
-            FileBlockService::new_allocated_block(file).map_err(|_| SecurityError::Unauthorized)?;
+            FileFsyncService::new_fsync_file(file).map_err(|_| SecurityError::Unauthorized)?;
         self.wait(FATAL + 1, |state| state.pending_open);
         // SAFETY: the CPU0 owner writes this slot while the role is stopped.
         unsafe {
@@ -259,7 +268,7 @@ impl<'a> Client<'a> {
         &self,
         frame: Frame,
         sequence: u64,
-        out: &mut [u8; BLOCK_BYTES],
+        out: &mut [u8; FSYNC_SCRATCH_MAX_BYTES],
     ) -> Result<usize, SecurityError> {
         // SAFETY: a queued FSYNC prevents the stopped holder's mutations.
         let grant = unsafe { (*addr_of_mut!(STATE)).grant.as_ref().unwrap() };

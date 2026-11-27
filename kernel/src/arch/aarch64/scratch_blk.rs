@@ -1,13 +1,13 @@
 //! Dedicated scratch VirtIO-blk plumbing shared by the V0.19.9 §9.2.1 format
-//! fixture (`v0199_format_fixture.rs`) and the V0.20 wave-11 opt-in media
-//! staging lane (`production/media_staging.rs`).
+//! fixture (`v0199_format_fixture.rs`), V0.20 media staging
+//! (`production/media_staging.rs`), and the read-only history fixture.
 //!
 //! Each 4 KiB block is transferred in two contiguous four-sector requests.
 //! Each request has its own validated and acknowledged device completion.
 //! The lane uses synchronous isolated FLUSH for durability boundaries.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
-//! Global invariant: both callers assert cpu::slot()==0 and drive the device
+//! Global invariant: callers assert cpu::slot()==0 and drive the device
 //! synchronously on CPU0 after the business CPUs were stopped (staging) or
 //! while they only run the smp business fixture (format fixture); no IRQ
 //! handler or secondary CPU touches the queue (completion interrupts are off).
@@ -143,7 +143,7 @@ pub(crate) enum AttachError {
     Absent = 1,
     /// More than one block device: the scratch target is ambiguous.
     Ambiguous = 2,
-    /// Not a writable modern VirtIO device with FLUSH.
+    /// The modern VirtIO, access mode or FLUSH requirements were not met.
     Device = 3,
     /// Not exactly 512 MiB.
     Geometry = 4,
@@ -187,13 +187,33 @@ fn select(info: &BootInfo) -> Result<Transport, AttachError> {
 
 /// Attach the one dedicated 512 MiB scratch block device. Call at most once.
 pub(crate) fn attach(info: &BootInfo) -> Result<&'static mut ScratchBlock, AttachError> {
+    attach_with(info, ScratchBlock::attach_writable_exact, 120_000_000_000)
+}
+
+/// Take custody of the one read-only 512 MiB archive without publishing a
+/// DMA queue when the device has the wrong access mode or geometry.
+#[cfg(feature = "v020-history-readonly-selftest")]
+pub(crate) fn attach_readonly(info: &BootInfo) -> Result<&'static mut ScratchBlock, AttachError> {
+    attach_with(info, ScratchBlock::attach_readonly_exact, 1_000_000_000)
+}
+
+fn attach_with(
+    info: &BootInfo,
+    attach_device: impl FnOnce(
+        Transport,
+        &'static mut BatchMemory,
+        u64,
+        &Board,
+    ) -> Result<ScratchBlock, DriverError>,
+    deadline_ns: u64,
+) -> Result<&'static mut ScratchBlock, AttachError> {
     let transport = select(info)?;
     if cpu::slot() != 0 || CLAIMED.swap(true, Ordering::AcqRel) {
         return Err(AttachError::Owner);
     }
     // SAFETY: the one-shot CPU0 claim gives this call exclusive access to QUEUE.
     let queue = unsafe { &mut *core::ptr::addr_of_mut!(QUEUE) };
-    let device = ScratchBlock::attach_writable_exact(
+    let device = attach_device(
         transport,
         queue,
         u64::from(BLOCK_COUNT) * SECTORS_PER_BLOCK,
@@ -214,7 +234,7 @@ pub(crate) fn attach(info: &BootInfo) -> Result<&'static mut ScratchBlock, Attac
     // FLUSH requests stay synchronous regardless of the batch policy.
     let now = Board.now_ns();
     device
-        .set_notify_policy(2, 1, now.saturating_add(120_000_000_000), now)
+        .set_notify_policy(2, 1, now.saturating_add(deadline_ns), now)
         .map_err(|_| AttachError::Policy)?;
     device.set_completion_interrupts(false, &Board);
     Ok(device)
@@ -237,7 +257,42 @@ pub(crate) fn sectors(
     write: Option<&[u8; BLOCK_BYTES]>,
     out: &mut [u8; BLOCK_BYTES],
 ) -> Result<(), SecurityError> {
-    let result = transfer(device, first, write, out);
+    let result = transfer(device, first, write, out, &mut || Ok(()));
+    finish_io(device, result)
+}
+
+#[cfg(cyxia_startup_catalog)]
+pub(crate) fn sectors_metered(
+    device: &mut ScratchBlock,
+    first: u64,
+    write: Option<&[u8; BLOCK_BYTES]>,
+    out: &mut [u8; BLOCK_BYTES],
+    checkpoint: &mut dyn FnMut() -> Result<(), SecurityError>,
+) -> Result<(), SecurityError> {
+    drive_metered(device, checkpoint, |device, checkpoint| {
+        transfer(device, first, write, out, checkpoint)
+    })
+}
+
+#[cfg(cyxia_startup_catalog)]
+fn drive_metered(
+    device: &mut ScratchBlock,
+    checkpoint: &mut dyn FnMut() -> Result<(), SecurityError>,
+    work: impl FnOnce(
+        &mut ScratchBlock,
+        &mut dyn FnMut() -> Result<(), SecurityError>,
+    ) -> Result<(), SecurityError>,
+) -> Result<(), SecurityError> {
+    let mut budget_fault = false;
+    let result = work(device, &mut || {
+        checkpoint().inspect_err(|_| budget_fault = true)
+    });
+    if budget_fault {
+        // A failed meter cannot authorize a reset. The pinned driver keeps
+        // any earlier requests and tokens with their original deadlines.
+        device.fence_for_recovery();
+        return result;
+    }
     finish_io(device, result)
 }
 
@@ -270,6 +325,7 @@ fn transfer(
     first: u64,
     write: Option<&[u8; BLOCK_BYTES]>,
     out: &mut [u8; BLOCK_BYTES],
+    checkpoint: &mut (impl FnMut() -> Result<(), SecurityError> + ?Sized),
 ) -> Result<(), SecurityError> {
     let kind = if write.is_some() {
         KIND_WRITE
@@ -286,6 +342,7 @@ fn transfer(
     }
     let mut tokens: [Option<Token>; 2] = [None; 2];
     for (i, slot) in tokens.iter_mut().enumerate() {
+        checkpoint()?;
         let input = write.map_or(&EMPTY_INPUT, |data| {
             data[i * TRANSFER_BYTES..]
                 .first_chunk::<TRANSFER_BYTES>()
@@ -299,10 +356,11 @@ fn transfer(
                 .map_err(driver(sector, kind, PHASE_BEGIN))?,
         );
     }
+    checkpoint()?;
     device
         .drain(&Board)
         .map_err(driver(first, kind, PHASE_DRAIN))?;
-    complete(device, first, &tokens, write.is_some(), out)
+    complete(device, first, &tokens, write.is_some(), out, checkpoint)
 }
 
 fn complete(
@@ -311,12 +369,14 @@ fn complete(
     tokens: &[Option<Token>; 2],
     write: bool,
     out: &mut [u8; BLOCK_BYTES],
+    checkpoint: &mut (impl FnMut() -> Result<(), SecurityError> + ?Sized),
 ) -> Result<(), SecurityError> {
     let kind = if write { KIND_WRITE } else { KIND_READ };
     let mut done = [false; 2];
     let mut remaining = tokens.len();
     let mut bytes = [0; TRANSFER_BYTES];
     while remaining != 0 {
+        checkpoint()?;
         let Some(c) = device
             .poll(&mut bytes, &Board)
             .map_err(driver(first, kind, PHASE_POLL))?
@@ -347,16 +407,31 @@ fn complete(
 /// Synchronous isolated FLUSH: only the actual device completion, not queue
 /// admission or a CPU barrier, may satisfy this call.
 pub(crate) fn flush(device: &mut ScratchBlock) -> Result<(), SecurityError> {
-    let result = issue_flush(device);
+    let result = issue_flush(device, &mut || Ok(()));
     finish_io(device, result)
 }
 
-fn issue_flush(device: &mut ScratchBlock) -> Result<(), SecurityError> {
+#[cfg(cyxia_startup_catalog)]
+pub(crate) fn flush_metered(
+    device: &mut ScratchBlock,
+    checkpoint: &mut dyn FnMut() -> Result<(), SecurityError>,
+) -> Result<(), SecurityError> {
+    drive_metered(device, checkpoint, |device, checkpoint| {
+        issue_flush(device, checkpoint)
+    })
+}
+
+fn issue_flush(
+    device: &mut ScratchBlock,
+    checkpoint: &mut (impl FnMut() -> Result<(), SecurityError> + ?Sized),
+) -> Result<(), SecurityError> {
+    checkpoint()?;
     let token = device
         .begin(Operation::Flush, &EMPTY_INPUT, true, true, &Board)
         .map_err(driver(0, KIND_FLUSH, PHASE_BEGIN))?;
     let mut bytes = [0; TRANSFER_BYTES];
     loop {
+        checkpoint()?;
         match device
             .poll(&mut bytes, &Board)
             .map_err(driver(0, KIND_FLUSH, PHASE_POLL))?

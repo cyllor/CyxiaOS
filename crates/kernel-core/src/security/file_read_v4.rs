@@ -24,6 +24,7 @@ pub const ENDPOINT: u64 = 0x4649_4c45_0000_0011;
 pub const ROOT_SELECTOR: u64 = 0x4649_4c45_0000_0001;
 pub const MAX_FRAME: usize = 128;
 pub const MAX_REPLY: usize = 256;
+pub const FSYNC_SCRATCH_MAX_BYTES: usize = 2 * BLOCK_BYTES;
 
 const OPEN: u16 = 2;
 const READ: u16 = 3;
@@ -187,6 +188,7 @@ enum Effect<'a> {
 
 pub type FileReadService = ScratchFileService<{ SCRATCH_FILE_DATA.len() }>;
 pub type FileBlockService = ScratchFileService<BLOCK_BYTES>;
+pub type FileFsyncService = ScratchFileService<FSYNC_SCRATCH_MAX_BYTES>;
 
 pub struct ScratchFileService<const CAPACITY: usize> {
     file: StagedFile,
@@ -218,6 +220,17 @@ impl FileReadService {
 impl FileBlockService {
     /// Used by the mounted FSYNC owner after validating the allocated extent.
     pub fn new_allocated_block(file: StagedFile) -> Result<Self, ReadError> {
+        if file.owner_rights != SCRATCH_FSYNC_FILE_OWNER_RIGHTS {
+            return Err(ReadError::Unauthorized);
+        }
+        Ok(Self::with_handle_limit(file, 1))
+    }
+}
+
+impl FileFsyncService {
+    /// Stage a bounded write version. The durable owner acquires the
+    /// additional block when the final FSYNC transaction commits.
+    pub fn new_fsync_file(file: StagedFile) -> Result<Self, ReadError> {
         if file.owner_rights != SCRATCH_FSYNC_FILE_OWNER_RIGHTS {
             return Err(ReadError::Unauthorized);
         }
@@ -275,9 +288,12 @@ impl<const CAPACITY: usize> ScratchFileService<CAPACITY> {
         &self,
         selector: u64,
         through_write_seq: u64,
-        dst: &mut [u8; BLOCK_BYTES],
+        dst: &mut [u8],
     ) -> Result<usize, ReadError> {
         self.check_fsync(selector, through_write_seq)?;
+        if dst.len() < self.len {
+            return Err(ReadError::ShortReply);
+        }
         dst.fill(0);
         dst[..self.len].copy_from_slice(&self.data[..self.len]);
         Ok(self.len)
