@@ -71,6 +71,8 @@ mod reopen;
 #[cfg(feature = "v020-production-media-signed")]
 #[path = "media_staging/signed.rs"]
 mod signed;
+#[cfg(feature = "v020-production-media-signed")]
+use cyxia_kernel_core::security::offline_config_v1::VerifiedOfflineConfig;
 #[path = "media_staging/volume.rs"]
 mod volume;
 
@@ -78,7 +80,8 @@ static STAGED: AtomicBool = AtomicBool::new(false);
 static SNAPSHOT_FAIL_CLOSED: AtomicU64 = AtomicU64::new(0);
 
 /// Result of the one-shot staging run (evidence words 145..149).
-#[derive(Clone, Copy, Default)]
+#[cfg_attr(not(feature = "v020-production-signed-resident"), derive(Clone, Copy))]
+#[derive(Default)]
 pub(super) struct StagingOutcome {
     pub(super) formatted: bool,
     identified: bool,
@@ -88,6 +91,8 @@ pub(super) struct StagingOutcome {
     pub(super) unified_map_validated: bool,
     /// `BootEpochAuthority::confirmed_epoch`, 0 = not confirmed.
     pub(super) confirmed_epoch: u64,
+    #[cfg(feature = "v020-production-signed-resident")]
+    pub(super) resident_boot: Option<SignedResidentBoot>,
     pub(super) admission_flow_ok: bool,
     chain_complete: bool,
     #[cfg(feature = "v020-production-media-signed")]
@@ -98,6 +103,24 @@ pub(super) struct StagingOutcome {
     pub(super) snapshot_catalog: Option<super::snapshot_catalog::MountedCatalog>,
     #[cfg(feature = "v020-production-file-read")]
     pub(super) file_read: Option<cyxia_kernel_core::security::file_read_v4::StagedFile>,
+}
+
+#[cfg(feature = "v020-production-signed-resident")]
+pub(super) struct SignedResidentBoot {
+    epochs: cyxia_kernel_core::security::boot_epoch_v1::BootEpochAuthority,
+    config: VerifiedOfflineConfig<'static>,
+}
+
+#[cfg(feature = "v020-production-signed-resident")]
+impl SignedResidentBoot {
+    pub(super) fn policy(
+        &self,
+    ) -> Result<
+        cyxia_kernel_core::security::durable_role_epoch_v0199::ConfirmedBootPolicy<'_>,
+        SecurityError,
+    > {
+        self.epochs.confirmed_boot_policy(&self.config)
+    }
 }
 
 impl StagingOutcome {
@@ -188,7 +211,22 @@ fn step(index: u64, result: Result<u64, SecurityError>) -> Option<u64> {
     result.ok()
 }
 
-fn run_chain(disk: &mut Disk, out: &mut StagingOutcome) -> Option<()> {
+#[cfg(feature = "v020-production-media-signed")]
+pub(super) fn verify_scratch_config() -> Result<VerifiedOfflineConfig<'static>, SecurityError> {
+    // SAFETY: the serialized CPU0 foreground owns this scratch outside
+    // package loading. The Ed25519 verifier wipes the borrowed span.
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(super::COPY_BUFFER.0) };
+    signed::verify(signed::WIRE, scratch)
+        .inspect_err(|e| report("V020_W13_CONFIG_ERROR", *e as u64, 0, 0))
+}
+
+fn run_chain(
+    disk: &mut Disk,
+    out: &mut StagingOutcome,
+    #[cfg(feature = "v020-production-signed-resident")] verified: Option<
+        VerifiedOfflineConfig<'static>,
+    >,
+) -> Option<()> {
     const REOPEN: bool = cfg!(feature = "v020-production-media-reopen");
     #[cfg(feature = "v020-production-fsync-scratch")]
     const LAYOUT: volume::SnapshotLayout = volume::SnapshotLayout::BaselineFsyncFile;
@@ -211,16 +249,13 @@ fn run_chain(disk: &mut Disk, out: &mut StagingOutcome) -> Option<()> {
     )) {
         return None;
     }
-    #[cfg(feature = "v020-production-media-signed")]
-    let verified = {
-        // SAFETY: CPU0 has joined the business CPUs; package loading is over.
-        // This is the existing FrameMeta Control scratch, exclusively borrowed
-        // for this synchronous verification and wiped by the Ed25519 wrapper.
-        let scratch = unsafe { &mut *core::ptr::addr_of_mut!(super::COPY_BUFFER.0) };
-        signed::verify(signed::WIRE, scratch)
-            .inspect_err(|e| report("V020_W13_CONFIG_ERROR", *e as u64, 0, 0))
-            .ok()?
-    };
+    #[cfg(all(
+        feature = "v020-production-media-signed",
+        not(feature = "v020-production-signed-resident")
+    ))]
+    let verified = verify_scratch_config().ok()?;
+    #[cfg(feature = "v020-production-signed-resident")]
+    let verified = verified?;
     #[cfg(feature = "v020-production-media-signed")]
     let config = Some(&verified);
     #[cfg(not(feature = "v020-production-media-signed"))]
@@ -264,10 +299,22 @@ fn run_chain(disk: &mut Disk, out: &mut StagingOutcome) -> Option<()> {
         ];
     }
     out.prior_epoch = mounted.boot.boot_epoch;
-    out.confirmed_epoch = step(
-        4,
-        authority::boot_epoch(disk, checkpoint, &mounted.security, config),
-    )?;
+    #[cfg(not(feature = "v020-production-signed-resident"))]
+    {
+        out.confirmed_epoch = step(
+            4,
+            authority::boot_epoch(disk, checkpoint, &mounted.security, config),
+        )?;
+    }
+    #[cfg(feature = "v020-production-signed-resident")]
+    let resident_epochs = {
+        let allocated = authority::boot_epoch_owner(disk, checkpoint, &mounted.security, config);
+        out.confirmed_epoch = step(
+            4,
+            allocated.as_ref().map(|(epoch, _)| *epoch).map_err(|e| *e),
+        )?;
+        allocated.ok()?.1
+    };
     #[cfg(feature = "v020-production-media-signed")]
     {
         let committed = authority::verified_pair_state(disk, checkpoint, config).ok()?;
@@ -345,11 +392,31 @@ fn run_chain(disk: &mut Disk, out: &mut StagingOutcome) -> Option<()> {
         .ok()?;
         out.snapshot_catalog = Some(catalog);
     }
+    #[cfg(feature = "v020-production-signed-resident")]
+    {
+        out.resident_boot = Some(SignedResidentBoot {
+            epochs: resident_epochs,
+            config: verified,
+        });
+    }
     Some(())
 }
 
-/// One-shot staging run on CPU0 after the business CPUs stopped.
+/// One-shot staging run on CPU0 with business-role admission closed.
 pub(super) fn stage(info: &BootInfo) -> StagingOutcome {
+    stage_with_policy(
+        info,
+        #[cfg(feature = "v020-production-signed-resident")]
+        None,
+    )
+}
+
+pub(super) fn stage_with_policy(
+    info: &BootInfo,
+    #[cfg(feature = "v020-production-signed-resident")] verified: Option<
+        VerifiedOfflineConfig<'static>,
+    >,
+) -> StagingOutcome {
     let mut out = StagingOutcome::default();
     if STAGED.swap(true, Ordering::AcqRel) {
         return out;
@@ -368,7 +435,14 @@ pub(super) fn stage(info: &BootInfo) -> StagingOutcome {
         writes: 0,
         flushes: 0,
     };
-    out.chain_complete = run_chain(&mut disk, &mut out).is_some();
+    #[cfg(not(feature = "v020-production-signed-resident"))]
+    {
+        out.chain_complete = run_chain(&mut disk, &mut out).is_some();
+    }
+    #[cfg(feature = "v020-production-signed-resident")]
+    {
+        out.chain_complete = run_chain(&mut disk, &mut out, verified).is_some();
+    }
     report("V020_W11_MEDIA_IO", disk.reads, disk.writes, disk.flushes);
     let queue = disk.device.notify_stats();
     report(

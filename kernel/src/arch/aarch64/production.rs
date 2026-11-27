@@ -126,9 +126,30 @@ mod net;
 mod observations;
 #[path = "production/recovery.rs"]
 pub(crate) mod recovery;
+#[cfg(feature = "v020-production-signed-resident")]
+#[path = "production/resident.rs"]
+mod resident;
+#[cfg(feature = "v020-production-signed-resident")]
+#[path = "production/signed_resident.rs"]
+mod signed_resident;
 #[cfg(feature = "v020-production-snapshot-catalog")]
 #[path = "production/snapshot_catalog.rs"]
 mod snapshot_catalog;
+
+#[cfg(all(
+    feature = "v020-production-signed-resident",
+    any(
+        feature = "v020-production-authenticated-net",
+        feature = "v020-production-live-control",
+        feature = "v020-production-fsync-scratch"
+    )
+))]
+compile_error!("The signed resident fixture requires the empty scratch authorization profile");
+
+#[cfg(feature = "v020-production-signed-resident")]
+pub(super) fn timer_deadline() -> u64 {
+    resident::timer_deadline()
+}
 
 // The advice EL0 advisor/carrier program is the SAME proven bounded program the
 // advice-e2e fixture uses (constructs the envelope at EL0, records the x0 return,
@@ -331,9 +352,12 @@ fn pair_ptr() -> *mut Pair {
     core::ptr::addr_of_mut!(PAIR).cast()
 }
 fn now_ns() -> u64 {
+    ns_from_ticks(timer::ticks())
+}
+fn ns_from_ticks(ticks: u64) -> u64 {
     let f = timer::frequency();
     assert!(f != 0);
-    u64::try_from(u128::from(timer::ticks()) * 1_000_000_000 / u128::from(f)).expect("monotonic ns")
+    u64::try_from(u128::from(ticks) * 1_000_000_000 / u128::from(f)).expect("monotonic ns")
 }
 fn sha(bytes: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -710,13 +734,26 @@ fn pie_cap_selector(index: usize) -> u64 {
     }
 }
 fn load_role(index: usize) -> NativeRole {
+    #[cfg(feature = "v020-production-live-control")]
+    let target_selector = observations::selector(ROLES[index]);
+    #[cfg(not(feature = "v020-production-live-control"))]
+    let target_selector = 0;
+    load_role_with_identity(index, 1, pie_cap_selector(index), target_selector)
+}
+
+fn load_role_with_identity(
+    index: usize,
+    generation: u64,
+    cap_selector: u64,
+    target_selector: u64,
+) -> NativeRole {
     let role = ROLES[index];
     let pkg = &CATALOG[index];
     assert_eq!(pkg.role_id, role.id());
     assert!(pkg.bytes.len() <= COPY);
     let actor = Identity {
         id: u64::from(role.id()),
-        generation: 1,
+        generation,
     };
     let endpoint = 0xC000 + index as u64;
     let b = backing(index);
@@ -749,11 +786,6 @@ fn load_role(index: usize) -> NativeRole {
         .stage(image, BASE, BASE, BASE + IMAGE as u64)
         .expect("private PIE stage");
     let stack = unsafe { &mut *core::ptr::addr_of_mut!((*b).stack) };
-    let cap_selector = pie_cap_selector(index);
-    #[cfg(feature = "v020-production-live-control")]
-    let target_selector = observations::selector(role);
-    #[cfg(not(feature = "v020-production-live-control"))]
-    let target_selector = 0u64;
     let mut args = [0u8; 24];
     args[..8].copy_from_slice(&cap_selector.to_le_bytes());
     args[8..16].copy_from_slice(&target_selector.to_le_bytes());
@@ -843,6 +875,15 @@ static PIE_ENTRY: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_C
 static PIE_SP: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
 static PIE_X0: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
 static PIE_X1: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
+
+fn pie_context(index: usize) -> user::Context {
+    let mut ctx = user::Context::empty();
+    ctx.pc = PIE_ENTRY[index].load(Ordering::Acquire);
+    ctx.sp = PIE_SP[index].load(Ordering::Acquire);
+    ctx.regs[0] = PIE_X0[index].load(Ordering::Acquire);
+    ctx.regs[1] = PIE_X1[index].load(Ordering::Acquire);
+    ctx
+}
 /// The sole accepted pointer range for a PIE role is its private stack.
 fn stack_span(index: usize, va: u64, n: usize, write: bool) -> Option<u64> {
     if n == 0 {
@@ -1273,7 +1314,8 @@ fn with_bundle(f: impl FnOnce(&FrozenNativePlan<'_>, &AssistedScope<'_>) -> u64)
 /// Production exception entry: dispatch the ABI-v3 production subset in-vector,
 /// fall through to the proven smp path for everything else.
 pub(crate) fn exception(f: &mut ExceptionFrame, kind: u64) {
-    if kind == 8
+    if !cfg!(feature = "v020-production-signed-resident")
+        && kind == 8
         && f.esr >> 26 == 0x15
         && let Some(outcome) = svc_dispatch(f)
     {
@@ -1363,6 +1405,10 @@ fn pie_turn(index: usize, ctx: &mut user::Context) {
 }
 
 pub(crate) fn run(info: &BootInfo) -> ! {
+    #[cfg(feature = "v020-production-signed-resident")]
+    if cfg!(feature = "v020-production-signed-resident") {
+        signed_resident::run(info);
+    }
     assert_eq!(
         cpu::slot(),
         0,
@@ -1422,14 +1468,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         pie_members[0].ttbr0_root,
         0,
     );
-    let mut pie_ctx: [user::Context; ROLE_COUNT] = core::array::from_fn(|i| {
-        let mut ctx = user::Context::empty();
-        ctx.pc = PIE_ENTRY[i].load(Ordering::Acquire);
-        ctx.sp = PIE_SP[i].load(Ordering::Acquire);
-        ctx.regs[0] = PIE_X0[i].load(Ordering::Acquire);
-        ctx.regs[1] = PIE_X1[i].load(Ordering::Acquire);
-        ctx
-    });
+    let mut pie_ctx: [user::Context; ROLE_COUNT] = core::array::from_fn(pie_context);
     // Bounded round-robin: every role clocks; snapshot/audit roles service their
     // role-specific SVC in-vector (EAGAIN), sleep roles yield.
     let until = timer::ticks()

@@ -87,12 +87,22 @@ pub(super) fn verified_pair_state(
 
 /// Allocate and durably confirm the next epoch on the scratch volume. Returns
 /// the authority's `confirmed_epoch`; any failure is returned (fail-closed).
+#[allow(dead_code)] // The signed resident build retains the authority instead.
 pub(super) fn boot_epoch(
     disk: &mut Disk,
     checkpoint: SuperblockV1,
     mounted: &SecurityStateStoreV2,
     config: volume::Config<'_>,
 ) -> Result<u64, SecurityError> {
+    boot_epoch_owner(disk, checkpoint, mounted, config).map(|(epoch, _)| epoch)
+}
+
+pub(super) fn boot_epoch_owner(
+    disk: &mut Disk,
+    checkpoint: SuperblockV1,
+    mounted: &SecurityStateStoreV2,
+    config: volume::Config<'_>,
+) -> Result<(u64, BootEpochAuthority), SecurityError> {
     let mut state = [0; BLOCK_BYTES];
     let mut boot = [0; BLOCK_BYTES];
     let mut sb_raw = [0; BLOCK_BYTES];
@@ -161,7 +171,7 @@ pub(super) fn boot_epoch(
     {
         return Err(SecurityError::Conflict);
     }
-    Ok(confirmed)
+    Ok((confirmed, authority))
 }
 
 fn user_frame(auth_context_id: u64) -> [u8; REQUEST_HEADER + 4] {

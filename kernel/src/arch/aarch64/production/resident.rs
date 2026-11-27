@@ -5,11 +5,14 @@
 //! inputs were pinned at build time, this path authenticates the signed
 //! envelope before running read-only SECURE_DEGRADED diagnostics.
 
+#[cfg(not(feature = "v020-production-signed-resident"))]
+use super::bring_up_production;
 use super::{
-    BootInfo, FAILURES, IRQS, ONLINE, Ordering, STOPPED, TIMER_IRQ, bring_up_production, cpu, gic,
-    report_payload, timer,
+    BootInfo, FAILURES, IRQS, ONLINE, Ordering, STOPPED, TIMER_IRQ, cpu, gic, report_payload, timer,
 };
-use crate::{ExceptionFrame, UART, machine::enqueue_resident_frame};
+#[cfg(not(feature = "v020-production-signed-resident"))]
+use crate::ExceptionFrame;
+use crate::{UART, machine::enqueue_resident_frame};
 use cyxia_contracts::{PhysAddr, UartResource};
 use cyxia_driver_pl011::Pl011;
 use cyxia_kernel_core::{
@@ -96,6 +99,7 @@ pub(super) fn timer_deadline() -> u64 {
     timer::ticks().saturating_add((timer::frequency() / 1_000).max(1))
 }
 
+#[cfg(not(feature = "v020-production-signed-resident"))]
 pub(crate) fn exception(frame: &mut ExceptionFrame, kind: u64) {
     super::exception(frame, kind);
 }
@@ -148,23 +152,42 @@ fn poll_console(
     }
 }
 
+#[cfg(not(feature = "v020-production-signed-resident"))]
 pub(crate) fn run(info: &BootInfo) -> ! {
     assert_eq!(cpu::slot(), 0);
     bring_up_production(info);
+    serve(info, None, Cpu0BudgetLedger::new())
+}
+
+pub(super) fn serve(
+    info: &BootInfo,
+    _startup_override: Option<&'static [u8]>,
+    ledger: Cpu0BudgetLedger,
+) -> ! {
+    serve_with_queue(info, _startup_override, ledger, OutputQueue::new(), None)
+}
+
+pub(super) fn attach_console(info: &BootInfo) -> Pl011 {
     let resource = UartResource {
         base: PhysAddr(UART.load(Ordering::Relaxed)),
         len: info.uart.expect("boot console").len,
     };
     // SAFETY: boot configured this mapped console. This handle leaves the
     // configuration untouched, and this CPU exclusively owns diagnostic I/O.
-    let mut uart = unsafe { Pl011::attach(resource) }.expect("resident console");
-    let mut pending = OutputQueue::new();
+    unsafe { Pl011::attach(resource) }.expect("resident console")
+}
+
+pub(super) fn serve_with_queue(
+    info: &BootInfo,
+    _startup_override: Option<&'static [u8]>,
+    ledger: Cpu0BudgetLedger,
+    mut pending: OutputQueue<128>,
+    mut fault: Option<(&'static str, [u64; 3])>,
+) -> ! {
+    let mut uart = attach_console(info);
     let frequency = timer::frequency();
     assert_ne!(frequency, 0);
-    let mut budget = ResidentBudget {
-        ledger: Cpu0BudgetLedger::new(),
-        frequency,
-    };
+    let mut budget = ResidentBudget { ledger, frequency };
     gic()
         .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
         .expect("CPU0 timer PPI");
@@ -176,8 +199,10 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     }
     #[cfg(not(cyxia_startup_catalog))]
     let (startup_banner, budget_degraded): (&[u8], _) = (
-        b"V020_STARTUP state=SECURE_DEGRADED reason=missing_startup_authority command=status\n",
-        false,
+        _startup_override.unwrap_or(
+            b"V020_STARTUP state=SECURE_DEGRADED reason=missing_startup_authority command=status\n",
+        ),
+        budget.ledger.ordinary_closed(),
     );
     #[cfg(cyxia_startup_catalog)]
     let catalog_check = budget.verify_startup_envelope();
@@ -198,7 +223,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     };
     #[cfg(cyxia_startup_catalog)]
     let mut catalog_cost = catalog_check.ok().map(|(_, cost)| cost);
-    enqueue_resident_frame(&mut pending, startup_banner).expect("resident startup frame");
+    let mut startup = Some(startup_banner);
     let mut command = 0;
     let mut last_interrupt = 0;
     let mut degraded = budget_degraded;
@@ -210,6 +235,17 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         if !accounting_fault && interrupts.wrapping_sub(last_interrupt) >= interval {
             last_interrupt = interrupts;
             let result = budget.turn(degraded, || {
+                if pending.pending() == 0 {
+                    if let Some((label, [a, b, c])) = fault.take() {
+                        let mut text = [0; 96];
+                        let payload = report_payload(&mut text, label, a, b, c);
+                        enqueue_resident_frame(&mut pending, payload)
+                            .expect("resident fault frame");
+                    } else if let Some(payload) = startup.take() {
+                        enqueue_resident_frame(&mut pending, payload)
+                            .expect("resident startup frame");
+                    }
+                }
                 #[cfg(cyxia_startup_catalog)]
                 if pending.pending() == 0
                     && let Some(cost) = catalog_cost.take()

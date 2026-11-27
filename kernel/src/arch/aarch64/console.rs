@@ -80,9 +80,12 @@ pub(crate) fn try_log(s: &[u8]) -> Result<(), PlatformError> {
 
 /// Admit a complete frame to the sole CPU0 writer. The resident console
 /// drains the retained suffix after a short write before admitting another.
-#[cfg(all(
-    feature = "v020-production",
-    not(feature = "v020-production-diagnostic")
+#[cfg(any(
+    feature = "v020-production-signed-resident",
+    all(
+        feature = "v020-production",
+        not(feature = "v020-production-diagnostic")
+    )
 ))]
 pub(crate) fn enqueue_resident_frame(
     pending: &mut cyxia_kernel_core::console::OutputQueue<128>,

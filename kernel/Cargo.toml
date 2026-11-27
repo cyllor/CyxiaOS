@@ -75,6 +75,7 @@ v020-production-media-staging = ["v020-production-diagnostic", "prototype-memory
 v020-production-authenticated-net = ["v020-production-diagnostic"]
 v020-production-media-reopen = ["v020-production-media-staging"]
 v020-production-media-signed = ["v020-production-media-staging"]
+v020-production-signed-resident = ["v020-production-media-signed"]
 # Separate signed baseline-v1 file owner on one dedicated test disk.
 v020-production-fsync-scratch = ["v020-production-media-signed"]
 v020-production-media-envelopes = ["v020-production-media-staging"]

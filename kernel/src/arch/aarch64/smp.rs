@@ -348,6 +348,7 @@ unsafe extern "C" {
     #[cfg(feature = "v0199-advice-e2e-selftest")]
     static v0199_advice_user_end: u8;
 }
+#[cfg(not(feature = "v020-production-signed-resident"))]
 fn index(slot: usize, plane: Plane) -> usize {
     slot * 2 + usize::from(plane == Plane::Control)
 }
@@ -510,11 +511,14 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
                     }
                     #[cfg(not(feature = "unified-runtime"))]
                     cpu::disable_timer();
-                    #[cfg(all(
-                        feature = "v020-production",
-                        not(feature = "v020-production-diagnostic")
+                    #[cfg(any(
+                        feature = "v020-production-signed-resident",
+                        all(
+                            feature = "v020-production",
+                            not(feature = "v020-production-diagnostic")
+                        )
                     ))]
-                    if slot == 0 {
+                    if slot == 0 && kind == 5 {
                         timer::arm(production::timer_deadline());
                     }
                 }
@@ -565,9 +569,12 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
             IrqAck::Spurious => {
                 prototype_runtime::irq_exit(slot);
             }
-            #[cfg(all(
-                feature = "v020-production",
-                not(feature = "v020-production-diagnostic")
+            #[cfg(any(
+                feature = "v020-production-signed-resident",
+                all(
+                    feature = "v020-production",
+                    not(feature = "v020-production-diagnostic")
+                )
             ))]
             IrqAck::Spurious if kind == 5 => {}
             #[cfg(not(feature = "unified-runtime"))]
@@ -575,6 +582,7 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
         }
         #[cfg(any(
             feature = "unified-runtime",
+            feature = "v020-production-signed-resident",
             all(
                 feature = "v020-production",
                 not(feature = "v020-production-diagnostic")
@@ -834,10 +842,14 @@ fn fixture_context_valid(ctx: &user::Context, i: usize) -> bool {
     }
     valid != 0
 }
-#[cfg(not(feature = "unified-runtime"))]
+#[cfg(all(
+    not(feature = "unified-runtime"),
+    not(feature = "v020-production-signed-resident")
+))]
 fn fixture_yielded(ctx: &user::Context) -> bool {
     ctx.kind == 9
 }
+#[cfg(not(feature = "v020-production-signed-resident"))]
 fn probes(slot: usize, i: usize) {
     // Probe an EL1-only address, an unmapped private address, code write, NX data,
     // and the user stack guard. A successful access/SVC is failure, not evidence.
@@ -910,9 +922,12 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
     ONLINE.fetch_or(1 << slot, Ordering::Release);
     #[cfg(feature = "register-v15-selftest")]
     register_evidence::worker(slot);
-    #[cfg(all(
-        feature = "v020-production",
-        not(feature = "v020-production-diagnostic")
+    #[cfg(any(
+        feature = "v020-production-signed-resident",
+        all(
+            feature = "v020-production",
+            not(feature = "v020-production-diagnostic")
+        )
     ))]
     {
         // Startup has yet to authorize any business EL0. The parked CPUs stay
@@ -922,16 +937,22 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
             timer::idle();
         }
     }
-    #[cfg(any(
-        not(feature = "v020-production"),
-        feature = "v020-production-diagnostic"
+    #[cfg(all(
+        not(feature = "v020-production-signed-resident"),
+        any(
+            not(feature = "v020-production"),
+            feature = "v020-production-diagnostic"
+        )
     ))]
     secondary_work(slot)
 }
 
-#[cfg(any(
-    not(feature = "v020-production"),
-    feature = "v020-production-diagnostic"
+#[cfg(all(
+    not(feature = "v020-production-signed-resident"),
+    any(
+        not(feature = "v020-production"),
+        feature = "v020-production-diagnostic"
+    )
 ))]
 fn secondary_work(slot: usize) -> ! {
     let mut contexts = [context(slot * 2), context(slot * 2 + 1)];

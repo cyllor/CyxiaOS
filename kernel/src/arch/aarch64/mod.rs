@@ -20,9 +20,12 @@ use cyxia_contracts::*;
 mod boot;
 mod console;
 mod exceptions;
-#[cfg(all(
-    feature = "v020-production",
-    not(feature = "v020-production-diagnostic")
+#[cfg(any(
+    feature = "v020-production-signed-resident",
+    all(
+        feature = "v020-production",
+        not(feature = "v020-production-diagnostic")
+    )
 ))]
 pub(crate) use console::enqueue_resident_frame;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
