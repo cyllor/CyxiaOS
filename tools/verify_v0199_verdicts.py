@@ -137,6 +137,8 @@ def aggregate(manifest_raw,locked_digest,root):
         if "evidence_count" in item:
             count = item["evidence_count"]
             require(type(count) is int and 0 <= count < 2**32, "invalid frozen evidence count")
+        if "evidence_digest" in item:
+            hash_value(item["evidence_digest"])
         for k in FIELDS:
             if k.endswith("_hash"):
                 require(hash_value(item[k])!="0"*64,"zero expected hash")
@@ -152,7 +154,8 @@ def aggregate(manifest_raw,locked_digest,root):
         if item is None:
             rows[key]={**base,"status":"NOT_RUN","reason":"missing frozen expected input"};continue
         # Fixed file naming is an internal archive convention, not a new
-        # guest ABI. The manifest commits the checker/build/input fields.
+        # guest ABI. The manifest commits the checker, inputs and exact
+        # evidence manifest supplied to that checker.
         stem=f'{key[0]:08x}-{key[1]}'
         rel=f'verdicts/{stem}.bin'
         path=root/rel
@@ -166,6 +169,8 @@ def aggregate(manifest_raw,locked_digest,root):
             if v["evidence_count"]:
                 require(v["evidence_count"] == item.get("evidence_count"),
                         "evidence count differs from frozen input")
+                require(v["evidence_digest"] == item.get("evidence_digest"),
+                        "evidence digest differs from frozen input")
                 # Digest of the exact external manifest bytes; each member's
                 # SHA256/size is then independently read from the archive.
                 m=safe_file(root,f'evidence/{stem}.json').read_bytes()
