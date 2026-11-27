@@ -127,13 +127,17 @@ def net_entropy(words: tuple, lines: list, enabled: bool) -> dict:
             "virtio_rng_health_samples": samples}
 
 
-def net_signer(lines: list, enabled: bool) -> dict:
+def net_signer(lines: list, enabled: bool, signed_boot_epoch: int | None) -> dict:
     spaces = rows(lines, "V020_SEC_N_SIGNER_SPACE")
     replies = rows(lines, "V020_SEC_N_SIGNER_REPLY")
     authenticated = rows(lines, "V020_SEC_N_VERIFIER_AUTHENTICATED")
+    identities = rows(lines, "V020_SEC_N_SIGNER_IDENTITY")
     if not enabled:
-        require(not (spaces or replies or authenticated), "unexpected isolated signer evidence")
+        require(not (spaces or replies or authenticated or identities), "unexpected isolated signer evidence")
         return {}
+    if signed_boot_epoch is not None or identities:
+        require(identities == [(signed_boot_epoch or 1, 1, 1)],
+                "Signer identity differs from the selected scratch BootEpoch or generation")
     require(len(spaces) == 1 and spaces[0][0] == 0x41
             and 0 < spaces[0][1] <= 64 and spaces[0][2] == 0,
             "missing bounded independent Signer address space")
@@ -148,7 +152,7 @@ def net_signer(lines: list, enabled: bool) -> dict:
             "native_verifier_authenticated_connections": len(authenticated)}
 
 
-def net_reset_proofs(lines: list) -> dict:
+def net_reset_proofs(lines: list, *, boot_epoch: int = 1) -> dict:
     prefix = "V020_SEC_D_NET_RESET_PROOF "
     encoded = [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
     unconfirmed = rows(lines, "V020_SEC_D_NET_RESET_UNCONFIRMED")
@@ -157,11 +161,12 @@ def net_reset_proofs(lines: list) -> dict:
     for queue_id, value in enumerate(encoded):
         require(re.fullmatch("[0-9a-f]{128}", value), "malformed ResetProof v1 bytes")
         fields = struct.unpack("<IHHQIHHQQQIIQ", bytes.fromhex(value))
-        require(fields[:-1] == (0x43595250, 1, 64, 1, 1, queue_id, 0, 1, 1, 1, 0, 0)
+        require(fields[:-1] == (0x43595250, 1, 64, boot_epoch, 1, queue_id, 0, 1, 1, 1, 0, 0)
                 and fields[-1] > 0, "native net ResetProof v1 has the wrong generation or readback")
         observations.append(fields[-1])
     require(observations[0] == observations[1], "net queues were not proved in one device reset")
-    return {"native_net_reset_queue_ids": [0, 1], "native_net_reset_observed_ns": observations[0]}
+    return {"native_net_reset_queue_ids": [0, 1], "native_net_reset_boot_epoch": boot_epoch,
+            "native_net_reset_observed_ns": observations[0]}
 
 
 def control_observations(words: tuple, lines: list, enabled: bool) -> dict:
@@ -196,7 +201,7 @@ def validate_extensions(words: tuple, lines: list, modes: Modes) -> dict:
         require(not any(words[162:164]), "unexpected media reopen evidence")
     return {
         **net_entropy(words, lines, modes.authenticated_net),
-        **net_signer(lines, modes.authenticated_net),
+        **net_signer(lines, modes.authenticated_net, words[148] if modes.signed_media else None),
         **control_observations(words, lines, modes.live_control),
         **net_retirement(words, lines, modes),
         **audit_session(words, lines, modes.live_control),

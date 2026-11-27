@@ -82,8 +82,7 @@ use cyxia_kernel_core::control_plane::{
     advice_ledger_v0199::EvidenceLedger,
     apply_report_v1::{
         ActionStatus, ApplyReportV1, BoundReport, ExecutorBindingV1, MAX_APPLY_REPORT_BYTES,
-        ReportOrigin,
-        TrustedApplyScope,
+        ReportOrigin, TrustedApplyScope,
     },
     apply_work_v1::ApplyWorkV1,
     cpu0_v0199 as profile,
@@ -992,9 +991,9 @@ fn reject_service_preflight(index: usize, args: [u64; 6]) -> Option<u64> {
             feature = "v020-production-fsync-scratch",
             feature = "v020-production-media-reopen"
         ))]
-        cyxia_kernel_core::security::file_read_v4::ENDPOINT => {
-            Some(file_receipt::reject_preflight(index, pie_member(index), args))
-        }
+        cyxia_kernel_core::security::file_read_v4::ENDPOINT => Some(
+            file_receipt::reject_preflight(index, pie_member(index), args),
+        ),
         #[cfg(all(
             not(feature = "v020-production-file-read"),
             feature = "v020-production-fsync-scratch",
@@ -1506,8 +1505,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         feature = "v020-production-fsync-scratch",
         feature = "v020-production-media-reopen"
     ))]
-    let other_protected_pool_bytes =
-        other_protected_pool_bytes + file_receipt::protected_bytes();
+    let other_protected_pool_bytes = other_protected_pool_bytes + file_receipt::protected_bytes();
     let pie_manifest = NativeRoleManifest {
         online_mask: profile::ONLINE,
         members: pie_members,
@@ -1868,7 +1866,12 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         .expect("D01 install without waiting");
     let fault = match timing {
         Some(t) => {
-            report("V020_SEC_S_TARGET_LOCK", t.work_ns, t.overhead_ns, t.total_ns);
+            report(
+                "V020_SEC_S_TARGET_LOCK",
+                t.work_ns,
+                t.overhead_ns,
+                t.total_ns,
+            );
             u64::from(t.exceeded())
         }
         None => 8, // unmeasured; close new work while retaining the installed root
@@ -1948,7 +1951,8 @@ pub(crate) fn run(info: &BootInfo) -> ! {
             Some(pair),
             |_, r| {
                 if r.state == ActionStatus::Applied
-                    && EXEC_TARGET.installed_weight(r.plan_version)
+                    && EXEC_TARGET
+                        .installed_weight(r.plan_version)
                         .is_some_and(|actual| actual.to_le_bytes() == r.action)
                 {
                     Ok(())
@@ -2024,8 +2028,9 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         );
     }
 
-    // SEC-N: real VirtIO-net + TCP relayed to the EL0 local-echo guest.
-    let net_outcome = net::serve(info);
+    // With no signed media, this is the standalone network fixture identity.
+    #[cfg(not(feature = "v020-production-media-signed"))]
+    let net_outcome = net::serve(info, super::sec_n_broker::BootIdentity::FIXTURE);
     // Opt-in G-B media staging on a throw-away scratch VirtIO-blk disk.
     #[cfg(feature = "v020-production-media-staging")]
     let staging_outcome = media_staging::stage(
@@ -2043,6 +2048,13 @@ pub(crate) fn run(info: &BootInfo) -> ! {
             )
         },
     );
+    // The signed scratch profile binds diagnostics to the same durable boot
+    // as the mount. No listener or device ownership starts on mount refusal.
+    #[cfg(feature = "v020-production-media-signed")]
+    let net_outcome = match staging_outcome.network_boot() {
+        Some(identity) => net::serve(info, identity),
+        None => net::NetOutcome::default(),
+    };
 
     // (11) QMP-readable evidence page.
     let words = unsafe { &*core::ptr::addr_of!(SMP_EVIDENCE) };
@@ -2161,18 +2173,24 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     #[cfg(feature = "v020-production-live-control")]
     observations::drive(&mut pie_ctx, &pie_manifest);
     #[cfg(feature = "v020-production-file-read")]
-    if staging_outcome.services_ready() && let Some(view) = staging_outcome.file_read {
+    if staging_outcome.services_ready()
+        && let Some(view) = staging_outcome.file_read
+    {
         file_read::drive(&mut pie_ctx, &pie_manifest, view);
     }
     #[cfg(all(
         feature = "v020-production-fsync-scratch",
         feature = "v020-production-media-reopen"
     ))]
-    if staging_outcome.services_ready() && let Some(view) = staging_outcome.file_receipts {
+    if staging_outcome.services_ready()
+        && let Some(view) = staging_outcome.file_receipts
+    {
         file_receipt::drive(&mut pie_ctx, &pie_manifest, view);
     }
     #[cfg(feature = "v020-production-snapshot-catalog")]
-    if staging_outcome.services_ready() && let Some(view) = staging_outcome.snapshot_catalog {
+    if staging_outcome.services_ready()
+        && let Some(view) = staging_outcome.snapshot_catalog
+    {
         snapshot_catalog::drive(&mut pie_ctx, &pie_manifest, view);
     }
     words.words[2].store(1, Ordering::Release);

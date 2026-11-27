@@ -9,13 +9,13 @@ const SIGNER_ELF: &[u8] =
 const SIGNER_ASID: u8 = 0x41;
 const SIGNER_FRAMES: usize = 64;
 const SIGNER_STACK_PAGES: usize = 16;
-const KEY_GENERATION: u64 = 1;
 #[unsafe(link_section = ".bss.sec_n")]
 static mut SIGNER: AddressSpace<SIGNER_FRAMES, SIGNER_STACK_PAGES> = AddressSpace::ZERO;
 
 pub(crate) struct Signer {
     memory: Memory,
     entry: u64,
+    identity: BootIdentity,
     issued: Option<(Request, Option<[u8; SIGNATURE_BYTES]>)>,
 }
 
@@ -24,7 +24,7 @@ impl Signer {
         matches!(self.issued, Some((request, Some(_))) if request.conn_generation == generation)
     }
 
-    pub(crate) fn load() -> Self {
+    pub(crate) fn load(identity: BootIdentity) -> Self {
         // SAFETY: the single CPU0 network owner loads this address space once.
         // Its key pages are separate from the verifier's virtual address space.
         let memory = unsafe { AddressSpace::memory(core::ptr::addr_of_mut!(SIGNER)) };
@@ -38,6 +38,7 @@ impl Signer {
         Self {
             memory,
             entry: layout.entry,
+            identity,
             issued: None,
         }
     }
@@ -67,11 +68,11 @@ impl Signer {
         // authorization before entering the signer; failure cannot issue a
         // second nonce for the same pending connection.
         let request = Request {
-            boot_epoch: BOOT_EPOCH,
-            verifier_generation: SERVICE_GEN,
+            boot_epoch: self.identity.boot_epoch,
+            verifier_generation: self.identity.verifier_generation,
             conn_id: connection,
             conn_generation: connection,
-            key_generation: KEY_GENERATION,
+            key_generation: self.identity.key_generation,
             nonce: 1,
             expires_ns,
             transcript_hash,
@@ -79,6 +80,12 @@ impl Signer {
         self.issued = Some((request, None));
         let signature = self.sign(&request)?;
         self.issued = Some((request, Some(signature)));
+        report(
+            "V020_SEC_N_SIGNER_IDENTITY",
+            request.boot_epoch,
+            request.verifier_generation,
+            request.key_generation,
+        );
         report("V020_SEC_N_SIGNER_REPLY", connection, request.nonce, 1);
         Some(signature)
     }

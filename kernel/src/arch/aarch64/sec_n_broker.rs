@@ -127,9 +127,52 @@ const PEER_NODE: [u8; 32] = [
 ];
 #[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) const SOURCE_IP: u32 = 0x0A00_0202; // 10.0.2.2, trusted native owner observation.
-const BOOT_EPOCH: u64 = 1;
-const SERVICE_GEN: u64 = 1;
 const UNIX_SECONDS: u64 = 1_700_000_000; // fixed: no time-based handshake timeout.
+
+/// Input from the trusted owner, never from the Verifier's shared page.
+#[derive(Clone, Copy)]
+pub(crate) struct BootIdentity {
+    pub(crate) boot_epoch: u64,
+    verifier_generation: u64,
+    #[cfg(feature = "v020-production-authenticated-net")]
+    key_generation: u64,
+}
+
+impl BootIdentity {
+    #[cfg(any(
+        feature = "v0199-sec-n-selftest",
+        not(feature = "v020-production-media-signed")
+    ))]
+    pub(crate) const FIXTURE: Self = Self {
+        boot_epoch: 1,
+        verifier_generation: 1,
+        #[cfg(feature = "v020-production-authenticated-net")]
+        key_generation: 1,
+    };
+
+    #[cfg(feature = "v020-production-media-signed")]
+    pub(crate) fn from_signed_scratch(
+        state: &cyxia_kernel_core::security::file_index_v0199::SecurityStateStoreV2,
+    ) -> Option<Self> {
+        const VERIFIER_SLOT: usize = 13 - 1;
+        const SIGNER_SLOT: usize = 14 - 1;
+
+        // These diagnostics still use the pinned generation-1 TLS key.
+        // A different persisted key generation requires a provisioned Signer.
+        let verifier_generation = state.service_generations[VERIFIER_SLOT];
+        (state.last_boot_epoch != 0
+            && state.key_generation == 1
+            && verifier_generation != 0
+            && state.service_generations[SIGNER_SLOT] != 0
+            && state.isolated_service_bitmap & ((1 << VERIFIER_SLOT) | (1 << SIGNER_SLOT)) == 0)
+            .then_some(Self {
+                boot_epoch: state.last_boot_epoch,
+                verifier_generation,
+                #[cfg(feature = "v020-production-authenticated-net")]
+                key_generation: state.key_generation,
+            })
+    }
+}
 
 // ---- private address-space layout ----
 const PAGE: usize = 4096;
@@ -466,10 +509,18 @@ fn shared_put(off: u64, bytes: &[u8]) {
 /// kernel-local node pin presented to the guest (wrong value => identity negative).
 #[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn stage_shared(local: [u8; 32], connected: bool, conn_epoch: u64) {
-    stage_connection(local, connected, conn_epoch, SOURCE_IP, now_ns());
+    stage_connection(
+        BootIdentity::FIXTURE,
+        local,
+        connected,
+        conn_epoch,
+        SOURCE_IP,
+        now_ns(),
+    );
 }
 
 pub(crate) fn stage_connection(
+    identity: BootIdentity,
     local: [u8; 32],
     connected: bool,
     conn_epoch: u64,
@@ -480,8 +531,8 @@ pub(crate) fn stage_connection(
     unsafe { core::ptr::write_bytes(p, 0, SHARED_PAGES * PAGE) };
     shared_write(OFF_MAGIC, SVC_MAGIC);
     shared_write(OFF_VERSION, SVC_VERSION);
-    shared_write(OFF_BOOT_EPOCH, BOOT_EPOCH);
-    shared_write(OFF_SERVICE_GEN, SERVICE_GEN);
+    shared_write(OFF_BOOT_EPOCH, identity.boot_epoch);
+    shared_write(OFF_SERVICE_GEN, identity.verifier_generation);
     shared_write(OFF_UNIX_SECONDS, UNIX_SECONDS);
     shared_write(OFF_MONOTONIC_MS, now_ms());
     shared_write(OFF_MONOTONIC_NS, accepted_ns);

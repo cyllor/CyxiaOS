@@ -414,6 +414,11 @@ class Production:
                     "CPU1-3 did not keep business-only native progress")
             require(business[slot - 1] == (slot, progress, irqs), "business serial/memory mismatch")
             progress_total += progress
+        if self.modes.signed_media and STAGING_INCOMPLETE in serial:
+            require(not any(words[138:143]) and words[160] == words[176] == 0
+                    and not any(line.startswith(("V020_W11_NET_", "V020_SEC_N_", "V020_SEC_D_NET_RESET_"))
+                                for line in lines), "network started without signed media custody")
+            raise ValueError("guest reported V020_W11_MEDIA_STAGING_INCOMPLETE: a staging step failed")
         extensions = validate_extensions(words, lines, self.modes)
         wave11 = validate_w11(words, lines, serial, self.staging, snapshot_calls, self.modes,
                               pending_fsync_blocks=pending_fsync_blocks)
@@ -651,6 +656,12 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
     check_w11_net(words, lines, serial)
     media_rows = check_w11_staging(words, lines, serial, staging, snapshot_calls, modes,
                                    pending_fsync_blocks=pending_fsync_blocks)
+    net_boot_epoch = words[148] if modes.signed_media else 1
+    if modes.signed_media:
+        listen = "V020_W11_NET_LISTEN a=7 b=0 c=0"
+        confirmation = f"V020_W11_MEDIA_STEP a=4 b=1 c={net_boot_epoch}"
+        require(lines.count(listen) == 1 and lines.index(confirmation) < lines.index(listen),
+                "signed-media network listened before durable BootEpoch confirmation")
     flags = {
         "frame_meta": words[129] == 1,
         "recovery": (words[131] == RECOVERY_ACCUMULATORS and words[133] == 1
@@ -671,7 +682,7 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
         "frame_meta_production_statics": True,
         "frame_meta_registered_static_pages": words[130],
         **measured_rows,
-        **net_reset_proofs(lines),
+        **net_reset_proofs(lines, boot_epoch=net_boot_epoch),
         **media_rows,
         "recovery_accumulators": words[131],
         "degraded_events": words[132],

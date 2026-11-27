@@ -2,7 +2,7 @@
 //! Compiled only under `v020-production-media-staging`; the G-A
 //! `v020-production` build never reads or writes any v1 on-disk layout.
 //!
-//! After the business CPUs stopped (and after SEC-N), CPU0 attaches ONE
+//! After the business CPUs stopped, CPU0 attaches one
 //! dedicated 512 MiB scratch VirtIO-blk device through
 //! the shared format-fixture plumbing (`scratch_blk`) and runs, each step only
 //! if the previous one passed (fail-closed chain):
@@ -120,6 +120,8 @@ pub(super) struct StagingOutcome {
     pub(super) unified_map_validated: bool,
     /// `BootEpochAuthority::confirmed_epoch`, 0 = not confirmed.
     pub(super) confirmed_epoch: u64,
+    #[cfg(feature = "v020-production-media-signed")]
+    network_boot: Option<super::super::sec_n_broker::BootIdentity>,
     #[cfg(feature = "v020-production-signed-resident")]
     pub(super) resident_boot: Option<SignedResidentBoot>,
     pub(super) admission_flow_ok: bool,
@@ -170,6 +172,11 @@ impl SignedResidentBoot {
 }
 
 impl StagingOutcome {
+    #[cfg(feature = "v020-production-media-signed")]
+    pub(super) fn network_boot(&self) -> Option<super::super::sec_n_broker::BootIdentity> {
+        self.network_boot.filter(|_| self.chain_complete)
+    }
+
     /// First missing staging result, including the independent in-vector probe.
     fn first_incomplete_step(&self, snapshot_refused: bool) -> Option<u8> {
         let missing = [
@@ -407,6 +414,8 @@ fn run_chain(
         if committed.last_boot_epoch != out.confirmed_epoch {
             return None;
         }
+        out.network_boot =
+            super::super::sec_n_broker::BootIdentity::from_signed_scratch(&committed);
         out.receipt_query_digest =
             Some(volume::confirmed_receipt_query_digest(&mounted, &committed, &verified).ok()?);
         #[cfg(all(

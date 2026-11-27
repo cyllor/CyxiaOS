@@ -96,8 +96,9 @@ def w11_lines(staging: bool = False) -> list:
                             queue, 0, 1, 1, 1, 0, 0, 5_000_000)
         lines.append("V020_SEC_D_NET_RESET_PROOF " + proof.hex())
     if staging:
-        lines += [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
-                  for index, detail in enumerate((1, 5, 151, 1, 1), start=1)]
+        listen = lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0")
+        lines[listen:listen] = [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
+                                for index, detail in enumerate((1, 5, 151, 1, 1), start=1)]
         lines += [f"V020_W11_MEDIA_SNAPSHOT_0X40 a=3 b={v.EAGAIN_RESULT} c=0",
                   "V020_W12_MEDIA_EPOCH a=0 b=1 c=0",
                   "V020_W11_MEDIA_IO a=135359 b=4138 c=6",
@@ -557,6 +558,38 @@ class W11Validation(unittest.TestCase):
         self.rejects("signed scratch test scope", words=words, lines=lines[:-1], staging=True, modes=modes)
         words[182] = 2
         self.rejects("signed scratch verdict and BootEpoch", words=words, lines=lines, staging=True, modes=modes)
+
+    def test_signed_reopen_requires_the_current_network_reset_epoch(self):
+        modes = v.Modes(media_reopen=True, signed_media=True)
+        words = w11_words(staging=True)
+        words[145] = 0
+        words[148] = 2
+        words[162:164] = [1, 1]
+        words[181:188] = [1, 2, 2, 2, 3, 4, 5]
+        lines = w11_lines(staging=True)
+        replacements = {
+            "V020_W11_MEDIA_STEP a=4 b=1 c=1": "V020_W11_MEDIA_STEP a=4 b=1 c=2",
+            "V020_W12_MEDIA_EPOCH a=0 b=1 c=0": "V020_W12_MEDIA_EPOCH a=1 b=2 c=1",
+            "V020_W11_MEDIA_IO a=135359 b=4138 c=6": "V020_W11_MEDIA_IO a=8261 b=15 c=5",
+        }
+        lines = [replacements.get(line, line) for line in lines] + [
+            "V020_W23_RECEIPT_VIEW a=2 b=7 c=2",
+            "V020_W13_SIGNED_SCRATCH a=1 b=2 c=1",
+            "V020_W13_MEDIA_SCOPE test_key=true format_golden=false signed_config=true",
+        ]
+        self.rejects("wrong generation", words=words, lines=lines, staging=True, modes=modes)
+        prefix = "V020_SEC_D_NET_RESET_PROOF "
+        for index, line in enumerate(lines):
+            if line.startswith(prefix):
+                encoded = bytearray.fromhex(line.removeprefix(prefix))
+                struct.pack_into("<Q", encoded, 8, 2)
+                lines[index] = prefix + encoded.hex()
+        self.assertEqual(self.check(words=words, lines=lines, staging=True, modes=modes)
+                         ["native_net_reset_boot_epoch"], 2)
+        listen = "V020_W11_NET_LISTEN a=7 b=0 c=0"
+        lines.remove(listen)
+        lines.insert(0, listen)
+        self.rejects("before durable BootEpoch", words=words, lines=lines, staging=True, modes=modes)
 
     def test_signed_receipt_view_host_disk_hash_rejects_modified_or_short_image(self):
         # Synthetic sparse file, not evidence of a native device run.
