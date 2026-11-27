@@ -153,24 +153,15 @@ impl BootIdentity {
     #[cfg(feature = "v020-production-media-signed")]
     pub(crate) fn from_signed_scratch(
         state: &cyxia_kernel_core::security::file_index_v0199::SecurityStateStoreV2,
+        config: &cyxia_kernel_core::security::offline_config_v1::VerifiedOfflineConfig<'_>,
+        installation: cyxia_kernel_core::security::network::TlsInstallation,
     ) -> Option<Self> {
-        const VERIFIER_SLOT: usize = 13 - 1;
-        const SIGNER_SLOT: usize = 14 - 1;
-
-        // These diagnostics still use the pinned generation-1 TLS key.
-        // A different persisted key generation requires a provisioned Signer.
-        let verifier_generation = state.service_generations[VERIFIER_SLOT];
-        (state.last_boot_epoch != 0
-            && state.key_generation == 1
-            && verifier_generation != 0
-            && state.service_generations[SIGNER_SLOT] != 0
-            && state.isolated_service_bitmap & ((1 << VERIFIER_SLOT) | (1 << SIGNER_SLOT)) == 0)
-            .then_some(Self {
-                boot_epoch: state.last_boot_epoch,
-                verifier_generation,
-                #[cfg(feature = "v020-production-authenticated-net")]
-                key_generation: state.key_generation,
-            })
+        Some(Self {
+            boot_epoch: installation.authorize(config, state).ok()?,
+            verifier_generation: installation.verifier_generation,
+            #[cfg(feature = "v020-production-authenticated-net")]
+            key_generation: installation.key_generation,
+        })
     }
 }
 

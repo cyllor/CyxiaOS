@@ -1,7 +1,9 @@
 //! SEC-N: bounded native TCP/TLS service admission and exact read-only echo.
 //! Cryptographic verification remains the responsibility of the real TLS
 //! engine; a wire message cannot manufacture VerifiedTls.
-use super::Error;
+use super::{
+    Error, file_index_v0199::SecurityStateStoreV2, offline_config_v1::VerifiedOfflineConfig,
+};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -16,6 +18,52 @@ const TOKEN: u64 = 1_000_000_000;
 const BURST: u64 = 4 * TOKEN;
 pub const TLS13: u16 = 0x0304;
 pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+
+/// Generations and key catalogue pinned by the owner of the installed TLS
+/// Verifier and Signer. The state must come from the confirmed boot pair.
+#[derive(Clone, Copy)]
+pub struct TlsInstallation {
+    pub verifier_generation: u64,
+    pub signer_generation: u64,
+    pub key_generation: u64,
+    pub key_manifest_hash: [u8; 32],
+}
+
+impl TlsInstallation {
+    pub fn authorize(
+        self,
+        config: &VerifiedOfflineConfig<'_>,
+        state: &SecurityStateStoreV2,
+    ) -> Result<u64, Error> {
+        const VERIFIER_SLOT: usize = 13 - 1;
+        const SIGNER_SLOT: usize = 14 - 1;
+        const SERVICES: u64 = (1 << VERIFIER_SLOT) | (1 << SIGNER_SLOT);
+
+        config.check_committed(state)?;
+        if state.last_boot_epoch == 0
+            || state.isolated_service_bitmap & SERVICES != 0
+            || config.header().key_manifest_hash != self.key_manifest_hash
+        {
+            return Err(Error::Unauthorized);
+        }
+        for (installed, committed) in [
+            (
+                self.verifier_generation,
+                state.service_generations[VERIFIER_SLOT],
+            ),
+            (
+                self.signer_generation,
+                state.service_generations[SIGNER_SLOT],
+            ),
+            (self.key_generation, state.key_generation),
+        ] {
+            if installed == 0 || installed != committed {
+                return Err(Error::Stale);
+            }
+        }
+        Ok(state.last_boot_epoch)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VerifiedTls {

@@ -436,7 +436,11 @@ fn run_chain(
         if committed.last_boot_epoch != out.confirmed_epoch {
             return None;
         }
-        out.network_boot = super::super::sec_n_broker::BootIdentity::from_signed_scratch(&committed);
+        out.network_boot = super::super::sec_n_broker::BootIdentity::from_signed_scratch(
+            &committed,
+            &verified,
+            signed::FIXTURE_TLS,
+        );
         out.receipt_query_digest =
             Some(volume::confirmed_receipt_query_digest(&mounted, &committed, &verified).ok()?);
         #[cfg(all(
