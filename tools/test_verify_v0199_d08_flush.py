@@ -81,6 +81,58 @@ class FlushGateTests(unittest.TestCase):
             with self.subTest(lines=invalid), self.assertRaises(ValueError):
                 check.check_reopen(invalid, snapshot, flush=True, before=before, after=after)
 
+    def test_qmp_replay_requires_ordered_responses_and_exact_serial(self):
+        disk = Path("/scratch.raw")
+        records = [{"direction": "receive", "message": {"QMP": {}}}]
+        index = 0
+
+        def exchange(command, response, args=None):
+            nonlocal index
+            index += 1
+            request = {"execute": command, "id": index}
+            if args is not None:
+                request["arguments"] = args
+            records.extend((
+                {"direction": "send", "message": request},
+                {"direction": "receive", "message": {"id": index, "return": response}},
+            ))
+
+        def snapshot(count):
+            exchange("x-query-virtio", [{"path": "/d08"}])
+            exchange("x-query-virtio-status", {"device-id": 2}, {"path": "/d08"})
+            exchange("query-block", [{"device": "scratch", "qdev": "d08",
+                                      "inserted": {"file": str(disk)}}])
+            exchange("query-blockstats", [{"device": "scratch",
+                                           "stats": dict.fromkeys(check.COUNTERS, count)}])
+
+        exchange("qmp_capabilities", {})
+        exchange("query-cpus-fast", [{"cpu-index": i, "qom-type": "cortex-a53-arm-cpu"}
+                                     for i in range(4)])
+        exchange("query-memory-size-summary", {"base-memory": 1024**3, "plugged-memory": 0})
+        snapshot(0)
+        exchange("cont", {})
+        exchange("ringbuf-read", "YWJj", {"device": "cyxlog", "size": 65536, "format": "base64"})
+        exchange("stop", {})
+        snapshot(1)
+        exchange("quit", {})
+        initial, final = check.replay_reopen_qmp(records, b"abc", disk)
+        self.assertEqual(initial["operations"], dict.fromkeys(check.COUNTERS, 0))
+        self.assertEqual(final["operations"], dict.fromkeys(check.COUNTERS, 1))
+        # An exit response can be absent after a clean disconnect; other replies cannot.
+        self.assertEqual(check.replay_reopen_qmp(records[:-1], b"abc", disk), (initial, final))
+        for changed in (records[:2] + records[3:], records[:3] + [records[2]] + records[3:]):
+            with self.assertRaises(ValueError):
+                check.replay_reopen_qmp(changed, b"abc", disk)
+        altered = copy.deepcopy(records)
+        next(row for row in altered if row["message"].get("execute") == "stop")["message"]["execute"] = "cont"
+        with self.assertRaises(ValueError):
+            check.replay_reopen_qmp(altered, b"abc", disk)
+        with self.assertRaises(ValueError):
+            check.replay_reopen_qmp(records, b"abd", disk)
+        with self.assertRaises(ValueError):
+            check.replay_reopen_qmp(records, b"abc", Path("/another.raw"))
+
+
     def test_preserved_disks_survive_next_writable_boot(self):
         with tempfile.TemporaryDirectory() as d, patch.object(check, "SCRATCH_BYTES", 16):
             root = Path(d)
