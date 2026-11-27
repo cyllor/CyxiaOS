@@ -119,7 +119,13 @@ impl ExecTarget {
             asm!("dsb sy", "isb", options(nostack, preserves_flags));
             timer::enable_irqs();
         }
-        let (installed, timing) = self.try_commit_irq_off(prepared, frequency);
+        let (installed, [before, work_start, work_end, after]) = self.try_commit_irq_off(prepared);
+        // IRQ is enabled here. Convert and latch the real sampled bounds
+        // before restoring the fixture's outer mask and timer routing.
+        let timing = IrqOffTiming::from_ticks(before, work_start, work_end, after, frequency).ok();
+        if timing.is_none_or(|t| t.exceeded() != 0) {
+            self.closed.store(true, Ordering::Release);
+        }
         // SAFETY: restore the exact outer IRQ state before restoring its
         // banked timer interrupt enable. No EL0 runs inside this function.
         unsafe {
@@ -128,66 +134,82 @@ impl ExecTarget {
         if was_enabled {
             gic().unmask(irq).expect("restore the registered timer PPI");
         }
-        let timing = timing.ok();
-        if timing.is_none_or(|t| t.exceeded() != 0) {
-            self.closed.store(true, Ordering::Release);
-        }
         // A measured overrun after the release store does not erase an
         // installed root or turn an accepted effect into a failed one.
         installed.map(|()| timing)
     }
 
     #[inline(never)]
-    fn try_commit_irq_off(
-        &self,
-        prepared: PreparedWeight,
-        frequency: u64,
-    ) -> (Result<(), Error>, Result<IrqOffTiming, Error>) {
-        let start: u64;
-        // SAFETY: called only with IRQ enabled by commit(). Time samples
-        // carry memory clobbers to keep the release store inside the scope.
+    fn try_commit_irq_off(&self, prepared: PreparedWeight) -> (Result<(), Error>, [u64; 4]) {
+        let before: u64;
+        let work_start: u64;
+        let work_end: u64;
+        let after: u64;
+        let lock_failed: u32;
+        let prior: u64;
+        // SAFETY: CPU0 enters with IRQ enabled and owns the timer handoff.
+        // Both precomputed addresses refer to aligned, live atomics in this
+        // target. One acquire-exclusive attempt owns the byte only after a
+        // successful store-exclusive. Its owner installs and releases with
+        // release ordering. A failed attempt never writes the root or unlocks
+        // the existing holder. Every exit restores IRQ before the last tick.
+        // No compiler-generated loads, stores, or conversions can enter
+        // this mask-to-restore interval.
         unsafe {
-            asm!("isb", "mrs {}, cntpct_el0", "msr daifset, #2", "isb",
-                out(reg) start, options(nostack, preserves_flags));
+            asm!(
+                "isb",
+                "mrs {before}, cntpct_el0",
+                "msr daifset, #2",
+                "isb",
+                "ldaxrb {lock_failed:w}, [{held}]",
+                "cbnz {lock_failed:w}, 3f",
+                "stxrb {lock_failed:w}, {one:w}, [{held}]",
+                "cbnz {lock_failed:w}, 4f",
+                "isb",
+                "mrs {work_start}, cntpct_el0",
+                "ldr {prior}, [{root}]",
+                "cbnz {prior}, 2f",
+                "stlr {new_root}, [{root}]",
+                "2:",
+                "isb",
+                "mrs {work_end}, cntpct_el0",
+                "stlrb wzr, [{held}]",
+                "msr daifclr, #2",
+                "isb",
+                "mrs {after}, cntpct_el0",
+                "b 5f",
+                "3:",
+                "clrex",
+                "4:",
+                "msr daifclr, #2",
+                "isb",
+                "mrs {after}, cntpct_el0",
+                "mov {prior}, xzr",
+                "mov {work_start}, {before}",
+                "mov {work_end}, {before}",
+                "5:",
+                held = in(reg) self.held.as_ptr(),
+                root = in(reg) self.installed.as_ptr(),
+                new_root = in(reg) prepared.0,
+                one = in(reg) 1u32,
+                before = out(reg) before,
+                work_start = out(reg) work_start,
+                work_end = out(reg) work_end,
+                after = out(reg) after,
+                lock_failed = out(reg) lock_failed,
+                prior = out(reg) prior,
+                options(nostack, preserves_flags),
+            );
         }
-        let (outcome, work_start, work_end) = if self
-            .held
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            let work_start = sample_ticks();
-            let outcome = if self.installed.load(Ordering::Relaxed) == 0 {
-                self.installed.store(prepared.0, Ordering::Release);
-                Ok(())
-            } else {
-                Err(Error::Stale)
-            };
-            let work_end = sample_ticks();
-            self.held.store(false, Ordering::Release);
-            (outcome, work_start, work_end)
+        let installed = if lock_failed != 0 {
+            Err(Error::Busy)
+        } else if prior != 0 {
+            Err(Error::Stale)
         } else {
-            (Err(Error::Busy), start, start)
+            Ok(())
         };
-        let end: u64;
-        // SAFETY: restore the I bit to the enabled state used at the start.
-        // The last timestamp is a conservative upper bound on IRQ-off time.
-        unsafe {
-            asm!("msr daifclr, #2", "isb", "mrs {}, cntpct_el0",
-                out(reg) end, options(nostack, preserves_flags));
-        }
-        (
-            outcome,
-            IrqOffTiming::from_ticks(start, work_start, work_end, end, frequency),
-        )
+        (installed, [before, work_start, work_end, after])
     }
-}
-
-#[inline(always)]
-fn sample_ticks() -> u64 {
-    let count: u64;
-    // SAFETY: native EL1 reads its own fixed-frequency architectural counter.
-    unsafe { asm!("isb", "mrs {}, cntpct_el0", out(reg) count, options(nostack, preserves_flags)) };
-    count
 }
 
 fn with_observations<R>(f: impl FnOnce(&mut CompletedSectionObservations) -> R) -> R {
