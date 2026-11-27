@@ -2,6 +2,8 @@
 //! CPU0 is the only writer of role backing and page tables. The published
 //! RX mappings have their writable aliases removed before first entry.
 use super::{Page, mmu, phys, ram_l3, timer, user};
+#[cfg(cyxia_signed_resident)]
+use core::sync::atomic::AtomicU16;
 use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(cyxia_startup_catalog)]
 use cyxia_contracts::PagePermissions;
@@ -28,6 +30,7 @@ pub(super) static PIE_CAP: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) 
 // ---- PIE role backing / page tables (CPU0 sole loader) ----
 struct BootPackage {
     role_id: u16,
+    syscall_abi: u16,
     bytes: &'static [u8],
     image_sha256: [u8; 32],
     relative_sha256: [u8; 32],
@@ -296,7 +299,7 @@ pub(super) fn load_role_with_identity(
     let spec = RolePackageSpec {
         role,
         package_id: u64::from(role.id()),
-        abi: 3,
+        abi: pkg.syscall_abi,
         image_bytes: pkg.bytes.len(),
         image_sha256: pkg.image_sha256,
         relative_count: pkg.relative.len(),
@@ -313,6 +316,8 @@ pub(super) fn load_role_with_identity(
         &mut || {},
     )
     .expect("trusted ABI3 role package");
+    #[cfg(cyxia_signed_resident)]
+    let syscall_abi = verified.syscall_abi();
     let relro = verified.relro();
     let image = unsafe { &mut *core::ptr::addr_of_mut!((*b).image) };
     let entry = verified
@@ -398,6 +403,8 @@ pub(super) fn load_role_with_identity(
     PIE_SP[index].store(startup.sp, Ordering::Release);
     PIE_X0[index].store(startup.x0, Ordering::Release);
     PIE_X1[index].store(startup.x1, Ordering::Release);
+    #[cfg(cyxia_signed_resident)]
+    PIE_SYSCALL_ABI[index].store(syscall_abi, Ordering::Release);
     Ok(NativeRole {
         role,
         actor,
@@ -417,6 +424,18 @@ static PIE_ENTRY: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_C
 static PIE_SP: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
 static PIE_X0: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
 static PIE_X1: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
+#[cfg(cyxia_signed_resident)]
+#[unsafe(export_name = "V020_SIGNED_ROLE_SYSCALL_ABI")]
+static PIE_SYSCALL_ABI: [AtomicU16; ROLE_COUNT] = [const { AtomicU16::new(0) }; ROLE_COUNT];
+
+#[cfg(cyxia_signed_resident)]
+pub(super) fn pie_syscall_abi(index: usize, root: u64) -> Option<u16> {
+    if root_pa(index) != root {
+        return None;
+    }
+    let abi = PIE_SYSCALL_ABI[index].load(Ordering::Acquire);
+    (abi != 0).then_some(abi)
+}
 
 pub(super) fn pie_context(index: usize) -> user::Context {
     let mut ctx = user::Context::empty();

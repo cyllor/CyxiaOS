@@ -11,6 +11,7 @@ mod lifecycle_packages;
 use lifecycle_packages::{LifecyclePackageDigest, lifecycle_package_message};
 
 const ROLES: [u16; 8] = [6, 7, 2, 8, 9, 3, 10, 11];
+const SYSCALL_ABI: u16 = 3;
 fn u16at(b: &[u8], n: usize) -> u16 {
     u16::from_le_bytes(b[n..n + 2].try_into().unwrap())
 }
@@ -338,7 +339,7 @@ pub fn build(default_catalog: bool) {
             "independent role ELF package unexpectedly identical"
         );
         hashes.push(hash);
-        manifest.push_str(&format!("BootPackage {{ role_id:{role}, bytes:include_bytes!(concat!(env!(\"OUT_DIR\"),\"/{name}\")), image_sha256:{hash:?}, relative_sha256:{rel:?},relative:{rust_entries} }},\n"));
+        manifest.push_str(&format!("BootPackage {{ role_id:{role}, syscall_abi:{SYSCALL_ABI}, bytes:include_bytes!(concat!(env!(\"OUT_DIR\"),\"/{name}\")), image_sha256:{hash:?}, relative_sha256:{rel:?},relative:{rust_entries} }},\n"));
         LifecyclePackageDigest {
             role,
             image: hash,

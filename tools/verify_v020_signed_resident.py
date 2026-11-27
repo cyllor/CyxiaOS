@@ -172,6 +172,27 @@ def verify_role_mappings(qmp, output: Path, elf: bytes, backing: dict) -> dict:
     return {"role_readonly_pages": readonly, "role_private_writable_pages": private}
 
 
+def capture_role_syscall_abi(qmp, output: Path, image: bytes) -> dict:
+    try:
+        location = symbol(image, "V020_SIGNED_ROLE_SYSCALL_ABI")
+    except ValueError as error:
+        if str(error) != "missing symbol V020_SIGNED_ROLE_SYSCALL_ABI":
+            raise
+        return {}
+    width = len(ROLES) * 2
+    require(location["size"] == width and location["pa"] % 2 == 0,
+            "invalid linked role syscall ABI table")
+    path = output / "role-syscall-abi.bin"
+    qmp.execute("pmemsave", {"val": location["pa"], "size": width,
+                             "filename": str(path.resolve())})
+    raw = path.read_bytes()
+    require(len(raw) == width, "incomplete role syscall ABI readback")
+    tags = struct.unpack(f"<{len(ROLES)}H", raw)
+    require(tags == (3,) * len(ROLES), "a signed lifecycle role lacks a verified ABI3 tag")
+    return {"role_syscall_abi": dict(zip(ROLES, tags)),
+            "role_syscall_abi_sha256": sha(path)}
+
+
 def capture_budget_trace(socket_path: Path, elf: Path, output: Path, deadline: float, *,
                          frame_table: tuple | None = None) -> dict:
     image = elf.read_bytes()
@@ -203,8 +224,9 @@ def capture_budget_trace(socket_path: Path, elf: Path, output: Path, deadline: f
                 table, table_bytes, _, _ = frame_table
                 qmp.execute("pmemsave", {"val": table, "size": table_bytes,
                                          "filename": str((output / FRAME_TABLE_FILE).resolve())})
+            mappings.update(capture_role_syscall_abi(qmp, output, image))
             if backing is not None:
-                mappings = verify_role_mappings(qmp, output, image, backing)
+                mappings.update(verify_role_mappings(qmp, output, image, backing))
         finally:
             (output / "budget-qmp.jsonl").write_text(
                 "".join(json.dumps(row) + "\n" for row in qmp.transcript), encoding="utf-8",

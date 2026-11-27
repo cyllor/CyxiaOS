@@ -9,7 +9,7 @@
 //! one continuous CPU0 cursor from early boot through the durable media
 //! handoff and the resident roles.
 
-use super::role_loader::RoleLaunch;
+use super::role_loader::{RoleLaunch, pie_syscall_abi};
 use super::{
     BootInfo, E_AUTH, Error, ExceptionFrame, IRQS, Identity, NativeRole, NativeRoleManifest,
     Ordering, ROLE_COUNT, ROLES, Role, TIMER_IRQ, bring_up_production, cpu, frames, gic,
@@ -28,7 +28,7 @@ use cyxia_kernel_core::{
         Error as SvcError,
         durable_role_epoch_v0199::ConfirmedBootPolicy,
         syscall::Syscall,
-        syscall_v3::{ABI_VERSION, decode_aarch64_lifecycle_svc_v3, preflight_errno},
+        syscall_v3::{decode_aarch64_lifecycle_svc_v3, preflight_errno},
     },
 };
 
@@ -54,14 +54,19 @@ const FENCED: &[u8] =
 #[cfg(cyxia_lifecycle_package_signature)]
 const UNQUALIFIED_PACKAGES: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=lifecycle_packages_unqualified command=status\n";
-// CPU0 publishes the expected root/ASID for the exclusive running turn.
-// The vector verifies the live EL0 context before handing control back.
+// CPU0 publishes the expected root/ASID for each EL0 entry. The
+// vector consumes it once, before the common native capture returns.
 static ACTIVE_ROLE_TTBR0: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn verify_captured_role(frame: &ExceptionFrame, kind: u64) {
     if cpu::slot() == 0 && matches!(kind, 8 | 9) {
-        let expected = ACTIVE_ROLE_TTBR0.load(Ordering::Acquire);
-        if expected == 0 || frame.spsr & 0x1f != 0 || trapped_ttbr0() != expected {
+        let captured = trapped_ttbr0();
+        if captured == 0
+            || frame.spsr & 0x1f != 0
+            || ACTIVE_ROLE_TTBR0
+                .compare_exchange(captured, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
             super::fatal(FATAL_ROLE_CONTEXT);
         }
     }
@@ -421,7 +426,7 @@ fn register_frames(info: &mut BootInfo, budget: &mut Budget) -> Result<(), Fault
 }
 
 impl Task {
-    fn trap(&mut self) -> Result<TaskAction, Error> {
+    fn trap(&mut self, syscall_abi: u16) -> Result<TaskAction, Error> {
         let ctx = &mut self.context;
         if ctx.kind == 9 {
             return Ok(TaskAction::EndTurn);
@@ -429,7 +434,7 @@ impl Task {
         if ctx.kind != 8 || ctx.esr >> 26 != 0x15 {
             return Err(Error::Denied);
         }
-        let call = match decode_aarch64_lifecycle_svc_v3(ABI_VERSION, ctx.esr, &ctx.regs) {
+        let call = match decode_aarch64_lifecycle_svc_v3(syscall_abi, ctx.esr, &ctx.regs) {
             Ok(call) => call,
             Err(error) => {
                 if error == SvcError::Unauthorized {
@@ -573,6 +578,7 @@ fn run_quantum(
     let trap_limit = if decision { 1 } else { 8 };
     let asid = role_asid(index);
     let ttbr0 = member.ttbr0_root | (u64::from(asid) << 48);
+    let syscall_abi = pie_syscall_abi(index, member.ttbr0_root).ok_or(Error::Denied)?;
     for _ in 0..trap_limit {
         let wall_ticks = timer::ticks();
         let wall_left = grant
@@ -589,7 +595,10 @@ fn run_quantum(
             break;
         }
         let deadline = wall_ticks.checked_add(ticks).ok_or(Error::Clock)?;
-        ACTIVE_ROLE_TTBR0.store(ttbr0, Ordering::Release);
+        task.context.kind = 0;
+        ACTIVE_ROLE_TTBR0
+            .compare_exchange(0, ttbr0, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::Denied)?;
         // SAFETY: CPU0 is the sole owner of each verified, pinned root and
         // context. Its ASID is private and its mappings are retained for boot.
         unsafe {
@@ -597,9 +606,13 @@ fn run_quantum(
             user::enter_pinned_until_retired(&mut task.context, member.ttbr0_root, asid);
             cpu::disable_timer();
         }
-        ACTIVE_ROLE_TTBR0.store(0, Ordering::Release);
+        // Every dispatch needs a newly captured lower-EL trap from the
+        // root registered for this entry. No stale trap reaches recovery.
+        if ACTIVE_ROLE_TTBR0.swap(0, Ordering::AcqRel) != 0 || task.context.kind == 0 {
+            return Err(Error::Denied);
+        }
         *returned += 1;
-        match task.trap() {
+        match task.trap(syscall_abi) {
             Ok(TaskAction::Resume) => {}
             Ok(TaskAction::EndTurn) => break,
             Ok(TaskAction::Exit(status)) => return Ok(Some(status)),
