@@ -134,8 +134,7 @@ impl ExecTarget {
             asm!("dsb sy", "isb", options(nostack, preserves_flags));
             timer::enable_irqs();
         }
-        let (installed, [before, work_start, work_end, after]) =
-            self.try_commit_irq_off(prepared, saved_daif, saved_daif & !IRQ_MASK);
+        let (installed, [before, work_start, work_end, after]) = self.try_commit_irq_off(prepared);
         // IRQ is enabled here. Convert and latch the real sampled bounds
         // before restoring the fixture's outer mask and timer routing.
         let timing = IrqOffTiming::from_ticks(before, work_start, work_end, after, frequency).ok();
@@ -163,12 +162,7 @@ impl ExecTarget {
     }
 
     #[inline(never)]
-    fn try_commit_irq_off(
-        &self,
-        prepared: PreparedWeight,
-        masked: u64,
-        restored: u64,
-    ) -> (Result<(), Error>, [u64; 4]) {
+    fn try_commit_irq_off(&self, prepared: PreparedWeight) -> (Result<(), Error>, [u64; 4]) {
         let before: u64;
         let work_start: u64;
         let work_end: u64;
@@ -178,23 +172,24 @@ impl ExecTarget {
         // SAFETY: commit is entered only from the synchronous CPU0 runner,
         // outside its vector and recovery handlers. No other CPU takes this
         // lock. With IRQ masked, the acquire load and claim store form one
-        // bounded try-lock attempt. The addresses refer to live atomics.
+        // bounded try-lock attempt. The DSB completes the CPU0-local claim
+        // store before work starts. The addresses refer to live atomics.
         // Readers acquire the installed root from its release store. A busy
         // attempt leaves the existing holder and root intact.
-        // The DAIF operands contain this CPU's saved masks. Every exit
-        // restores the caller's mask before the last tick. Each DSB
-        // completes accesses to the inner-shareable target before the
-        // subsequent counter read.
+        // IRQ is enabled at entry with the stopped timer PPI masked. The
+        // immediate DAIF instructions change only its IRQ mask. Every
+        // exit restores IRQ before the last tick. Each DSB completes
+        // accesses to the inner-shareable target before the next sample.
         // No compiler-generated loads, stores, or conversions can enter
         // this mask-to-restore interval.
         unsafe {
             asm!(
                 "isb",
                 "mrs {before}, cntpct_el0",
-                "msr daif, {masked}",
+                "msr daifset, #2",
                 "ldarb {lock_failed:w}, [{held}]",
                 "cbnz {lock_failed:w}, 3f",
-                "stlrb {one:w}, [{held}]",
+                "strb {one:w}, [{held}]",
                 "dsb ish",
                 "mrs {work_start}, cntpct_el0",
                 "ldr {prior}, [{root}]",
@@ -204,12 +199,12 @@ impl ExecTarget {
                 "dsb ish",
                 "mrs {work_end}, cntpct_el0",
                 "stlrb wzr, [{held}]",
-                "msr daif, {restored}",
+                "msr daifclr, #2",
                 "dsb ish",
                 "mrs {after}, cntpct_el0",
                 "b 5f",
                 "3:",
-                "msr daif, {restored}",
+                "msr daifclr, #2",
                 "dsb ish",
                 "mrs {after}, cntpct_el0",
                 "mov {prior}, xzr",
@@ -219,8 +214,6 @@ impl ExecTarget {
                 held = in(reg) self.held.as_ptr(),
                 root = in(reg) self.installed.as_ptr(),
                 new_root = in(reg) prepared.0,
-                masked = in(reg) masked,
-                restored = in(reg) restored,
                 one = in(reg) 1u32,
                 before = out(reg) before,
                 work_start = out(reg) work_start,
@@ -250,9 +243,9 @@ fn local_daif() -> u64 {
     daif
 }
 
-/// Exercise the real target-lock routine on a private target before opening
-/// the business gates. This prepares its instruction path with the boot
-/// mask held throughout. Ordinary installs have their own admission receipt.
+/// Exercise the target lock on a private target before opening business
+/// gates. CPU0 has registered its interrupt handler. The same commit path
+/// masks the stopped timer PPI and restores the boot DAIF and PPI state.
 #[inline(never)]
 pub(super) fn check_target_lock_at_boot() {
     let daif = local_daif();
@@ -264,14 +257,14 @@ pub(super) fn check_target_lock_at_boot() {
     // Both callers use the same compiled try-lock body with a runtime target.
     let target = core::hint::black_box(&scratch);
     let prepared = 1u64 << WEIGHT_BITS;
-    let (result, [before, start, end, after]) =
-        target.try_commit_irq_off(PreparedWeight(prepared), daif, daif);
-    assert_eq!(result, Ok(()));
+    let sample = target
+        .commit(PreparedWeight(prepared))
+        .expect("private boot target lock")
+        .expect("monotonic boot target-lock clock");
     assert_eq!(target.installed.load(Ordering::Acquire), prepared);
     assert!(!target.held.load(Ordering::Acquire));
     assert_eq!(local_daif(), daif);
-    let timing = IrqOffTiming::from_ticks(before, start, end, after, frequency)
-        .expect("monotonic boot target-lock clock");
+    let timing = sample.timing;
     report(
         "V020_D01_BOOT_PROBE",
         timing.work_ns,
