@@ -868,15 +868,25 @@ mod tests {
 
     #[test]
     fn signed_fsync_binds_then_recovers_segmented_data_and_receipt() {
-        check_signed_fsync_roundtrip(false);
+        check_signed_fsync_roundtrip(121, None);
     }
 
     #[test]
     fn signed_fsync_growth_preserves_adjacent_owner_and_recovers_new_extent() {
-        check_signed_fsync_roundtrip(true);
+        check_signed_fsync_roundtrip(1, Some(3));
     }
 
-    fn check_signed_fsync_roundtrip(growing: bool) {
+    #[test]
+    fn signed_fsync_growth_resumes_across_checkpoint_without_exposing_tail() {
+        check_signed_fsync_roundtrip(121, Some(3));
+    }
+
+    #[test]
+    fn signed_fsync_growth_checkpoints_initialized_new_extents() {
+        check_signed_fsync_roundtrip(1, Some(125));
+    }
+
+    fn check_signed_fsync_roundtrip(initial_pages: usize, added_pages: Option<usize>) {
         use crate::security::{
             file_admission_flow_v1::FileAdmissionFlowV1,
             file_auth_context_v1::{AdmissionLedgerV1, AuthContextV1, AuthorityFacts},
@@ -946,10 +956,16 @@ mod tests {
         const CAP: u64 = 9;
         const BOOT: u64 = 2;
         const RECEIPT_SLOT: usize = 21;
-        let target_pages = if growing { 4 } else { 121 };
+        let growing = added_pages.is_some();
+        let target_pages = initial_pages + added_pages.unwrap_or(0);
+        let segmented = target_pages > 120;
         let target_size = (target_pages - 1) * BLOCK + 17;
-        let initial_pages = if growing { 1 } else { target_pages };
-        let initial_size = if growing { 8 } else { target_size };
+        let initial_size = if growing {
+            (initial_pages - 1) * BLOCK + 8
+        } else {
+            target_size
+        };
+        let neighbor_block = DATA + initial_pages as u32;
         let mut source = fixture();
         source.set_allocated(STATE_HOME + 1, false);
         for block in DATA..DATA + initial_pages as u32 {
@@ -965,9 +981,9 @@ mod tests {
         if growing {
             // A second live ordinary inode owns the physical neighbor.
             // Fill its entire extent so any unintended overwrite is visible.
-            source.set_allocated(DATA + 1, true);
-            source.0.insert(DATA + 1, Box::new([0xa5; BLOCK]));
-            inode(source.inode_slot(6), 1, BLOCK as u64, DATA + 1, 1);
+            source.set_allocated(neighbor_block, true);
+            source.0.insert(neighbor_block, Box::new([0xa5; BLOCK]));
+            inode(source.inode_slot(6), 1, BLOCK as u64, neighbor_block, 1);
             inode(source.inode_slot(0), 2, 256, ROOT, 1);
             let acl = source.acl_slot(6);
             p32(acl, 4, 1);
@@ -1055,7 +1071,7 @@ mod tests {
         source.0.insert(1, Box::new(superblock(CHECKPOINT)));
 
         let path = std::env::temp_dir().join(std::format!(
-            "cyx-fsync-test-{}-{growing}.raw",
+            "cyx-fsync-test-{}-{initial_pages}-{target_pages}.raw",
             std::process::id()
         ));
         let file = OpenOptions::new()
@@ -1179,17 +1195,52 @@ mod tests {
         assert!(raw.iter().all(|&byte| byte == 0));
         writer.read_committed(BITMAP_START, &mut raw).unwrap();
         assert_eq!(raw, bitmap_before);
-        let (mut writer, final_epoch) = if growing {
+        let (mut writer, final_epoch) = if !segmented {
             (writer, CHECKPOINT.log_epoch)
         } else {
-            let (prefix, _) = committed(&mut writer, &job, 248);
+            let prefix_pages = 120usize;
+            let prefix_size = prefix_pages * BLOCK;
+            let prefix_growth = prefix_pages.saturating_sub(initial_pages);
+            let prefix_log_blocks = if prefix_growth == 0 { 248 } else { 252 };
+            let (prefix, _) = committed(&mut writer, &job, prefix_log_blocks);
             assert_eq!(
                 (prefix.status, prefix.completed_prefix as usize),
-                (2, 120 * BLOCK)
+                (2, prefix_size)
             );
             writer.read_committed(INODE_START, &mut raw).unwrap();
-            assert_eq!(Inode::decode(&raw[256..512]).unwrap().durable_write_seq, 0);
-            writer.read_committed(DATA + 120, &mut raw).unwrap();
+            let current = Inode::decode(&raw[256..512]).unwrap();
+            assert_eq!(current.durable_write_seq, 0);
+            assert_eq!(current.size, initial_size.max(prefix_size) as u64);
+            assert_eq!(current.extents, 1 + u16::from(prefix_growth != 0));
+            if prefix_growth != 0 {
+                assert_eq!(
+                    current.runs[1],
+                    Extent {
+                        logical: initial_pages as u32,
+                        physical: DATA_START,
+                        count: prefix_growth as u32,
+                    }
+                );
+                writer
+                    .read_committed_at(BITMAP_START, prefix.commit_lsn, &mut raw)
+                    .unwrap();
+                for block in DATA_START..DATA_START + prefix_growth as u32 {
+                    let bit = block as usize;
+                    bitmap_before[bit / 8] |= 1 << (bit % 8);
+                    writer
+                        .read_committed_at(block, prefix.commit_lsn, &mut raw)
+                        .unwrap();
+                    assert_eq!(&raw, pages[initial_pages + (block - DATA_START) as usize]);
+                }
+            }
+            writer.read_committed(BITMAP_START, &mut raw).unwrap();
+            assert_eq!(raw, bitmap_before);
+            let untouched = if prefix_growth == 0 {
+                DATA + prefix_pages as u32
+            } else {
+                DATA_START + prefix_growth as u32
+            };
+            writer.read_committed(untouched, &mut raw).unwrap();
             assert!(raw.iter().all(|&byte| byte == 0));
             let (before_final, checkpoint) =
                 recover_checkpoint_with_evidence(&mut disk, &mut journal, |io, sb| {
@@ -1213,19 +1264,21 @@ mod tests {
                 prefix.log_epoch + 1,
             )
         };
-        let final_log_blocks = if growing { 20 } else { 12 };
+        let final_pages = target_pages - usize::from(segmented) * 120;
+        // Data + both receipt blocks, index, inode and optional bitmap.
+        let final_log_blocks = 2 + 2 * (final_pages as u32 + 4 + u32::from(growing));
         let (done, committed_digest) = committed(&mut writer, &job, final_log_blocks);
         assert_eq!(done.log_epoch, final_epoch);
         if growing {
             writer
                 .read_committed_at(BITMAP_START, done.commit_lsn, &mut raw)
                 .unwrap();
-            for block in DATA_START..DATA_START + 3 {
+            for block in DATA_START..DATA_START + added_pages.unwrap() as u32 {
                 let byte = block as usize / 8;
                 bitmap_before[byte] |= 1 << (block % 8);
             }
             assert_eq!(raw, bitmap_before);
-            writer.read_committed(DATA + 1, &mut raw).unwrap();
+            writer.read_committed(neighbor_block, &mut raw).unwrap();
             assert_eq!(raw, [0xa5; BLOCK]);
         }
         assert_eq!(
@@ -1297,7 +1350,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(evidence.transactions, 1 + u32::from(growing));
+        assert_eq!(evidence.transactions, if segmented { 1 } else { 2 });
         assert_eq!(next.checkpoint_lsn, done.commit_lsn);
         disk.read(INODE_START, &mut raw).unwrap();
         let current = Inode::decode(&raw[256..512]).unwrap();
@@ -1309,7 +1362,7 @@ mod tests {
                 neighbor.runs[0],
                 Extent {
                     logical: 0,
-                    physical: DATA + 1,
+                    physical: neighbor_block,
                     count: 1
                 }
             );
@@ -1320,18 +1373,18 @@ mod tests {
                 Extent {
                     logical: 0,
                     physical: DATA,
-                    count: 1
+                    count: initial_pages as u32
                 }
             );
             assert_eq!(
                 current.runs[1],
                 Extent {
-                    logical: 1,
+                    logical: initial_pages as u32,
                     physical: DATA_START,
-                    count: 3
+                    count: added_pages.unwrap() as u32
                 }
             );
-            disk.read(DATA + 1, &mut raw).unwrap();
+            disk.read(neighbor_block, &mut raw).unwrap();
             assert_eq!(raw, [0xa5; BLOCK]);
         }
         let mut contents = Sha256::new();

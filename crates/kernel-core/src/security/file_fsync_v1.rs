@@ -22,7 +22,7 @@ use super::{
     file_receipt_query_v4::ReceiptKey,
     file_receipt_store_v0199::{RECEIPT_STORE_BYTES, home_closure, scan_receipts_with_index},
     file_service_v4::Request,
-    file_structure_v1::{BLOCK, Extent, INODE_BYTES, INODES, Inode, SystemKind},
+    file_structure_v1::{BLOCK, Extent, INODE_BYTES, INODES, Inode, MAX_FILE, SystemKind},
     offline_config_v1::VerifiedOfflineConfig,
     recovery_v1::{CommittedRedo, RecoveryWorkspace, RedoImage, RedoTransaction, RedoWriter},
 };
@@ -53,9 +53,9 @@ pub struct FsyncJob<'a> {
     pub frame: &'a [u8],
     pub key: ReceiptKey,
     /// Bind the new logical size as a little-endian u64 before the pages in
-    /// the frozen digest. Growth fits one final segment and may append a
-    /// free run described by one bitmap page. An unchanged-size job uses the
-    /// legacy pages-only digest.
+    /// the frozen digest. Each segment may append a free run described by
+    /// one bitmap page. An unchanged-size job uses the legacy pages-only
+    /// digest.
     pub grown_size: Option<usize>,
     /// Complete frozen logical file, in order, with zero padding after EOF.
     pub pages: &'a [&'a [u8; BLOCK]],
@@ -284,7 +284,7 @@ pub fn commit_segment<I: EpochBlockIo>(
     let pages = size.div_ceil(BLOCK);
     let old_pages = current_size.div_ceil(BLOCK);
     if job.grown_size.is_some()
-        && (current_size == 0 || size < current_size || pages > MAX_DATA_HOMES)
+        && (current_size == 0 || size < current_size || size as u64 > MAX_FILE)
     {
         return Err(Error::Invalid);
     }
@@ -380,33 +380,45 @@ pub fn commit_segment<I: EpochBlockIo>(
         return Err(Error::Conflict);
     }
     let prefix = receipt.completed_prefix as usize;
-    if prefix != size && prefix % BLOCK != 0 || job.grown_size.is_some() && prefix != 0 {
+    if prefix > current_size || prefix != size && prefix % BLOCK != 0 {
         return Err(Error::Conflict);
     }
-    // BOUND records intentions only. Revalidate availability on the final
-    // segment and publish bitmap, data, inode and DONE in one redo closure.
-    let bitmap_home = if pages > old_pages {
-        Some(allocate_growth(
-            writer,
-            &mut inode,
-            &mut work.bitmap,
-            (pages - old_pages) as u32,
-        )?)
-    } else {
-        None
-    };
     let first = prefix.div_ceil(BLOCK);
     let end = if bind {
         first
     } else {
         (first + MAX_DATA_HOMES).min(job.pages.len())
     };
+    let completed = (end * BLOCK).min(size);
     let final_segment = !bind && end == job.pages.len();
+    // Every visible byte must be covered by the old file or by this
+    // initialized segment. The terminal write sequence advances separately.
+    let published_size = current_size.max(completed);
+    let update_inode = final_segment || published_size != current_size;
+    let checked_pages = if bind {
+        pages.min(MAX_DATA_HOMES)
+    } else {
+        published_size.div_ceil(BLOCK)
+    };
+    // Before binding, check space for the first segment without publishing
+    // allocation. Recheck under the exclusive writer on every growth commit.
+    let bitmap_home = if checked_pages > old_pages {
+        let home = allocate_growth(
+            writer,
+            &mut inode,
+            &mut work.bitmap,
+            (checked_pages - old_pages) as u32,
+        )?;
+        (!bind).then_some(home)
+    } else {
+        None
+    };
     let closure = home_closure(slot).ok_or(Error::Invalid)?;
     let count = (end - first)
         + closure.receipt_block_count
         + usize::from(closure.requires_stream_index_block)
-        + usize::from(final_segment) * (1 + usize::from(bitmap_home.is_some()));
+        + usize::from(update_inode)
+        + usize::from(bitmap_home.is_some());
     let plan = writer.prepare(count)?;
     if plan.fs_uuid != boot.fs_uuid
         || plan.log_epoch < receipt.log_epoch
@@ -418,7 +430,7 @@ pub fn commit_segment<I: EpochBlockIo>(
     receipt.log_epoch = plan.log_epoch;
     receipt.txid = plan.txid;
     receipt.commit_lsn = plan.commit_lsn;
-    receipt.completed_prefix = (end * BLOCK).min(size) as u32;
+    receipt.completed_prefix = completed as u32;
     if bind {
         receipt.status = BOUND;
         receipt.operation_digest = proposal.operation_digest;
@@ -427,10 +439,10 @@ pub fn commit_segment<I: EpochBlockIo>(
     if final_segment {
         receipt.status = DONE;
         receipt.output_digest = output_digest;
+    }
+    if update_inode {
         let raw = &mut work.inode_page[inode_at..inode_at + INODE_BYTES];
-        if job.grown_size.is_some() {
-            raw[16..24].copy_from_slice(&(size as u64).to_le_bytes());
-        }
+        raw[16..24].copy_from_slice(&(published_size as u64).to_le_bytes());
         if bitmap_home.is_some() {
             let extent = usize::from(inode.extents) - 1;
             let at = 48 + extent * 12;
@@ -440,7 +452,9 @@ pub fn commit_segment<I: EpochBlockIo>(
             raw[at + 4..at + 8].copy_from_slice(&run.physical.to_le_bytes());
             raw[at + 8..at + 12].copy_from_slice(&run.count.to_le_bytes());
         }
-        raw[24..32].copy_from_slice(&write_seq.to_le_bytes());
+        if final_segment {
+            raw[24..32].copy_from_slice(&write_seq.to_le_bytes());
+        }
         let crc = crc32c_zeroed(raw, 252)?;
         raw[252..].copy_from_slice(&crc.to_le_bytes());
     }
@@ -481,7 +495,7 @@ pub fn commit_segment<I: EpochBlockIo>(
         contents: &work.scratch,
     };
     next += 1;
-    if final_segment {
+    if update_inode {
         if let Some(home) = bitmap_home {
             images[next] = RedoImage {
                 home,
