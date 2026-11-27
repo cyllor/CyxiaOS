@@ -9,6 +9,7 @@
 //! one continuous CPU0 cursor from early boot through the durable media
 //! handoff and the resident roles.
 
+use super::role_loader::RoleLaunch;
 use super::{
     BootInfo, E_AUTH, Error, ExceptionFrame, IRQS, Identity, NativeRole, NativeRoleManifest,
     Ordering, ROLE_COUNT, ROLES, Role, TIMER_IRQ, bring_up_production, cpu, frames, gic,
@@ -21,7 +22,7 @@ use cyxia_kernel_core::{
     console::OutputQueue,
     control_plane::{
         role_budget_v0199::{CLASS_LIMITS, Class, Cpu0BudgetLedger, Settlement, Turn, WINDOW_NS},
-        role_manifest_v0199::ValidatedRoleManifest,
+        role_manifest_v0199::ValidatedLifecycleManifest,
     },
     security::{
         Error as SvcError,
@@ -481,9 +482,33 @@ fn startup_work<T>(budget: &mut Budget, step: u64, work: impl FnOnce() -> T) -> 
     Ok(result)
 }
 
+fn load_signed_roles(
+    budget: &mut Budget,
+    policy: &ConfirmedBootPolicy<'_>,
+    actors: &[Identity; ROLE_COUNT],
+) -> Result<[NativeRole; ROLE_COUNT], Fault> {
+    startup_work(budget, 2, || {
+        #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+        if !frames::role_storage_registered() {
+            return Err(Error::Denied);
+        }
+        recovery::init_signed(policy).map_err(|_| Error::Denied)
+    })??;
+
+    // Each package owns a separate prepaid Recovery turn. The cohort stays
+    // unpublished until every package is loaded and its full inventory passes.
+    let mut members = [None; ROLE_COUNT];
+    for (index, slot) in members.iter_mut().enumerate() {
+        *slot = Some(startup_work(budget, 3 + index as u64, || {
+            load_role_with_identity(index, actors[index].generation, RoleLaunch::Lifecycle)
+        })?);
+    }
+    Ok(members.map(|entry| entry.expect("complete signed launch inventory")))
+}
+
 fn turn(
     policy: &ConfirmedBootPolicy<'_>,
-    manifest: &ValidatedRoleManifest<'_>,
+    manifest: &ValidatedLifecycleManifest<'_>,
     index: usize,
     task: &mut Task,
     budget: &mut Budget,
@@ -588,7 +613,7 @@ fn run_quantum(
 fn run_tasks(
     info: &BootInfo,
     policy: &ConfirmedBootPolicy<'_>,
-    manifest: &ValidatedRoleManifest<'_>,
+    manifest: &ValidatedLifecycleManifest<'_>,
     budget: &mut Budget,
     pending: &mut OutputQueue<128>,
 ) -> Result<core::convert::Infallible, Fault> {
@@ -891,24 +916,8 @@ pub(super) fn run(info: &BootInfo) -> ! {
         Ok(actors) => actors,
         Err(error) => fence(info, budget, OutputQueue::new(), error.into()),
     };
-    if recovery::init_signed(&policy).is_err() {
-        fence(info, budget, OutputQueue::new(), Error::Denied.into());
-    }
-    let members = match startup_work(
-        &mut budget,
-        2,
-        || -> Result<[NativeRole; ROLE_COUNT], Error> {
-            #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
-            if !frames::role_storage_registered() {
-                return Err(Error::Denied);
-            }
-            Ok(core::array::from_fn(|index| {
-                load_role_with_identity(index, actors[index].generation, 0, 0)
-            }))
-        },
-    ) {
-        Ok(Ok(members)) => members,
-        Ok(Err(error)) => fence(info, budget, OutputQueue::new(), error.into()),
+    let members = match load_signed_roles(&mut budget, &policy, &actors) {
+        Ok(members) => members,
         Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     };
     let other_protected_pool_bytes =
@@ -921,7 +930,7 @@ pub(super) fn run(info: &BootInfo) -> ! {
         other_protected_pool_bytes,
         other_control_ns_per_100ms: 10_000_000,
     };
-    let manifest = match manifest.validated() {
+    let manifest = match manifest.validated_lifecycle() {
         Ok(manifest) => manifest,
         Err(error) => fence(info, budget, OutputQueue::new(), error.into()),
     };

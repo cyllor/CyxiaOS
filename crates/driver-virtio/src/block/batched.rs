@@ -5,10 +5,12 @@ use super::{FLUSH, Operation, READ_ONLY, SECTOR_BYTES};
 // This sentinel is never a start time and allocates no additional metadata.
 const COMPLETED_RETAINED: u64 = u64::MAX;
 
+use core::num::NonZeroU64;
+
 use crate::{
     Error, Platform, Transport,
     queue::{BatchMemory, BatchQueue, MAX_CHAINS, NotifyStats, Token},
-    reset::DeviceState,
+    reset::{DeviceState, ResetProof},
 };
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockCompletion {
@@ -210,6 +212,19 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         })
     }
 
+    /// Encode the one-shot block queue's observed DMA stop. The caller
+    /// supplies the current boot's verified epoch. Request and durability
+    /// obligations are unchanged by the proof.
+    pub fn reset_proof(&self, boot_epoch: NonZeroU64) -> Option<ResetProof> {
+        let observed = self.reset?.ok()?;
+        Some(ResetProof::for_first_generation(
+            boot_epoch.get(),
+            2,
+            0,
+            observed,
+        ))
+    }
+
     pub fn free(&self) -> usize {
         self.queue.free()
     }
@@ -251,6 +266,17 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
     /// Completion/FLUSH obligations remain in custody, including after the
     /// device and its old queue read back disabled.
     pub fn stop_failed_mmio(&mut self, p: &impl Platform) -> Option<Result<u64, Error>> {
+        self.stop_failed_mmio_with_checkpoint(p, || Ok(()))
+    }
+
+    /// The serialized recovery owner can renew its grant before the reset
+    /// write and each observation. Refusal consumes the one-shot attempt
+    /// without permitting another MMIO access or releasing any request.
+    pub fn stop_failed_mmio_with_checkpoint(
+        &mut self,
+        p: &impl Platform,
+        checkpoint: impl FnMut() -> Result<(), Error>,
+    ) -> Option<Result<u64, Error>> {
         if !matches!(
             self.state,
             DeviceState::Failed | DeviceState::RecoveryFenced
@@ -259,7 +285,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         }
         self.state = DeviceState::ResetAttempted;
         self.queue.fence();
-        let result = self.transport.observe_mmio_reset(2, &[0], p);
+        let result = self.transport.observe_mmio_reset(2, &[0], p, checkpoint);
         self.reset = Some(result);
         Some(result)
     }
@@ -320,33 +346,32 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         header[8..16].copy_from_slice(&sector.to_le_bytes());
         let payload = if kind == 1 { data.as_slice() } else { &[] };
         let writable = if kind == 0 { BYTES + 1 } else { 1 };
-        // Like the single-request block owner, require an explicit device
-        // status write. A correct used length alone is not proof of success.
-        let token = match self.queue.enqueue_parts(
-            &mut self.transport,
-            (&header, payload),
-            (writable, Some(0xff)),
-            synchronous || kind == 4,
-            isolated,
-            p,
-        ) {
-            Ok(token) => token,
-            Err(e) => {
-                if !matches!(e, Error::Busy | Error::Address) {
-                    self.fail(p);
-                }
-                return Err(e);
-            }
-        };
         let started = p.now_ms();
-        // u64::MAX is reserved for a fully verified, not-yet-acknowledged
-        // completion; accepting it as a start tick could forge that state.
+        // This value is reserved for a verified completion. Check before
+        // reserving DMA so a clock fault leaves no new device obligation.
         if started == COMPLETED_RETAINED {
             self.fail(p);
             return Err(Error::Timeout);
         }
-        self.pending[usize::from(token.slot)] = Some((token, operation, started));
-        Ok(token)
+        let pending = &mut self.pending;
+        // Like the single-request block owner, require an explicit device
+        // status write. A correct used length alone is not proof of success.
+        match self.queue.enqueue_parts(
+            &mut self.transport,
+            (&header, payload),
+            (writable, Some(0xff)),
+            synchronous || isolated || kind == 4,
+            p,
+            |token| pending[usize::from(token.slot)] = Some((token, operation, started)),
+        ) {
+            Ok(token) => Ok(token),
+            Err(e) => {
+                if !matches!(e, Error::Busy | Error::Address) {
+                    self.fail(p);
+                }
+                Err(e)
+            }
+        }
     }
     pub fn drain(&mut self, p: &impl Platform) -> Result<(), Error> {
         self.require_capacity(p)?;
@@ -458,6 +483,8 @@ mod tests {
         idle_clock: Cell<Option<u64>>,
         mmio: usize,
         reset_on_completion_ack: Cell<bool>,
+        needs_reset_on_prepare: Cell<bool>,
+        request_clock: Option<u64>,
         feature_banks: Option<[u32; 2]>,
         reject_features: bool,
         complete_mmio_reset: bool,
@@ -507,9 +534,13 @@ mod tests {
             }
         }
         fn now_ms(&self) -> u64 {
-            self.clock.get() / 1_000_000
+            self.request_clock.unwrap_or(self.clock.get() / 1_000_000)
         }
         fn now_ns(&self) -> u64 {
+            if self.needs_reset_on_prepare.replace(false) {
+                // The device requested a reset between reservation and drain.
+                unsafe { write_volatile((self.mmio + 0x70) as *mut u32, 15 | 64) };
+            }
             let now = self.clock.get();
             self.clock.set(now.saturating_add(self.clock_step_ns));
             now
@@ -526,6 +557,8 @@ mod tests {
             idle_clock: Cell::new(None),
             mmio: mmio.address(),
             reset_on_completion_ack: Cell::new(false),
+            needs_reset_on_prepare: Cell::new(false),
+            request_clock: None,
             feature_banks: None,
             reject_features: false,
             complete_mmio_reset: false,
@@ -574,6 +607,8 @@ mod tests {
             idle_clock: Cell::new(None),
             mmio: mmio.address(),
             reset_on_completion_ack: Cell::new(false),
+            needs_reset_on_prepare: Cell::new(false),
+            request_clock: None,
             feature_banks: Some([low, 1]),
             reject_features,
             complete_mmio_reset: false,
@@ -731,6 +766,51 @@ mod tests {
     }
 
     #[test]
+    fn drain_failure_during_begin_preserves_the_reserved_operation() {
+        for operation in [Operation::Read(0), Operation::Write(0), Operation::Flush] {
+            let (mut block, platform, _) = fixture();
+            platform.needs_reset_on_prepare.set(true);
+
+            assert_eq!(
+                block.begin(operation, &[0; 512], true, true, &platform),
+                Err(Error::Device)
+            );
+            assert_eq!(block.free(), block.capacity() - 1);
+            assert_eq!(block.notify_stats().published, 0);
+            block.fence_for_recovery();
+
+            let custody = block.terminal_custody().unwrap();
+            assert_eq!(block.retained_requests(), (1, 0));
+            assert_eq!(
+                custody.requests[0],
+                Some(RetainedBlock {
+                    token: Token {
+                        slot: 0,
+                        generation: 1
+                    },
+                    operation,
+                    completed: false,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn failed_request_clock_never_leaves_an_unrecorded_published_write() {
+        let (mut block, mut platform, _) = fixture();
+        platform.request_clock = Some(u64::MAX);
+
+        assert_eq!(
+            block.begin(Operation::Write(0), &[0; 512], true, true, &platform),
+            Err(Error::Timeout)
+        );
+        block.fence_for_recovery();
+        assert_eq!(block.notify_stats().published, 0);
+        assert_eq!(block.free(), block.capacity());
+        assert_eq!(block.retained_requests(), (0, 0));
+    }
+
+    #[test]
     fn recovery_fence_retains_pending_block_without_more_transport_io() {
         let (mut block, platform, _) = fixture();
         platform.clock.set(1_000_000);
@@ -794,6 +874,107 @@ mod tests {
         assert_eq!(block.stop_failed_mmio(&platform), None);
         assert_eq!(block.terminal_custody(), Some(custody));
         assert_eq!(block.retained_requests(), (0, 1));
+    }
+
+    #[test]
+    fn reset_proof_keeps_the_unconfirmed_write_in_custody() {
+        let (mut block, mut platform, _) = fixture();
+        let operation = Operation::Write(0);
+        let token = block
+            .begin(operation, &[0; 512], true, true, &platform)
+            .unwrap();
+        block.fence_for_recovery();
+        let epoch = core::num::NonZeroU64::new(7).unwrap();
+        assert_eq!(block.reset_proof(epoch), None);
+
+        platform.complete_mmio_reset = true;
+        platform.clock.set(123_000);
+        assert_eq!(block.stop_failed_mmio(&platform), Some(Ok(123_000)));
+        let raw = block.reset_proof(epoch).unwrap().encode();
+        assert_eq!(
+            u32::from_le_bytes(raw[..4].try_into().unwrap()),
+            0x4359_5250
+        );
+        assert_eq!(
+            u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+            epoch.get()
+        );
+        assert_eq!(u32::from_le_bytes(raw[16..20].try_into().unwrap()), 2);
+        assert_eq!(&raw[20..24], &[0; 4]);
+        assert_eq!(u64::from_le_bytes(raw[56..64].try_into().unwrap()), 123_000);
+        assert_eq!(block.reset_proof(epoch).unwrap().encode(), raw);
+        assert_eq!(
+            block.terminal_custody().unwrap().requests[usize::from(token.slot)],
+            Some(RetainedBlock {
+                token,
+                operation,
+                completed: false
+            }),
+        );
+        assert_eq!(block.acknowledge(token), Err(Error::Response));
+    }
+
+    #[test]
+    fn reset_checkpoints_can_refuse_before_or_after_the_status_write() {
+        for refuse_at in [1, 3] {
+            let (mut block, platform, _) = fixture();
+            let operation = Operation::Write(0);
+            let token = block
+                .begin(operation, &[0; 512], true, false, &platform)
+                .unwrap();
+            block.fence_for_recovery();
+
+            let mut checkpoints = 0;
+            assert_eq!(
+                block.stop_failed_mmio_with_checkpoint(&platform, || {
+                    checkpoints += 1;
+                    if checkpoints == refuse_at {
+                        Err(Error::Busy)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Some(Err(Error::Busy))
+            );
+            assert_eq!(checkpoints, refuse_at);
+            let status = if refuse_at == 1 { 15 } else { 0 };
+            assert_eq!(block.transport.status(), status);
+            assert!(block.transport.queue_enabled());
+            assert_eq!(block.stop_failed_mmio(&platform), None);
+            assert_eq!(block.retained_requests(), (1, 0));
+            assert_eq!(block.reset_proof(core::num::NonZeroU64::MIN), None);
+            assert_eq!(
+                block.terminal_custody().unwrap().requests[usize::from(token.slot)],
+                Some(RetainedBlock {
+                    token,
+                    operation,
+                    completed: false
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn reset_checkpoints_do_not_restart_the_device_deadline() {
+        let (mut block, mut platform, _) = fixture();
+        platform.complete_mmio_reset = true;
+        block.fence_for_recovery();
+
+        let mut checkpoints = 0;
+        assert_eq!(
+            block.stop_failed_mmio_with_checkpoint(&platform, || {
+                checkpoints += 1;
+                if checkpoints == 2 {
+                    platform.clock.set(crate::reset::RESET_DEADLINE_NS);
+                }
+                Ok(())
+            }),
+            Some(Err(Error::Timeout))
+        );
+        assert_eq!(checkpoints, 2);
+        assert_eq!(block.transport.status(), 0);
+        assert!(!block.transport.queue_enabled());
+        assert_eq!(block.stop_failed_mmio(&platform), None);
     }
 
     #[test]

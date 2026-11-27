@@ -295,15 +295,25 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
     require(not any(raw[end_offset:]), "unexpected unused signed CPU0 trace bytes")
     intervals = list(SIGNED_ROW.iter_unpack(raw[rows_offset:end_offset]))
     replay = (elapsed, charged, peak, None, wall, end_wall, *classes)
+    split_startup = 1 + len(SIGNED_ROLES)  # roster preflight and each package
     if version == 1:
-        require(media_budget is None and len(recovery) == 2 and phase_start <= wall // WINDOW
+        require(media_budget is None and len(recovery) in (2, 1 + split_startup)
+                and phase_start <= wall // WINDOW
                 and 0 < phase_end == recovery[0] <= SIGNED_RECOVERY_QUOTA,
                 "invalid opening signed Recovery debit")
+        current = tick
+        debits = []
+        for row in intervals:
+            if row[4] == RECOVERY + 1:
+                debits.append(row[1] - current)
+            current = row[1]
+        require(debits == list(recovery[1:]), "signed startup PMU debits differ from UART")
         return _replay_intervals(intervals, (wall, tick, before), replay,
-                                 recovery_slices=(1, recovery[1]), signed_roles=roles,
+                                 recovery_slices=(len(debits), max(debits)), signed_roles=roles,
                                  opening_recovery=(phase_start, phase_end))
 
-    require(media_budget is not None and len(recovery) == 3 and 0 < phase_start < phase_end < count,
+    require(media_budget is not None and len(recovery) in (3, 2 + split_startup)
+            and 0 < phase_start < phase_end < count,
             "missing signed media accounting span")
     media_rows = intervals[phase_start:phase_end]
     require(all(row[4] in (0, RECOVERY + 1) for row in intervals[:phase_end])
@@ -334,7 +344,7 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
             and sum(media_recovery) > 0, "signed media PMU debits differ from UART")
     result = _replay_intervals(
         intervals, (wall, tick, before), replay, signed_roles=roles,
-        recovery_slices=(len(frame_recovery) + len(media_recovery) + 3,
+        recovery_slices=(len(frame_recovery) + len(media_recovery) + len(startup_recovery),
                          max(startup_recovery + frame_recovery + media_recovery)),
     )
     if frame_budget is not None:

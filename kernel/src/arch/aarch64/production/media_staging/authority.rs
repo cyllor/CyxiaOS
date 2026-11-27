@@ -55,6 +55,7 @@ const EVIDENCE: [u8; 32] = [0x3c; 32];
 static mut PAIR: BootPairRedo = BootPairRedo::new();
 
 /// Read and verify the sole transaction this staging owner could have left.
+#[cfg(test)]
 pub(super) fn verify_previous_pair(
     disk: &mut Disk,
     sb: SuperblockV1,
@@ -73,6 +74,14 @@ pub(super) fn verified_pair_state(
     // SAFETY: synchronous, non-overlapping use of this CPU0-owned workspace.
     let pair = unsafe { &mut *core::ptr::addr_of_mut!(PAIR) };
     pair.read(disk, FIRST_LOG_BLOCK)?;
+    verify_pair_state(pair, sb, config)
+}
+
+fn verify_pair_state(
+    pair: &BootPairRedo,
+    sb: SuperblockV1,
+    config: volume::Config<'_>,
+) -> Result<SecurityStateStoreV2, SecurityError> {
     let state = pair.verify(
         sb,
         FIRST_LOG_BLOCK,
@@ -90,6 +99,51 @@ pub(super) fn verified_pair_state(
         return Err(SecurityError::Conflict);
     }
     Ok(state)
+}
+
+pub(super) enum BootLog {
+    Empty,
+    Committed,
+    Checkpointed,
+}
+
+/// Classify the bounded boot-only log before any home or log write.
+pub(super) fn recovery_log(
+    disk: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    config: volume::Config<'_>,
+) -> Result<BootLog, SecurityError> {
+    // SAFETY: the one-shot recovery still owns the sole PAIR workspace.
+    let pair = unsafe { &mut *core::ptr::addr_of_mut!(PAIR) };
+    pair.read(disk, FIRST_LOG_BLOCK)?;
+    if pair.blank() {
+        return Ok(BootLog::Empty);
+    }
+    let current_error = match verify_pair_state(pair, sb, config) {
+        Ok(_) => return Ok(BootLog::Committed),
+        Err(error) => error,
+    };
+    if sb.generation == 1 {
+        return Err(current_error);
+    }
+    let mut raw = [0; BLOCK_BYTES];
+    disk.read((sb.generation & 1) as u32, &mut raw)?;
+    let prior = SuperblockV1::decode(&raw)?;
+    if prior.fs_uuid != sb.fs_uuid
+        || prior.generation.checked_add(1) != Some(sb.generation)
+        || prior.log_epoch.checked_add(1) != Some(sb.log_epoch)
+        || prior.checkpoint_lsn.checked_add(4) != Some(sb.checkpoint_lsn)
+    {
+        return Err(current_error);
+    }
+    pair.verify_checkpointed_residue(
+        disk,
+        prior,
+        FIRST_LOG_BLOCK,
+        [SECURITY_HOME, BOOT_HOME],
+        volume::expected_state(prior.generation, config)?,
+    )?;
+    Ok(BootLog::Checkpointed)
 }
 
 /// Allocate and durably confirm the next epoch on the scratch volume. Returns

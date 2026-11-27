@@ -16,7 +16,7 @@ pub const INODES: usize = 256;
 pub const INODE_BYTES: usize = 256;
 const MAX_EXTENTS: usize = 16;
 const BITMAP_BYTES: usize = BLOCK_COUNT as usize / 8;
-const MAX_FILE: u64 = 8 * 1024 * 1024;
+pub(super) const MAX_FILE: u64 = 8 * 1024 * 1024;
 const MAX_DIR: u64 = 256 * 128;
 fn u16at(b: &[u8], i: usize) -> u16 {
     u16::from_le_bytes(b[i..i + 2].try_into().unwrap())

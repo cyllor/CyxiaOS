@@ -163,11 +163,18 @@ pub struct NativeRoleManifest {
 /// finish using this borrow before changing any registered role. Admission
 /// may then avoid repeating the complete eight-role overlap scan on each
 /// individual SVC without accepting unvalidated or stale manifest fields.
-pub struct ValidatedRoleManifest<'a>(&'a NativeRoleManifest);
-impl<'a> ValidatedRoleManifest<'a> {
+pub struct ValidatedRoleManifest<'a, const SERVICES: bool = true>(&'a NativeRoleManifest);
+
+/// A signed bootstrap cohort owns private contexts and CPU turns. This
+/// validation supplies no service endpoint or capability authorization.
+pub type ValidatedLifecycleManifest<'a> = ValidatedRoleManifest<'a, false>;
+
+impl<'a, const SERVICES: bool> ValidatedRoleManifest<'a, SERVICES> {
     pub fn manifest(&self) -> &'a NativeRoleManifest {
         self.0
     }
+}
+impl ValidatedRoleManifest<'_> {
     pub fn can_act(&self, role: Role, actor: Identity, cap: u64, cpu: usize) -> Result<(), Error> {
         self.0.can_act_validated(role, actor, cap, cpu)
     }
@@ -196,7 +203,14 @@ impl NativeRoleManifest {
         self.validate()?;
         Ok(ValidatedRoleManifest(self))
     }
+    pub fn validated_lifecycle(&self) -> Result<ValidatedLifecycleManifest<'_>, Error> {
+        self.validate_inventory(false)?;
+        Ok(ValidatedRoleManifest(self))
+    }
     pub fn validate(&self) -> Result<(), Error> {
+        self.validate_inventory(true)
+    }
+    fn validate_inventory(&self, services: bool) -> Result<(), Error> {
         if self.online_mask != REQUIRED_ONLINE_MASK
             || self.other_control_ns_per_100ms >= CONTROL_NS_PER_100MS
             || self.other_protected_pool_bytes >= CONTROL_POOL_LIMIT
@@ -206,6 +220,13 @@ impl NativeRoleManifest {
         let mut charge_ns = self.other_control_ns_per_100ms;
         let mut pool = self.other_protected_pool_bytes;
         for (index, entry) in self.members.iter().enumerate() {
+            let authority_valid = if services {
+                entry.endpoint_id != 0 && entry.caps == entry.role.allowed_caps()
+            } else {
+                entry.endpoint_id == 0
+                    && entry.caps == 0
+                    && entry.actor.id == u64::from(entry.role.id())
+            };
             if entry.role != ROLES[index]
                 || !entry.actor.valid()
                 || entry.ttbr0_root == 0
@@ -213,9 +234,8 @@ impl NativeRoleManifest {
                 || entry.ttbr0_root.checked_add(PAGE_SIZE).is_none()
                 || entry.cpu_mask != CONTROL_MASK
                 || entry.thread_count != 1
-                || entry.endpoint_id == 0
                 || !entry.private_rw.valid()
-                || entry.caps != entry.role.allowed_caps()
+                || !authority_valid
                 || entry.control_ns_per_100ms == 0
                 || (entry.role == Role::Operations
                     && entry.control_ns_per_100ms > OPERATIONS_MAX_NS)
@@ -245,7 +265,7 @@ impl NativeRoleManifest {
                 // same registry identity, or map each other's TTBR root RW.
                 if prior.actor.id == entry.actor.id
                     || prior.ttbr0_root == entry.ttbr0_root
-                    || prior.endpoint_id == entry.endpoint_id
+                    || (services && prior.endpoint_id == entry.endpoint_id)
                     || prior.private_rw.overlaps(entry.private_rw)
                     || root.overlaps(prior.private_rw)
                     || prior_root.overlaps(entry.private_rw)

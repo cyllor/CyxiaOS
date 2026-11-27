@@ -34,3 +34,10 @@ path = "src/signer.rs"
 test = false
 bench = false
 required-features = ["guest-signer"]
+
+[[bin]]
+name = "cyxia-echo-ingress"
+path = "src/ingress.rs"
+test = false
+bench = false
+required-features = ["guest-signer"]

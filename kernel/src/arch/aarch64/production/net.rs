@@ -28,6 +28,9 @@
 //!   independent pinned TLS peer and combines that result with this evidence.
 //! * Word 176 counts a normally retired guest Admission credit in the opt-in
 //!   authenticated profile. RX pools and queue memory stay pinned after return.
+//! * Incoming frames in the authenticated path cross a private EL0 structural
+//!   parser before native TCP receives the original bytes. TCP states and
+//!   transport admission still belong to the existing trusted owners.
 //! * No device => `V020_W11_NET_ABSENT`, words 138..142 stay 0, boot continues.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
@@ -69,7 +72,60 @@ const TCP_SEED_BYTES: usize = 8;
 /// QEMU user-net gateway; must equal the guest's trusted source observation.
 const PEER_IP: [u8; 4] = [10, 0, 2, 2];
 
-type Stream<'a> = Tcp<'a, VirtioPort<'a, Board, BatchedNet>>;
+type Nic<'a> = VirtioPort<'a, Board, BatchedNet>;
+type Stream<'a> = Tcp<'a, IngressPort<'a>>;
+
+#[cfg(not(feature = "v020-production-authenticated-net"))]
+type IngressPort<'a> = Nic<'a>;
+
+#[cfg(feature = "v020-production-authenticated-net")]
+struct IngressPort<'a> {
+    nic: Nic<'a>,
+    parser: sec_n_broker::ingress::Parser,
+}
+
+#[cfg(feature = "v020-production-authenticated-net")]
+impl Port for IngressPort<'_> {
+    fn diagnostic_stage(&self, stage: u64) {
+        self.nic.diagnostic_stage(stage);
+    }
+
+    fn send(&mut self, frame: &[u8]) -> Result<(), device::Error> {
+        self.nic.send(frame)
+    }
+
+    fn receive(&mut self, frame: &mut [u8; device::MTU]) -> Result<Option<usize>, device::Error> {
+        self.receive_with_checkpoint(frame, &mut || {})
+    }
+
+    fn receive_with_checkpoint(
+        &mut self,
+        frame: &mut [u8; device::MTU],
+        checkpoint: &mut dyn FnMut(),
+    ) -> Result<Option<usize>, device::Error> {
+        let Some(length) = self.nic.receive_with_checkpoint(frame, checkpoint)? else {
+            return Ok(None);
+        };
+        let bytes = frame.get(..length).ok_or(device::Error::Frame)?;
+        checkpoint();
+        // The NIC received into the EL1-owned buffer above. The parser sees
+        // only an immutable copy and returns a verdict, never bytes or a
+        // claimed peer identity. smoltcp can then process the original copy.
+        Ok(self.parser.accepts(bytes)?.then_some(length))
+    }
+
+    fn flush(&mut self) -> Result<(), device::Error> {
+        self.nic.flush()
+    }
+
+    fn burst_capacity(&self) -> usize {
+        self.nic.burst_capacity()
+    }
+
+    fn tx_quiescent(&self) -> bool {
+        self.nic.tx_quiescent()
+    }
+}
 
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut TCP_RX: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
@@ -102,6 +158,7 @@ impl StreamPort<'_, '_> {
         // BatchedNet::poll_tx checks a used entry and acknowledges its exact token.
         self.tcp
             .port_mut()
+            .nic
             .net
             .poll_tx(&Board)
             .map_err(|_| device::Error::Device)?;
@@ -237,6 +294,11 @@ fn open_stream<'a>(
     let port = VirtioPort {
         net: dev,
         platform: &Board,
+    };
+    #[cfg(feature = "v020-production-authenticated-net")]
+    let port = IngressPort {
+        nic: port,
+        parser: sec_n_broker::ingress::Parser::load(config.mac, LOCAL_IP, PEER_IP, LISTEN_PORT),
     };
     // SAFETY: one-shot (SERVED swap above) on CPU0; these are the only
     // references ever formed to the stream buffers (see module header).
@@ -453,6 +515,8 @@ fn serve_stream(
         Ok(accepted) => accepted,
         Err(failure) => {
             stream.abort();
+            #[cfg(feature = "v020-production-authenticated-net")]
+            stream.port_mut().parser.publish();
             report(
                 "V020_W11_NET_NO_PEER",
                 failure as u64,
@@ -469,6 +533,8 @@ fn serve_stream(
         Ok(dispatched) => (dispatched, 0),
         Err(stop) => (stop.dispatched, stop.code),
     };
+    #[cfg(feature = "v020-production-authenticated-net")]
+    stream.port_mut().parser.publish();
     #[cfg(feature = "v020-production-authenticated-net")]
     let retired = stop_code == 0 && sec_n_broker::retired();
     #[cfg(not(feature = "v020-production-authenticated-net"))]

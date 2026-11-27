@@ -360,18 +360,17 @@ impl Transport {
     }
 
     /// Poll a terminal reset after the serialized owner has fenced every old
-    /// queue. Use one deadline for status and readiness across all queues.
+    /// queue. Use one deadline for status and readiness across all queues,
+    /// including time spent renewing a grant between MMIO observations.
     pub(crate) fn observe_mmio_reset(
         &mut self,
         device_id: u32,
         queues: &[u16],
         platform: &impl Platform,
+        mut checkpoint: impl FnMut() -> Result<(), Error>,
     ) -> Result<u64, Error> {
         if !matches!(self.backend, Backend::Mmio(_)) {
             return Err(Error::Unsupported);
-        }
-        if device_id == 0 || self.device_id() != device_id {
-            return Err(Error::Device);
         }
         let started = platform.now_ns();
         let now_within_deadline = || {
@@ -381,9 +380,15 @@ impl Transport {
                 .map(|_| now)
                 .ok_or(Error::Timeout)
         };
+        checkpoint()?;
+        now_within_deadline()?;
+        if device_id == 0 || self.device_id() != device_id {
+            return Err(Error::Device);
+        }
         self.set_status(0);
         platform.barrier();
         loop {
+            checkpoint()?;
             now_within_deadline()?;
             if self.device_id() != device_id {
                 return Err(Error::Device);

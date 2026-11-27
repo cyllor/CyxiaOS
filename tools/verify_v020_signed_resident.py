@@ -234,10 +234,17 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
                         "all eight roles did not sustain authorized lifecycle progress")
                 recovery = rows(lines, "V020_SIGNED_RESIDENT_RECOVERY")
                 media_budget = rows(lines, "V020_SIGNED_MEDIA_BUDGET")
+                first_step = 0 if early_boot else 1
+                steps = [step for step, _, _ in recovery]
                 require(trace_size in (SIGNED_TRACE_BYTES, SIGNED_EARLY_TRACE_BYTES)
-                        and [step for step, _, _ in recovery] == ([0, 1, 2] if early_boot else [1, 2])
+                        and steps in (list(range(first_step, 3)),
+                                      list(range(first_step, 3 + len(ROLES))))
                         and all(0 < used <= quota == RECOVERY_NS for _, used, quota in recovery),
                         "signed startup lacks a Recovery settlement")
+                ready = lines.index(f"V020_SIGNED_RESIDENT_BOOT a={epoch} b={len(ROLES)} c=0")
+                last_settlement = max(i for i, line in enumerate(lines)
+                                      if line.startswith("V020_SIGNED_RESIDENT_RECOVERY "))
+                require(last_settlement < ready, "role startup preceded Recovery settlement")
                 require(len(media_budget) == int(early_boot), "missing or unexpected media Recovery settlement")
                 if early_boot:
                     batches, used, quota = media_budget[0]

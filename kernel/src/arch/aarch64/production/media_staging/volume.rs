@@ -414,7 +414,10 @@ fn staging_acl(
     Ok(())
 }
 
-pub(super) fn require_zero_blocks(disk: &mut Disk, range: Range<u32>) -> Result<(), SecurityError> {
+pub(super) fn require_zero_blocks(
+    disk: &mut impl EpochBlockIo,
+    range: Range<u32>,
+) -> Result<(), SecurityError> {
     let mut block = [0; BLOCK_BYTES];
     for index in range {
         disk.read(index, &mut block)?;
@@ -426,7 +429,7 @@ pub(super) fn require_zero_blocks(disk: &mut Disk, range: Range<u32>) -> Result<
 }
 
 fn read_root(
-    disk: &mut Disk,
+    disk: &mut impl EpochBlockIo,
     raw: &mut [u8; BLOCK_BYTES],
     first: Option<&[u8; ROOT_SLOT_BYTES]>,
 ) -> Result<(), SecurityError> {
@@ -456,7 +459,7 @@ pub(super) struct ScratchFile {
 
 /// Read the sealed ACL, root slot and full file block from the exclusive disk.
 pub(super) fn read_scratch_file(
-    disk: &mut Disk,
+    disk: &mut impl EpochBlockIo,
     raw: &mut [u8; BLOCK_BYTES],
     snapshots: SnapshotLayout,
     owner: Principal,
@@ -512,7 +515,7 @@ pub(super) fn expected_state(
 /// Both boot modes use exactly the staging manifest and ACL policy. The only
 /// mutable homes in this fixture are the paired security and boot epochs.
 pub(super) fn validate_homes(
-    disk: &mut Disk,
+    disk: &mut impl EpochBlockIo,
     sb: SuperblockV1,
     epoch: u64,
     config: Config<'_>,
@@ -582,7 +585,7 @@ pub(super) fn validate_homes(
 /// Validate the signed FSYNC diagnostic's persisted file and paired epoch.
 #[cfg(feature = "v020-production-fsync-scratch")]
 pub(super) fn validate_fsync_homes(
-    disk: &mut Disk,
+    disk: &mut impl EpochBlockIo,
     checkpoint: SuperblockV1,
     config: &VerifiedOfflineConfig<'_>,
     epoch: u64,
@@ -643,7 +646,10 @@ fn checked_map() -> Result<[UnifiedSystemObject; unified::UNIFIED_SYSTEM_OBJECTS
     Ok(map)
 }
 
-fn verify_snapshot_envelopes(disk: &mut Disk, fs_uuid: [u8; 16]) -> Result<(), SecurityError> {
+fn verify_snapshot_envelopes(
+    disk: &mut impl EpochBlockIo,
+    fs_uuid: [u8; 16],
+) -> Result<(), SecurityError> {
     let mut raw = [0; BLOCK_BYTES];
     for object in SNAPSHOTS {
         disk.read(object.first_block, &mut raw)?;
@@ -659,7 +665,7 @@ fn verify_snapshot_envelopes(disk: &mut Disk, fs_uuid: [u8; 16]) -> Result<(), S
 
 /// Return the selected v1 checkpoint and its bytes for the paired boot grant.
 pub(super) fn read_checkpoint(
-    disk: &mut Disk,
+    disk: &mut impl EpochBlockIo,
     raw: &mut [u8; BLOCK_BYTES],
     config: Config<'_>,
 ) -> Result<SuperblockV1, SecurityError> {
@@ -709,7 +715,7 @@ fn checkpoint_lsn_valid(copy: SuperblockV1) -> bool {
 /// Check the N=8 manifest geometry and each mode's snapshot bytes.
 /// Allocated layouts additionally require structural and ACL validation.
 pub(super) fn unified_map(
-    disk: &mut Disk,
+    disk: &mut impl EpochBlockIo,
     sb: SuperblockV1,
     snapshots: SnapshotLayout,
 ) -> Result<u32, SecurityError> {

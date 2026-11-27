@@ -129,6 +129,23 @@ def net_entropy(words: tuple, lines: list, enabled: bool) -> dict:
             "virtio_rng_health_samples": samples}
 
 
+def net_ingress(lines: list, enabled: bool) -> dict:
+    spaces = rows(lines, "V020_SEC_N_PARSER_SPACE")
+    frames = rows(lines, "V020_SEC_N_PARSER_FRAMES")
+    if not enabled:
+        require(not (spaces or frames), "unexpected isolated ingress parser evidence")
+        return {}
+    require(len(spaces) == 1 and spaces[0][0] == 0x42
+            and 0 < spaces[0][1] <= 16 and spaces[0][2] == 1,
+            "missing isolated ingress parser space")
+    require(len(frames) == 1 and frames[0][0] == frames[0][1] + frames[0][2]
+            and frames[0][1] > 0, "inconsistent isolated ingress parser frame counts")
+    checked, accepted, dropped = frames[0]
+    return {"native_parser_asid": spaces[0][0], "native_parser_image_pages": spaces[0][1],
+            "native_parser_checked_frames": checked, "native_parser_accepted_frames": accepted,
+            "native_parser_dropped_frames": dropped}
+
+
 def net_signer(lines: list, enabled: bool, signed_boot_epoch: int | None) -> dict:
     spaces = rows(lines, "V020_SEC_N_SIGNER_SPACE")
     replies = rows(lines, "V020_SEC_N_SIGNER_REPLY")
@@ -220,6 +237,7 @@ def validate_extensions(words: tuple, lines: list, modes: Modes) -> dict:
         require(not any(words[162:164]), "unexpected media reopen evidence")
     return {
         **net_entropy(words, lines, modes.authenticated_net),
+        **net_ingress(lines, modes.authenticated_net),
         **net_signer(lines, modes.authenticated_net, words[148] if modes.signed_media else None),
         **control_observations(words, lines, modes.live_control),
         **net_retirement(words, lines, modes),

@@ -617,7 +617,14 @@ fn load_role(index: usize) -> NativeRole {
     let target_selector = observations::selector(ROLES[index]);
     #[cfg(not(feature = "v020-production-live-control"))]
     let target_selector = 0;
-    load_role_with_identity(index, 1, pie_cap_selector(index), target_selector)
+    load_role_with_identity(
+        index,
+        1,
+        role_loader::RoleLaunch::Diagnostic {
+            cap_selector: pie_cap_selector(index),
+            target_selector,
+        },
+    )
 }
 
 // ---- in-vector production dispatch ----

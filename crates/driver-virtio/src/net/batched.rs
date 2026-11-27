@@ -157,7 +157,7 @@ impl BatchedNet {
         self.rx.fence();
         self.tx.fence();
         self.transport
-            .observe_mmio_reset(1, &[0, 1], platform)
+            .observe_mmio_reset(1, &[0, 1], platform, || Ok(()))
             .map(|observed| {
                 [0, 1].map(|id| ResetProof::for_first_generation(boot_epoch, 1, id, observed))
             })

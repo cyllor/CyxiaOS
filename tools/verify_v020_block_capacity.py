@@ -102,6 +102,7 @@ def resize_during_reopen(binary, elf, output, disk, timeout):
                     and handoff[0][0] % 512 == 0 and handoff[0][1:] == (2, 0)
                     and rows(lines, "V020_W11_MEDIA_RECOVERY_REQUIRED") == [(0, 0, 0)]
                     and recovery == [(0, 1, stopped[0][2])]
+                    and not any(line.startswith("V020_SEC_D_BLOCK_RESET_PROOF ") for line in lines)
                     and len(chains) == len(ops) == sum(custody[0][:2])
                     and len({slot for slot, _, _ in chains}) == len(chains)
                     and all(slot < 8 and generation > 0 and complete in (0, 1)

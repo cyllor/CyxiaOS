@@ -1,0 +1,99 @@
+name: V0.20 G4 bounded model replay (partial evidence)
+on:
+  push:
+    branches: [CyxiaOS-V0.20]
+    paths:
+      - 'crates/kernel-core/**'
+      - 'crates/control-model/**'
+      - 'crates/contracts/**'
+      - 'crates/prototype/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - 'vendor/**'
+      - 'docs/design/baselines/v0.19.9-implementation-spec.txt'
+      - 'tools/check_v0199_h04_model.py'
+      - 'tools/check_v0199_h05_model.py'
+      - '.github/workflows/v20-g4-bounded-model-replay.yml'
+  pull_request:
+    branches: [CyxiaOS-V0.20]
+    paths:
+      - 'crates/kernel-core/**'
+      - 'crates/control-model/**'
+      - 'crates/contracts/**'
+      - 'crates/prototype/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - 'vendor/**'
+      - 'docs/design/baselines/v0.19.9-implementation-spec.txt'
+      - 'tools/check_v0199_h04_model.py'
+      - 'tools/check_v0199_h05_model.py'
+      - '.github/workflows/v20-g4-bounded-model-replay.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bounded-model:
+    name: bounded-model-${{ matrix.case }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [h04, h05]
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+      CASE: ${{ matrix.case }}
+      CARGO_TARGET_DIR: target/g4-bounded-model
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build and independently replay bounded model (not a formal Verdict)
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$CASE" in h04|h05) ;; *) exit 2 ;; esac
+          dir="artifacts/g4-bounded-model/$CASE"
+          example="v0199_${CASE}_model_check"
+          checker="tools/check_v0199_${CASE}_model.py"
+          mkdir -p "$dir"
+          git rev-parse HEAD > "$dir/commit.txt"
+          git rev-parse HEAD^{tree} > "$dir/tree.txt"
+          git diff --exit-code HEAD
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustc -Vv > "$dir/rustc.txt"
+          cargo -V > "$dir/cargo.txt"
+          python3 --version > "$dir/python.txt"
+          cargo fetch --locked 2>&1 | tee "$dir/fetch.log"
+          cargo build --locked --offline -p cyxia-kernel-core --example "$example" 2>&1 | tee "$dir/build.log"
+          cp "$CARGO_TARGET_DIR/debug/examples/$example" "$dir/harness"
+          sha256sum "$dir/harness" "$checker" "crates/kernel-core/examples/$example.rs" Cargo.lock docs/design/baselines/v0.19.9-implementation-spec.txt > "$dir/pre-run.sha256"
+          set -x
+          harness_rc=0
+          timeout 300s "$dir/harness" > "$dir/observed.tsv" 2> "$dir/harness.stderr" || harness_rc=$?
+          printf '%s\n' "$harness_rc" > "$dir/harness.exit"
+          checker_rc=0
+          if [ "$harness_rc" -eq 0 ]; then
+            timeout 300s python3 -B "$checker" --observed "$dir/observed.tsv" --harness "$dir/harness" --output "$dir/bounded-report.json" > "$dir/checker.stdout" 2> "$dir/checker.stderr" || checker_rc=$?
+            printf '%s\n' "$checker_rc" > "$dir/checker.exit"
+          else
+            printf 'NOT_RUN\n' > "$dir/checker.exit"
+          fi
+          set +x
+          sha256sum -c "$dir/pre-run.sha256"
+          git diff --exit-code HEAD
+          if [ -f "$dir/checker.stdout" ]; then cat "$dir/checker.stdout"; fi
+          if [ -f "$dir/checker.stderr" ]; then cat "$dir/checker.stderr" >&2; fi
+          if [ "$harness_rc" -ne 0 ]; then exit "$harness_rc"; fi
+          exit "$checker_rc"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-g4-bounded-${{ matrix.case }}-${{ github.sha }}
+          path: artifacts/g4-bounded-model/${{ matrix.case }}/
+          if-no-files-found: error
+          retention-days: 30

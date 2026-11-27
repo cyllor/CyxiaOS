@@ -29,6 +29,7 @@ struct Disk {
     writes: u64,
     flushes: u64,
     first_flush_writes: Option<u64>,
+    fail_before_write: Option<u64>,
 }
 
 impl EpochBlockIo for Disk {
@@ -42,6 +43,9 @@ impl EpochBlockIo for Disk {
     }
 
     fn write(&mut self, block: u32, data: &[u8; BLOCK_BYTES]) -> Result<(), Error> {
+        if self.fail_before_write == Some(self.writes) {
+            return Err(Error::Unknown);
+        }
         self.writes += 1;
         self.blocks.insert(block, *data);
         Ok(())
@@ -56,6 +60,49 @@ impl EpochBlockIo for Disk {
 
 // These native static workspaces belong to one CPU0 at a time.
 static STAGING_OWNER: Mutex<()> = Mutex::new(());
+
+#[test]
+fn signed_boot_recovery_resumes_at_durable_boundaries() {
+    let _owner = STAGING_OWNER.lock().unwrap();
+    let verified = signed::verify(signed::WIRE, &mut [0; 1024]).unwrap();
+    let config = Some(&verified);
+    let mut prepared = Disk::default();
+    let first = volume::format(&mut prepared, config, LegacyZero).unwrap();
+    let mount = volume::mount(&mut prepared, first, config, LegacyZero).unwrap();
+    assert_eq!(
+        authority::boot_epoch(&mut prepared, first, &mount.security, config),
+        Ok(1)
+    );
+
+    for completed_writes in 1..=9 {
+        let mut disk = Disk {
+            blocks: prepared.blocks.clone(),
+            ..Disk::default()
+        };
+        if completed_writes < 9 {
+            disk.fail_before_write = Some(completed_writes);
+            assert_eq!(
+                reopen::recover(&mut disk, first, config, LegacyZero).err(),
+                Some(Error::Unknown)
+            );
+            disk.fail_before_write = None;
+        } else {
+            // Recovery fully retired the old log, then the boot ended
+            // before the next epoch transaction was issued.
+            reopen::recover(&mut disk, first, config, LegacyZero).unwrap();
+        }
+        assert_eq!(disk.writes, completed_writes);
+        let selected = reopen::identify(&mut disk, config).unwrap();
+        let (checkpoint, mounted) = reopen::recover(&mut disk, selected, config, LegacyZero)
+            .unwrap_or_else(|e| panic!("recovery after {completed_writes} writes: {e:?}"));
+        assert_eq!((checkpoint.generation, checkpoint.checkpoint_lsn), (2, 4));
+        assert_eq!(mounted.boot.boot_epoch, 1);
+        assert_eq!(
+            authority::boot_epoch(&mut disk, checkpoint, &mounted.security, config),
+            Ok(2)
+        );
+    }
+}
 
 #[test]
 fn signed_unified_genesis_matches_the_independent_full_image_vector() {

@@ -41,6 +41,9 @@
 //! * ACTIVE_POLL_TIMER joins the CPU0 foreground wait to its banked PPI
 //!   handler. Only that IRQ, while enabled by the waiter, may rearm it.
 //! * asm!("dsb/tlbi/ic"): bounded TLB/cache maintenance; options(nostack).
+#[cfg(feature = "v020-production-authenticated-net")]
+#[path = "sec_n_broker/ingress.rs"]
+pub(super) mod ingress;
 #[path = "sec_n_broker/receipt.rs"]
 mod receipt;
 #[cfg(feature = "v020-production-authenticated-net")]
@@ -373,10 +376,10 @@ pub(crate) struct Layout {
 /// admission contract (pie_image_v0199) deliberately rejects ET_EXEC, so this
 /// loader parses the fixed-address guest directly and never grants capabilities.
 pub(crate) fn load_guest() -> Layout {
-    load_image(GUEST_ELF, &guest_memory())
+    load_image(GUEST_ELF, &guest_memory(), SHARED_PAGES, true)
 }
 
-fn load_image(b: &[u8], memory: &Memory) -> Layout {
+fn load_image(b: &[u8], memory: &Memory, shared_pages: usize, shared_writable: bool) -> Layout {
     assert!(b.len() >= 64 && &b[0..4] == b"\x7fELF" && b[4] == 2 && b[5] == 1 && b[6] == 1);
     assert_eq!(le16(b, 16), 2, "guest must be ET_EXEC fixed-address");
     assert_eq!(le16(b, 18), 183, "guest must be AArch64");
@@ -452,10 +455,16 @@ fn load_image(b: &[u8], memory: &Memory) -> Layout {
             memory.map_page(va + p as u64 * PAGE as u64, pa, write, execute);
         }
     }
-    // Shared broker page (RW, never executable).
-    for p in 0..SHARED_PAGES {
+    // Only explicitly requested shared pages are mapped, always XN.
+    assert!(shared_pages <= SHARED_PAGES);
+    for p in 0..shared_pages {
         let pa = phys(unsafe { memory.shared.add(p) as u64 });
-        memory.map_page(SHARED_VA + p as u64 * PAGE as u64, pa, true, false);
+        memory.map_page(
+            SHARED_VA + p as u64 * PAGE as u64,
+            pa,
+            shared_writable,
+            false,
+        );
     }
     // Guarded guest stack (RW). Pages below STACK_VA stay unmapped as a guard.
     for p in 0..memory.stack_pages {
