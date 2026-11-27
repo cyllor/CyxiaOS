@@ -65,6 +65,10 @@ def check_reopen(lines: list, snapshot: dict, *, flush: bool, before: str, after
     operations = snapshot["operations"]
     require(rows(lines, "SMP_BOOT_OK") == [(4, 15, 0)], "four-vCPU boot did not complete")
     require(not any(line.startswith(("FAIL", "PANIC", "SMP_ERROR")) for line in lines), "guest failed")
+    # A semantic mount refusal must not hide a transport failure or UNKNOWN
+    # custody; nor can a successful writable mount carry either witness.
+    for marker in ("V020_W11_MEDIA_IO_ERROR", "V020_SEC_D_BLOCK_MMIO_UNKNOWN"):
+        require(not rows(lines, marker), "unexpected device failure: " + marker)
     attach_errors = rows(lines, "V020_W11_MEDIA_ATTACH_ERROR")
     boot_rows = rows(lines, "V020_SIGNED_RESIDENT_BOOT")
     media_steps = rows(lines, "V020_W11_MEDIA_STEP")
@@ -75,13 +79,18 @@ def check_reopen(lines: list, snapshot: dict, *, flush: bool, before: str, after
                 "driver did not negotiate FLUSH")
         require(not attach_errors and not states and boot_rows == [(2, len(ROLES), 0)]
                 and (4, 1, 2) in media_steps, "signed mount did not confirm the next BootEpoch")
+        require(lines.index("V020_W11_MEDIA_STEP a=4 b=1 c=2")
+                < lines.index(f"V020_SIGNED_RESIDENT_BOOT a=2 b={len(ROLES)} c=0"),
+                "signed roles started before durable BootEpoch confirmation")
         require(all(operations[key] > 0 for key in COUNTERS) and before != after,
                 "the writable mount lacks observed media I/O and FLUSH")
     else:
         require(FAILED in detail["status"] and DRIVER_OK not in detail["status"],
                 "driver did not refuse the device before setting DRIVER_OK")
         require(attach_errors == [(3, 0, 0)] and states == [STARTUP] and not boot_rows and not media_steps
-                and not rows(lines, "V020_W11_MEDIA_IO") and not rows(lines, "V020_SIGNED_RESIDENT_ROLE"),
+                and not rows(lines, "V020_W11_MEDIA_IO") and not rows(lines, "V020_SIGNED_RESIDENT_ROLE")
+                and not rows(lines, "V020_SIGNED_RESIDENT_PROGRESS")
+                and not rows(lines, "V020_SIGNED_RESIDENT_CPU"),
                 "guest did not fence the writable mount at device attachment")
         require(all(operations[key] == 0 for key in COUNTERS) and before == after,
                 "rejected device performed media I/O or changed the volume")
@@ -146,7 +155,7 @@ def reopen(binary: Path, elf: Path, disk: Path, output: Path, timeout: float, *,
     detail = check_reopen(lines, final, flush=flush, before=before, after=sha(disk))
     if flush:
         detail["policy_sha256"] = verify_disk(disk, 2, rows(lines, "V020_SIGNED_RESIDENT_ROLE"))
-    detail["capture_sha256"] = {name: sha(output / name) for name in ("argv.json", "serial.bin", "qmp.jsonl")}
+    detail["capture_sha256"] = {name: sha(output / name) for name in ("argv.json", "serial.bin", "serial.txt", "qmp.jsonl", "qemu-stderr.log")}
     return detail
 
 

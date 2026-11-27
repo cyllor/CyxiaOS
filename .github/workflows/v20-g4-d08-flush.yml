@@ -1,0 +1,119 @@
+# Actual paired QEMU mount evidence, NOT a formal G4 Verdict.
+# Keep the existing exact-source PMU-only QEMU attestation intact. The newer
+# two-patch production transport lane remains separate and unchanged.
+name: V0.20 G4 SEC-D08 signed mount FLUSH replay
+on:
+  push:
+    branches: [CyxiaOS-V0.20]
+    paths:
+      - 'kernel/**'
+      - 'crates/**'
+      - 'user/**'
+      - 'tests/fixtures/v020-signed-scratch/**'
+      - 'tools/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - 'vendor/**'
+      - 'docs/design/baselines/v0.19.9-implementation-spec.txt'
+      - '.github/workflows/v20-g4-d08-flush.yml'
+  pull_request:
+    branches: [CyxiaOS-V0.20]
+    paths:
+      - 'kernel/**'
+      - 'crates/**'
+      - 'user/**'
+      - 'tests/fixtures/v020-signed-scratch/**'
+      - 'tools/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'rust-toolchain*'
+      - 'vendor/**'
+      - 'docs/design/baselines/v0.19.9-implementation-spec.txt'
+      - '.github/workflows/v20-g4-d08-flush.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  signed-mount-flush:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Validate D08 checker rejection cases
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/g4-d08
+          PYTHONPATH=tools python3 -B -m unittest -v tools.test_verify_v0199_d08_flush 2>&1 | tee artifacts/g4-d08/checker-regression.log
+      - name: Build the signed scratch resident and cold-reopen ELF
+        run: |
+          set -euo pipefail
+          dir=artifacts/g4-d08
+          git rev-parse HEAD > "$dir/commit.txt"
+          git rev-parse HEAD^{tree} > "$dir/tree.txt"
+          git diff --exit-code HEAD
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make ninja-build pkg-config libglib2.0-dev libpixman-1-dev libfdt-dev python3-venv
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat --target aarch64-unknown-none
+          rustup override set 1.95.0
+          rustc -vV > "$dir/rustc.txt"
+          cargo -V > "$dir/cargo.txt"
+          python3 --version > "$dir/python.txt"
+          cargo fetch --locked 2>&1 | tee "$dir/fetch.log"
+          python3 -B -c 'import sys; sys.path.insert(0, "tools"); import verify_v0199_sec_n as s; s.build_guest(isolated_signer=True)' 2>&1 | tee "$dir/guest-build.log"
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v020-production-signed-resident 2>&1 | tee "$dir/fresh-build.log"
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel "$dir/fresh.elf"
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --features v020-production-signed-resident,v020-production-media-reopen 2>&1 | tee "$dir/reopen-build.log"
+          cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel "$dir/reopen.elf"
+      - name: Build exact-source pinned PMU-only QEMU
+        run: |
+          set -euo pipefail
+          source="$RUNNER_TEMP/qemu-source"
+          git clone --filter=blob:none --no-checkout https://github.com/qemu/qemu.git "$source"
+          git -C "$source" checkout --detach f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          test "$(git -C "$source" rev-parse HEAD)" = f8ed81651e61d9c2166df6121ce2af0f44f06b3e
+          git -C "$source" apply --check "$PWD/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$source" apply "$PWD/tools/qemu/cyxia-per-vcpu-pmu.patch"
+          git -C "$source" diff --check
+          git -C "$source" diff --binary > artifacts/g4-d08/qemu-applied.patch
+          git -C "$source" rev-parse HEAD > artifacts/g4-d08/qemu-upstream.txt
+          cd "$source"
+          ./configure --target-list=aarch64-softmmu --disable-docs --disable-gtk --disable-sdl --disable-opengl --disable-werror 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/g4-d08/qemu-configure.log"
+          ninja -C build qemu-system-aarch64 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/g4-d08/qemu-build.log"
+          build/qemu-system-aarch64 --version > "$GITHUB_WORKSPACE/artifacts/g4-d08/qemu-version.txt"
+      - name: Freeze exact local inputs and run actual three-boot D08 checker
+        run: |
+          set -euo pipefail
+          dir=artifacts/g4-d08
+          binary="$RUNNER_TEMP/qemu-source/build/qemu-system-aarch64"
+          # This CI-local pre-run hash manifest is not a separately authenticated
+          # normative run manifest, so the checker retains formal_status=NOT_RUN.
+          git ls-files -z 'tools/*.py' 'tests/fixtures/v020-signed-scratch/**' | xargs -0 sha256sum > "$dir/pre-run.sha256"
+          sha256sum "$binary" "$dir/fresh.elf" "$dir/reopen.elf" Cargo.lock docs/design/baselines/v0.19.9-implementation-spec.txt tools/v0199-required-proof-inventory.json tools/qemu/cyxia-per-vcpu-pmu.patch "$dir/commit.txt" "$dir/tree.txt" "$dir/rustc.txt" "$dir/cargo.txt" "$dir/python.txt" "$dir/qemu-applied.patch" "$dir/qemu-upstream.txt" >> "$dir/pre-run.sha256"
+          sha256sum "$dir/pre-run.sha256" > "$dir/pre-run.digest"
+          git diff --exit-code HEAD
+          read -r expected ignored < <(sha256sum "$binary")
+          rc=0
+          python3 -B tools/verify_v0199_d08_flush.py \
+            --fresh-elf "$dir/fresh.elf" --reopen-elf "$dir/reopen.elf" \
+            --qemu "$binary" --qemu-source "$RUNNER_TEMP/qemu-source" \
+            --qemu-sha256 "$expected" --output "$dir/capture" --timeout 120 \
+            2>&1 | tee "$dir/verify.log" || rc=$?
+          printf '%s\n' "$rc" > "$dir/checker.exit"
+          sha256sum -c "$dir/pre-run.digest"
+          sha256sum -c "$dir/pre-run.sha256"
+          git diff --exit-code HEAD
+          exit "$rc"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-g4-d08-${{ github.sha }}
+          path: artifacts/g4-d08/
+          if-no-files-found: error
+          retention-days: 30
