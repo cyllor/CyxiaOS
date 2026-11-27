@@ -291,6 +291,20 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         self.stop_failed_mmio_with_checkpoint(p, || Ok(()))
     }
 
+    /// End an exclusive upper-layer I/O session that will never run again.
+    /// A local abort can strand accepted requests in a healthy transport.
+    /// Fence those requests before attempting the same one-shot MMIO stop.
+    pub fn stop_abandoned_mmio(
+        &mut self,
+        p: &impl Platform,
+        checkpoint: impl FnMut() -> Result<(), Error>,
+    ) -> Option<Result<u64, Error>> {
+        if self.pending.iter().any(Option::is_some) {
+            self.fence_for_recovery();
+        }
+        self.stop_failed_mmio_with_checkpoint(p, checkpoint)
+    }
+
     /// The serialized recovery owner can renew its grant before the reset
     /// write and each observation. Refusal consumes the one-shot attempt
     /// without permitting another MMIO access or releasing any request.
@@ -968,6 +982,58 @@ mod tests {
         assert_eq!(block.stop_failed_mmio(&platform), None);
         assert_eq!(block.terminal_custody(), Some(custody));
         assert_eq!(block.retained_requests(), (0, 1));
+    }
+
+    #[test]
+    fn abandoned_block_session_seals_the_exact_retained_request_even_if_transport_is_live() {
+        let (mut block, mut platform, _) = fixture();
+        let operation = Operation::Read(0);
+        let token = block
+            .begin(operation, &[0; 512], true, true, &platform)
+            .unwrap();
+        let published = block.notify_stats().published;
+        assert_eq!(published, 1);
+        assert_eq!(block.stop_failed_mmio(&platform), None);
+
+        platform.complete_mmio_reset = true;
+        platform.clock.set(123_000);
+        assert_eq!(
+            block.stop_abandoned_mmio(&platform, || Ok(())),
+            Some(Ok(123_000)),
+        );
+
+        let custody = block.terminal_custody().unwrap();
+        assert_eq!(custody.reset, Some(Ok(123_000)));
+        assert_eq!(
+            custody.requests[usize::from(token.slot)],
+            Some(RetainedBlock {
+                token,
+                operation,
+                completed: false
+            }),
+        );
+        assert_eq!(block.retained_requests(), (1, 0));
+        assert_eq!(block.acknowledge(token), Err(Error::Response));
+        assert_eq!(block.free(), block.capacity() - 1);
+        assert_eq!(
+            block.begin(operation, &[0; 512], true, true, &platform),
+            Err(Error::Device)
+        );
+        assert_eq!(block.notify_stats().published, published);
+        assert_eq!(block.stop_abandoned_mmio(&platform, || Ok(())), None);
+    }
+
+    #[test]
+    fn abandoned_block_session_without_an_obligation_does_not_reset_a_healthy_queue() {
+        let (mut block, platform, _) = fixture();
+        assert!(block.is_quiescent());
+        assert_eq!(
+            block.stop_abandoned_mmio(&platform, || Err(Error::Busy)),
+            None
+        );
+        assert!(block.is_quiescent());
+        assert_eq!(block.transport.status(), 15);
+        assert!(block.terminal_custody().is_none());
     }
 
     #[test]

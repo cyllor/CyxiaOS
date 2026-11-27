@@ -477,7 +477,7 @@ fn finish_io(
     let mut budget_refused = false;
     if result.is_err()
         && TERMINAL_STATE.load(Ordering::Relaxed) == EMPTY
-        && let Some(stop) = device.stop_failed_mmio_with_checkpoint(&Board, || {
+        && let Some(stop) = device.stop_abandoned_mmio(&Board, || {
             checkpoint().map_err(|_| {
                 budget_refused = true;
                 DriverError::Busy
