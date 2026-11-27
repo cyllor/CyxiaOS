@@ -63,6 +63,9 @@ use cyxia_kernel_core::security::{
 
 #[path = "media_staging/authority.rs"]
 mod authority;
+#[cfg(feature = "v020-production-fsync-scratch")]
+#[path = "media_staging/fsync.rs"]
+mod fsync;
 #[path = "media_staging/reopen.rs"]
 mod reopen;
 #[cfg(feature = "v020-production-media-signed")]
@@ -187,6 +190,9 @@ fn step(index: u64, result: Result<u64, SecurityError>) -> Option<u64> {
 
 fn run_chain(disk: &mut Disk, out: &mut StagingOutcome) -> Option<()> {
     const REOPEN: bool = cfg!(feature = "v020-production-media-reopen");
+    #[cfg(feature = "v020-production-fsync-scratch")]
+    const LAYOUT: volume::SnapshotLayout = volume::SnapshotLayout::BaselineFsyncFile;
+    #[cfg(not(feature = "v020-production-fsync-scratch"))]
     const LAYOUT: volume::SnapshotLayout = if cfg!(feature = "v020-production-file-volatile-write")
     {
         volume::SnapshotLayout::AllocatedEnvelopesWithWritableFile
@@ -199,6 +205,12 @@ fn run_chain(disk: &mut Disk, out: &mut StagingOutcome) -> Option<()> {
     } else {
         volume::SnapshotLayout::LegacyZero
     };
+    if cfg!(all(
+        feature = "v020-production-fsync-scratch",
+        feature = "v020-production-media-envelopes"
+    )) {
+        return None;
+    }
     #[cfg(feature = "v020-production-media-signed")]
     let verified = {
         // SAFETY: CPU0 has joined the business CPUs; package loading is over.
@@ -223,6 +235,11 @@ fn run_chain(disk: &mut Disk, out: &mut StagingOutcome) -> Option<()> {
     out.identified = REOPEN;
     let sb = sb.ok()?;
     let mounted = if REOPEN {
+        #[cfg(feature = "v020-production-fsync-scratch")]
+        {
+            fsync::recover(disk, sb, &verified)
+        }
+        #[cfg(not(feature = "v020-production-fsync-scratch"))]
         reopen::recover(disk, sb, config, LAYOUT)
     } else {
         volume::mount(disk, sb, config, LAYOUT).map(|mounted| (sb, mounted))
@@ -259,6 +276,17 @@ fn run_chain(disk: &mut Disk, out: &mut StagingOutcome) -> Option<()> {
         }
         out.receipt_query_digest =
             Some(volume::confirmed_receipt_query_digest(&mounted, &committed, &verified).ok()?);
+        #[cfg(feature = "v020-production-fsync-scratch")]
+        {
+            let result = if REOPEN {
+                fsync::readback(disk, &verified, &committed)
+            } else {
+                fsync::execute(disk, checkpoint, &mounted, &verified, &committed)
+            };
+            result
+                .inspect_err(|e| report("V020_FSYNC_ERROR", *e as u64, 0, 0))
+                .ok()?;
+        }
     }
     step(
         5,

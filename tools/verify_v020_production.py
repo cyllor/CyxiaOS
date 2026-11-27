@@ -99,6 +99,7 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/net_entropy.rs",
     "kernel/src/arch/aarch64/production/media_staging.rs",
     "kernel/src/arch/aarch64/production/media_staging/authority.rs",
+    "kernel/src/arch/aarch64/production/media_staging/fsync.rs",
     "kernel/src/arch/aarch64/production/media_staging/reopen.rs",
     "kernel/src/arch/aarch64/production/media_staging/signed.rs",
     "kernel/src/arch/aarch64/production/media_staging/volume.rs",
@@ -122,6 +123,8 @@ PRODUCTION_SOURCES = [
     "crates/kernel-core/src/security/file_format_v1.rs",
     "crates/kernel-core/src/security/file_media_unified_v1.rs",
     "crates/kernel-core/src/security/file_mount_v1.rs",
+    "crates/kernel-core/src/security/file_fsync_v1.rs",
+    "crates/kernel-core/src/security/recovery_v1.rs",
     "crates/kernel-core/src/security/file_receipt_query_v4.rs",
     "crates/kernel-core/src/security/file_receipt_store_v0199.rs",
     "crates/kernel-core/src/security/file_index_v0199.rs",
@@ -155,6 +158,7 @@ PRODUCTION_SOURCES = [
     "user/local-echo/src/lib.rs",
     "user/local-echo/src/runtime.rs",
     "tools/verify_v020_production.py",
+    "tools/verify_v020_fsync_scratch.py",
     "tools/qmp_stdio.py",
     "tools/v020_production_media.py",
     "tools/v020_production_modes.py",
@@ -163,6 +167,7 @@ PRODUCTION_SOURCES = [
     "tools/v020_snapshot_envelopes.py",
     "tools/v020_tls_peer.py",
     "tests/fixtures/v020-signed-scratch/config.bin",
+    "tests/fixtures/v020-signed-scratch/fsync-config.bin",
 ]
 GUEST_ELF = "target/aarch64-unknown-none/release/cyxia-local-echo"
 MAGIC = 0x4359_5052_4431_3030
@@ -524,7 +529,7 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     require(lines.count(STAGING_MARKER) == 1,
             "staging marker with golden_vector_pending=1 must appear exactly once")
     steps = w11_rows(lines, "V020_W11_MEDIA_STEP")
-    live_inodes = (9 if modes.media_unified else 5) + int(modes.file_read)
+    live_inodes = (9 if modes.media_unified else 5) + int(modes.file_read or modes.fsync_scratch)
     require([step[:2] for step in steps] == [(index, 1) for index in range(1, 6)]
             and steps[0][2] == 1 and steps[1][2] == live_inodes and steps[2][2] == 151 and steps[4][2] == 1,
             "media staging serial steps must show format, mount, map, epoch and admission success")
@@ -534,6 +539,11 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     if modes.media_unified:
         fresh_writes = 4276 + int(modes.file_read)
     expected_io = (15, 5) if reopen else (fresh_writes, 6)
+    if modes.fsync_scratch:
+        # Fresh writes one extra file and 24 additional log blocks. Reopen
+        # replays seven homes, checkpoints, clears 24 nonzero old blocks and
+        # appends the six-block BootEpoch pair.
+        expected_io = (38, 5) if reopen else (4163, 12)
     require(len(io) == 1 and io[0][0] > 0 and io[0][1:] == expected_io,
             "media staging device writes and flushes disagree with the selected protocol")
     snapshot = w11_rows(lines, "V020_W11_MEDIA_SNAPSHOT_0X40")
@@ -622,6 +632,8 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
     require(staging or not modes.file_volatile_write, "file volatile write requires the staging lane")
     require(staging or not modes.signed_media, "signed media requires the staging lane")
     require(staging or not modes.snapshot_envelopes, "snapshot envelopes require the staging lane")
+    require(not modes.fsync_scratch or not modes.snapshot_envelopes,
+            "baseline FSYNC scratch requires an envelope-free volume")
     require(not modes.snapshot_read or (staging and modes.snapshot_catalog and modes.file_read),
             "snapshot read requires the staging lane, snapshot catalog and file read")
     require(not modes.file_sessions or (staging and modes.file_read),
@@ -739,7 +751,8 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                     require(before == source_manifest(), "production source changed during guest run")
                     if modes.signed_media:
                         epoch = report["observations"]["signed_config_bound_boot_epoch"]
-                        report["signed_scratch_policy_sha256"] = verify_signed_disk(scratch, epoch)
+                        report["signed_scratch_policy_sha256"] = verify_signed_disk(
+                            scratch, epoch, fsync_scratch=modes.fsync_scratch)
                         report["signed_receipt_view_disk_sha256"] = verify_signed_receipt_view(
                             scratch, report["observations"]["signed_receipt_view_sha256"])
                         report["signed_config"] = True

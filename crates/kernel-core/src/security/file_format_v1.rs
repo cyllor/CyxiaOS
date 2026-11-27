@@ -81,6 +81,7 @@ pub const SCRATCH_FILE_OWNER_RIGHTS: u32 = 1 << 8;
 pub const SCRATCH_FILE_WRITE_RIGHTS: u32 = 1 << 9;
 pub const SCRATCH_WRITABLE_FILE_OWNER_RIGHTS: u32 =
     SCRATCH_FILE_OWNER_RIGHTS | SCRATCH_FILE_WRITE_RIGHTS;
+pub const SCRATCH_FSYNC_FILE_OWNER_RIGHTS: u32 = SCRATCH_WRITABLE_FILE_OWNER_RIGHTS | (1 << 13);
 pub const SCRATCH_FILE_INODE: u32 = 1;
 pub const SCRATCH_FILE_GENERATION: u64 = 1;
 pub const SCRATCH_FILE_BLOCK: u32 = unified::CANONICAL_BUSINESS_START + 1;
@@ -532,6 +533,24 @@ pub fn format(
     w: &mut FormatWorkspace,
 ) -> Result<FormatEvidence, Error> {
     format_layout(io, total_blocks, m, None, None, w)
+}
+
+/// Format the signed diagnostic baseline-v1 file fixture. Its ordinary file
+/// and exact FSYNC ACL are initialized before publishing either superblock.
+pub fn format_baseline_with_fsync_scratch_file(
+    io: &mut impl EpochBlockIo,
+    total_blocks: u32,
+    m: &FormatManifest,
+    w: &mut FormatWorkspace,
+) -> Result<FormatEvidence, Error> {
+    format_layout(
+        io,
+        total_blocks,
+        m,
+        None,
+        Some(SCRATCH_FSYNC_FILE_OWNER_RIGHTS),
+        w,
+    )
 }
 
 /// Format an all-zero v1 image with the eight-object D1 scratch layout.

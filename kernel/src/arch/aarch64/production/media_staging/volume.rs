@@ -43,10 +43,13 @@ use cyxia_kernel_core::security::{
     offline_config_v1::{Principal, VerifiedOfflineConfig},
 };
 
+#[cfg(not(feature = "v020-production-fsync-scratch"))]
 pub(super) const UUID: [u8; 16] = *b"CYX-W11-STAGING!";
+#[cfg(feature = "v020-production-fsync-scratch")]
+pub(super) const UUID: [u8; 16] = *b"CYX-FSYNC-TEST!!";
 pub(super) const FIRST_LOG_BLOCK: u32 = 2;
 pub(super) const BOOT_HOME: u32 = DATA_START;
-const RECEIPTS_HOME: u32 = DATA_START + 1;
+pub(super) const RECEIPTS_HOME: u32 = DATA_START + 1;
 const ACL_HOME: u32 = DATA_START + 8;
 pub(super) const SECURITY_HOME: u32 = DATA_START + 12;
 const ROOT: u32 = CANONICAL_BUSINESS_START;
@@ -95,6 +98,8 @@ const SNAPSHOTS: [UnifiedSystemObject; SNAPSHOT_ENVELOPE_COUNT] = [
 #[derive(Clone, Copy)]
 pub(super) enum SnapshotLayout {
     LegacyZero,
+    #[cfg(feature = "v020-production-fsync-scratch")]
+    BaselineFsyncFile,
     EmptyEnvelopes,
     AllocatedEnvelopes,
     AllocatedEnvelopesWithFile,
@@ -117,6 +122,8 @@ impl SnapshotLayout {
 
     const fn file_owner_rights(self) -> Option<u32> {
         match self {
+            #[cfg(feature = "v020-production-fsync-scratch")]
+            Self::BaselineFsyncFile => Some(file_format_v1::SCRATCH_FSYNC_FILE_OWNER_RIGHTS),
             Self::AllocatedEnvelopesWithFile => Some(SCRATCH_FILE_OWNER_RIGHTS),
             Self::AllocatedEnvelopesWithWritableFile => Some(SCRATCH_WRITABLE_FILE_OWNER_RIGHTS),
             Self::LegacyZero | Self::EmptyEnvelopes | Self::AllocatedEnvelopes => None,
@@ -232,6 +239,15 @@ pub(super) fn format(
     let w = slot.write(FormatWorkspace::new());
     let e = match snapshots {
         SnapshotLayout::LegacyZero => file_format_v1::format(disk, BLOCK_COUNT, &manifest, w)?,
+        #[cfg(feature = "v020-production-fsync-scratch")]
+        SnapshotLayout::BaselineFsyncFile => {
+            file_format_v1::format_baseline_with_fsync_scratch_file(
+                disk,
+                BLOCK_COUNT,
+                &manifest,
+                w,
+            )?
+        }
         SnapshotLayout::EmptyEnvelopes => {
             checked_map()?;
             let mut writer = EnvelopeFormatDisk {
@@ -541,6 +557,40 @@ pub(super) fn validate_homes(
     Ok(e)
 }
 
+/// Validate only the signed diagnostic's post-replay view, after the exact
+/// expected journal homes were verified and replayed by the scratch owner.
+#[cfg(feature = "v020-production-fsync-scratch")]
+pub(super) fn validate_fsync_homes(
+    disk: &mut Disk,
+    checkpoint: SuperblockV1,
+    config: &VerifiedOfflineConfig<'_>,
+) -> Result<MountEvidence, SecurityError> {
+    // SAFETY: the one-shot CPU0 mount excludes all other MOUNT borrows.
+    let w = unsafe { &mut *core::ptr::addr_of_mut!(MOUNT) };
+    let e =
+        file_mount_v1::validate_signed(disk, checkpoint, &SYSTEM, config, w, |a, inode, kind| {
+            staging_acl(
+                a,
+                inode,
+                kind.map(UnifiedSystemKind::from_baseline),
+                SnapshotLayout::BaselineFsyncFile,
+                config.principals()[0],
+            )
+        })?;
+    if e.security != expected_state(1, Some(config))?
+        || e.boot.boot_epoch != 1
+        || e.structure.live_inodes != 6
+        || e.structure.directory_entries != 1
+        || e.system_blocks != 13
+        || e.structure.data_blocks != 15
+        || e.receipts.occupied != 1
+        || e.receipts.unresolved != 0
+    {
+        return Err(SecurityError::Conflict);
+    }
+    Ok(e)
+}
+
 /// The exclusive mount workspace retains the seven receipt/index blocks
 /// read by validate_homes. Only the known paired boot transaction has run
 /// since that mount; its independently verified state is required here.
@@ -591,13 +641,12 @@ pub(super) fn read_checkpoint(
     let sb = unified::unified_superblock_pair(raw, &other)?;
     let a = SuperblockV1::decode(raw)?;
     let b = SuperblockV1::decode(&other)?;
-    // A completed staging boot has exactly one boot pair per generation.
-    // The formatter writes identical generation 1 headers; subsequently the
-    // frozen checkpoint procedure alternates copies, starting with slot 1.
+    // The formatter writes identical generation 1 headers. Later checkpoints
+    // alternate copies and each fixture checks its exact committed boundary.
     for copy in [a, b] {
         if copy.fs_uuid != UUID
             || copy.log_epoch != copy.generation
-            || (copy.generation - 1).checked_mul(4) != Some(copy.checkpoint_lsn)
+            || expected_checkpoint_lsn(copy.generation) != Some(copy.checkpoint_lsn)
         {
             return Err(SecurityError::Conflict);
         }
@@ -609,6 +658,17 @@ pub(super) fn read_checkpoint(
         *raw = other;
     }
     Ok(sb)
+}
+
+fn expected_checkpoint_lsn(generation: u64) -> Option<u64> {
+    #[cfg(feature = "v020-production-fsync-scratch")]
+    return match generation {
+        1 => Some(0),
+        2 => Some(super::fsync::FINAL_LSN),
+        _ => None,
+    };
+    #[cfg(not(feature = "v020-production-fsync-scratch"))]
+    (generation - 1).checked_mul(4)
 }
 
 /// Check the N=8 manifest geometry and each mode's snapshot bytes.
@@ -628,6 +688,10 @@ pub(super) fn unified_map(
         return Err(SecurityError::Conflict);
     }
     match snapshots {
+        #[cfg(feature = "v020-production-fsync-scratch")]
+        SnapshotLayout::BaselineFsyncFile => {
+            require_zero_blocks(disk, SNAPSHOT_CATALOG_BLOCK..CANONICAL_BUSINESS_START)?;
+        }
         SnapshotLayout::LegacyZero => {
             require_zero_blocks(disk, SNAPSHOT_CATALOG_BLOCK..CANONICAL_BUSINESS_START)?;
         }

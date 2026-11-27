@@ -427,6 +427,11 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
         })
     }
 
+    /// Bounded scan and independently verified appends in this session.
+    pub fn evidence(&self) -> Option<RecoveryEvidence> {
+        self.workspace.evidence
+    }
+
     /// Append into a reserved span of blank blocks and verified obsolete
     /// records. A span that strands a nonzero REDO continuation is busy.
     /// The owner holds data/log/flush/completion reservations from BEGIN
