@@ -285,6 +285,9 @@ pub(crate) enum AttachError {
     Policy = 5,
     /// The boot's exclusive CPU0 owner already claimed the pinned queue.
     Owner = 6,
+    /// No Recovery grant for the next probe, reset observation or DMA setup.
+    #[cfg(cyxia_startup_catalog)]
+    Budget = 7,
 }
 
 fn select(info: &BootInfo) -> Result<(Transport, u64), AttachError> {
@@ -320,8 +323,42 @@ fn select(info: &BootInfo) -> Result<(Transport, u64), AttachError> {
 }
 
 /// Attach the one dedicated 512 MiB scratch block device. Call at most once.
+#[cfg(any(not(cyxia_startup_catalog), feature = "v0199-format-selftest"))]
 pub(crate) fn attach(info: &BootInfo) -> Result<&'static mut ScratchBlock, AttachError> {
     attach_with(info, ScratchBlock::attach_writable_exact, 120_000_000_000)
+}
+
+/// Use the signed boot's live Recovery ledger from the first probe until
+/// queue admission. The driver checkpoints the reset independently of I/O.
+#[cfg(cyxia_startup_catalog)]
+pub(crate) fn attach_metered(
+    info: &BootInfo,
+    checkpoint: &mut dyn FnMut() -> Result<(), SecurityError>,
+) -> Result<&'static mut ScratchBlock, AttachError> {
+    checkpoint().map_err(|_| AttachError::Budget)?;
+    let mut budget_refused = false;
+    let attached = attach_with(
+        info,
+        |transport, queue, sectors, platform| {
+            ScratchBlock::attach_writable_exact_with_checkpoint(
+                transport,
+                queue,
+                sectors,
+                platform,
+                &mut || {
+                    checkpoint().map_err(|_| {
+                        budget_refused = true;
+                        DriverError::Busy
+                    })
+                },
+            )
+        },
+        120_000_000_000,
+    );
+    if budget_refused {
+        return Err(AttachError::Budget);
+    }
+    attached
 }
 
 /// Take custody of the one read-only 512 MiB archive without publishing a

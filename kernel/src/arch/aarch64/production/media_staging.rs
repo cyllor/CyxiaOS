@@ -604,13 +604,15 @@ pub(super) fn stage_with_policy(
     if STAGED.swap(true, Ordering::AcqRel) {
         return out;
     }
-    // Start the prepaid slice before probing or configuring the transport.
     #[cfg(cyxia_startup_catalog)]
-    if checkpoint().is_err() {
-        return out;
-    }
-    let device = match scratch_blk::attach(info) {
+    let attach = scratch_blk::attach_metered(info, checkpoint);
+    #[cfg(not(cyxia_startup_catalog))]
+    let attach = scratch_blk::attach(info);
+    let device = match attach {
         Ok(device) => device,
+        // The signed boot owner already records and fences its ledger fault.
+        #[cfg(cyxia_startup_catalog)]
+        Err(scratch_blk::AttachError::Budget) => return out,
         Err(e) => {
             super::super::super::log(b"V020_W11_MEDIA_ABSENT golden_vector_pending=1\n");
             report("V020_W11_MEDIA_ATTACH_ERROR", e as u64, 0, 0);
