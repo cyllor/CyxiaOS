@@ -1187,6 +1187,36 @@ class FileVolatileWriteEvidence(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected file volatile write evidence"):
                 media.require_read_only_refusal(report, lines, output, 2)
 
+    def test_read_only_refusal_rejects_device_io_error(self):
+        report = {
+            "status": "FAIL",
+            "error": "ValueError: guest reported V020_W11_MEDIA_STAGING_INCOMPLETE: a staging step failed",
+            "scratch_before_sha256": "unchanged",
+            "scratch_disk": {"scratch_after_sha256": "unchanged"},
+        }
+        # Even a coincidentally correct mount error cannot prove that the
+        # semantic check was reached after a device failure.
+        lines = [
+            "V020_W11_MEDIA_STAGING_INCOMPLETE step=2",
+            "V020_W11_MEDIA_IO a=319 b=0 c=0",
+            "V020_W11_MEDIA_STEP a=2 b=0 c=3",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "native-page.bin").write_bytes(bytes(4096))
+            media.require_read_only_refusal(report, lines, output, 2)
+            for failure in (
+                "V020_W11_MEDIA_IO_ERROR a=6 b=32928 c=13",
+                "V020_W11_MEDIA_IO_ERROR a=0 b=32928 c=15",
+            ):
+                with self.subTest(failure=failure):
+                    with self.assertRaisesRegex(ValueError, "device I/O failure"):
+                        media.require_read_only_refusal(report, lines + [failure], output, 2)
+            with self.assertRaisesRegex(ValueError, "malformed V020_W11_MEDIA_IO_ERROR"):
+                media.require_read_only_refusal(
+                    report, lines + ["V020_W11_MEDIA_IO_ERROR a=6 b=32928 c=bad"], output, 2
+                )
+
     def test_acl_mode_mismatch_rejects_and_restores_the_original_record(self):
         offset = 4126 * 4096 + 64
         original = bytearray(struct.pack("<IIQQQIIQIIII", 1, 1, 1, 1, 1, 768, 0, 1, 0, 0, 0, 0))

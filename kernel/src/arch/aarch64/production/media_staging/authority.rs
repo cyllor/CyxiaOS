@@ -34,6 +34,9 @@ use cyxia_kernel_core::security::{
     file_index_v0199::{BLOCK_BYTES, SecurityStateStoreV2},
     file_media_v0199::SuperblockV1,
 };
+// This file is also compiled directly by kernel-core integration tests.
+// Keep the diagnostic helpers available there without enabling them in a
+// default non-diagnostic kernel.
 #[cfg(any(test, feature = "v020-production-diagnostic"))]
 use cyxia_kernel_core::security::{
     file_admission_flow_v1::{AdmissionFlowInput, FlowOutcome, run_admission_flow},
