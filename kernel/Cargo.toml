@@ -90,6 +90,8 @@ v020-production-frame-pool = ["v020-production-diagnostic"]
 v0199-control-bringup = ["v0199-cpu0-role-selftest"]
 # Same diagnostic program inventory with the normative RAM topology; not G0.
 v0199-control-bringup-1g = ["v0199-control-bringup", "prototype-memory"]
+# Consecutive native role windows with real slot backpressure evidence.
+v0199-control-load-selftest = ["v0199-control-bringup-1g"]
 # Separate native scratch journal, never a production mounted filesystem.
 v0199-epoch-disk-selftest = ["v0199-cpu0-role-selftest", "prototype-memory", "dep:sha2"]
 # Adds an independent, dedicated VirtIO RNG to the epoch effect fixture.
