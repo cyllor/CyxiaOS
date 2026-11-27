@@ -325,7 +325,20 @@ pub(super) fn verify_scratch_config() -> Result<VerifiedOfflineConfig<'static>, 
     // SAFETY: the serialized CPU0 foreground owns this scratch outside
     // package loading. The Ed25519 verifier wipes the borrowed span.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!(super::COPY_BUFFER.0) };
-    #[cfg(any(cyxia_signed_scratch_catalog, cyxia_startup_catalog))]
+    #[cfg(any(
+        cyxia_startup_catalog,
+        all(
+            cyxia_signed_scratch_catalog,
+            not(feature = "v020-production-fsync-scratch")
+        )
+    ))]
+    let config = startup_catalog::verify_policy(scratch, |header, _, lists| {
+        signed::verify_lifecycle_payload(header, lists)
+    });
+    #[cfg(all(
+        cyxia_signed_scratch_catalog,
+        feature = "v020-production-fsync-scratch"
+    ))]
     let config = startup_catalog::verify_policy(scratch, |header, principals, lists| {
         signed::verify_scratch_payload(header, principals, lists, signed::PAYLOAD)
     });
@@ -384,7 +397,7 @@ fn run_chain(
     // also require recovery if it returns with uncertain media completion.
     out.mount_requires_recovery = REOPEN;
     let sb = if REOPEN {
-        reopen::identify(disk)
+        reopen::identify(disk, config)
     } else {
         volume::format(disk, config, LAYOUT)
     };

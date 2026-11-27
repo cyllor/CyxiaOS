@@ -45,15 +45,31 @@ def count_fsync_retirement_blocks(path: Path) -> int:
 
 
 def verify_signed_disk(path: Path, epoch: int, *, fsync_scratch: bool = False,
-                       expected_policy_sha256: str | None = None) -> str:
+                       expected_policy_sha256: str | None = None,
+                       expected_policy_envelope: bytes | None = None) -> str:
     """Check the frozen SecurityState header at home and in the appended redo."""
     uuid = FSYNC_UUID if fsync_scratch else STAGING_UUID
     digest = FSYNC_POLICY_SHA256 if fsync_scratch else SIGNED_POLICY_SHA256
+    generations = (1, 1, 1, 1)  # configuration, rules, security, keys
     if expected_policy_sha256 is not None:
         require(len(expected_policy_sha256) == 64
                 and all(c in "0123456789abcdef" for c in expected_policy_sha256),
                 "invalid expected signed policy SHA-256")
         digest = expected_policy_sha256
+    if expected_policy_envelope is not None:
+        wire = expected_policy_envelope
+        require(not fsync_scratch and expected_policy_sha256 is None and len(wire) == 588,
+                "expected one signed lifecycle envelope")
+        require(struct.unpack_from("<IHHII", wire) == (0x43594F46, 1, 256, 588, 268)
+                and wire[192:256] == bytes(64) and wire[512:524] == bytes(12)
+                and hashlib.sha256(wire[256:524]).digest() == wire[160:192],
+                "expected policy is not a restricted lifecycle envelope")
+        uuid = wire[16:32]
+        generations = struct.unpack_from("<4Q", wire, 32)
+        require(uuid != bytes(16) and all(generations),
+                "expected policy omits volume identity or generations")
+        digest = hashlib.sha256(wire).hexdigest()
+    config_generation, rule_generation, security_generation, key_generation = generations
     with path.open("rb") as disk:
         for offset, expected_epoch in (
             (SECURITY_HOME * BLOCK_BYTES, epoch - 1),
@@ -62,8 +78,10 @@ def verify_signed_disk(path: Path, epoch: int, *, fsync_scratch: bool = False,
             disk.seek(offset)
             state = disk.read(120)
             require(len(state) == 120 and state[:4] == b"SSYC" and state[8:24] == uuid
+                    and struct.unpack_from("<3Q", state, 32)
+                    == (rule_generation, security_generation, key_generation)
                     and int.from_bytes(state[64:72], "little") == expected_epoch
-                    and int.from_bytes(state[80:88], "little") == 1
+                    and int.from_bytes(state[80:88], "little") == config_generation
                     and state[88:120].hex() == digest,
                     "signed policy digest or epoch in the scratch disk differs from the expected value")
     return digest

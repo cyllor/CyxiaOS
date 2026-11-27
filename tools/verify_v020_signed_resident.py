@@ -47,8 +47,11 @@ def verify_resident_budget(lines: list, progress: list) -> list:
     return samples
 
 
-def verify_disk(path: Path, epoch: int, roles: list, *, expected_policy_sha256: str | None = None) -> str:
-    policy = verify_signed_disk(path, epoch, expected_policy_sha256=expected_policy_sha256)
+def verify_disk(path: Path, epoch: int, roles: list, *, expected_policy_sha256: str | None = None,
+                expected_policy_envelope: bytes | None = None) -> str:
+    policy = verify_signed_disk(path, epoch, expected_policy_sha256=expected_policy_sha256,
+                                expected_policy_envelope=expected_policy_envelope)
+    uuid = STAGING_UUID if expected_policy_envelope is None else expected_policy_envelope[16:32]
     with path.open("rb") as disk:
         for offset, expected in (
             (DATA_START * BLOCK_BYTES, epoch - 1),
@@ -56,7 +59,7 @@ def verify_disk(path: Path, epoch: int, roles: list, *, expected_policy_sha256: 
         ):
             disk.seek(offset)
             image = disk.read(BLOCK_BYTES)
-            prefix = struct.pack("<IHH16sQ", 0x43594245, 1, 40, STAGING_UUID, expected)
+            prefix = struct.pack("<IHH16sQ", 0x43594245, 1, 40, uuid, expected)
             require(len(image) == BLOCK_BYTES and image[:32] == prefix
                     and struct.unpack_from("<I", image, 32)[0] == crc32c_zeroed(image, 32),
                     "durable boot home or redo differs from the admitted BootEpoch")
@@ -94,6 +97,7 @@ def capture_budget_trace(socket_path: Path, elf: Path, output: Path, deadline: f
 
 def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None,
          epoch: int | None, *, expected_policy_sha256: str | None = None,
+         expected_policy_envelope: bytes | None = None,
          budget_trace: bool = False) -> dict:
     output.mkdir()
     elf_digest = sha(elf)
@@ -218,6 +222,7 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
     if result["status"] == "PASS" and epoch is not None:
         result["policy_sha256"] = verify_disk(
             disk, epoch, result["roles"], expected_policy_sha256=expected_policy_sha256,
+            expected_policy_envelope=expected_policy_envelope,
         )
     return result
 
@@ -229,10 +234,14 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--qemu-sha256", required=True, help="pinned accounting QEMU executable")
     parser.add_argument("--patch-sha256", required=True, help="pinned per-vCPU PMU source patch")
-    parser.add_argument("--policy-sha256", help="SHA-256 of the independently signed scratch catalog")
+    policy = parser.add_mutually_exclusive_group()
+    policy.add_argument("--policy-sha256", help="SHA-256 of the independently signed scratch catalog")
+    policy.add_argument("--policy-envelope", type=Path,
+                        help="independent signed lifecycle envelope for a specific volume")
     parser.add_argument("--budget-trace", action="store_true", help="replay stopped CPU0 per-role and per-window debits")
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args()
+    expected_envelope = None if args.policy_envelope is None else args.policy_envelope.read_bytes()
     require(1 <= args.timeout <= 120, "invalid run timeout")
     binary = shutil.which("qemu-system-aarch64")
     require(binary is not None, "qemu-system-aarch64 is missing")
@@ -260,6 +269,7 @@ def main() -> int:
             ):
                 run = boot(binary, elf, args.output / name, args.timeout, medium, epoch,
                            expected_policy_sha256=args.policy_sha256,
+                           expected_policy_envelope=expected_envelope,
                            budget_trace=args.budget_trace and epoch is not None)
                 summary[name] = run
                 require(run["status"] == "PASS", f"{name}: {run.get('error')}")

@@ -19,8 +19,8 @@ static mut RECOVERY: MaybeUninit<RecoveryWorkspace> = MaybeUninit::uninit();
 // constructing the roughly 120 KiB value on the CPU0 stack would overflow it.
 static INITIAL_RECOVERY: RecoveryWorkspace = RecoveryWorkspace::new();
 
-pub(super) fn identify(disk: &mut Disk) -> Result<SuperblockV1, Error> {
-    volume::read_checkpoint(disk, &mut [0; BLOCK_BYTES])
+pub(super) fn identify(disk: &mut Disk, config: volume::Config<'_>) -> Result<SuperblockV1, Error> {
+    volume::read_checkpoint(disk, &mut [0; BLOCK_BYTES], config)
 }
 
 /// SAFETY: only the one-shot CPU0 staging owner may borrow this workspace.
@@ -55,7 +55,7 @@ pub(super) fn recover_boot_pair(
 ) -> Result<(SuperblockV1, MountEvidence), Error> {
     // Reject incompatible media, pending obligations and unexpected write
     // targets before the recovery engine is allowed to replay a single home.
-    if identify(disk)? != sb {
+    if identify(disk, config)? != sb {
         return Err(Error::Conflict);
     }
     volume::unified_map(disk, sb, snapshots)?;
@@ -81,7 +81,7 @@ pub(super) fn recover_boot_pair(
         || chain.distinct_home_blocks != 2
         || chain.incomplete_tail
         || sb.checkpoint_lsn.checked_add(4) != Some(chain.last_commit_lsn)
-        || identify(disk)? != checkpoint
+        || identify(disk, config)? != checkpoint
     {
         return Err(Error::Conflict);
     }

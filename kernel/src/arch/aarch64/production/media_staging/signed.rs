@@ -1,13 +1,21 @@
-//! Signed scratch policy. The resident may pin an external empty policy at
-//! build time. The FSYNC profile pins its separate test volume and owner.
+//! Signed lifecycle and scratch policies. A pinned external lifecycle
+//! catalog supplies the volume and generations. The FSYNC profile pins its
+//! separate test volume and owner.
+#[cfg(any(
+    feature = "v020-production-fsync-scratch",
+    not(any(cyxia_signed_scratch_catalog, cyxia_startup_catalog))
+))]
 use super::volume::UUID;
+#[cfg(any(feature = "v020-production-media-signed", not(cyxia_startup_catalog)))]
+use cyxia_kernel_core::security::network::TlsInstallation;
+#[cfg(any(
+    feature = "v020-production-fsync-scratch",
+    not(any(cyxia_signed_scratch_catalog, cyxia_startup_catalog))
+))]
+use cyxia_kernel_core::security::offline_config_v1::Principal;
 #[cfg(not(any(cyxia_signed_scratch_catalog, cyxia_startup_catalog)))]
 use cyxia_kernel_core::security::offline_config_v1::{CatalogBindings, VerifiedOfflineConfig};
-use cyxia_kernel_core::security::{
-    Error,
-    network::TlsInstallation,
-    offline_config_v1::{ConfigHeader, Principal},
-};
+use cyxia_kernel_core::security::{Error, offline_config_v1::ConfigHeader};
 
 #[cfg(not(any(
     feature = "v020-production-fsync-scratch",
@@ -22,7 +30,7 @@ pub(super) const WIRE: &[u8] =
 #[cfg(not(feature = "v020-production-fsync-scratch"))]
 pub(super) const PAYLOAD: &[u8] = &[0; 12];
 #[cfg(feature = "v020-production-fsync-scratch")]
-const PAYLOAD: &[u8] = b"CYX-SCRATCH-FSYNC/v1:inode=1,principal=1";
+pub(super) const PAYLOAD: &[u8] = b"CYX-SCRATCH-FSYNC/v1:inode=1,principal=1";
 #[cfg(feature = "v020-production-fsync-scratch")]
 const RECEIPT_QUERY_WIRE: &[u8] =
     include_bytes!("../../../../../../tests/fixtures/v020-signed-scratch/fsync-receipt-query.bin");
@@ -93,6 +101,7 @@ const CATALOG: CatalogBindings = CatalogBindings {
 };
 
 // These images embed the generation-1 verifier and signer packages.
+#[cfg(any(feature = "v020-production-media-signed", not(cyxia_startup_catalog)))]
 pub(super) const FIXTURE_TLS: TlsInstallation = TlsInstallation {
     verifier_generation: 1,
     signer_generation: 1,
@@ -113,6 +122,13 @@ pub(super) fn verify<'a>(
     verify_vector(wire, scratch, PAYLOAD, WIRE_DIGEST)
 }
 
+#[cfg(any(
+    not(any(cyxia_signed_scratch_catalog, cyxia_startup_catalog)),
+    all(
+        cyxia_signed_scratch_catalog,
+        feature = "v020-production-fsync-scratch"
+    )
+))]
 pub(super) fn verify_scratch_payload(
     header: &ConfigHeader,
     principals: &[Principal; 16],
@@ -132,6 +148,22 @@ pub(super) fn verify_scratch_payload(
             .enumerate()
             .any(|(index, p)| p.id != index as u64 + 1 || p.generation != 1)
     {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    all(
+        any(cyxia_startup_catalog, cyxia_signed_scratch_catalog),
+        not(feature = "v020-production-fsync-scratch")
+    ),
+    test,
+))]
+pub(super) fn verify_lifecycle_payload(header: &ConfigHeader, lists: &[u8]) -> Result<(), Error> {
+    // Only the three empty lists are understood here. A signature cannot
+    // authorize service rights, a mode change or clearance of isolation.
+    if header.mode != 0 || header.clear_isolation_bitmap != 0 || lists != PAYLOAD {
         return Err(Error::Unauthorized);
     }
     Ok(())
