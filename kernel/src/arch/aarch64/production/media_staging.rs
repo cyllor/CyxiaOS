@@ -643,6 +643,7 @@ pub(super) fn stage_with_policy(
             0,
         );
     }
+    scratch_blk::report_recovery_custody(out.confirmed_epoch);
     report("V020_W11_MEDIA_IO", disk.reads, disk.writes, disk.flushes);
     let queue = disk.device.notify_stats();
     report(

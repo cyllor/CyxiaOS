@@ -18,6 +18,8 @@
 //!   in the `.bss.sec_n` range registered as permanently pinned static Arena
 //!   pages. This accounts for the storage across requests, independently of
 //!   the device queue's per-request DMA ownership.
+//! * TERMINAL: CPU0 publishes one detached copy of the original requests and
+//!   stop result. Recovery can read it without borrowing the driver's queues.
 //! * Transport::attach: MMIO window bounded to the virt board's virtio-mmio
 //!   range 0x0a000000..0x0a200000 through the high-half device alias.
 //! * LAST_ERROR_{CODE,SECTOR,SITE}, MAX_LATENCY_{NS,SECTOR}, SLOW (atomics):
@@ -32,7 +34,7 @@ use core::{
 };
 use cyxia_driver_virtio::{
     Error as DriverError, Platform, Transport,
-    block::{BatchedBlockIo, Operation, SECTOR_BYTES},
+    block::{BatchedBlockIo, BlockTerminalCustody, Operation, SECTOR_BYTES},
     queue::{BatchMemory, Token},
 };
 use cyxia_kernel_core::security::{
@@ -50,6 +52,51 @@ static mut QUEUE: BatchMemory = BatchMemory::zeroed();
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut DEVICE: MaybeUninit<ScratchBlock> = MaybeUninit::uninit();
 static CLAIMED: AtomicBool = AtomicBool::new(false);
+static mut TERMINAL: MaybeUninit<BlockTerminalCustody> = MaybeUninit::uninit();
+static TERMINAL_READY: AtomicBool = AtomicBool::new(false);
+
+fn retain_for_recovery(device: &ScratchBlock) {
+    let Some(custody) = device.terminal_custody() else {
+        return;
+    };
+    if TERMINAL_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: only the one-shot CPU0 owner publishes, before any recovery
+    // readback. IRQ handlers and secondaries never access this record.
+    unsafe { core::ptr::addr_of_mut!(TERMINAL).write(MaybeUninit::new(custody)) };
+    TERMINAL_READY.store(true, Ordering::Release);
+}
+
+#[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
+pub(crate) fn report_recovery_custody(boot_epoch: u64) {
+    if !TERMINAL_READY.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: publication released the sole writer and the snapshot is Copy.
+    let custody = unsafe { (&*core::ptr::addr_of!(TERMINAL)).assume_init_read() };
+    let (state, detail) = match custody.reset {
+        None => (0, 0),
+        Some(Ok(observed)) => (1, observed),
+        Some(Err(error)) => (2, error as u64),
+    };
+    report("V020_SEC_D_BLOCK_RECOVERY", boot_epoch, state, detail);
+    for request in custody.requests.iter().flatten() {
+        let slot = u64::from(request.token.slot);
+        report(
+            "V020_SEC_D_BLOCK_RECOVERY_CHAIN",
+            slot,
+            request.token.generation,
+            u64::from(request.completed),
+        );
+        let (kind, sector) = match request.operation {
+            Operation::Read(sector) => (KIND_READ, sector),
+            Operation::Write(sector) => (KIND_WRITE, sector),
+            Operation::Flush => (KIND_FLUSH, 0),
+        };
+        report("V020_SEC_D_BLOCK_RECOVERY_OP", slot, kind, sector);
+    }
+}
 
 // First failure of a scratch request, kept so the caller can report the real
 // driver error instead of the collapsed `SecurityError::Unknown`.
@@ -291,6 +338,7 @@ fn drive_metered(
         // A failed meter cannot authorize a reset. The pinned driver keeps
         // any earlier requests and tokens with their original deadlines.
         device.fence_for_recovery();
+        retain_for_recovery(device);
         return result;
     }
     finish_io(device, result)
@@ -303,6 +351,7 @@ fn finish_io(
     if result.is_err()
         && let Some(stop) = device.stop_failed_mmio(&Board)
     {
+        retain_for_recovery(device);
         let (unknown, completed) = device.retained_requests();
         report(
             "V020_SEC_D_BLOCK_CUSTODY",

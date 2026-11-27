@@ -2,7 +2,9 @@
 //! Queue DMA pages stay pinned after any error; only successful FLUSH is durable.
 use crate::{Error, Platform, Queue, QueueMemory, Transport};
 mod batched;
-pub use batched::{BatchedBlock, BatchedBlockIo, BlockCompletion};
+pub use batched::{
+    BatchedBlock, BatchedBlockIo, BlockCompletion, BlockTerminalCustody, RetainedBlock,
+};
 
 pub const SECTOR_BYTES: usize = 512;
 const FLUSH: u32 = 1 << 9;
