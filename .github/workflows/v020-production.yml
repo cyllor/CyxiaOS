@@ -319,6 +319,8 @@ jobs:
           # NOT G4 acceptance; the verifier exits non-zero on any FAIL so set -e
           # preserves honesty — a skeleton-lane green is never production acceptance.
           export PATH="$PWD/artifacts/v020-production-qemu/bin:$PATH"
+          read -r CYXIA_V020_QEMU_SHA256 qemu_digest_path < artifacts/v020-production-qemu/binary.sha256
+          export CYXIA_V020_QEMU_SHA256
           python3 -B tools/verify_v020_resident.py \
             --elf artifacts/v020-production/kernel-resident.elf \
             --output artifacts/v020-production/run-resident
@@ -398,6 +400,8 @@ jobs:
           # disk per run. Boot + fail-closed paths only; NOT persistence, NOT a
           # format golden vector, NOT signed config, NOT G4.
           export PATH="$PWD/artifacts/v020-production-qemu/bin:$PATH"
+          read -r CYXIA_V020_QEMU_SHA256 qemu_digest_path < artifacts/v020-production-qemu/binary.sha256
+          export CYXIA_V020_QEMU_SHA256
           python3 -B tools/verify_v020_production.py \
             --elf artifacts/v020-production/kernel-staging.elf \
             --output artifacts/v020-production/run-media-staging \
@@ -471,6 +475,8 @@ jobs:
           # disk per run. Boot + fail-closed paths only; NOT persistence, NOT a
           # format golden vector, NOT signed config, NOT G4.
           export PATH="$PWD/artifacts/v020-production-qemu/bin:$PATH"
+          read -r CYXIA_V020_QEMU_SHA256 qemu_digest_path < artifacts/v020-production-qemu/binary.sha256
+          export CYXIA_V020_QEMU_SHA256
           python3 -B tools/verify_v020_production.py \
             --fresh-elf artifacts/v020-production/kernel-catalog.elf \
             --unsigned-fresh-elf artifacts/v020-production/kernel-unified-unsigned.elf \

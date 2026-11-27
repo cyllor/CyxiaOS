@@ -42,6 +42,7 @@ import base64
 from dataclasses import replace
 from functools import partial
 import json
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -1036,7 +1037,8 @@ def source_manifest() -> dict:
 def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
         nic: bool = True, connect_peer: bool = True, *, modes: Modes = Modes(),
         rng_present: bool = True, boot_disk: Path | None = None,
-        qmp_stdio: bool = False, expected_fsync_epoch: int | None = None) -> dict:
+        qmp_stdio: bool = False, expected_fsync_epoch: int | None = None,
+        expected_qemu_sha256: str | None = None) -> dict:
     require = verify_smp.require
     require(1 <= timeout <= 300, "invalid execution budget")
     require(not staging or (nic and connect_peer), "network negative controls are G-A only")
@@ -1091,13 +1093,16 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
             location = acceptance.profile(elf.read_bytes())
             binary = shutil.which("qemu-system-aarch64")
             require(binary is not None, "qemu-system-aarch64 is missing")
+            binary_path = Path(binary)
+            report["qemu_sha256"] = sha(binary_path)
+            if expected_qemu_sha256 is not None:
+                report["expected_qemu_sha256"] = expected_qemu_sha256
+                require(expected_qemu_sha256 == report["qemu_sha256"],
+                        "wrong QEMU executable for the supplied SHA-256 pin")
             version = subprocess.check_output([binary, "--version"], timeout=10, text=True)
-            # Prefix match accepts both stock 10.2.2 and the repo's pinned
-            # per-vCPU-PMU-patched 10.2.2 build (mirrors verify_v0199_eight_packages).
-            require(version.splitlines()[0].startswith("QEMU emulator version 10.2.2"),
+            require(version.startswith("QEMU emulator version 10.2.2"),
                     "unverified QEMU version")
             report["qemu_version"] = version
-            report["qemu_sha256"] = sha(Path(binary))
             if scratch is not None:
                 if boot_disk is None:
                     create_scratch(scratch)
@@ -1121,10 +1126,19 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
             end = started + timeout
             sock = PipeTransport(proc) if qmp_stdio else connect_qmp(proc, path, end)
             qmp = Qmp(sock)
-            require("QMP" in qmp.receive(end), "invalid QMP greeting")
+            greeting = qmp.receive(end)
+            require("QMP" in greeting, "invalid QMP greeting")
+            require(greeting["QMP"].get("version", {}).get("qemu")
+                    == {"major": 10, "minor": 2, "micro": 2}, "unexpected running QEMU version")
             qmp.execute("qmp_capabilities")
             actual_cpus = qmp.execute("query-cpus-fast")
             report["qmp_cpus"] = actual_cpus
+            require(isinstance(actual_cpus, list) and len(actual_cpus) == 4
+                    and all(isinstance(cpu, dict) and type(cpu.get("cpu-index")) is int
+                            and cpu.get("target") == "aarch64"
+                            and cpu.get("qom-type") == "cortex-a53-arm-cpu" for cpu in actual_cpus)
+                    and {cpu["cpu-index"] for cpu in actual_cpus} == {0, 1, 2, 3},
+                    "QMP did not report the four expected Cortex-A53 guests")
             if scratch is not None:
                 host_samples = HostMediaSamples(proc.pid, actual_cpus)
                 host_samples.observe(len(decoded), phase="start")
@@ -1187,6 +1201,8 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                         require(peer is None or relay_bytes == peer.result["sent"],
                                 "relayed bytes (word 141) differ from the bytes the host peer sent")
                     require(sha(elf) == report["elf_sha256"], "ELF changed during guest run")
+                    require(sha(binary_path) == report["qemu_sha256"],
+                            "QEMU executable changed during guest run")
                     require(before == source_manifest(), "production source changed during guest run")
                     if modes.signed_media:
                         epoch = report["observations"]["signed_config_bound_boot_epoch"]
@@ -1273,7 +1289,6 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
 def build(staging: bool, modes: Modes = Modes()) -> Path:
     """Build the fixture-identity local-echo guest first (the kernel embeds it),
     then the production kernel feature, exactly as verify_v0199_sec_n.build()."""
-    import os
     import verify_v0199_sec_n
     verify_v0199_sec_n.build_guest(isolated_signer=modes.authenticated_net)
     verify_smp.require((ROOT / GUEST_ELF).is_file(), "local-echo guest ELF missing after build")
@@ -1299,6 +1314,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--qmp-stdio", action="store_true", help="use owned pipes instead of a Unix socket")
+    parser.add_argument("--qemu-sha256", default=os.environ.get("CYXIA_V020_QEMU_SHA256"),
+                        help="expected QEMU executable SHA-256 (also CYXIA_V020_QEMU_SHA256)")
     media = parser.add_mutually_exclusive_group()
     media.add_argument("--media-staging", action="store_true",
                        help="staging boot with an all-zero scratch disk")
@@ -1370,7 +1387,7 @@ def main() -> int:
         parser.error("prebuilt signed reopen also requires --unsigned-fresh-elf")
     if (args.abrupt_peer or args.no_rng) and not args.authenticated_net:
         parser.error("--abrupt-peer and --no-rng require --authenticated-net")
-    runner = partial(run, qmp_stdio=True) if args.qmp_stdio else run
+    runner = partial(run, qmp_stdio=args.qmp_stdio, expected_qemu_sha256=args.qemu_sha256)
     try:
         if args.media_reopen:
             with tempfile.TemporaryDirectory(prefix="cyx-v020-images-") as temp:
