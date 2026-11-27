@@ -51,6 +51,9 @@ const NO_MEDIA: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=signed_media_unavailable command=status\n";
 const FENCED: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=signed_roles_fenced command=status\n";
+#[cfg(cyxia_lifecycle_package_signature)]
+const UNQUALIFIED_PACKAGES: &[u8] =
+    b"V020_STARTUP state=SECURE_DEGRADED reason=lifecycle_packages_unqualified command=status\n";
 // CPU0 publishes the expected root/ASID for the exclusive running turn.
 // The vector verifies the live EL0 context before handing control back.
 static ACTIVE_ROLE_TTBR0: AtomicU64 = AtomicU64::new(0);
@@ -902,14 +905,22 @@ pub(super) fn run(info: &BootInfo) -> ! {
     };
     #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
     let info = &reserved;
-    let config = match startup_work(&mut budget, 1, media_staging::verify_scratch_config) {
+    let config = match startup_work(&mut budget, 1, || {
+        // An authenticated catalog with unsupported lists can still be
+        // inspected by the default read-only diagnostics.
+        let fallback = if cfg!(cyxia_startup_catalog) {
+            None
+        } else {
+            Some(FENCED)
+        };
+        let config = media_staging::verify_scratch_config().map_err(|_| fallback)?;
+        #[cfg(cyxia_lifecycle_package_signature)]
+        super::startup_catalog::verify_lifecycle_packages(&config)
+            .map_err(|_| Some(UNQUALIFIED_PACKAGES))?;
+        Ok(config)
+    }) {
         Ok(Ok(config)) => config,
-        // A valid catalog for a different policy can still be inspected by
-        // the read-only diagnostics. It cannot reach the SIM mount or EL0.
-        #[cfg(cyxia_startup_catalog)]
-        Ok(Err(_)) => degraded(info, budget, None),
-        #[cfg(not(cyxia_startup_catalog))]
-        Ok(Err(_)) => degraded(info, budget, Some(FENCED)),
+        Ok(Err(reason)) => degraded(info, budget, reason),
         Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     };
     #[cfg(cyxia_startup_catalog)]

@@ -36,6 +36,21 @@ struct BootPackage {
 static CATALOG: [BootPackage; ROLE_COUNT] =
     include!(concat!(env!("OUT_DIR"), "/v0199-role-catalog.rs"));
 
+#[cfg(cyxia_lifecycle_package_signature)]
+use cyxia_kernel_core::security::startup_catalog_v0199::LifecyclePackageDigest;
+
+#[cfg(cyxia_lifecycle_package_signature)]
+pub(super) fn lifecycle_package_digests() -> [LifecyclePackageDigest; ROLE_COUNT] {
+    core::array::from_fn(|index| {
+        let package = &CATALOG[index];
+        LifecyclePackageDigest {
+            role: package.role_id,
+            image: package.image_sha256,
+            relocations: package.relative_sha256,
+        }
+    })
+}
+
 #[cfg(feature = "v020-production-diagnostic")]
 pub(super) fn image_digest(index: usize) -> [u8; 32] {
     CATALOG[index].image_sha256

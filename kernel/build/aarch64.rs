@@ -41,7 +41,7 @@ pub fn build() {
         || env::var_os("CARGO_FEATURE_V0199_EPOCH_DISK_SELFTEST").is_some()
         || env::var_os("CARGO_FEATURE_V020_PRODUCTION_DIAGNOSTIC").is_some()
     {
-        v0199_roles::build();
+        v0199_roles::build(default_catalog);
     }
     println!("cargo:rerun-if-env-changed=CYXIA_A03_DEMAND");
     let demand = env::var("CYXIA_A03_DEMAND").unwrap_or_else(|_| "off".into());

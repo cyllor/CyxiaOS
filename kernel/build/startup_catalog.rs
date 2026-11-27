@@ -7,6 +7,7 @@ pub(super) fn build() -> bool {
     println!("cargo:rustc-check-cfg=cfg(cyxia_startup_catalog)");
     println!("cargo:rustc-check-cfg=cfg(cyxia_signed_scratch_catalog)");
     println!("cargo:rustc-check-cfg=cfg(cyxia_signed_resident)");
+    println!("cargo:rustc-check-cfg=cfg(cyxia_lifecycle_package_signature)");
     println!("cargo:rerun-if-env-changed={DIR}");
     let signed_scratch = env::var_os("CARGO_FEATURE_V020_PRODUCTION_SIGNED_RESIDENT").is_some();
     if signed_scratch {
@@ -52,6 +53,22 @@ pub(super) fn build() -> bool {
     println!("cargo:rustc-cfg={cfg}");
     if !signed_scratch {
         println!("cargo:rustc-cfg=cyxia_signed_resident");
+        // Sign OUT_DIR/startup-catalog/lifecycle-packages-to-sign.bin with
+        // the offline Ed25519 key, install the detached result here and
+        // rebuild with the same role sources and toolchain.
+        let name = "lifecycle-packages.sig";
+        let signature = input.join(name);
+        if signature
+            .try_exists()
+            .expect("startup package signature metadata")
+        {
+            fs::write(out.join(name), load(input, name, 64, 64))
+                .expect("copy startup package signature");
+            println!("cargo:rustc-cfg=cyxia_lifecycle_package_signature");
+        } else {
+            // Watch additions as well as edits to an installed signature.
+            println!("cargo:rerun-if-changed={}", input.display());
+        }
     }
     !signed_scratch
 }

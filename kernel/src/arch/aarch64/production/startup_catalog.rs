@@ -57,3 +57,15 @@ pub(super) fn verify_policy(
 ) -> Result<VerifiedOfflineConfig<'static>, Error> {
     CATALOG.verify_policy(scratch, verify_payload)
 }
+
+#[cfg(cyxia_lifecycle_package_signature)]
+pub(super) fn verify_lifecycle_packages(config: &VerifiedOfflineConfig<'_>) -> Result<(), Error> {
+    CATALOG.qualify_lifecycle_packages(
+        config,
+        super::role_loader::lifecycle_package_digests(),
+        include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/startup-catalog/lifecycle-packages.sig"
+        )),
+    )
+}
