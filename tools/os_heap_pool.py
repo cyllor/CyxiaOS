@@ -11,6 +11,17 @@ def snapshot(console):
     row = dict(zip(('capacity', 'free', 'used', 'peak', 'virtual_pages'), map(int, match.groups())))
     pc.require(row['capacity'] == 65536 and row['virtual_pages'] == 16384 and
                row['free'] + row['used'] == row['capacity'], 'physical-pool accounting invalid')
+    # Full-os attaches the actual PoolBridge. Require its receipt, not just
+    # the legacy allocator counters. Quarantine is not synonymous with free.
+    ledger = console.until(rb'ANON_POOL_LEDGER free=(\d+) reserved=(\d+) allocated=(\d+) quarantined=(\d+) permanent=(\d+) conservation=([A-Z]+)\r?\n', start)
+    row['ledger'] = dict(zip(('free', 'reserved', 'allocated', 'quarantined', 'permanent'),
+                             map(int, ledger.groups()[:5])))
+    inv = row['ledger']
+    pc.require(ledger.group(6) == b'OK' and
+               inv['free'] + inv['reserved'] + inv['allocated'] + inv['quarantined'] == row['capacity'] and
+               inv['permanent'] + row['capacity'] == 65536 and
+               inv['allocated'] <= row['used'] <= inv['allocated'] + inv['quarantined'],
+               'FrameMeta ledger conservation invalid')
     accounting = console.until(rb'AI_DOMAIN name=anonymous ([^\r\n]+)', start).group(1)
     row['anonymous'] = {key.decode(): int(value) for key, value in
                         re.findall(rb'(\w+)=(\d+)', accounting)}

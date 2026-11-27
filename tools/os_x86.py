@@ -193,7 +193,9 @@ def launch_argv(qemu, image, *, accel='tcg', display='none', disk=None, qmp=None
     pc.require(display in ('none', 'cocoa', 'gtk', 'sdl'), 'unsupported display')
     pc.require(type(cpus) is int and 1 <= cpus <= 4, 'PC runtime supports 1–4 CPUs')
     pc.require(type(ram_mib) is int and 256 <= ram_mib <= 1024, 'PC runtime supports 256–1024 MiB')
-    command = [str(qemu), '-machine', 'pc-i440fx-10.2', '-cpu', 'qemu64',
+    firmware = pc.pinned_qemu_firmware()
+    command = [str(qemu)] + (['-L', str(firmware)] if firmware is not None else [])
+    command += ['-machine', 'pc-i440fx-10.2', '-cpu', 'qemu64',
                '-smp', f'cpus={cpus},sockets=1,cores={cpus},threads=1', '-m', f'{ram_mib}M',
                '-accel', pc.accelerator(accel), '-display', display,
                '-vga', 'none',

@@ -17,6 +17,10 @@ on:
       - 'tools/verify_smp.py'
       - 'tools/verify_v0199_cpu0_roles.py'
       - 'tools/x86_64.py'
+      - 'tools/os_x86.py'
+      - 'tools/os_heap_pool.py'
+      - 'tools/test_os_heap_pool.py'
+      - 'tools/test_os_x86.py'
   # The workflow change itself receives a real PR run; after integration
   # relevant main-branch pushes automatically run on the merged source tree.
   # Avoid rebuilding QEMU on every independent component-review branch.
@@ -24,6 +28,13 @@ on:
     branches: [CyxiaOS-V0.20]
     paths:
       - '.github/workflows/v20-native-mechanism.yml'
+      - 'crates/kernel-core/src/frames.rs'
+      - 'crates/kernel-core/src/frame_meta_v0199.rs'
+      - 'kernel/src/desktop/memory/user_heap/**'
+      - 'tools/os_x86.py'
+      - 'tools/os_heap_pool.py'
+      - 'tools/test_os_heap_pool.py'
+      - 'tools/test_os_x86.py'
   workflow_dispatch:
 
 permissions:
@@ -209,3 +220,70 @@ jobs:
           retention-days: 7
           if-no-files-found: error
           path: artifacts/v020-cpu0-native/
+
+  x86-full-os-heap-pool:
+    # Real optional legacy desktop profile, not V0.20 production/G4 acceptance.
+    needs: qemu-pinned
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: '1.95.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Record exact source and scope
+        run: |
+          mkdir -p artifacts/v020-x86-full-os
+          git rev-parse HEAD > artifacts/v020-x86-full-os/commit.txt
+          git rev-parse HEAD^{tree} > artifacts/v020-x86-full-os/tree.txt
+          printf '%s\n' 'OPTIONAL_X86_FULL_OS_HEAP_POOL; NOT G4/G5; NOT PHYSICAL A53' > artifacts/v020-x86-full-os/scope.txt
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: v020-pinned-qemu-${{ github.sha }}
+          path: qemu-evidence
+      - name: Install target toolchain and runtime dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang make python3-venv libfdt1 libglib2.0-0 libpixman-1-0
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update --component llvm-tools-preview --target x86_64-unknown-none
+          rustup override set 1.95.0
+          cargo fetch --locked
+          rustc -Vv > artifacts/v020-x86-full-os/rustc.txt
+      - name: Test firmware selection and ledger receipt parser
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s tools -p test_os_heap_pool.py
+          python3 -B -m unittest discover -s tools -p test_os_x86.py
+      - name: Build genuine x86 target sysroot and ported heap probe
+        run: |
+          set -euo pipefail
+          python3 -B tools/build_sysroot.py build --arch x86_64 --fetch --jobs 4 2>&1 | tee artifacts/v020-x86-full-os/sysroot.log
+          python3 -B tools/build_sysroot.py probes --arch x86_64 --probe heap-pool-probe --jobs 4 2>&1 | tee artifacts/v020-x86-full-os/probe.log
+      - name: Build and boot actual full-os heap-pool profile
+        run: |
+          set -euo pipefail
+          (cd qemu-evidence && sha256sum -c archive.sha256)
+          tar -xzf qemu-evidence/qemu-bin.tar.gz -C "$RUNNER_TEMP"
+          export PATH="$RUNNER_TEMP/qemu-bin:$PATH"
+          export CYXIA_PINNED_QEMU_FIRMWARE="$RUNNER_TEMP/qemu-bin/pc-bios"
+          sha256sum "$RUNNER_TEMP/qemu-bin/qemu-system-x86_64" "$CYXIA_PINNED_QEMU_FIRMWARE/bios-256k.bin" > artifacts/v020-x86-full-os/qemu.sha256
+          python3 -B tools/os_x86.py build --profile release --graphics --ported --feature full-os \
+            --sysroot artifacts/sysroot/x86_64-musl --output artifacts/v020-x86-full-os/build \
+            2>&1 | tee artifacts/v020-x86-full-os/build.log
+          python3 -B tools/os_smoke.py --build artifacts/v020-x86-full-os/build --scenario heap-pool \
+            --output artifacts/v020-x86-full-os/capture 2>&1 | tee artifacts/v020-x86-full-os/capture.log
+          python3 -c 'import json; from pathlib import Path; r=json.loads(Path("artifacts/v020-x86-full-os/capture/summary.json").read_text()); assert r["status"] == "OS_HEAP-POOL_PASS", r'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v020-x86-full-os-heap-pool-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            artifacts/v020-x86-full-os/
+            artifacts/sysroot/x86_64-musl/*report.json
+            artifacts/sysroot/x86_64-musl/*layout.json
+            artifacts/sysroot/x86_64-musl/probe.elf
+            artifacts/sysroot/x86_64-musl/heap-pool-probe.elf
