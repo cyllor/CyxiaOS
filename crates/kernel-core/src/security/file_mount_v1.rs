@@ -886,6 +886,16 @@ mod tests {
         check_signed_fsync_roundtrip(1, Some(125));
     }
 
+    #[test]
+    fn signed_fsync_first_extent_durably_grows_an_empty_file() {
+        check_signed_fsync_roundtrip(0, Some(2));
+    }
+
+    #[test]
+    fn signed_fsync_first_extent_keeps_only_initialized_prefix_at_checkpoint() {
+        check_signed_fsync_roundtrip(0, Some(122));
+    }
+
     fn check_signed_fsync_roundtrip(initial_pages: usize, added_pages: Option<usize>) {
         use crate::security::{
             file_admission_flow_v1::FileAdmissionFlowV1,
@@ -960,7 +970,9 @@ mod tests {
         let target_pages = initial_pages + added_pages.unwrap_or(0);
         let segmented = target_pages > 120;
         let target_size = (target_pages - 1) * BLOCK + 17;
-        let initial_size = if growing {
+        let initial_size = if initial_pages == 0 {
+            0
+        } else if growing {
             (initial_pages - 1) * BLOCK + 8
         } else {
             target_size
@@ -1191,7 +1203,13 @@ mod tests {
             .unwrap();
         let (bound, _) = committed(&mut writer, &job, 8);
         assert_eq!((bound.status, bound.completed_prefix), (2, 0));
-        writer.read_committed(DATA, &mut raw).unwrap();
+        writer.read_committed(INODE_START, &mut raw).unwrap();
+        let initial = Inode::decode(&raw[256..512]).unwrap();
+        let initial_extents = usize::from(initial_pages != 0);
+        assert_eq!(initial.size, initial_size as u64);
+        assert_eq!(usize::from(initial.extents), initial_extents);
+        let first_candidate = if initial_pages == 0 { DATA_START } else { DATA };
+        writer.read_committed(first_candidate, &mut raw).unwrap();
         assert!(raw.iter().all(|&byte| byte == 0));
         writer.read_committed(BITMAP_START, &mut raw).unwrap();
         assert_eq!(raw, bitmap_before);
@@ -1211,10 +1229,13 @@ mod tests {
             let current = Inode::decode(&raw[256..512]).unwrap();
             assert_eq!(current.durable_write_seq, 0);
             assert_eq!(current.size, initial_size.max(prefix_size) as u64);
-            assert_eq!(current.extents, 1 + u16::from(prefix_growth != 0));
+            assert_eq!(
+                usize::from(current.extents),
+                initial_extents + usize::from(prefix_growth != 0)
+            );
             if prefix_growth != 0 {
                 assert_eq!(
-                    current.runs[1],
+                    current.runs[initial_extents],
                     Extent {
                         logical: initial_pages as u32,
                         physical: DATA_START,
@@ -1367,17 +1388,19 @@ mod tests {
                 }
             );
             assert_eq!(neighbor.durable_write_seq, 0);
-            assert_eq!(current.extents, 2);
+            assert_eq!(usize::from(current.extents), initial_extents + 1);
+            if initial_extents != 0 {
+                assert_eq!(
+                    current.runs[0],
+                    Extent {
+                        logical: 0,
+                        physical: DATA,
+                        count: initial_pages as u32
+                    }
+                );
+            }
             assert_eq!(
-                current.runs[0],
-                Extent {
-                    logical: 0,
-                    physical: DATA,
-                    count: initial_pages as u32
-                }
-            );
-            assert_eq!(
-                current.runs[1],
+                current.runs[initial_extents],
                 Extent {
                     logical: initial_pages as u32,
                     physical: DATA_START,

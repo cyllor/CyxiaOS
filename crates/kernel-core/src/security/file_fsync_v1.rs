@@ -1,4 +1,4 @@
-//! Frozen baseline-v1 FSYNC for existing allocated files. The serialized
+//! Frozen baseline-v1 FSYNC for existing files. The serialized
 //! file owner holds the mounted volume, live admission, frozen pages and
 //! completion resources for all segments. Recovery may query a prior boot's
 //! receipt but cannot use it to resume writing.
@@ -135,12 +135,11 @@ fn allocate_growth(
     bitmap: &mut [u8; BLOCK],
     blocks: u32,
 ) -> Result<u32, Error> {
-    let extent = inode.extents.checked_sub(1).ok_or(Error::Conflict)?;
-    let last = inode.runs[usize::from(extent)];
-    let adjacent = last.physical + last.count;
-    let adjacent_end = adjacent + blocks;
-    let preferred = (adjacent / BLOCKS_PER_BITMAP).min(BITMAP_PAGES - 1);
-    let can_append_extent = usize::from(inode.extents) < inode.runs.len();
+    let extent_count = usize::from(inode.extents);
+    let last = inode.runs[..extent_count].last().copied();
+    let adjacent = last.map(|run| run.physical + run.count);
+    let preferred = (adjacent.unwrap_or(DATA_START) / BLOCKS_PER_BITMAP).min(BITMAP_PAGES - 1);
+    let can_append_extent = extent_count < inode.runs.len();
     let scan_pages = if can_append_extent { BITMAP_PAGES } else { 1 };
     for offset in 0..scan_pages {
         let page = (preferred + offset) % BITMAP_PAGES;
@@ -151,28 +150,28 @@ fn allocate_growth(
         // Preserve a contiguous last extent when possible. Otherwise use
         // the first free run on one verified bitmap page. The mount owner
         // excludes all competing writes through the eventual commit.
-        let physical = if adjacent >= first
-            && adjacent_end <= end
-            && first_free_run(bitmap, adjacent, adjacent_end, blocks).is_some()
-        {
-            Some(adjacent)
-        } else if can_append_extent {
-            first_free_run(bitmap, first, end, blocks)
-        } else {
-            None
-        };
-        let Some(physical) = physical else {
+        let adjacent_free = adjacent.filter(|&start| {
+            let stop = start + blocks;
+            start >= first && stop <= end && first_free_run(bitmap, start, stop, blocks).is_some()
+        });
+        let Some(physical) = adjacent_free.or_else(|| {
+            if can_append_extent {
+                first_free_run(bitmap, first, end, blocks)
+            } else {
+                None
+            }
+        }) else {
             continue;
         };
         for block in physical..physical + blocks {
             let (byte, mask) = bitmap_bit(block);
             bitmap[byte] |= mask;
         }
-        if physical == adjacent {
-            inode.runs[usize::from(extent)].count += blocks;
+        if adjacent_free.is_some() {
+            inode.runs[extent_count - 1].count += blocks;
         } else {
-            inode.runs[usize::from(inode.extents)] = Extent {
-                logical: last.logical + last.count,
+            inode.runs[extent_count] = Extent {
+                logical: last.map_or(0, |run| run.logical + run.count),
                 physical,
                 count: blocks,
             };
@@ -283,9 +282,7 @@ pub fn commit_segment<I: EpochBlockIo>(
     let size = job.grown_size.unwrap_or(current_size);
     let pages = size.div_ceil(BLOCK);
     let old_pages = current_size.div_ceil(BLOCK);
-    if job.grown_size.is_some()
-        && (current_size == 0 || size < current_size || size as u64 > MAX_FILE)
-    {
+    if job.grown_size.is_some() && (size == 0 || size < current_size || size as u64 > MAX_FILE) {
         return Err(Error::Invalid);
     }
     if job.pages.len() != pages
