@@ -77,6 +77,82 @@ pub(crate) fn try_log(s: &[u8]) -> Result<(), PlatformError> {
     }
 }
 
+#[cfg(feature = "v020-production")]
+#[repr(u64)]
+pub(super) enum EmergencyTxStatus {
+    Queued = 1,
+    FifoFull = 2,
+    Unavailable = 3,
+    Deadline = 4,
+    ConsoleUnconfirmed = 5,
+}
+
+#[cfg(feature = "v020-production")]
+pub(super) struct EmergencyTx {
+    pub(super) status: EmergencyTxStatus,
+    pub(super) sequence: u64,
+    pub(super) written: u64,
+}
+
+/// The once-only PANIC_STOP owner may use the boot-registered PL011 after
+/// CPU0's ordinary writer is quiescent. This leaves ordinary queues,
+/// counters, and device configuration alone.
+#[cfg(feature = "v020-production")]
+pub(super) fn emergency_stop_write(
+    payload: &[u8; 27],
+    began: u64,
+    until: u64,
+    console_quiescent: bool,
+) -> EmergencyTx {
+    use cyxia_arch_aarch64::timer;
+    let discarded = |status| EmergencyTx {
+        status,
+        sequence: 0,
+        written: 0,
+    };
+    if !console_quiescent {
+        return discarded(EmergencyTxStatus::ConsoleUnconfirmed);
+    }
+    let base = UART.load(Ordering::Acquire);
+    let sequence = LOG_SEQUENCE.load(Ordering::Relaxed);
+    if base != HIGH + 0x0900_0000 || sequence == 0 {
+        return discarded(EmergencyTxStatus::Unavailable);
+    }
+    // SAFETY: this is exactly the immutable Device mapping verified at boot.
+    // The ordinary CPU0 writer is terminal and only the elected owner writes.
+    let Ok(mut uart) = (unsafe {
+        cyxia_driver_pl011::Pl011::attach(UartResource {
+            base: PhysAddr(base),
+            len: 4096,
+        })
+    }) else {
+        return discarded(EmergencyTxStatus::Unavailable);
+    };
+    let mut frame = [0; 55];
+    let Ok(size) = cyxia_contracts::transport::encode(1, sequence, payload, &mut frame) else {
+        return discarded(EmergencyTxStatus::Unavailable);
+    };
+    if size != frame.len() {
+        return discarded(EmergencyTxStatus::Unavailable);
+    }
+    let mut expired = false;
+    let written = uart.try_write_before(&frame, || {
+        expired = !(began..until).contains(&timer::ticks());
+        !expired
+    });
+    EmergencyTx {
+        status: if expired {
+            EmergencyTxStatus::Deadline
+        } else if written == frame.len() {
+            EmergencyTxStatus::Queued
+        } else {
+            EmergencyTxStatus::FifoFull
+        },
+        sequence,
+        written: written as u64,
+    }
+}
+
 /// Admit a complete frame to the sole CPU0 writer. The resident console
 /// drains the retained suffix after a short write before admitting another.
 #[cfg(any(

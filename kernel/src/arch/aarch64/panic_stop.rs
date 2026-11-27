@@ -75,6 +75,12 @@ struct StopRecord {
     frequency: AtomicU64,
     sent_targets: AtomicU64,
     cpus: [StopCpu; CORES],
+    // The ACK verdict seals independently of this best-effort owner record.
+    uart_began: AtomicU64,
+    uart_ended: AtomicU64,
+    uart_sequence: AtomicU64,
+    uart_written: AtomicU64,
+    uart_status: AtomicU64,
 }
 
 #[cfg(feature = "v020-production")]
@@ -93,12 +99,19 @@ static CYXIA_STOP_EVIDENCE: StopRecord = StopRecord {
     frequency: AtomicU64::new(0),
     sent_targets: AtomicU64::new(0),
     cpus: [const { StopCpu::empty() }; CORES],
+    uart_began: AtomicU64::new(0),
+    uart_ended: AtomicU64::new(0),
+    uart_sequence: AtomicU64::new(0),
+    uart_written: AtomicU64::new(0),
+    uart_status: AtomicU64::new(0),
 };
 
 #[cfg(feature = "v020-production")]
 const _: () = {
     assert!(core::mem::size_of::<StopRecord>() == 4096);
     assert!(core::mem::offset_of!(StopRecord, cpus) == 88);
+    assert!(core::mem::offset_of!(StopRecord, uart_began) == 280);
+    assert!(core::mem::offset_of!(StopRecord, uart_status) == 312);
     assert!(core::mem::size_of::<StopCpu>() == 48);
 };
 
@@ -243,6 +256,54 @@ fn coordinate(slot: usize, gic: &Gic, stop: &StopRecord, token: u64, began: u64)
         if confirmed == ALL_CORES { 1 } else { 2 },
         Ordering::Release,
     );
+    report_stop(slot, stop, token, confirmed, frequency);
+}
+
+#[cfg(feature = "v020-production")]
+fn report_stop(slot: usize, stop: &StopRecord, token: u64, confirmed: u64, frequency: u64) {
+    use super::console::{EmergencyTx, EmergencyTxStatus, emergency_stop_write};
+
+    fn hex_digit(value: u64) -> u8 {
+        let digit = (value & 15) as u8;
+        if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + (digit - 10)
+        }
+    }
+
+    let began = timer::ticks();
+    let budget = frequency / 100; // 10 ms at the registered physical counter.
+    let mut attempt = EmergencyTx {
+        status: EmergencyTxStatus::Deadline,
+        sequence: 0,
+        written: 0,
+    };
+    if budget != 0
+        && let Some(until) = began.checked_add(budget)
+    {
+        let mut payload = *b"PANIC_STOP g=0 o=0 a=0 u=0\n";
+        payload[13] = hex_digit(token >> 8);
+        payload[17] = hex_digit(slot as u64);
+        payload[21] = hex_digit(confirmed);
+        payload[25] = hex_digit(ALL_CORES & !confirmed);
+        // A secondary owner cannot race with an unconfirmed CPU0 writer.
+        attempt = emergency_stop_write(&payload, began, until, slot == 0 || confirmed & 1 != 0);
+    }
+    let ended = timer::ticks();
+    if ended
+        .checked_sub(began)
+        .is_none_or(|elapsed| elapsed > budget)
+    {
+        attempt.status = EmergencyTxStatus::Deadline;
+    }
+    stop.uart_began.store(began, Ordering::Relaxed);
+    stop.uart_ended.store(ended, Ordering::Relaxed);
+    stop.uart_sequence
+        .store(attempt.sequence, Ordering::Relaxed);
+    stop.uart_written.store(attempt.written, Ordering::Relaxed);
+    stop.uart_status
+        .store(attempt.status as u64, Ordering::Release);
 }
 
 /// SAFETY of entry is established by vectors.S: terminal DAIF mask and a

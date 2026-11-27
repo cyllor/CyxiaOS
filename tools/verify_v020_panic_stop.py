@@ -10,6 +10,7 @@ import struct
 import subprocess
 import tempfile
 import time
+import zlib
 
 from check_elf import boot_profile, symbol
 from run_qemu import Qmp
@@ -22,6 +23,8 @@ SGI = 15
 ALL = 15
 HEADER = 11
 ROW = 6
+UART = HEADER + ROW * 4
+UART_STATUS = {1: "queued", 2: "fifo_full", 3: "unavailable", 4: "deadline", 5: "console_unconfirmed"}
 
 
 def stopped_cpus(qmp, park):
@@ -80,6 +83,43 @@ def validate_record(data, late_peer=False):
             "sgi": SGI, "sent_hardware_targets": sent, "cpus": rows}
 
 
+def validate_uart(data, wire, stop):
+    began, ended, sequence, written, status = struct.unpack_from("<5Q", data, UART * 8)
+    require(status in UART_STATUS and stop["finished_ticks"] <= began <= ended,
+            "owner UART outcome was not sealed after the ACK outcome")
+    elapsed = ended - began
+    require(elapsed <= stop["frequency_hz"] // 100, "owner emergency UART exceeded 10 ms")
+    expected = (f"PANIC_STOP g={stop['generation']:x} o={stop['owner']:x} "
+                f"a={stop['confirmed_mask']:x} u={stop['unknown_mask']:x}\n").encode("ascii")
+    frame_bytes = len(expected) + 28
+    require(0 <= written <= frame_bytes and written <= len(wire), "invalid emergency UART byte count")
+    require((status != 1 or written == frame_bytes) and (status != 2 or written < frame_bytes),
+            "emergency UART outcome contradicts its write count")
+    require((status not in (3, 5) or written == sequence == 0)
+            and (status not in (1, 2) or sequence > 0), "invalid emergency UART sequence")
+    if written:
+        header = struct.pack("<4sBBHQQ", b"CYX1", 1, 0, len(expected), 1, sequence)
+        frame = header + expected
+        frame += struct.pack("<I", zlib.crc32(frame))
+        require(wire[-written:] == frame[:written], "emergency UART bytes do not match the sealed owner result")
+    ordinary = wire[:-written] if written else wire
+    decoder = FrameDecoder()
+    frames = decoder.feed(ordinary)
+    require(not decoder.buffer and decoder.loss == decoder.corrupt == 0
+            and b"SMP_BOOT_OK a=4 b=15 c=0\n" in frames
+            and not any(frame.startswith(b"FAIL") for frame in frames),
+            "healthy four-core startup lacked its original serial proof")
+    require(sequence in (0, decoder.last + 1), "emergency UART reused an ordinary frame sequence")
+    if status == 1:
+        require(decoder.feed(wire[-written:]) == [expected], "complete emergency frame failed decoding")
+        frames.append(expected)
+    return {
+        "status": UART_STATUS[status], "sequence": sequence, "written_bytes": written,
+        "frame_bytes": frame_bytes, "started_ticks": began, "finished_ticks": ended,
+        "elapsed_ns": elapsed * 1_000_000_000 // stop["frequency_hz"],
+    }, b"".join(frames)
+
+
 def verify(elf, output, qemu_digest, timeout, late_peer=False):
     require(1 <= timeout <= 120, "invalid test deadline")
     raw = elf.read_bytes()
@@ -96,7 +136,8 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
     report = {"status": "FAIL", "scope": "healthy-boot-terminal-four-cpu-ack-subcheck",
               "formal_verdict": False, "elf_sha256": sha(elf), "qemu_sha256": qemu_digest,
               "qemu_version": version, "proof_class": "RUNTIME_QEMU"}
-    serial = bytearray()
+    wire = bytearray()
+    serial = b""
     with tempfile.TemporaryDirectory(prefix="cyx-stop-") as tmp, (output / "qemu-stderr.log").open("wb") as err:
         path, data = str(Path(tmp) / "q"), Path(tmp) / "evidence"
         argv = [binary, "-machine", "virt-10.2,gic-version=2,secure=off,virtualization=off",
@@ -114,7 +155,6 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
                 require("QMP" in qmp.receive(deadline), "QMP handshake failed")
                 qmp.execute("qmp_capabilities")
                 require(len(qmp.execute("query-cpus-fast")) == 4, "wrong vCPU count")
-                decoder = FrameDecoder()
 
                 def read_record():
                     qmp.execute("pmemsave", {"val": page["pa"], "size": page["size"], "filename": str(data)})
@@ -122,17 +162,22 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
                     require(len(snapshot) == page["size"], "short QMP memory snapshot")
                     return snapshot
 
-                while True:
-                    require(time.monotonic() < deadline, "terminal stop was not sealed")
+                def read_uart():
                     payload = qmp.execute("ringbuf-read", {"device": "cyxlog", "size": 65536,
                                                            "format": "base64"})
-                    for frame in decoder.feed(base64.b64decode(payload, validate=True)):
-                        serial.extend(frame)
-                    require(len(serial) <= 65536, "oversized terminal trace")
+                    wire.extend(base64.b64decode(payload, validate=True))
+                    require(len(wire) <= 65536, "oversized terminal trace")
+
+                while True:
+                    require(time.monotonic() < deadline, "terminal stop was not sealed")
+                    read_uart()
                     record = read_record()
-                    if struct.unpack_from("<Q", record, 6 * 8)[0] != 0:
+                    if struct.unpack_from("<Q", record, (UART + 4) * 8)[0] != 0:
                         break
                     time.sleep(0.01)
+                # The first live dump may overlap the release seal. Read the
+                # now-stable owner fields before accepting any result.
+                record = read_record()
                 if late_peer:
                     sealed = record[:HEADER * 8]
                     peer_ack = (HEADER + 3 * ROW + 2) * 8
@@ -142,9 +187,6 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
                         record = read_record()
                     require(record[:HEADER * 8] == sealed, "late acknowledgement rewrote owner result")
                 (output / "native-stop-evidence.bin").write_bytes(record)
-                require(b"SMP_BOOT_OK a=4 b=15 c=0\n" in serial
-                        and b"FAIL" not in serial and decoder.loss == decoder.corrupt == 0,
-                        "healthy four-core startup lacked its original serial proof")
                 report.update(validate_record(record, late_peer))
                 qmp.execute("pmemsave", {"val": admission["pa"], "size": 8, "filename": str(data)})
                 require(data.read_bytes() == (1).to_bytes(8, "little"), "terminal admission latch is open")
@@ -154,6 +196,8 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
                 report["terminal_registers_first"] = stopped_cpus(qmp, park)
                 time.sleep(0.02)
                 report["terminal_registers_second"] = stopped_cpus(qmp, park)
+                read_uart()
+                report["owner_uart"], serial = validate_uart(record, bytes(wire), report)
                 require(elf.read_bytes() == raw, "kernel ELF changed during the run")
                 report["status"] = "PASS"
                 shutdown(proc, qmp)
@@ -162,6 +206,7 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
         finally:
             shutdown(proc, None)
     (output / "serial.txt").write_bytes(serial)
+    (output / "serial-wire.bin").write_bytes(wire)
     (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
