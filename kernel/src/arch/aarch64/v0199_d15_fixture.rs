@@ -618,4 +618,6 @@ pub(super) fn run(
     super::v0199_d05_fixture::run(boot, &mut gate, snapshots, inbox, desired);
     #[cfg(feature = "v0199-d11-rng-selftest")]
     super::v0199_d11_fixture::run(boot, info, &mut gate, snapshots, inbox, desired);
+    #[cfg(feature = "v0199-d01-scheduler-selftest")]
+    super::v0199_d01_fixture::run(boot, &mut gate, snapshots, inbox, desired);
 }

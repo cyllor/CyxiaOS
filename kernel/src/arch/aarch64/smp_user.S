@@ -249,6 +249,22 @@ smp_d05_ipc:
  svc #0
  b .
 .endif
+.if {d01_enabled}
+// Both D01 tasks execute this same bounded body through distinct private
+// TTBR0 roots. The EL0 counter advances before each real ABI3 Yield.
+.global smp_d01_yield
+smp_d01_yield:
+ ldr x10, [x20]
+ mov x11, #2048
+1:
+ add x10, x10, #1
+ subs x11, x11, #1
+ b.ne 1b
+ str x10, [x20]
+ mov x8, #2
+ svc #0
+ b smp_d01_yield
+.endif
 .global smp_user_end
 smp_user_end:
 .balign 4096

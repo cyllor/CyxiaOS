@@ -109,6 +109,9 @@ compile_error!("v0199-advice-e2e-selftest requires the plain smp-selftest profil
 mod v0199_control_bringup;
 #[cfg(feature = "v0199-control-bringup")]
 pub(super) use v0199_control_bringup::BudgetMeter;
+#[cfg(feature = "v0199-d01-scheduler-selftest")]
+#[path = "v0199_d01_fixture.rs"]
+mod v0199_d01_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_d02_fixture.rs"]
 mod v0199_d02_fixture;
@@ -211,6 +214,11 @@ const PRIVATE_SPACES: usize = C * 2
         8
     } else {
         0
+    }
+    + if cfg!(feature = "v0199-d01-scheduler-selftest") {
+        2
+    } else {
+        0
     };
 const STACK_BYTES: usize = 4096 + 65536;
 const CODE: u64 = 0x10000;
@@ -226,6 +234,7 @@ core::arch::global_asm!(include_str!("../../../../crates/arch-aarch64/src/second
 core::arch::global_asm!(
     include_str!("smp_user.S"),
     d02_enabled = const cfg!(feature = "v0199-epoch-disk-selftest") as u8,
+    d01_enabled = const cfg!(feature = "v0199-d01-scheduler-selftest") as u8,
 );
 #[cfg(feature = "v0199-advice-e2e-selftest")]
 core::arch::global_asm!(include_str!("v0199_advice_user.S"));
@@ -961,6 +970,14 @@ fn secondary_work(slot: usize) -> ! {
         if slot == 1
             && token.plane == Plane::Business
             && (v0199_d02_fixture::worker_step() || v0199_d05_fixture::worker_step())
+        {
+            drop(permit);
+            continue;
+        }
+        #[cfg(feature = "v0199-d01-scheduler-selftest")]
+        if slot == 1
+            && token.plane == Plane::Business
+            && v0199_d01_fixture::worker_step(token.generation)
         {
             drop(permit);
             continue;

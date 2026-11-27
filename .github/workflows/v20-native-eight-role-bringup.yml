@@ -25,6 +25,9 @@ on:
       - 'crates/arch-aarch64/src/lib.rs'
       - 'crates/control-model/src/native_v0199.rs'
       - 'crates/kernel-core/src/security/epoch_redo_v0199.rs'
+      - 'kernel/src/arch/aarch64/smp.rs'
+      - 'kernel/src/arch/aarch64/smp_user.S'
+      - 'crates/prototype/src/domains/tasks/scheduler.rs'
       - 'kernel/src/arch/aarch64/v0199_epoch_disk.rs'
       - 'kernel/src/arch/aarch64/v0199_d*_fixture.rs'
       - 'kernel/src/arch/aarch64/v0199_effect_fixture.rs'
@@ -201,6 +204,8 @@ jobs:
             feature: v0199-epoch-disk-selftest
           - artifact: epoch-disk-d11
             feature: v0199-d11-rng-selftest
+          - artifact: epoch-disk-d01
+            feature: v0199-d01-scheduler-selftest
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -234,7 +239,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        artifact: [epoch-disk, epoch-disk-d11]
+        artifact: [epoch-disk, epoch-disk-d11, epoch-disk-d01]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -262,6 +267,9 @@ jobs:
           args=()
           if [ '${{ matrix.artifact }}' = epoch-disk-d11 ]; then
             args+=(--d11-rng)
+          fi
+          if [ '${{ matrix.artifact }}' = epoch-disk-d01 ]; then
+            args+=(--d01-scheduler)
           fi
           PATH="$PWD/artifacts/eight-qemu/bin:$PATH" python3 -B tools/verify_v0199_epoch_disk.py "${args[@]}" \
             --elf artifacts/epoch-disk/kernel.elf --role7 artifacts/epoch-disk/role7.elf \
