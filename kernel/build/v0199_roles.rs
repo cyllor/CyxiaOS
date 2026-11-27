@@ -166,6 +166,7 @@ pub fn build() {
         "user/v0199-control/catalog.rs",
         "user/v0199-control/file_read.rs",
         "user/v0199-control/file_receipt.rs",
+        "user/v0199-control/file_fsync.rs",
         "crates/control-model/src/native_v0199.rs",
         "crates/prototype/src/model.rs",
         "crates/prototype/src/learning/seed.rs",
@@ -179,8 +180,8 @@ pub fn build() {
             || env::var_os("CARGO_FEATURE_V0199_EPOCH_DISK_SELFTEST").is_some());
     let snapshot_catalog = env::var_os("CARGO_FEATURE_V020_PRODUCTION_SNAPSHOT_CATALOG").is_some();
     let file_read = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_READ").is_some();
-    let file_receipt_query = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FSYNC_SCRATCH").is_some()
-        && env::var_os("CARGO_FEATURE_V020_PRODUCTION_MEDIA_REOPEN").is_some();
+    let fsync = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FSYNC_SCRATCH").is_some();
+    let reopen = env::var_os("CARGO_FEATURE_V020_PRODUCTION_MEDIA_REOPEN").is_some();
     let file_sessions = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_SESSIONS").is_some();
     let file_volatile_write =
         env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_VOLATILE_WRITE").is_some();
@@ -200,8 +201,15 @@ pub fn build() {
         if file_read && matches!(role, 6 | 11) {
             compiler.args(["--cfg", "file_read_probe"]);
         }
-        if file_receipt_query && role == 11 {
-            compiler.args(["--cfg", "file_receipt_query_probe"]);
+        if fsync && role == 11 {
+            compiler.args([
+                "--cfg",
+                if reopen {
+                    "file_receipt_query_probe"
+                } else {
+                    "file_fsync_probe"
+                },
+            ]);
         }
         if file_sessions && role == 11 {
             compiler.args(["--cfg", "file_sessions_probe"]);
@@ -221,6 +229,7 @@ pub fn build() {
                 "--check-cfg=cfg(snapshot_catalog_probe)",
                 "--check-cfg=cfg(file_read_probe)",
                 "--check-cfg=cfg(file_receipt_query_probe)",
+                "--check-cfg=cfg(file_fsync_probe)",
                 "--check-cfg=cfg(file_sessions_probe)",
                 "--check-cfg=cfg(file_volatile_write_probe)",
                 "--check-cfg=cfg(snapshot_read_probe)",

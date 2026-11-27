@@ -111,6 +111,10 @@ use sha2::{Digest, Sha256};
 
 #[path = "production/evidence.rs"]
 mod evidence;
+#[cfg(feature = "v020-production-fsync-scratch")]
+#[cfg_attr(feature = "v020-production-media-reopen", allow(dead_code))]
+#[path = "production/file_durable.rs"]
+mod file_durable;
 #[cfg(feature = "v020-production-file-read")]
 #[path = "production/file_read.rs"]
 mod file_read;
@@ -931,10 +935,7 @@ fn svc_dispatch(f: &mut ExceptionFrame) -> Option<u64> {
             #[cfg(any(
                 feature = "v020-production-snapshot-catalog",
                 feature = "v020-production-file-read",
-                all(
-                    feature = "v020-production-fsync-scratch",
-                    feature = "v020-production-media-reopen"
-                )
+                feature = "v020-production-fsync-scratch"
             ))]
             if f.esr == 0x5600_0000 && caller < ROLE_COUNT as u64 && x8 == 0x50 {
                 let index = caller as usize;
@@ -974,10 +975,7 @@ fn pie_member(index: usize) -> NativeRole {
 #[cfg(any(
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
-    all(
-        feature = "v020-production-fsync-scratch",
-        feature = "v020-production-media-reopen"
-    )
+    feature = "v020-production-fsync-scratch"
 ))]
 fn reject_service_preflight(index: usize, args: [u64; 6]) -> Option<u64> {
     match args[0] {
@@ -997,6 +995,14 @@ fn reject_service_preflight(index: usize, args: [u64; 6]) -> Option<u64> {
         cyxia_kernel_core::security::file_read_v4::ENDPOINT => {
             Some(file_receipt::reject_preflight(index, pie_member(index), args))
         }
+        #[cfg(all(
+            not(feature = "v020-production-file-read"),
+            feature = "v020-production-fsync-scratch",
+            not(feature = "v020-production-media-reopen")
+        ))]
+        cyxia_kernel_core::security::file_read_v4::ENDPOINT => Some(
+            file_durable::reject_preflight(index, pie_member(index), args),
+        ),
         _ => None,
     }
 }
@@ -1037,10 +1043,7 @@ fn trapped_ttbr0() -> u64 {
 #[cfg(any(
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
-    all(
-        feature = "v020-production-fsync-scratch",
-        feature = "v020-production-media-reopen"
-    )
+    feature = "v020-production-fsync-scratch"
 ))]
 fn wait_for_role_yield(
     index: usize,
@@ -1125,6 +1128,17 @@ fn pie_dispatch(index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u
         ))]
         0x50 if args[0] == cyxia_kernel_core::security::file_read_v4::ENDPOINT => {
             let result = file_receipt::dispatch(index, member, args);
+            if result == EAGAIN as u64 {
+                PIE_ROLE_CALLS[index].fetch_add(1, Ordering::Relaxed);
+            }
+            result
+        }
+        #[cfg(all(
+            feature = "v020-production-fsync-scratch",
+            not(feature = "v020-production-media-reopen")
+        ))]
+        0x50 if args[0] == cyxia_kernel_core::security::file_read_v4::ENDPOINT => {
+            let result = file_durable::dispatch(index, member, args);
             if result == EAGAIN as u64 {
                 PIE_ROLE_CALLS[index].fetch_add(1, Ordering::Relaxed);
             }
@@ -1485,6 +1499,11 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     let other_protected_pool_bytes = other_protected_pool_bytes + file_read::protected_bytes();
     #[cfg(all(
         feature = "v020-production-fsync-scratch",
+        not(feature = "v020-production-media-reopen")
+    ))]
+    let other_protected_pool_bytes = other_protected_pool_bytes + file_durable::protected_bytes();
+    #[cfg(all(
+        feature = "v020-production-fsync-scratch",
         feature = "v020-production-media-reopen"
     ))]
     let other_protected_pool_bytes =
@@ -1529,12 +1548,24 @@ pub(crate) fn run(info: &BootInfo) -> ! {
             pie_turn(i, ctx);
         }
     }
-    for i in 0..ROLE_COUNT {
+    // Both sinks record this same startup phase, before later native file
+    // turns reuse the role's syscall outcome and progress counters.
+    let pie_startup: [[u64; 6]; ROLE_COUNT] = core::array::from_fn(|i| {
+        [
+            pie_members[i].ttbr0_root,
+            PIE_CLOCKS[i].load(Ordering::Acquire),
+            PIE_ROLE_CALLS[i].load(Ordering::Acquire),
+            PIE_YIELDS[i].load(Ordering::Acquire),
+            u64::from_le_bytes(CATALOG[i].image_sha256[..8].try_into().unwrap()),
+            SVC_OUT[i].load(Ordering::Acquire),
+        ]
+    });
+    for (i, row) in pie_startup.iter().enumerate() {
         report(
             "V020_PROD_PIE_ROLE",
             u64::from(ROLES[i].id()),
-            PIE_CLOCKS[i].load(Ordering::Acquire),
-            PIE_ROLE_CALLS[i].load(Ordering::Acquire),
+            row[1],
+            row[2],
         );
     }
     report("V020_PROD_STAGE", 2, ROLE_COUNT as u64, 0);
@@ -1997,7 +2028,21 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     let net_outcome = net::serve(info);
     // Opt-in G-B media staging on a throw-away scratch VirtIO-blk disk.
     #[cfg(feature = "v020-production-media-staging")]
-    let staging_outcome = media_staging::stage(info);
+    let staging_outcome = media_staging::stage(
+        info,
+        #[cfg(all(
+            feature = "v020-production-fsync-scratch",
+            not(feature = "v020-production-signed-resident")
+        ))]
+        if cfg!(feature = "v020-production-media-reopen") {
+            None
+        } else {
+            Some(
+                file_durable::Client::new(&mut pie_ctx, &pie_manifest)
+                    .expect("scratch file client"),
+            )
+        },
+    );
 
     // (11) QMP-readable evidence page.
     let words = unsafe { &*core::ptr::addr_of!(SMP_EVIDENCE) };
@@ -2097,17 +2142,11 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         }
     }
     // PIE role evidence: distinct TTBR roots + image hashes + in-vector calls.
-    for i in 0..ROLE_COUNT {
+    for (i, row) in pie_startup.into_iter().enumerate() {
         let at = 80 + i * 6;
-        words.words[at].store(pie_members[i].ttbr0_root, Ordering::Relaxed);
-        words.words[at + 1].store(PIE_CLOCKS[i].load(Ordering::Acquire), Ordering::Relaxed);
-        words.words[at + 2].store(PIE_ROLE_CALLS[i].load(Ordering::Acquire), Ordering::Relaxed);
-        words.words[at + 3].store(PIE_YIELDS[i].load(Ordering::Acquire), Ordering::Relaxed);
-        words.words[at + 4].store(
-            u64::from_le_bytes(CATALOG[i].image_sha256[..8].try_into().unwrap()),
-            Ordering::Relaxed,
-        );
-        words.words[at + 5].store(SVC_OUT[i].load(Ordering::Relaxed), Ordering::Relaxed);
+        for (field, value) in row.into_iter().enumerate() {
+            words.words[at + field].store(value, Ordering::Relaxed);
+        }
     }
     // Wave 11 segment (words 128..160): magic + staged boot epoch; later wave-11
     // tasks fill their own rows through evidence::put before this seal.

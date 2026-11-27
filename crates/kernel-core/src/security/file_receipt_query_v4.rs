@@ -178,12 +178,17 @@ impl<'a> MountedReceiptQuery<'a> {
         reply
             .get_mut(..REPLY_HEADER)
             .ok_or(Error::Capacity)?
-            .copy_from_slice(&encode_reply(caller, receipt));
+            .copy_from_slice(&encode_receipt_reply(caller, receipt));
         Ok(REPLY_HEADER)
     }
 }
 
-fn encode_reply(caller: ReceiptQueryCaller, receipt: FileReceiptV4) -> [u8; REPLY_HEADER] {
+/// Encode the committed receipt for a native query or operation completion.
+/// The mounted owner supplies the already-authorized and validated receipt.
+pub fn encode_receipt_reply(
+    caller: ReceiptQueryCaller,
+    receipt: FileReceiptV4,
+) -> [u8; REPLY_HEADER] {
     // A prior boot cannot finish an admission with its old frozen pages.
     // Keep the on-disk BOUND record and reply with uncertainty until the
     // recovery owner reconciles it and durably proves a terminal outcome.

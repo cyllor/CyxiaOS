@@ -80,6 +80,8 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/boot.rs",
     "kernel/src/arch/aarch64/exceptions.rs",
     "kernel/src/arch/aarch64/console.rs",
+    "kernel/src/arch/aarch64/mod.rs",
+    "kernel/src/arch/aarch64/panic_stop.rs",
     "kernel/Cargo.toml",
     "kernel/linker/aarch64.ld",
     "kernel/build/aarch64.rs",
@@ -94,6 +96,7 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/file_read.rs",
     "kernel/src/arch/aarch64/production/file_read/sessions.rs",
     "kernel/src/arch/aarch64/production/file_read/volatile_write.rs",
+    "kernel/src/arch/aarch64/production/file_durable.rs",
     "kernel/src/arch/aarch64/production/file_receipt.rs",
     "kernel/src/arch/aarch64/production/recovery.rs",
     "kernel/src/arch/aarch64/production/meter.rs",
@@ -166,6 +169,7 @@ PRODUCTION_SOURCES = [
     "user/v0199-control/catalog.rs",
     "user/v0199-control/file_read.rs",
     "user/v0199-control/file_receipt.rs",
+    "user/v0199-control/file_fsync.rs",
     "user/local-echo/src/broker.rs",
     "user/local-echo/src/lib.rs",
     "user/local-echo/src/runtime.rs",
@@ -184,6 +188,7 @@ PRODUCTION_SOURCES = [
     "tests/fixtures/v020-signed-scratch/config.bin",
     "tests/fixtures/v020-signed-scratch/fsync-config.bin",
     "tests/fixtures/v020-signed-scratch/fsync-receipt-query.bin",
+    "tests/fixtures/v020-signed-scratch/fsync-client.bin",
 ]
 GUEST_ELF = "target/aarch64-unknown-none/release/cyxia-local-echo"
 MAGIC = 0x4359_5052_4431_3030
@@ -587,6 +592,15 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     require(len(io) == 1 and io[0][0] > 0 and io[0][1:] == expected_io,
             "media staging device writes and flushes disagree with the selected protocol")
     evidence = {}
+    synced = w11_rows(lines, "V020_FSYNC_WRITE_ABI")
+    if synced:
+        require(modes.fsync_scratch and not reopen and synced == [(1, 11, 1)],
+                "unexpected native file FSYNC client identity")
+        evidence["native_file_fsync"] = {
+            "boot_epoch": synced[0][0],
+            "actor": synced[0][1],
+            "service_generation": synced[0][2],
+        }
     receipt = w11_rows(lines, "V020_FSYNC_RECEIPT_ABI")
     if receipt:
         require(modes.fsync_scratch and reopen and receipt == [(2, 11, 1)],

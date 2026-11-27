@@ -15,9 +15,10 @@
 //!    the snapshot ranges before replay on reopen;
 //! 4. paired BootEpoch allocation on the mounted volume. The explicitly
 //!    signed lane additionally verifies an immutable public test config;
-//! 5. `file_admission_flow_v1::run_admission_flow` under the confirmed epoch.
-//!    The file layouts then seal the reread owner ACL, root slot and file
-//!    bytes for the client turn under that epoch.
+//! 5. the signed FSYNC scratch lane stages the reread owner ACL, root slot
+//!    and bytes for the qualified EL0 holder, then consumes its protected
+//!    pending requests in the foreground mount owner. The file admission
+//!    contract and the staged views use the same confirmed epoch.
 //!
 //! The in-vector snapshot SVC 0x40 is routed here and answers EAGAIN: the
 //! snapshot backend (catalog/slot payloads, SnapshotStore, live ViewGrant) is
@@ -43,6 +44,8 @@
 //! * Second DMA user of the production boot: the scratch VirtIO-blk device and
 //!   its queue (registered in scratch_blk.rs), driven synchronously by CPU0 in
 //!   `stage` only, after the business CPUs stopped; completion IRQs are off.
+//!   A file trap has no device borrow. The foreground can enter the qualified
+//!   client between completed transactions and while preparing a frozen job.
 //! * Workspaces FORMAT/MOUNT (volume.rs), RECOVERY (reopen.rs), and PAIR (authority.rs): static mut in
 //!   `.bss.sec_n`, counted as static FrameMeta Arena pages; borrowed only
 //!   inside `stage`. The static registration does not track DMA pins.
@@ -59,10 +62,7 @@ use cyxia_contracts::BootInfo;
 #[cfg(any(
     feature = "v020-production-file-read",
     feature = "v020-production-snapshot-catalog",
-    all(
-        feature = "v020-production-fsync-scratch",
-        feature = "v020-production-media-reopen"
-    )
+    feature = "v020-production-fsync-scratch"
 ))]
 use cyxia_kernel_core::security::recovery_proof_v2::{RECOVERY_REQUIRED, refusal_errno};
 use cyxia_kernel_core::security::{
@@ -95,10 +95,7 @@ static SNAPSHOT_FAIL_CLOSED: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(
     feature = "v020-production-file-read",
     feature = "v020-production-snapshot-catalog",
-    all(
-        feature = "v020-production-fsync-scratch",
-        feature = "v020-production-media-reopen"
-    )
+    feature = "v020-production-fsync-scratch"
 ))]
 static MOUNT_REQUIRES_RECOVERY: AtomicBool = AtomicBool::new(false);
 
@@ -217,10 +214,7 @@ impl StagingOutcome {
 #[cfg(any(
     feature = "v020-production-file-read",
     feature = "v020-production-snapshot-catalog",
-    all(
-        feature = "v020-production-fsync-scratch",
-        feature = "v020-production-media-reopen"
-    )
+    feature = "v020-production-fsync-scratch"
 ))]
 pub(super) fn ordinary_file_refusal() -> Option<i64> {
     if MOUNT_REQUIRES_RECOVERY.load(Ordering::Acquire) {
@@ -299,6 +293,11 @@ fn run_chain(
     #[cfg(feature = "v020-production-signed-resident")] verified: Option<
         VerifiedOfflineConfig<'static>,
     >,
+    #[cfg(all(
+        feature = "v020-production-fsync-scratch",
+        not(feature = "v020-production-signed-resident")
+    ))]
+    file_client: Option<super::file_durable::Client<'_>>,
 ) -> Option<()> {
     const REOPEN: bool = cfg!(feature = "v020-production-media-reopen");
     #[cfg(feature = "v020-production-fsync-scratch")]
@@ -402,7 +401,10 @@ fn run_chain(
         }
         out.receipt_query_digest =
             Some(volume::confirmed_receipt_query_digest(&mounted, &committed, &verified).ok()?);
-        #[cfg(feature = "v020-production-fsync-scratch")]
+        #[cfg(all(
+            feature = "v020-production-fsync-scratch",
+            not(feature = "v020-production-signed-resident")
+        ))]
         {
             if REOPEN {
                 let view = fsync::readback(disk, checkpoint, &verified, &committed)
@@ -415,9 +417,16 @@ fn run_chain(
                 #[cfg(not(feature = "v020-production-media-reopen"))]
                 let _ = view;
             } else {
-                fsync::execute(disk, checkpoint, &mounted, &verified, &committed)
-                    .inspect_err(|e| report("V020_FSYNC_ERROR", *e as u64, 0, 0))
-                    .ok()?;
+                fsync::execute(
+                    disk,
+                    checkpoint,
+                    &mounted,
+                    &verified,
+                    &committed,
+                    file_client?,
+                )
+                .inspect_err(|e| report("V020_FSYNC_ERROR", *e as u64, 0, 0))
+                .ok()?;
             }
         }
     }
@@ -490,11 +499,23 @@ fn run_chain(
 }
 
 /// One-shot staging run on CPU0 with business-role admission closed.
-pub(super) fn stage(info: &BootInfo) -> StagingOutcome {
+pub(super) fn stage(
+    info: &BootInfo,
+    #[cfg(all(
+        feature = "v020-production-fsync-scratch",
+        not(feature = "v020-production-signed-resident")
+    ))]
+    file_client: Option<super::file_durable::Client<'_>>,
+) -> StagingOutcome {
     stage_with_policy(
         info,
         #[cfg(feature = "v020-production-signed-resident")]
         None,
+        #[cfg(all(
+            feature = "v020-production-fsync-scratch",
+            not(feature = "v020-production-signed-resident")
+        ))]
+        file_client,
     )
 }
 
@@ -503,6 +524,11 @@ pub(super) fn stage_with_policy(
     #[cfg(feature = "v020-production-signed-resident")] verified: Option<
         VerifiedOfflineConfig<'static>,
     >,
+    #[cfg(all(
+        feature = "v020-production-fsync-scratch",
+        not(feature = "v020-production-signed-resident")
+    ))]
+    file_client: Option<super::file_durable::Client<'_>>,
 ) -> StagingOutcome {
     let mut out = StagingOutcome::default();
     if STAGED.swap(true, Ordering::AcqRel) {
@@ -522,9 +548,19 @@ pub(super) fn stage_with_policy(
         writes: 0,
         flushes: 0,
     };
-    #[cfg(not(feature = "v020-production-signed-resident"))]
+    #[cfg(not(any(
+        feature = "v020-production-signed-resident",
+        feature = "v020-production-fsync-scratch"
+    )))]
     {
         out.chain_complete = run_chain(&mut disk, &mut out).is_some();
+    }
+    #[cfg(all(
+        feature = "v020-production-fsync-scratch",
+        not(feature = "v020-production-signed-resident")
+    ))]
+    {
+        out.chain_complete = run_chain(&mut disk, &mut out, file_client).is_some();
     }
     #[cfg(feature = "v020-production-signed-resident")]
     {
@@ -533,10 +569,7 @@ pub(super) fn stage_with_policy(
     #[cfg(any(
         feature = "v020-production-file-read",
         feature = "v020-production-snapshot-catalog",
-        all(
-            feature = "v020-production-fsync-scratch",
-            feature = "v020-production-media-reopen"
-        )
+        feature = "v020-production-fsync-scratch"
     ))]
     MOUNT_REQUIRES_RECOVERY.store(out.mount_requires_recovery, Ordering::Release);
     if out.mount_requires_recovery {

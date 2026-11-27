@@ -3,6 +3,7 @@
 //! Cold reopen exports a verified read-only receipt view to its qualified
 //! native client. Only the staging owner accesses the device.
 
+use super::super::file_durable::{ALLOC, Client, FSYNC};
 use super::{
     Disk, StagedReceiptQuery, authority, reopen, report, signed,
     volume::{self, RECEIPTS_HOME, SnapshotLayout},
@@ -14,16 +15,22 @@ use cyxia_kernel_core::security::{
     file_admission_flow_v1::FileAdmissionFlowV1,
     file_auth_context_v1::{AdmissionLedgerV1, AuthContextIssuerV1, AuthorityFacts},
     file_auth_v3::{AdmitRequestV3, FILE_SERVICE_ROLE, TerminalState, Verdict},
-    file_format_v1::{SCRATCH_FILE_BLOCK, SCRATCH_FILE_GENERATION, SCRATCH_FILE_INODE},
+    file_format_v1::{
+        SCRATCH_FILE_BLOCK, SCRATCH_FILE_FSYNC_RIGHTS, SCRATCH_FILE_GENERATION, SCRATCH_FILE_INODE,
+    },
     file_fsync_v1::{FsyncJob, FsyncProgress, FsyncWorkspace, commit_segment},
     file_index_v0199::{BLOCK_BYTES as BLOCK, FileStreamIndexV4, SecurityStateStoreV2},
     file_media_v0199::{
         BITMAP_START, FileReceiptV4, INODE_START, RECEIPT_BYTES, SuperblockV1, crc32c_zeroed,
     },
     file_mount_v1::MountEvidence,
-    file_receipt_query_v4::{MountedReceiptQuery, ReceiptKey, ReceiptQueryCaller},
+    file_read_v4::StagedFile,
+    file_receipt_query_v4::{
+        MountedReceiptQuery, RECEIPT_KEY_BYTES, ReceiptKey, ReceiptQueryCaller,
+        encode_receipt_reply,
+    },
     file_receipt_store_v0199::RECEIPT_STORE_BYTES,
-    file_service_v4::{REQUEST_HEADER, REQUEST_MAGIC, REQUEST_VERSION, Request},
+    file_service_v4::{REPLY_HEADER, REQUEST_HEADER, REQUEST_MAGIC, REQUEST_VERSION, Request},
     file_structure_v1::{INODE_BYTES, Inode},
     offline_config_v1::VerifiedOfflineConfig,
     recovery_v1::{
@@ -87,6 +94,7 @@ fn fsync_frame() -> [u8; REQUEST_HEADER + 8] {
 fn freeze(
     issuer: &mut AuthContextIssuerV1,
     frame: &[u8],
+    cap_selector: u64,
     data: &[u8],
 ) -> Result<FileAdmissionFlowV1, Error> {
     FileAdmissionFlowV1::begin(
@@ -94,12 +102,12 @@ fn freeze(
         1,
         FILE_SERVICE_ROLE,
         frame,
-        TEST_CAP,
+        cap_selector,
         AdmitRequestV3 {
             auth_context_id: 0,
             target_id: u64::from(SCRATCH_FILE_INODE),
             target_generation: SCRATCH_FILE_GENERATION,
-            required_rights: 1 << 13,
+            required_rights: u64::from(SCRATCH_FILE_FSYNC_RIGHTS),
             request_seq: 1,
             prepared_version: 0,
             acl_generation: 1,
@@ -177,12 +185,15 @@ fn reserve(
 fn issue(
     writer: &mut RedoWriter<'_, Disk>,
     image: &mut [u8; RECEIPT_STORE_BYTES],
+    frame: &[u8],
 ) -> Result<(), Error> {
-    // The pinned diagnostic principal issues exactly the frozen op-10 form.
-    let mut frame = [0; REQUEST_HEADER + 16];
-    request_header(&mut frame, 10, 0);
-    frame[REQUEST_HEADER + 8..].copy_from_slice(&KEY.stream_generation.to_le_bytes());
-    Request::decode(&frame, 0)?;
+    let request = Request::decode(frame, 0)?;
+    if request.op != 10
+        || u64::from(request.payload[0]) != KEY.stream_slot
+        || u64::from_le_bytes(request.payload[8..].try_into().unwrap()) != KEY.request_seq
+    {
+        return Err(Error::Unauthorized);
+    }
     let mut index = [0; BLOCK];
     writer.read_committed(RECEIPTS_HOME + 6, &mut index)?;
     issued_index(&mut index)?;
@@ -219,6 +230,7 @@ pub(super) fn execute(
     mounted: &MountEvidence,
     config: &VerifiedOfflineConfig<'_>,
     committed: &SecurityStateStoreV2,
+    mut client: Client<'_>,
 ) -> Result<(), Error> {
     config.check_committed(committed)?;
     if checkpoint.generation != 1
@@ -229,18 +241,50 @@ pub(super) fn execute(
     {
         return Err(Error::Unauthorized);
     }
+    // SAFETY: the one-shot CPU0 staging owner is the only borrower. Private
+    // role packages already reside in their own pages before staging.
+    let scratch = unsafe { &mut *core::ptr::addr_of_mut!(super::super::COPY_BUFFER.0) };
+    let principal = signed::fsync_client_principal(config, scratch)?;
+    let file = volume::read_scratch_file(
+        disk,
+        &mut [0; BLOCK],
+        SnapshotLayout::BaselineFsyncFile,
+        principal,
+    )?;
+    let caller = receipt_caller(principal.id, committed)?;
+    let file = StagedFile::new_with_owner_rights(
+        committed.last_boot_epoch,
+        file.acl.principal,
+        file.dirent,
+        file.data,
+        file.acl.owner_rights,
+    )?;
+    client.start(file, KEY, WRITE_SEQ);
+    let allocation = client.request(ALLOC);
     // SAFETY: CPU0 is the sole synchronous staging owner. No other native
     // service or role can borrow these scratch workspaces.
     let workspace = unsafe { reopen::workspace() };
     let work = unsafe { &mut *core::ptr::addr_of_mut!(WORK) };
     let receipt_image = unsafe { &mut *core::ptr::addr_of_mut!(RECEIPTS) };
     let mut writer = RedoWriter::open(disk, workspace, checkpoint)?;
-    issue(&mut writer, receipt_image)?;
+    issue(&mut writer, receipt_image, allocation.bytes())?;
+    let issued = issued_receipt();
+    let mut reply = [0; REPLY_HEADER + RECEIPT_KEY_BYTES];
+    reply[..REPLY_HEADER].copy_from_slice(&encode_receipt_reply(caller, issued));
+    reply[36..40].copy_from_slice(&(RECEIPT_KEY_BYTES as u32).to_le_bytes());
+    reply[REPLY_HEADER..].copy_from_slice(&issued.encode()?[8..8 + RECEIPT_KEY_BYTES]);
+    client.publish(ALLOC, &reply);
 
-    let frame = fsync_frame();
-    let data = frozen_file();
+    let request = client.request(FSYNC);
+    let mut data = [0; BLOCK];
+    client.freeze(request, WRITE_SEQ, &mut data)?;
+    if data != frozen_file() {
+        // This scratch profile has one pinned data image and readback
+        // specification. An unrelated write version cannot reach redo.
+        return Err(Error::Unauthorized);
+    }
     let mut issuer = AuthContextIssuerV1::new(1)?;
-    let mut flow = freeze(&mut issuer, &frame, &data)?;
+    let mut flow = freeze(&mut issuer, request.bytes(), request.selector, &data)?;
     let mut ledger = AdmissionLedgerV1::new(1)?;
     flow.admit(
         &mut ledger,
@@ -259,8 +303,8 @@ pub(super) fn execute(
         admission: &flow,
         ledger: &ledger,
         inode_id: SCRATCH_FILE_INODE as u16,
-        cap_selector: TEST_CAP,
-        frame: &frame,
+        cap_selector: request.selector,
+        frame: request.bytes(),
         key: KEY,
         pages: &pages,
     };
@@ -305,18 +349,26 @@ pub(super) fn execute(
     if admission == 0 || ledger.inflight_count() != 0 {
         return Err(Error::Conflict);
     }
+    client.publish(FSYNC, &encode_receipt_reply(caller, receipt));
+    let holder = client.finish();
     report(
         "V020_FSYNC_COMMITTED",
         receipt.commit_lsn,
         receipt.write_seq,
         receipt.completed_prefix.into(),
     );
+    report(
+        "V020_FSYNC_WRITE_ABI",
+        caller.boot_epoch,
+        holder,
+        caller.service_generation,
+    );
     Ok(())
 }
 
 fn final_receipt(data: &[u8; BLOCK], commit_lsn: u64) -> Result<FileReceiptV4, Error> {
     let frame = fsync_frame();
-    let frozen = freeze(&mut AuthContextIssuerV1::new(1)?, &frame, data)?;
+    let frozen = freeze(&mut AuthContextIssuerV1::new(1)?, &frame, TEST_CAP, data)?;
     Ok(FileReceiptV4 {
         log_epoch: 1,
         txid: 4,
@@ -458,11 +510,7 @@ pub(super) fn readback(
     // and the loaded executable images no longer depend on those bytes.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!(super::super::COPY_BUFFER.0) };
     let principal = signed::receipt_query_principal(config, scratch)?;
-    let service_slot = (FILE_SERVICE_ROLE - 1) as usize;
-    let service_generation = state.service_generations[service_slot];
-    if service_generation == 0 || state.isolated_service_bitmap & (1 << service_slot) != 0 {
-        return Err(Error::Unauthorized);
-    }
+    let caller = receipt_caller(principal.id, state)?;
 
     // SAFETY: the one-shot CPU0 staging owner is the only writer. Reopen
     // has finished measuring and modifying the journal before this borrow.
@@ -478,11 +526,23 @@ pub(super) fn readback(
     let view = MountedReceiptQuery::new(receipts, &raw, config, state)?;
     Ok(StagedReceiptQuery {
         view,
-        caller: ReceiptQueryCaller {
-            principal_id: principal.id,
-            boot_epoch: state.last_boot_epoch,
-            service_generation,
-        },
+        caller,
         expected,
+    })
+}
+
+fn receipt_caller(
+    principal_id: u64,
+    state: &SecurityStateStoreV2,
+) -> Result<ReceiptQueryCaller, Error> {
+    let service_slot = (FILE_SERVICE_ROLE - 1) as usize;
+    let service_generation = state.service_generations[service_slot];
+    if service_generation == 0 || state.isolated_service_bitmap & (1 << service_slot) != 0 {
+        return Err(Error::Unauthorized);
+    }
+    Ok(ReceiptQueryCaller {
+        principal_id,
+        boot_epoch: state.last_boot_epoch,
+        service_generation,
     })
 }

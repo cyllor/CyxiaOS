@@ -642,7 +642,7 @@ class NativeSecurityWiring(unittest.TestCase):
             line = next(line for line in manifest.splitlines() if line.startswith(base + " = "))
             for feature in ("authenticated-net", "live-control", "media-reopen", "media-signed",
                             "media-envelopes", "media-unified", "snapshot-catalog", "file-read",
-                            "snapshot-read", "file-sessions", "frame-pool"):
+                            "snapshot-read", "file-sessions", "fsync-scratch", "frame-pool"):
                 self.assertNotIn(feature, line)
 
     def test_v020_wave11_media_staging_is_opt_in(self):
@@ -655,7 +655,10 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertEqual(before[0].strip(), f"#[cfg({staging})]")
         self.assertEqual(before[1].strip(), '#[path = "production/media_staging.rs"]')
         media = source(arm / "production/media_staging.rs")
-        self.assertIn("pub(super) fn stage(info: &BootInfo) -> StagingOutcome", media)
+        signature = media.split("pub(super) fn stage(", 1)[1].split(") -> StagingOutcome", 1)[0]
+        self.assertIn("info: &BootInfo", signature)
+        self.assertIn('feature = "v020-production-fsync-scratch"', signature)
+        self.assertIn("file_client: Option<super::file_durable::Client<'_>>", signature)
         self.assertIn("golden_vector_pending=1", media)
         # Outside staging the in-vector 0x40 branch still answers EAGAIN.
         arm40 = prod.split("0x40 => {", 1)[1].split("0x50 if", 1)[0]
