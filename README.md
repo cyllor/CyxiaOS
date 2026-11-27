@@ -1,8 +1,10 @@
 # CyxiaOS
 
-## V0.20 开发中（未通过 ARM/x86 完整原生验收）
+## V0.20 开发中（G4-QEMU 待验收）
 
 `CyxiaOS-V0.20` 分支的版本号为 `0.20.0-dev`。控制面固定在 CPU0，普通业务只在 CPU1–3 运行。CPU0 失效时停止新的控制发布，业务核不接任控制核。
+
+V0.20 在锁定的 Cortex-A53 QEMU 上验收，以 G4-QEMU 为最终门槛。实体板卡验收可单独发起。[V0.20 验收约束](docs/design/v0.20-native-local-system.md#7-验收与发布)
 
 第十一波在 AArch64 `v020-production` 启动配置接入 FrameMeta 静态页登记、RecoveryProof v2 发布门、建议链桥接计量，以及真实 VirtIO-net TCP 转接和 EL0 Admission 收据校验。
 

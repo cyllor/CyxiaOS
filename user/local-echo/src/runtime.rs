@@ -6,17 +6,58 @@
 //! and restart. This candidate is intentionally NOT installed as the current
 //! production service by default.
 use crate::broker;
-use alloc::sync::Arc;
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::time::Duration;
 use cyxia_net_transport::{
     admission::Admission,
     native_tcp::{self, NativeSocket, SocketError},
-    tls::{Buffers, Pairing, Session, node_id},
+    tls::{Buffers, LocalEchoVerifier, Session, node_id},
 };
 use rustls::{
-    pki_types::{CertificateDer, PrivatePkcs8KeyDer, UnixTime},
+    Error as TlsError, SignatureAlgorithm, SignatureScheme,
+    pki_types::{CertificateDer, SubjectPublicKeyInfoDer, UnixTime},
+    server::ParsedCertificate,
+    sign::{Signer, SigningKey},
     time_provider::TimeProvider,
 };
+
+#[derive(Debug)]
+struct VerifierKey(SubjectPublicKeyInfoDer<'static>);
+
+impl SigningKey for VerifierKey {
+    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+        offered
+            .contains(&SignatureScheme::ED25519)
+            .then(|| Box::new(CertificateVerify) as Box<dyn Signer>)
+    }
+
+    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+        Some(SubjectPublicKeyInfoDer::from(self.0.as_ref()))
+    }
+
+    fn algorithm(&self) -> SignatureAlgorithm {
+        SignatureAlgorithm::ED25519
+    }
+}
+
+#[derive(Debug)]
+struct CertificateVerify;
+
+impl Signer for CertificateVerify {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, TlsError> {
+        // rustls constructs this message from the current transcript. The
+        // signer receives just the SHA-256 hash and reconstructs the context.
+        let hash = cyxia_contracts::tls_signer::certificate_verify_hash(message)
+            .ok_or_else(|| TlsError::General("wrong CertificateVerify context".into()))?;
+        broker::certificate_verify(&hash)
+            .map(|signature| signature.to_vec())
+            .map_err(|_| TlsError::General("CertificateVerify authorization refused".into()))
+    }
+
+    fn scheme(&self) -> SignatureScheme {
+        SignatureScheme::ED25519
+    }
+}
 #[derive(Debug)]
 struct Clock;
 impl TimeProvider for Clock {
@@ -79,9 +120,9 @@ fn handshake(
     tls: &mut Session<'_>,
     scratch: &mut [u8],
 ) -> Result<(), ()> {
-    // Bounded number of cooperative native turns plus rustls' own monotonic
-    // handshake deadline. No blocking model, external POSIX or host socket.
-    for _ in 0..8192 {
+    // The broker bounds each entry and the total number of calls. End the
+    // handshake by elapsed monotonic time, independent of empty-poll speed.
+    loop {
         let now = broker::now().map_err(|_| ())?;
         socket.poll_native(now).map_err(|_| ())?;
         send_pending(socket, tls)?;
@@ -104,7 +145,6 @@ fn handshake(
         }
         broker::yield_cpu();
     }
-    Err(())
 }
 pub fn run() -> ! {
     let certificate =
@@ -116,6 +156,9 @@ pub fn run() -> ! {
     if node_id(&certificate).ok() != Some(kernel_local) || kernel_peer != peer {
         broker::park();
     }
+    let public_key = ParsedCertificate::try_from(&certificate)
+        .unwrap_or_else(|_| broker::park())
+        .subject_public_key_info();
     let mut gate = Admission::new();
     let mut buffers = Buffers::new();
     let mut scratch = [0u8; cyxia_local_echo::broker_surface::PAYLOAD];
@@ -138,13 +181,13 @@ pub fn run() -> ! {
             .begin_ns(source, admission_ns, 16)
             .unwrap_or_else(|_| broker::park());
         broker::admission_granted(ticket, generation, source).unwrap_or_else(|_| broker::park());
-        // Reconstruct the key object from static provisioned DER only. No
-        // private key or peer identity is ever taken from wire requests.
-        let key =
-            PrivatePkcs8KeyDer::from(&include_bytes!(concat!(env!("OUT_DIR"), "/key.der"))[..]);
-        let pairing =
-            Pairing::new_local_echo(certificate.clone(), key.into(), peer, Arc::new(Clock))
-                .unwrap_or_else(|_| broker::park());
+        let pairing = LocalEchoVerifier::new(
+            certificate.clone(),
+            Arc::new(VerifierKey(public_key.clone())),
+            peer,
+            Arc::new(Clock),
+        )
+        .unwrap_or_else(|_| broker::park());
         // V0.19 Echo is a passive server; no cluster peer auto-dial. This
         // native profile requires a kernel-owned listener and pinned client.
         let mut session = pairing
@@ -163,6 +206,7 @@ pub fn run() -> ! {
         let active = gate
             .authenticate(ticket, &session)
             .unwrap_or_else(|_| broker::park());
+        broker::tls_authenticated(&active, generation, source).unwrap_or_else(|_| broker::park());
         if normal_close {
             session
                 .enable_normal_close()

@@ -58,7 +58,7 @@ from v020_production_media import (
 )
 from v020_production_modes import (
     Modes, QEMU_GATEWAY_IPV4, W21_END, authenticated_echo, file_read_evidence, file_sessions_evidence,
-    file_volatile_write_evidence, rows as w11_rows, signed_media_authority, snapshot_catalog_evidence,
+    file_volatile_write_evidence, net_reset_proofs, rows as w11_rows, signed_media_authority, snapshot_catalog_evidence,
     snapshot_envelope_evidence, snapshot_read_evidence, unified_mount_evidence, validate_extensions,
 )
 from v020_production_host_samples import HostMediaSamples
@@ -80,12 +80,15 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/boot.rs",
     "kernel/src/arch/aarch64/exceptions.rs",
     "kernel/src/arch/aarch64/console.rs",
+    "kernel/src/arch/aarch64/mod.rs",
+    "kernel/src/arch/aarch64/panic_stop.rs",
     "kernel/Cargo.toml",
     "kernel/linker/aarch64.ld",
     "kernel/build/aarch64.rs",
     "kernel/build/v0199_roles.rs",
     "kernel/src/arch/aarch64/sec_n_broker.rs",
     "kernel/src/arch/aarch64/sec_n_broker/receipt.rs",
+    "kernel/src/arch/aarch64/sec_n_broker/signer.rs",
     "kernel/src/arch/aarch64/scratch_blk.rs",
     "kernel/src/arch/aarch64/production/evidence.rs",
     "kernel/src/arch/aarch64/production/frames.rs",
@@ -93,6 +96,8 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/file_read.rs",
     "kernel/src/arch/aarch64/production/file_read/sessions.rs",
     "kernel/src/arch/aarch64/production/file_read/volatile_write.rs",
+    "kernel/src/arch/aarch64/production/file_durable.rs",
+    "kernel/src/arch/aarch64/production/file_receipt.rs",
     "kernel/src/arch/aarch64/production/recovery.rs",
     "kernel/src/arch/aarch64/production/meter.rs",
     "kernel/src/arch/aarch64/production/net.rs",
@@ -109,14 +114,23 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/snapshot_catalog.rs",
     "kernel/src/platform/virt/net_device.rs",
     "crates/arch-aarch64/src/entry.S",
+    "crates/arch-aarch64/src/secondary.S",
+    "crates/arch-aarch64/src/vectors.S",
     "crates/arch-aarch64/src/timer.rs",
     "crates/platform-virt/src/lib.rs",
     "crates/driver-virtio/src/lib.rs",
     "crates/driver-virtio/src/block.rs",
     "crates/driver-virtio/src/block/batched.rs",
+    "crates/driver-virtio/src/net.rs",
+    "crates/driver-virtio/src/net/batched.rs",
     "crates/driver-virtio/src/queue.rs",
+    "crates/driver-virtio/src/reset.rs",
+    "crates/driver-virtio/src/transport.rs",
+    "crates/contracts/src/tls_signer.rs",
     "crates/kernel-core/src/security/recovery_proof_v2.rs",
     "crates/kernel-core/src/security/boot_epoch_v1.rs",
+    "crates/kernel-core/src/security/network/entropy.rs",
+    "crates/kernel-core/src/security/network/pending_tls.rs",
     "crates/kernel-core/src/security/durable_role_epoch_v0199.rs",
     "crates/kernel-core/src/security/epoch_redo_v0199.rs",
     "crates/kernel-core/src/security/offline_config_v1.rs",
@@ -154,9 +168,14 @@ PRODUCTION_SOURCES = [
     "user/v0199-control/audit_hash.rs",
     "user/v0199-control/catalog.rs",
     "user/v0199-control/file_read.rs",
+    "user/v0199-control/file_receipt.rs",
+    "user/v0199-control/file_fsync.rs",
     "user/local-echo/src/broker.rs",
     "user/local-echo/src/lib.rs",
     "user/local-echo/src/runtime.rs",
+    "user/local-echo/src/signer.rs",
+    "user/local-echo/build.rs",
+    "user/local-echo/linker.ld",
     "tools/verify_v020_production.py",
     "tools/verify_v020_fsync_scratch.py",
     "tools/qmp_stdio.py",
@@ -168,6 +187,8 @@ PRODUCTION_SOURCES = [
     "tools/v020_tls_peer.py",
     "tests/fixtures/v020-signed-scratch/config.bin",
     "tests/fixtures/v020-signed-scratch/fsync-config.bin",
+    "tests/fixtures/v020-signed-scratch/fsync-receipt-query.bin",
+    "tests/fixtures/v020-signed-scratch/fsync-client.bin",
 ]
 GUEST_ELF = "target/aarch64-unknown-none/release/cyxia-local-echo"
 MAGIC = 0x4359_5052_4431_3030
@@ -324,6 +345,20 @@ class Production:
         require(rows("V020_PROD_PUBLISH") == [(8, SVC64, 1)], "publish not accepted via in-vector 0x41")
         require(rows("V020_PROD_PUBLISH_REPLAY") == [(8, 2, 1)], "publish replay re-accepted")
         require(rows("V020_PROD_APPLY") == [(1, 180, 4)], "executor apply evidence wrong")
+        lock = rows("V020_SEC_S_TARGET_LOCK")
+        require(len(lock) == 1, "missing or duplicate D01 target-lock interval")
+        work_ns, overhead_ns, irq_off_ns = lock[0]
+        require(irq_off_ns > 0 and work_ns + overhead_ns - irq_off_ns in (0, 1),
+                "invalid D01 target-lock interval")
+        # Safety budgets are checked independently from the bridge observation.
+        lock_fault = (int(work_ns > 45_000) | (int(overhead_ns > 5_000) << 1)
+                      | (int(irq_off_ns > 50_000) << 2))
+        require(rows("V020_SEC_S_TARGET_INSTALL") == [(7, 4, lock_fault)],
+                "D01 target install did not enforce measured budgets")
+        labels = [line.split(" ", 1)[0] for line in lines]
+        require(labels.index("V020_SEC_S_TARGET_LOCK")
+                < labels.index("V020_SEC_S_TARGET_INSTALL") < labels.index("V020_PROD_APPLY"),
+                "D01 target-lock measurement must precede its application report")
         require(rows("V020_PROD_SETTLE") == [(1, 1, 2)], "terminal/causal label wrong")
         require(rows("V020_PROD_CHAIN") == [(1, 1, 1)], "causal chain ids disagree")
         # Negatives.
@@ -402,6 +437,10 @@ class Production:
             "fallback_index": words[11],
             "causal_label": words[12],
             "unique_native_accept_count": words[13],
+            "target_lock_work_ns": work_ns,
+            "target_lock_overhead_ns": overhead_ns,
+            "target_lock_irq_off_ns": irq_off_ns,
+            "target_lock_closed_new_work": lock_fault != 0,
             "rejected_negatives": words[15],
             "business_progress_turns": progress_total,
             "in_vector_dispatch": True,
@@ -540,25 +579,51 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
         fresh_writes = 4276 + int(modes.file_read)
     expected_io = (15, 5) if reopen else (fresh_writes, 6)
     if modes.fsync_scratch:
-        # Fresh writes one extra file and 24 additional log blocks. Reopen
-        # replays seven homes, checkpoints, clears 24 nonzero old blocks and
-        # appends the six-block BootEpoch pair.
-        expected_io = (38, 5) if reopen else (4163, 12)
+        event = "V020_FSYNC_RECOVERED" if reopen else "V020_FSYNC_COMMITTED"
+        terminal = w11_rows(lines, event)
+        legacy = [(2, 19, 7)] if reopen else [(19, 7, 29)]
+        current = [(2, 21, 7)] if reopen else [(21, 7, 29)]
+        require(terminal in (legacy, current), "media staging FSYNC terminal differs")
+        # Current binding and completion each add the two-block REDO for
+        # the stream index. Reopen retires those four extra journal blocks.
+        closure_writes = 4 if terminal == current else 0
+        writes, flushes = (38, 5) if reopen else (4163, 12)
+        expected_io = (writes + closure_writes, flushes)
     require(len(io) == 1 and io[0][0] > 0 and io[0][1:] == expected_io,
             "media staging device writes and flushes disagree with the selected protocol")
+    evidence = {}
+    synced = w11_rows(lines, "V020_FSYNC_WRITE_ABI")
+    if synced:
+        require(modes.fsync_scratch and not reopen and synced == [(1, 11, 1)],
+                "unexpected native file FSYNC client identity")
+        evidence["native_file_fsync"] = {
+            "boot_epoch": synced[0][0],
+            "actor": synced[0][1],
+            "service_generation": synced[0][2],
+        }
+    receipt = w11_rows(lines, "V020_FSYNC_RECEIPT_ABI")
+    if receipt:
+        require(modes.fsync_scratch and reopen and receipt == [(2, 11, 1)],
+                "unexpected native file receipt-query identity")
+        evidence["native_file_receipt_query"] = {
+            "boot_epoch": receipt[0][0],
+            "actor": receipt[0][1],
+            "service_generation": receipt[0][2],
+        }
     snapshot = w11_rows(lines, "V020_W11_MEDIA_SNAPSHOT_0X40")
     require(snapshot == [(snapshot_calls, EAGAIN_RESULT, 0)],
             "media staging snapshot refusal must match in-vector EAGAIN role calls")
     queue = w11_rows(lines, "V020_W11_MEDIA_QUEUE")
     if not queue:
-        return {}  # Historical staging ELFs report only logical block operations.
+        return evidence  # Historical staging ELFs report only logical block operations.
     reads, writes, flushes = io[0]
     expected = 2 * (reads + writes) + flushes
     require(len(queue) == 1 and queue[0][:2] == (expected, expected)
             and 0 <= queue[0][2] <= expected,
             "scratch queue requests disagree with logical blocks and isolated flushes")
-    return {"scratch_virtio_requests_completed": expected,
-            "scratch_virtio_doorbells": queue[0][2]}
+    evidence.update({"scratch_virtio_requests_completed": expected,
+                     "scratch_virtio_doorbells": queue[0][2]})
+    return evidence
 
 
 def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
@@ -589,6 +654,7 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
         "frame_meta_production_statics": True,
         "frame_meta_registered_static_pages": words[130],
         **measured_rows,
+        **net_reset_proofs(lines),
         **media_rows,
         "recovery_accumulators": words[131],
         "degraded_events": words[132],
@@ -836,7 +902,7 @@ def build(staging: bool, modes: Modes = Modes()) -> Path:
     then the production kernel feature, exactly as verify_v0199_sec_n.build()."""
     import os
     import verify_v0199_sec_n
-    verify_v0199_sec_n.build_guest()
+    verify_v0199_sec_n.build_guest(isolated_signer=modes.authenticated_net)
     verify_smp.require((ROOT / GUEST_ELF).is_file(), "local-echo guest ELF missing after build")
     feature = modes.features(staging)
     kernel_env = dict(os.environ)

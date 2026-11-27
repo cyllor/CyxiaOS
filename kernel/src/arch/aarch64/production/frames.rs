@@ -39,9 +39,15 @@ use cyxia_kernel_core::security::Error as LedgerError;
 #[path = "frames/pool.rs"]
 mod pool;
 
-/// 16 MiB physical window, including the 12 MiB SEC-N guest frame pool.
-/// The 160 KiB of row backing fits within the FrameMeta reservation.
-const ROWS: usize = 4096;
+/// Base 16 MiB window, including the 12 MiB SEC-N verifier frame pool.
+/// The authenticated profile also pins a separate 95-page signer address
+/// space. Reserve 128 additional rows for it and surrounding linker gaps.
+/// The largest backing (165 KiB) fits within the FrameMeta reservation.
+const ROWS: usize = if cfg!(feature = "v020-production-authenticated-net") {
+    4096 + 128
+} else {
+    4096
+};
 const _: () = assert!(ROWS <= COUNT);
 const STATICS: usize = 12;
 /// Fatal code when production static registration fails.

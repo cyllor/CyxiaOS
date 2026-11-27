@@ -19,9 +19,9 @@
 //!   a=902/900/901); a remote peer can never halt the boot.
 //! * READ is length-aware (never dequeues more than the guest asked for); a
 //!   closed/reset/failed stream reaches the guest as EOF + disconnected POLL.
-//! * The authenticated test profile uses only the pinned VirtIO RNG for
-//!   the smoltcp seed and guest entropy. Its absence ends the relay setup.
-//!   The earlier transport probe retains its fixture entropy source.
+//! * The authenticated test profile seeds separate TCP-ISN and TLS DRBG
+//!   domains from the pinned VirtIO RNG. Missing or failed entropy closes
+//!   authentication. The transport-only probe has its own fixture source.
 //! * Word 140 counts the admission receipt issued by the guest and accepted by
 //!   the broker for this connection epoch and pinned peer IPv4.
 //! * Word 142 stays zero. The authenticated verifier observes Echo with its
@@ -47,6 +47,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use cyxia_arch_aarch64::timer;
 use cyxia_contracts::BootInfo;
 use cyxia_driver_virtio::net::BatchedNet;
+use cyxia_driver_virtio::reset::{RESET_PROOF_BYTES, ResetProof};
 use cyxia_net_transport::device::{self, Port, VirtioPort};
 use cyxia_net_transport::tcp::{self, BUFFER_SIZE, Config, State, Storage, Tcp};
 
@@ -184,7 +185,7 @@ enum AcceptFailure {
 }
 
 /// Bounded polling accept: Ok once the pinned peer is Established.
-fn accept(stream: &mut Stream<'_>) -> Result<u32, AcceptFailure> {
+fn accept(stream: &mut Stream<'_>) -> Result<(u32, u64), AcceptFailure> {
     for _ in 0..NET_POLL_TURNS {
         let now = sec_n_broker::now_ms();
         stream
@@ -197,7 +198,7 @@ fn accept(stream: &mut Stream<'_>) -> Result<u32, AcceptFailure> {
             Ok(State::Established) => {
                 return stream
                     .peer_ipv4()
-                    .map(u32::from_be_bytes)
+                    .map(|ip| (u32::from_be_bytes(ip), sec_n_broker::now_ns()))
                     .ok_or(AcceptFailure::Peer);
             }
             Ok(_) => pace(),
@@ -250,6 +251,7 @@ fn open_stream<'a>(
 fn relay(
     stream: &mut Stream<'_>,
     source: u32,
+    accepted_ns: u64,
     entropy: &mut sec_n_broker::EntropyFill<'_>,
 ) -> Result<u64, sec_n_broker::GuestStop> {
     let layout = sec_n_broker::load_guest();
@@ -260,16 +262,18 @@ fn relay(
         sec_n_broker::GUEST_ELF.len() as u64,
     );
     sec_n_broker::reset_guest_data(&layout);
-    sec_n_broker::stage_connection(sec_n_broker::LOCAL_NODE, true, 1, source);
+    sec_n_broker::stage_connection(sec_n_broker::LOCAL_NODE, true, 1, source, accepted_ns);
     let mut port = StreamPort { tcp: stream };
     #[cfg(feature = "v020-production-authenticated-net")]
     {
+        let mut signer = sec_n_broker::signer::Signer::load();
         sec_n_broker::run_guest(
             &layout,
             &mut port,
             entropy,
             GUEST_SVC_BUDGET,
             Some(StreamPort::poll_normal_close),
+            Some(&mut signer),
         )
     }
     #[cfg(not(feature = "v020-production-authenticated-net"))]
@@ -294,8 +298,47 @@ pub(super) fn serve(info: &BootInfo) -> NetOutcome {
             return NetOutcome::default();
         }
     };
+    let outcome = serve_attached_network(info, &mut dev);
+    // The stream and its polling port have been dropped. The exclusive
+    // device owner freezes both queues before attempting the MMIO reset.
+    match dev.stop(super::BOOT) {
+        Ok(proofs) => {
+            for proof in proofs {
+                emit_reset_proof(proof);
+            }
+        }
+        Err(error) => report("V020_SEC_D_NET_RESET_UNCONFIRMED", error as u64, 0, 0),
+    }
+    outcome
+}
+
+fn emit_reset_proof(proof: ResetProof) {
+    const PREFIX: &[u8] = b"V020_SEC_D_NET_RESET_PROOF ";
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = [0; PREFIX.len() + 2 * RESET_PROOF_BYTES + 1];
+    text[..PREFIX.len()].copy_from_slice(PREFIX);
+    for (slot, byte) in text[PREFIX.len()..].chunks_exact_mut(2).zip(proof.encode()) {
+        slot[0] = HEX[usize::from(byte >> 4)];
+        slot[1] = HEX[usize::from(byte & 0xf)];
+    }
+    text[PREFIX.len() + 2 * RESET_PROOF_BYTES] = b'\n';
+    // The console consumer reassembles bytes in sequence. CPU0 owns this
+    // writer, and each fragment fits the native payload limit.
+    for fragment in text.chunks(96) {
+        super::super::super::log(fragment);
+    }
+}
+
+fn serve_attached_network(
+    #[cfg_attr(
+        not(feature = "v020-production-authenticated-net"),
+        allow(unused_variables)
+    )]
+    info: &BootInfo,
+    dev: &mut NetDevice,
+) -> NetOutcome {
     #[cfg(feature = "v020-production-authenticated-net")]
-    let mut rng = match net_entropy::Entropy::attach(info) {
+    let mut rng = match net_entropy::Entropy::attach(info, super::BOOT) {
         Ok(rng) => rng,
         Err(error) => {
             report("V020_W12_NET_ENTROPY_UNAVAILABLE", error as u64, 0, 0);
@@ -305,19 +348,23 @@ pub(super) fn serve(info: &BootInfo) -> NetOutcome {
             };
         }
     };
-    #[cfg(feature = "v020-production-authenticated-net")]
-    let mut entropy = |out: &mut [u8]| rng.fill(out);
-    #[cfg(not(feature = "v020-production-authenticated-net"))]
-    let mut entropy = sec_n_broker::fixture_entropy;
     let mut seed = [0u8; TCP_SEED_BYTES];
-    if !entropy(&mut seed) {
+    #[cfg(feature = "v020-production-authenticated-net")]
+    let seeded = rng.fill_tcp_seed(&mut seed).is_ok();
+    #[cfg(not(feature = "v020-production-authenticated-net"))]
+    let seeded = sec_n_broker::fixture_entropy(&mut seed);
+    if !seeded {
         report("V020_W12_NET_ENTROPY_UNAVAILABLE", 0, 0, 0);
         return NetOutcome {
             device: true,
             ..NetOutcome::default()
         };
     }
-    let outcome = serve_stream(&mut dev, u64::from_le_bytes(seed) | 1, &mut entropy);
+    #[cfg(feature = "v020-production-authenticated-net")]
+    let mut entropy = |out: &mut [u8]| rng.fill(out);
+    #[cfg(not(feature = "v020-production-authenticated-net"))]
+    let mut entropy = sec_n_broker::fixture_entropy;
+    let outcome = serve_stream(dev, u64::from_le_bytes(seed) | 1, &mut entropy);
     #[cfg(feature = "v020-production-authenticated-net")]
     let outcome = {
         let rng_bytes = rng.supplied - TCP_SEED_BYTES as u64;
@@ -326,6 +373,12 @@ pub(super) fn serve(info: &BootInfo) -> NetOutcome {
             TCP_SEED_BYTES as u64,
             rng_bytes,
             u64::from(rng.failed),
+        );
+        report(
+            "V020_SEC_N_DRBG",
+            rng.key_epoch(),
+            rng.raw_samples(),
+            rng_bytes,
         );
         NetOutcome {
             rng_bytes,
@@ -340,8 +393,7 @@ fn serve_stream(
     random_seed: u64,
     entropy: &mut sec_n_broker::EntropyFill<'_>,
 ) -> NetOutcome {
-    // Dropping `dev` at return never releases the pinned DMA pools or resets
-    // the device (net_device.rs contract).
+    // The outer owner resets the stopped device after this port returns.
     let mut storage = [Storage::EMPTY];
     let Some(mut stream) = open_stream(dev, &mut storage, random_seed) else {
         report("V020_W11_NET_STREAM_ERROR", 0, 0, 0);
@@ -351,8 +403,8 @@ fn serve_stream(
         };
     };
     report("V020_W11_NET_LISTEN", u64::from(LISTEN_PORT), 0, 0);
-    let source = match accept(&mut stream) {
-        Ok(source) => source,
+    let (source, accepted_ns) = match accept(&mut stream) {
+        Ok(accepted) => accepted,
         Err(failure) => {
             stream.abort();
             report(
@@ -367,7 +419,7 @@ fn serve_stream(
             };
         }
     };
-    let (dispatched, stop_code) = match relay(&mut stream, source, entropy) {
+    let (dispatched, stop_code) = match relay(&mut stream, source, accepted_ns, entropy) {
         Ok(dispatched) => (dispatched, 0),
         Err(stop) => (stop.dispatched, stop.code),
     };

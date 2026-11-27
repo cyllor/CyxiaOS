@@ -231,6 +231,9 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
     if args[3] != LIST_SELECTOR {
         return Err(E_AUTH);
     }
+    if let Some(error) = media_staging::ordinary_file_refusal() {
+        return Err(error);
+    }
 
     let Some(grant) = &state.grant else {
         state.checks.unready |= request.request_id == 1;
@@ -270,12 +273,21 @@ fn serve_read(state: &mut State, selector: u64, wire: &[u8]) -> Result<(), i64> 
         }
         error.errno()
     })?;
+    if !request.selector_matches(selector) {
+        if state.mounted() {
+            state.read_checks.denials |= match (request.op, request.request_id, selector) {
+                (SNAP_OP_HISTORY_OPEN, 24, LIST_SELECTOR) => 1 << 2,
+                (SNAP_OP_QUERY, 25, HISTORY_SELECTOR) => 1 << 3,
+                _ => 0,
+            };
+        }
+        return Err(E_AUTH);
+    }
+    if let Some(error) = media_staging::ordinary_file_refusal() {
+        return Err(error);
+    }
     let Some(grant) = &state.grant else {
-        return Err(if request.selector_matches(selector) {
-            EAGAIN
-        } else {
-            E_AUTH
-        });
+        return Err(EAGAIN);
     };
     if !request.authorized(
         selector,
@@ -287,8 +299,6 @@ fn serve_read(state: &mut State, selector: u64, wire: &[u8]) -> Result<(), i64> 
             state.read_checks.denials |= match (request.op, request.request_id, selector) {
                 (SNAP_OP_QUERY, 22, LIST_SELECTOR) => 1 << 0,
                 (SNAP_OP_HISTORY_OPEN, 23, HISTORY_SELECTOR) => 1 << 1,
-                (SNAP_OP_HISTORY_OPEN, 24, LIST_SELECTOR) => 1 << 2,
-                (SNAP_OP_QUERY, 25, HISTORY_SELECTOR) => 1 << 3,
                 _ => 0,
             };
         }

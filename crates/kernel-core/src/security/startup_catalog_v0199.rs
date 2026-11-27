@@ -9,11 +9,13 @@ use super::{
 use crate::control_plane::rule_profile_v2::Profile;
 use sha2::{Digest, Sha256};
 
+mod profile;
+
 pub struct PinnedStartupCatalog<'a> {
     pub boot_public_key: &'a [u8; 32],
     pub offline_config: &'a [u8],
     pub rules: &'a [u8],
-    pub security_profile: &'a [u8; 256],
+    pub security_profile: &'a [u8; profile::BYTES],
     pub key_manifest: &'a [u8],
     pub key_generation: u64,
 }
@@ -26,18 +28,9 @@ impl PinnedStartupCatalog<'_> {
         let rules = Profile::parse(self.rules).map_err(|_| Error::Invalid)?;
         let rule_hash: [u8; 32] = Sha256::digest(rules.canonical_bytes()).into();
         let security = self.security_profile;
-        let security_generation = u64::from_le_bytes(security[8..16].try_into().unwrap());
-        if security[..8] != [0x50, 0x53, 0x59, 0x43, 3, 0, 0, 1]
-            || security_generation == 0
-            || u64::from_le_bytes(security[48..56].try_into().unwrap()) != 0xf
-            || security[221..].iter().any(|&byte| byte != 0)
-            || self.key_generation == 0
-            || self.key_manifest.is_empty()
-        {
+        let security_generation = profile::generation(security, &rule_hash)?;
+        if self.key_generation == 0 || self.key_manifest.is_empty() {
             return Err(Error::Invalid);
-        }
-        if security[16..48] != rule_hash {
-            return Err(Error::Conflict);
         }
         AuthenticatedEnvelope::verify(
             self.offline_config,
@@ -73,12 +66,8 @@ mod tests {
             1, 0, 0, 0, 1, 0, 1, 0, 17, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 48, 0, 0, 0,
             0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 4, 0, 1, 0, 0, 0, 0, 0,
         ]);
-        let mut security = [0; 256];
-        security[..8].copy_from_slice(&[0x50, 0x53, 0x59, 0x43, 3, 0, 0, 1]);
-        security[8] = 9;
         let rule_hash: [u8; 32] = Sha256::digest(rules).into();
-        security[16..48].copy_from_slice(&rule_hash);
-        security[48] = 0xf;
+        let security = profile::fixture(9, rule_hash);
         let keys = b"test-only key manifest bytes";
         let security_hash: [u8; 32] = Sha256::digest(security).into();
         let key_manifest_hash: [u8; 32] = Sha256::digest(keys).into();
@@ -117,6 +106,22 @@ mod tests {
         };
         let mut scratch = [0; 1024];
         assert_eq!(catalog.authenticate(&mut scratch), Ok(()));
+
+        let mut widened = security;
+        widened[118..120].copy_from_slice(&4000u16.to_le_bytes());
+        let mut signed_widened = wire;
+        signed_widened[96..128].copy_from_slice(&Sha256::digest(widened));
+        let signed = [SIGNATURE_LABEL, &signed_widened[..513]].concat();
+        signed_widened[513..].copy_from_slice(&signer.sign(&signed).to_bytes());
+        let invalid_profile = PinnedStartupCatalog {
+            security_profile: &widened,
+            offline_config: &signed_widened,
+            ..catalog
+        };
+        assert_eq!(
+            invalid_profile.authenticate(&mut scratch),
+            Err(Error::Invalid)
+        );
         let invalid_key_manifest = PinnedStartupCatalog {
             key_manifest: b"other",
             ..catalog

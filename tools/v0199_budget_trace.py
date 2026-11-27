@@ -184,3 +184,50 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, 
         result.update(early_boot_coordination_intervals=boot_intervals,
                       early_boot_coordination_cpu_ns=boot_cpu_ns)
     return result
+
+
+def verify_sustained(raw, windows):
+    """Cross-check the workload markers against the already replayed trace."""
+    _, _, count, _, _, _ = HEADER.unpack_from(raw)
+    trace = list(ROW.iter_unpack(raw[HEADER.size:HEADER.size + count * ROW.size]))
+    require(len(windows) == 8, "wrong sustained window count")
+    first_window = windows[0][0]
+    previous_end = 0
+    totals = [0] * len(ROLE_LIMITS)
+    work_cpu_ns = []
+    role_calls = []
+    all_roles = (1 << len(ROLE_LIMITS)) - 1
+    decision_roles = sum(1 << i for i, (category, _, _) in enumerate(ROLE_GRANTS) if category == 2)
+    per_window = all_roles ^ decision_roles
+    serviced_in_run = 0
+    for index, (window, begin, end, serviced, refused, security_reads) in enumerate(windows):
+        require(window == first_window + index and max(1, previous_end) <= begin < end < count,
+                "nonconsecutive or overlapping sustained accounting windows")
+        preceding = trace[begin - 1]
+        preceding_wall = preceding[0]
+        grants = [0] * len(ROLE_LIMITS)
+        require(serviced & per_window == per_window and serviced & ~all_roles == 0
+                and (refused, security_reads) == (3, 4),
+                "incomplete sustained syscall or slot refusal evidence")
+        serviced_in_run |= serviced
+        role_calls.append(serviced)
+        for row in trace[begin:end]:
+            end_wall, _, _, _, scope, _ = row
+            require(preceding_wall // WINDOW == (end_wall - 1) // WINDOW == window,
+                    "sustained work fell outside its aligned window")
+            if scope:
+                actor = (scope >> 8) & 0xff
+                require(1 <= actor <= len(grants) and scope >> 32 == 2,
+                        "unexpected kernel or stale role grant during sustained work")
+                grants[actor - 1] += 1
+            preceding_wall = end_wall
+        require(grants[:2] == [1, 4] and all(grants), "missing sustained role grant")
+        work_cpu_ns.append(trace[end - 1][1] - preceding[1])
+        totals = [total + actual for total, actual in zip(totals, grants)]
+        previous_end = end
+    require(serviced_in_run == all_roles, "missing sustained decision or publisher syscall")
+    require(trace[-1][0] >= (first_window + len(windows)) * WINDOW,
+            "sustained trace ends before the final window closes")
+    return {"sustained_windows": len(windows), "sustained_role_grants": totals,
+            "sustained_slot_refusals": 2 * len(windows), "sustained_work_cpu_ns": work_cpu_ns,
+            "sustained_role_calls_mask_by_window": role_calls}

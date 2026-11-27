@@ -20,6 +20,7 @@ NAMES={v:k for k,v in CLASSES.items()}
 STATUS={0:"NOT_RUN",1:"PASS",2:"FAIL"}
 REASONS={0:{1,2,7,8,9},1:{0},2:{3,4,5,6}}
 INVENTORY=Path(__file__).resolve().parent/"v0199-required-proof-inventory.json"
+VERDICT_GATES = {"g4": "G4_QEMU", "g5": "G5_ARCH"}
 
 # Verdict v4 identity allocation and the ranges in baseline 安§7.4.
 _CASE_RANGES = (
@@ -121,7 +122,7 @@ def parse(raw):
 FIELDS=("checker_id","checker_version","boot_epoch","controller_epoch","security_epoch",
         "object_or_stream_generation","seed","fault_point_id","design_hash","binary_hash",
         "security_profile_hash","input_hash","rule_hash")
-def aggregate(manifest_raw,locked_digest,root):
+def aggregate(manifest_raw, locked_digest, root, *, a53_lock=None):
     require(digest(manifest_raw)==hash_value(locked_digest),"run manifest not the locked input")
     j=strict_json(manifest_raw)
     g4,g5,ids,inv_hash=inventory()
@@ -177,6 +178,12 @@ def aggregate(manifest_raw,locked_digest,root):
             v=parse(raw)
             require((v["run_id"],v["test_id"],v["proof_class"])==(run,*key),"wrong run/proof key")
             require(all(v[k]==item[k] for k in FIELDS),"frozen input mismatch")
+            physical = key[1] == CLASSES["ARCH_A53"] and v["status"] != "NOT_RUN"
+            if physical:
+                require(a53_lock is not None, "ARCH_A53 needs a validated platform lock")
+                require(hash_value(item.get("platform_lock_sha256")) == a53_lock["manifest_sha256"]
+                        and v["binary_hash"] == a53_lock["boot_image_sha256"],
+                        "ARCH_A53 platform or kernel differs from the frozen input")
             if v["evidence_count"]:
                 require(v["evidence_count"] == item.get("evidence_count"),
                         "evidence count differs from frozen input")
@@ -186,7 +193,16 @@ def aggregate(manifest_raw,locked_digest,root):
                 # SHA256/size is then independently read from the archive.
                 m=safe_file(root,f'evidence/{stem}.json').read_bytes()
                 require(digest(m)==v["evidence_digest"],"evidence manifest digest mismatch")
-                members=strict_json(m)["files"]
+                evidence = strict_json(m)
+                require(isinstance(evidence, dict), "invalid evidence manifest")
+                if physical:
+                    require(type(evidence.get("run_id")) is int and type(evidence.get("test_id")) is int
+                            and (evidence["run_id"], evidence["test_id"], evidence.get("proof_class"))
+                            == (run, key[0], "ARCH_A53")
+                            and evidence.get("platform_lock_sha256") == a53_lock["manifest_sha256"]
+                            and evidence.get("raw_capture_sha256") == a53_lock["raw_capture_sha256"],
+                            "ARCH_A53 evidence does not bind the run and physical capture")
+                members=evidence["files"]
                 require(isinstance(members,list) and len(members)==v["evidence_count"],"evidence count mismatch")
                 identities=set()
                 previous_path = b""
@@ -208,24 +224,54 @@ def aggregate(manifest_raw,locked_digest,root):
             # A malformed archive is an integration blocker. Do not invent
             # a checker Verdict v4 FAIL, or override reliable prior verdicts.
             rows[key]={**base,"status":"INVALID_EVIDENCE","reason":str(exc)}
+    statuses = ("PASS", "FAIL", "NOT_RUN", "INVALID_EVIDENCE")
+
+    def count(keys):
+        counts = dict.fromkeys(statuses, 0)
+        for key in keys:
+            counts[rows[key]["status"]] += 1
+        return counts
+
     def summary(keys):
-        counts={s:sum(rows[k]["status"]==s for k in keys) for s in ("PASS","FAIL","NOT_RUN","INVALID_EVIDENCE")}
+        counts = count(keys)
         status="FAIL" if counts["FAIL"] else "BLOCKED_INVALID_EVIDENCE" if counts["INVALID_EVIDENCE"] else "NOT_RUN" if counts["NOT_RUN"] else "PASS"
+        by_class = {NAMES[proof]: count(key for key in keys if key[1] == proof)
+                    for proof in sorted({key[1] for key in keys})}
         return dict(status=status,required=len(keys),counts=counts,
-                    complete_ids=sum(all(rows[k]["status"]=="PASS" for k in keys if k[0]==i) for i in ids))
+                    complete_ids=sum(all(rows[k]["status"]=="PASS" for k in keys if k[0]==i)
+                                     for i in {key[0] for key in keys}), by_class=by_class)
     return dict(schema="cyxia-verdict-aggregation/v1",run_id=run,manifest_sha256=locked_digest,
-                scope="archive integrity and proof coverage only; checker semantics and trusted origin external",
-                G4_QEMU=summary(g4),G5_ARCH=summary(g5),proofs=list(rows.values()))
+                scope="archive integrity and proof coverage; release prerequisites and checker authority are external",
+                a53_platform_lock_sha256=None if a53_lock is None else a53_lock["manifest_sha256"],
+                G4_QEMU=summary(g4),G5_ARCH=summary(g5),ARCH_A53=summary(g5 - g4),proofs=list(rows.values()))
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--manifest",type=Path,required=True)
     p.add_argument("--manifest-sha256",required=True)
     p.add_argument("--evidence-root",type=Path,required=True)
     p.add_argument("--output",type=Path,required=True)
+    p.add_argument("--scope", choices=VERDICT_GATES, default="g4",
+                   help="choose g4 (default) for V0.20 QEMU acceptance or g5 for physical-board acceptance")
+    p.add_argument("--a53-manifest", type=Path, help="operator-locked physical platform manifest")
+    p.add_argument("--a53-manifest-sha256")
+    p.add_argument("--a53-evidence-root", type=Path)
     a=p.parse_args()
-    result=aggregate(a.manifest.read_bytes(),a.manifest_sha256,a.evidence_root.resolve(strict=True))
+    physical_inputs = (a.a53_manifest, a.a53_manifest_sha256, a.a53_evidence_root)
+    if any(physical_inputs) and not all(physical_inputs):
+        p.error("physical platform verification requires all three --a53-* arguments")
+    a53_lock = None
+    if all(physical_inputs):
+        if __package__:
+            from .verify_v0199_a53_handoff import load_handoff
+        else:
+            from verify_v0199_a53_handoff import load_handoff
+        a53_lock = load_handoff(a.a53_manifest, a.a53_manifest_sha256, a.a53_evidence_root)
+    result=aggregate(a.manifest.read_bytes(),a.manifest_sha256,a.evidence_root.resolve(strict=True),
+                     a53_lock=a53_lock)
+    required_gate = VERDICT_GATES[a.scope]
+    result["required_gate"] = required_gate
     with a.output.open("x",encoding="utf-8") as f:json.dump(result,f,ensure_ascii=False,indent=2);f.write("\n")
-    print(json.dumps({k:result[k] for k in ("run_id","G4_QEMU","G5_ARCH")},indent=2))
-    return 0 if result["G4_QEMU"]["status"]==result["G5_ARCH"]["status"]=="PASS" else 1
+    print(json.dumps({k:result[k] for k in ("run_id","required_gate","G4_QEMU","G5_ARCH","ARCH_A53")},indent=2))
+    return int(result[required_gate]["status"] != "PASS")
 if __name__=="__main__":
     raise SystemExit(main())

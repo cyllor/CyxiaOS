@@ -1,8 +1,9 @@
 """Independent checker regressions for measured diagnostic CPU0 evidence."""
 
+import struct
 import unittest
 
-from v0199_budget_trace import HEADER, MAGIC, ROW, TRACE_BYTES, WINDOW, verify_trace
+from v0199_budget_trace import HEADER, MAGIC, ROW, TRACE_BYTES, WINDOW, verify_sustained, verify_trace
 
 
 class BudgetTraceTests(unittest.TestCase):
@@ -94,6 +95,39 @@ class BudgetTraceTests(unittest.TestCase):
         self.rows[-1] = (end, tick, 8_000_000, deadline, scope, lower)
         with self.assertRaisesRegex(ValueError, "incorrect EL1 prepayment"):
             verify_trace(self.evidence(), self.summary)
+
+    def test_sustained_window_claim_requires_all_native_role_admissions(self):
+        raw = bytearray(TRACE_BYTES)
+        trace = []
+        windows = []
+        tick = 10_000
+        for window in range(2, 10):
+            start = window * WINDOW + 32
+            trace.append((start, tick, 0, 0, 0, start - 16))
+            begin = len(trace)
+            for actor in (1, 2, 2, 2, 2, 3, 4, 5, 6, 7, 8):
+                start += 1_000
+                tick += 100
+                trace.append((start, tick, 0, 0, (2 << 32) | (actor << 8) | 4, start - 16))
+            serviced = 255 ^ (1 << (2 + window % 2))
+            windows.append((window, begin, len(trace), serviced, 3, 4))
+        trace.append((10 * WINDOW + 32, tick, 0, 0, 0, 10 * WINDOW + 16))
+        HEADER.pack_into(raw, 0, MAGIC, 4, len(trace), WINDOW + 32, 10_000, WINDOW + 16)
+        for index, row in enumerate(trace):
+            ROW.pack_into(raw, HEADER.size + index * ROW.size, *row)
+        result = verify_sustained(raw, windows)
+        self.assertEqual(result["sustained_windows"], 8)
+        self.assertEqual(result["sustained_slot_refusals"], 16)
+        self.assertEqual(result["sustained_role_grants"], [8, 32, 8, 8, 8, 8, 8, 8])
+        self.assertEqual(result["sustained_role_calls_mask_by_window"], [251, 247] * 4)
+        missing_publisher = [(window, begin, end, mask & ~(1 << 3), refused, reads)
+                             for window, begin, end, mask, refused, reads in windows]
+        with self.assertRaisesRegex(ValueError, "missing sustained decision or publisher syscall"):
+            verify_sustained(raw, missing_publisher)
+        last = windows[0][2] - 1
+        struct.pack_into("<Q", raw, HEADER.size + last * ROW.size + 32, (2 << 32) | (7 << 8) | 4)
+        with self.assertRaisesRegex(ValueError, "missing sustained role grant"):
+            verify_sustained(raw, windows)
 
 
 if __name__ == "__main__":

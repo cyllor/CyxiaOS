@@ -1,13 +1,23 @@
 //! Logical slot identity installed by trusted bootstrap, not truncated MPIDR.
 use core::arch::asm;
+use core::sync::atomic::AtomicU64;
+
+// Written by the stackless exception failure path and read before dispatch
+// and EL0 entry or return. A closed latch is not a remote CPU stop ACK.
+#[used]
+#[unsafe(no_mangle)]
+static EXCEPTION_ADMISSION_CLOSED: AtomicU64 = AtomicU64::new(0);
+
 pub const MAX_CPUS: usize = cyxia_contracts::BOOT_CPUS;
-pub fn slot() -> usize {
+pub fn registered_slot() -> Option<usize> {
     let value: u64;
     unsafe {
         asm!("mrs {}, tpidr_el1", out(reg) value, options(nomem, nostack, preserves_flags));
     }
-    assert!(value < MAX_CPUS as u64, "unregistered CPU slot");
-    value as usize
+    (value < MAX_CPUS as u64).then_some(value as usize)
+}
+pub fn slot() -> usize {
+    registered_slot().expect("unregistered CPU slot")
 }
 pub fn affinity() -> u64 {
     let value: u64;

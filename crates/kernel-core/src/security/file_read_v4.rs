@@ -10,9 +10,11 @@ use super::{
     Error,
     file::GROUP_VOLATILE_SLOTS,
     file_format_v1::{
-        SCRATCH_FILE_DATA, SCRATCH_FILE_GENERATION, SCRATCH_FILE_INODE, SCRATCH_FILE_NAME,
-        SCRATCH_FILE_OWNER_RIGHTS, SCRATCH_FILE_WRITE_RIGHTS, SCRATCH_WRITABLE_FILE_OWNER_RIGHTS,
+        SCRATCH_FILE_DATA, SCRATCH_FILE_FSYNC_RIGHTS, SCRATCH_FILE_GENERATION, SCRATCH_FILE_INODE,
+        SCRATCH_FILE_NAME, SCRATCH_FILE_OWNER_RIGHTS, SCRATCH_FILE_WRITE_RIGHTS,
+        SCRATCH_FSYNC_FILE_OWNER_RIGHTS, SCRATCH_WRITABLE_FILE_OWNER_RIGHTS,
     },
+    file_index_v0199::BLOCK_BYTES,
     file_media_v0199::crc32c_zeroed,
     file_service_v4::{REPLY_HEADER, REPLY_MAGIC, REPLY_VERSION, REQUEST_HEADER, Request},
     offline_config_v1::Principal,
@@ -77,7 +79,9 @@ impl StagedFile {
             || owner.generation == 0
             || !matches!(
                 owner_rights,
-                SCRATCH_FILE_OWNER_RIGHTS | SCRATCH_WRITABLE_FILE_OWNER_RIGHTS
+                SCRATCH_FILE_OWNER_RIGHTS
+                    | SCRATCH_WRITABLE_FILE_OWNER_RIGHTS
+                    | SCRATCH_FSYNC_FILE_OWNER_RIGHTS
             )
             || u32::from_le_bytes(field(&dirent, 0)) != SCRATCH_FILE_INODE
             || usize::from(u16::from_le_bytes(field(&dirent, 4))) != SCRATCH_FILE_NAME.len()
@@ -240,6 +244,30 @@ impl FileReadService {
     /// Return the latest committed volatile write sequence for this boot.
     pub const fn write_sequence(&self) -> u64 {
         self.write_seq
+    }
+
+    /// Copy the complete current write version for the mounted native owner.
+    /// The caller serializes the freeze with later mutations and runs the
+    /// durable transaction separately. A rejected freeze leaves dst intact.
+    pub fn freeze_fsync(
+        &self,
+        selector: u64,
+        through_write_seq: u64,
+        dst: &mut [u8; BLOCK_BYTES],
+    ) -> Result<(), ReadError> {
+        self.check_fsync(selector, through_write_seq)?;
+        dst.fill(0);
+        dst[..self.file.data.len()].copy_from_slice(&self.file.data);
+        Ok(())
+    }
+
+    /// Read-only preflight before the native owner queues a durable job.
+    pub fn check_fsync(&self, selector: u64, through_write_seq: u64) -> Result<(), ReadError> {
+        self.live_child_slot(selector, SCRATCH_FILE_FSYNC_RIGHTS)?;
+        if through_write_seq == 0 || through_write_seq != self.write_seq {
+            return Err(ReadError::Stale);
+        }
+        Ok(())
     }
 
     pub fn serve(
@@ -554,6 +582,51 @@ mod tests {
             SCRATCH_WRITABLE_FILE_OWNER_RIGHTS,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn fsync_freeze_requires_live_handle_and_the_current_write_sequence() {
+        let file = StagedFile::new_with_owner_rights(
+            EPOCH,
+            OWNER,
+            fixture_dirent(),
+            *SCRATCH_FILE_DATA,
+            SCRATCH_FSYNC_FILE_OWNER_RIGHTS,
+        )
+        .unwrap();
+        let mut service = FileReadService::with_multiple_handles(file);
+        let mut wire = [0; MAX_REPLY];
+        let writable = open(1, SCRATCH_FILE_NAME, SCRATCH_FILE_WRITE_RIGHTS);
+        service.serve(ROOT_SELECTOR, &writable, &mut wire).unwrap();
+        let writer = Reply::decode(&wire[..REPLY_HEADER])
+            .unwrap()
+            .new_cap_selector;
+        let durable = open(2, SCRATCH_FILE_NAME, SCRATCH_FSYNC_FILE_OWNER_RIGHTS);
+        service.serve(ROOT_SELECTOR, &durable, &mut wire).unwrap();
+        let handle = Reply::decode(&wire[..REPLY_HEADER])
+            .unwrap()
+            .new_cap_selector;
+        service
+            .serve(writer, &write(3, 0, b"new"), &mut wire)
+            .unwrap();
+        let mut frozen = [0xa5; 4096];
+        assert_eq!(
+            service.freeze_fsync(writer, 1, &mut frozen),
+            Err(ReadError::Unauthorized)
+        );
+        assert_eq!(
+            service.freeze_fsync(handle, 2, &mut frozen),
+            Err(ReadError::Stale)
+        );
+        assert!(frozen.iter().all(|byte| *byte == 0xa5));
+        service.freeze_fsync(handle, 1, &mut frozen).unwrap();
+        assert_eq!(&frozen[..3], b"new");
+        assert_eq!(&frozen[3..SCRATCH_FILE_DATA.len()], &SCRATCH_FILE_DATA[3..]);
+        assert!(
+            frozen[SCRATCH_FILE_DATA.len()..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
     }
 
     fn request(op: u16, id: u64, payload: &[u8]) -> Vec<u8> {

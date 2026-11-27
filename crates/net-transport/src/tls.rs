@@ -20,6 +20,7 @@ use rustls::{
         ParsedCertificate, UnbufferedServerConnection,
         danger::{ClientCertVerified, ClientCertVerifier},
     },
+    sign::{CertifiedKey, SigningKey, SingleCertAndKey},
     time_provider::TimeProvider,
     unbuffered::{ConnectionState, UnbufferedStatus},
 };
@@ -281,31 +282,15 @@ impl Pairing {
         key: PrivateKeyDer<'static>,
         peer: [u8; 32],
         time: Arc<dyn TimeProvider>,
-        mut provider: CryptoProvider,
+        provider: CryptoProvider,
         application: ApplicationProtocol,
     ) -> Result<Self, Error> {
-        if time.current_time().is_none() {
-            return Err(Error::Time);
-        }
-        let local = node_id(&certificate)?;
-        if local == peer || peer == [0; 32] {
-            return Err(Error::Identity);
-        }
-        provider.cipher_suites = vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
-        provider.kx_groups = vec![rustls::crypto::ring::kx_group::X25519];
-        let mut probe = [0; 32];
-        let entropy = provider.secure_random.fill(&mut probe);
-        probe.fill(0);
-        entropy.map_err(|_| Error::Entropy)?;
-        let provider = Arc::new(provider);
+        let (provider, local) = pinned_provider(&certificate, peer, &*time, provider)?;
         // Unlike from_der's permissive Unknown case, require demonstrable
         // equality of the provisioned Ed25519 certificate and private key.
-        let certified = rustls::sign::CertifiedKey::from_der(
-            vec![certificate.clone()],
-            key.clone_key(),
-            &provider,
-        )
-        .map_err(Error::Protocol)?;
+        let certified =
+            CertifiedKey::from_der(vec![certificate.clone()], key.clone_key(), &provider)
+                .map_err(Error::Protocol)?;
         certified.keys_match().map_err(Error::Protocol)?;
         let pin = Arc::new(Pin {
             node: peer,
@@ -323,23 +308,13 @@ impl Pairing {
         client.enable_sni = false;
         client.max_fragment_size = Some(4096);
         client.alpn_protocols = vec![application.alpn().to_vec()];
-        let mut server = ServerConfig::builder_with_details(provider, time.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(Error::Protocol)?
-            .with_client_cert_verifier(pin)
-            .with_single_cert(vec![certificate], key)
-            .map_err(Error::Protocol)?;
-        server.send_tls13_tickets = 0;
-        server.max_early_data_size = 0;
-        server.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-        server.max_fragment_size = Some(4096);
-        server.alpn_protocols = vec![application.alpn().to_vec()];
+        let server = pinned_server(provider, time.clone(), pin, application, certified)?;
         Ok(Self {
             local,
             peer,
             application,
             client: Arc::new(client),
-            server: Arc::new(server),
+            server,
             time,
         })
     }
@@ -379,6 +354,103 @@ impl Pairing {
     }
     pub fn local_node(&self) -> [u8; 32] {
         self.local
+    }
+}
+
+fn pinned_provider(
+    certificate: &CertificateDer<'_>,
+    peer: [u8; 32],
+    time: &dyn TimeProvider,
+    mut provider: CryptoProvider,
+) -> Result<(Arc<CryptoProvider>, [u8; 32]), Error> {
+    if time.current_time().is_none() {
+        return Err(Error::Time);
+    }
+    let local = node_id(certificate)?;
+    if local == peer || peer == [0; 32] {
+        return Err(Error::Identity);
+    }
+    provider.cipher_suites = vec![rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256];
+    provider.kx_groups = vec![rustls::crypto::ring::kx_group::X25519];
+    let mut probe = [0; 32];
+    let entropy = provider.secure_random.fill(&mut probe);
+    probe.fill(0);
+    entropy.map_err(|_| Error::Entropy)?;
+    Ok((Arc::new(provider), local))
+}
+
+fn pinned_server(
+    provider: Arc<CryptoProvider>,
+    time: Arc<dyn TimeProvider>,
+    pin: Arc<Pin>,
+    application: ApplicationProtocol,
+    certified: CertifiedKey,
+) -> Result<Arc<ServerConfig>, Error> {
+    let mut server = ServerConfig::builder_with_details(provider, time)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(Error::Protocol)?
+        .with_client_cert_verifier(pin)
+        .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified)));
+    server.send_tls13_tickets = 0;
+    server.max_early_data_size = 0;
+    server.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    server.max_fragment_size = Some(4096);
+    server.alpn_protocols = vec![application.alpn().to_vec()];
+    Ok(Arc::new(server))
+}
+
+/// Passive local Echo TLS verifier with a separate certificate signing owner.
+/// It owns the transcript, record keys and peer verification. Its provider
+/// only supplies CertificateVerify signatures for the server handshake.
+pub struct LocalEchoVerifier {
+    peer: [u8; 32],
+    server: Arc<ServerConfig>,
+    time: Arc<dyn TimeProvider>,
+}
+
+impl LocalEchoVerifier {
+    pub fn new(
+        certificate: CertificateDer<'static>,
+        signer: Arc<dyn SigningKey>,
+        peer: [u8; 32],
+        time: Arc<dyn TimeProvider>,
+    ) -> Result<Self, Error> {
+        let (provider, local) = pinned_provider(
+            &certificate,
+            peer,
+            &*time,
+            rustls::crypto::ring::default_provider(),
+        )?;
+        if local <= peer {
+            return Err(Error::Direction);
+        }
+        let certified = CertifiedKey::new(vec![certificate], signer);
+        certified.keys_match().map_err(Error::Protocol)?;
+        let pin = Arc::new(Pin {
+            node: peer,
+            provider: provider.clone(),
+        });
+        let server = pinned_server(
+            provider,
+            time.clone(),
+            pin,
+            ApplicationProtocol::LocalEcho,
+            certified,
+        )?;
+        Ok(Self { peer, server, time })
+    }
+
+    pub fn server<'a>(&self, buffers: &'a mut Buffers, now_ms: u64) -> Result<Session<'a>, Error> {
+        let connection =
+            UnbufferedServerConnection::new(self.server.clone()).map_err(Error::Protocol)?;
+        Session::new(
+            Connection::Server(connection),
+            buffers,
+            self.peer,
+            self.time.clone(),
+            ApplicationProtocol::LocalEcho,
+            now_ms,
+        )
     }
 }
 

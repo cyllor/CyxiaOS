@@ -46,9 +46,12 @@ secondary_halt:
 .section .text.secondary_high,"ax"
 secondary_high:
  ldr x0, =SMP_STACK_TOPS
- ldr x1, [x0, x19, lsl #3]
- cbz x1, secondary_high_halt
- mov sp, x1
+ ldr x2, [x0, x19, lsl #3]
+ cbz x2, secondary_high_halt
+ mov sp, x2
+ mov x0, x19
+ sub x1, x2, #{exec_stack_pages}, lsl #12
+ bl exception_register_stack
  ldr x0, =exception_vectors
  msr vbar_el1, x0
  isb

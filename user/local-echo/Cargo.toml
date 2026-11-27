@@ -7,11 +7,14 @@ build = "build.rs"
 [features]
 default = []
 guest = []
+guest-signer = ["guest", "dep:ring"]
 
 [dependencies]
+cyxia-contracts = { path = "../../crates/contracts" }
 cyxia-net-transport = { path = "../../crates/net-transport", features = ["tls"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring"] }
 getrandom = { version = "=0.2.17", default-features = false, features = ["custom"] }
+ring = { version = "=0.17.14", default-features = false, optional = true }
 
 [dev-dependencies]
 # Test-only comparison with the kernel's historical shared-page ABI.
@@ -24,3 +27,10 @@ path = "src/main.rs"
 test = false
 bench = false
 required-features = ["guest"]
+
+[[bin]]
+name = "cyxia-echo-signer"
+path = "src/signer.rs"
+test = false
+bench = false
+required-features = ["guest-signer"]

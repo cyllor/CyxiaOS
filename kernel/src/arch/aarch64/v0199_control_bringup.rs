@@ -1185,6 +1185,127 @@ fn turn(
     assert!(!budget.ledger.ordinary_closed());
     parked
 }
+
+/// Exercise all available diagnostic role calls in consecutive aligned
+/// windows. The two advisor roles use the existing D01 and D12 sources.
+#[cfg(feature = "v0199-control-load-selftest")]
+fn exercise_sustained(
+    order: [usize; ROLE_COUNT],
+    manifest: &ValidatedRoleManifest<'_>,
+    roles: &mut [Running; ROLE_COUNT],
+    budget: &mut BudgetMeter,
+) {
+    const WINDOW_COUNT: usize = 8;
+    const EVIDENCE_MAGIC: u64 = 0x4359_584c_4f41_4431;
+    let evidence = &SMP_EVIDENCE.words[72..128];
+    let (header, rows) = evidence.split_at(8);
+    let business = || -> [u64; 3] {
+        core::array::from_fn(|index| PROGRESS[(index + 1) * 2].load(Ordering::Acquire))
+    };
+    let wait_until = |budget: &mut BudgetMeter, deadline| {
+        while now_ns() < deadline {
+            budget.idle_until(deadline);
+        }
+    };
+    let first_window = now_ns() / WINDOW_NS + 1;
+    wait_until(budget, first_window * WINDOW_NS);
+    let before_business = business();
+    let mut serviced_in_run = 0;
+    for (index, row) in rows.chunks_exact(6).enumerate() {
+        let window = first_window + index as u64;
+        let (wall, _) = budget.sample_gap();
+        if wall / WINDOW_NS != window {
+            report("V0199_SUSTAINED_FAIL_WINDOW", window, wall, 0);
+            fatal(693);
+        }
+        let first_interval = budget.trace.intervals();
+        let mut serviced = 0u64;
+        let mut security_reads = 0;
+        for role_index in order {
+            let role = &mut roles[role_index];
+            let first_call = role.role_calls;
+            let decision = class(manifest.manifest().members[role_index].role).0 == Class::Decision;
+            let wanted = if role_index == 1 { 4 } else { 1 };
+            // Give both decision roles one prepaid turn per window. They
+            // share 0.5ms and may finish a multi-SVC step in later windows.
+            for _ in 0..if decision { 1 } else { 8 } {
+                if role.role_calls - first_call >= wanted {
+                    break;
+                }
+                wait_until(budget, role.wake_ns);
+                if now_ns() / WINDOW_NS != window {
+                    report("V0199_SUSTAINED_FAIL_WINDOW", window, now_ns(), role_index as u64 + 1);
+                    fatal(693);
+                }
+                let before_turns = role.turns;
+                turn(role_index, manifest, role, budget, false);
+                if role.turns == before_turns {
+                    report("V0199_SUSTAINED_FAIL_GRANT", window, role_index as u64,
+                           role.role_calls - first_call);
+                    fatal(693);
+                }
+            }
+            let calls = role.role_calls - first_call;
+            if calls == wanted {
+                serviced |= 1 << role_index;
+            } else if !decision || calls != 0 {
+                report("V0199_SUSTAINED_FAIL_SYSCALL", window, role_index as u64,
+                       calls);
+                fatal(693);
+            }
+            if role_index == 1 {
+                security_reads = calls;
+            }
+        }
+        serviced_in_run |= serviced;
+        let mut refused = 0u64;
+        for index in [0, 1] {
+            // Both real advisors remain eligible to run. The first has
+            // consumed its D01 slot and the second its four review slots.
+            let (now, _) = budget.sample_gap();
+            assert_eq!(now / WINDOW_NS, window);
+            assert!(roles[index].wake_ns <= now);
+            let member = manifest.manifest().members[index];
+            let (class, domain, quota) = class(member.role);
+            assert_eq!(
+                budget.ledger.reserve_indexed_role_with_wall(
+                    manifest, index, member.actor, cpu::slot(), class, domain, quota, 50_000_000,
+                    now,
+                ),
+                Err(Error::Exhausted),
+            );
+            refused |= 1 << index;
+        }
+        for (cell, value) in row.iter().zip([
+            window,
+            first_interval as u64,
+            budget.trace.intervals() as u64,
+            serviced,
+            refused,
+            security_reads,
+        ]) {
+            cell.store(value, Ordering::Relaxed);
+        }
+        wait_until(budget, (window + 1) * WINDOW_NS);
+    }
+    assert_eq!(serviced_in_run, (1 << ROLE_COUNT) - 1);
+    let after_business = business();
+    for index in 0..3 {
+        assert!(after_business[index] > before_business[index]);
+        header[2 + index].store(before_business[index], Ordering::Relaxed);
+        header[5 + index].store(after_business[index], Ordering::Relaxed);
+    }
+    header[0].store(EVIDENCE_MAGIC, Ordering::Relaxed);
+    header[1].store(WINDOW_COUNT as u64, Ordering::Relaxed);
+    budget.coordinated(|| {
+        report(
+            "V0199_BOOTSTRAP_SUSTAINED",
+            WINDOW_COUNT as u64,
+            first_window,
+            first_window + WINDOW_COUNT as u64 - 1,
+        );
+    });
+}
 /// Quiescent CPU0 owner only. First revoke the selected context and all
 /// its old low mappings. Only after the architectural TLBI completion can
 /// the old image be made writable again. These static frames are never
@@ -1660,6 +1781,8 @@ pub(super) fn run(mut budget: BudgetMeter) -> ! {
         progressed,
         total_delta,
     );
+    #[cfg(feature = "v0199-control-load-selftest")]
+    exercise_sustained(order, &checked, &mut running, &mut budget);
     for (i, role) in ROLES[..2].iter().enumerate() {
         for generation in 1..=2 {
             let at = 493 + i * 8 + (generation - 1) * 4;

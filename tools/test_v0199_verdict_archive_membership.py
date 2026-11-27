@@ -35,11 +35,18 @@ def archive(root, keys):
 
 class ArchiveMembership(unittest.TestCase):
     def test_complete_canonical_archive_still_aggregates(self):
-        with tempfile.TemporaryDirectory() as d:
-            r=Path(d); _,keys,_,_=v.inventory(); m=archive(r,keys)
-            result=v.aggregate(m,v.digest(m),r)
-            self.assertEqual(result['G4_QEMU']['counts']['PASS'],262)
-            self.assertEqual(result['G5_ARCH']['counts']['PASS'],288)
+        g4,g5,_,_=v.inventory()
+        # Synthetic namespace fixtures cannot supply a trusted board lock.
+        # Preserve the target's stronger physical evidence boundary.
+        for keys, physical_status in ((g4,'NOT_RUN'),(g5,'INVALID_EVIDENCE')):
+            with self.subTest(physical_status=physical_status), tempfile.TemporaryDirectory() as d:
+                r=Path(d); m=archive(r,keys)
+                result=v.aggregate(m,v.digest(m),r)
+                self.assertEqual(result['G4_QEMU']['counts']['PASS'],262)
+                self.assertEqual(result['G4_QEMU']['complete_ids'],127)
+                self.assertEqual(result['G5_ARCH']['counts']['PASS'],262)
+                self.assertEqual(result['ARCH_A53']['counts'][physical_status],26)
+                self.assertNotEqual(result['G5_ARCH']['status'],'PASS')
     def test_complete_archive_with_unknown_or_duplicate_record_rejected(self):
         for filename in ('0008000c-1.bin','00010001-2.bin','duplicate.bin'):
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as d:

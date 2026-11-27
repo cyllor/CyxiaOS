@@ -1,6 +1,8 @@
 """Synthetic structural regressions only; no formal case verdicts are issued."""
 import hashlib,json,struct,tempfile,unittest
 from pathlib import Path
+import subprocess
+import sys
 from unittest.mock import patch
 import verify_v0199_verdicts as v
 class VerdictTests(unittest.TestCase):
@@ -9,16 +11,17 @@ class VerdictTests(unittest.TestCase):
         locked["proofs"][0].update(evidence_count=count, evidence_digest=v.digest(evidence))
         return json.dumps(locked).encode()
 
-    def setup_run(self,root,status=1,reason=0):
+    def setup_run(self,root,status=1,reason=0,*,pair=None):
         g4,g5,ids,inv=v.inventory()
-        test,proof=min(g4)
+        test,proof=pair or min(g4)
         fields=dict(checker_id=(test>>16<<16)|1,checker_version=1,boot_epoch=1,controller_epoch=1,
                     security_epoch=0,object_or_stream_generation=1,seed=0,fault_point_id=0)
         fields.update({k:"11"*32 for k in v.FIELDS if k.endswith("_hash")})
         item=dict(test_id=test,proof_class=v.NAMES[proof],**fields)
         manifest=json.dumps(dict(schema="cyxia-frozen-verdict-run/v1",run_id=1,inventory_sha256=inv,proofs=[item])).encode()
         stem=f"{test:08x}-{proof}"
-        (root/"verdicts").mkdir();(root/"evidence").mkdir()
+        (root/"verdicts").mkdir(exist_ok=True)
+        (root/"evidence").mkdir(exist_ok=True)
         e=b"synthetic test fixture, not runtime proof"
         (root/"evidence"/"object.bin").write_bytes(e)
         m=json.dumps({"files":[{"path":"evidence/object.bin","bytes":len(e),"sha256":v.digest(e)}]}).encode()
@@ -174,6 +177,51 @@ class VerdictTests(unittest.TestCase):
             rec=bytearray(p.read_bytes());struct.pack_into("<H",rec,20,2);struct.pack_into("<I",rec,32,4)
             rec[288:]=hashlib.sha256(b"CYX/VERDICT/v4"+rec[:288]).digest();p.write_bytes(rec)
             self.assertEqual(v.aggregate(m,v.digest(m),r)["G4_QEMU"]["status"],"FAIL")
+
+    def test_cli_defaults_to_complete_qemu_evidence(self):
+        g4, _, _, inventory_digest = v.inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            items = []
+            for pair in sorted(g4):
+                fixture, verdict_path = self.setup_run(root, pair=pair)
+                items.extend(json.loads(fixture)["proofs"])
+            manifest = json.dumps({
+                "schema": "cyxia-frozen-verdict-run/v1", "run_id": 1,
+                "inventory_sha256": inventory_digest, "proofs": items,
+            }).encode()
+            run_path = root / "run.json"
+            run_path.write_bytes(manifest)
+
+            def check(name, *args):
+                report_path = root / f"{name}.json"
+                process = subprocess.run([
+                    sys.executable, "-B", str(Path(v.__file__).resolve()),
+                    "--manifest", str(run_path), "--manifest-sha256", v.digest(manifest),
+                    "--evidence-root", str(root), "--output", str(report_path), *args,
+                ], capture_output=True, text=True, timeout=10)
+                self.assertEqual(process.stderr, "")
+                report = json.loads(report_path.read_bytes())
+                self.assertEqual(json.loads(process.stdout).get("required_gate"), report.get("required_gate"))
+                return process.returncode, report
+
+            code, report = check("default")
+            self.assertEqual(code, 0)
+            self.assertEqual(report["required_gate"], "G4_QEMU")
+            self.assertEqual(report["G4_QEMU"]["counts"]["PASS"], 262)
+            self.assertEqual(report["G4_QEMU"]["complete_ids"], 127)
+            self.assertEqual(report["ARCH_A53"]["counts"]["NOT_RUN"], 26)
+
+            code, report = check("physical", "--scope", "g5")
+            self.assertEqual(code, 1)
+            self.assertEqual(report["required_gate"], "G5_ARCH")
+            self.assertEqual(report["G5_ARCH"]["status"], "NOT_RUN")
+
+            verdict_path.unlink()
+            code, report = check("incomplete")
+            self.assertEqual(code, 1)
+            self.assertEqual(report["G4_QEMU"]["counts"]["NOT_RUN"], 1)
+
     def test_invalid_record_evidence_or_manifest_cannot_count_as_pass(self):
         with tempfile.TemporaryDirectory() as d:
             r=Path(d);m,p=self.setup_run(r)
@@ -196,5 +244,40 @@ class VerdictTests(unittest.TestCase):
             report = v.aggregate(raw, v.digest(raw), root)
             self.assertEqual(report["G4_QEMU"]["counts"]["PASS"], 0)
             self.assertEqual(report["G4_QEMU"]["status"], "BLOCKED_INVALID_EVIDENCE")
+
+    def test_physical_proof_requires_the_same_validated_board_lock_and_kernel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            g4, g5, _, _ = v.inventory()
+            pair = min(g5 - g4)
+            raw, verdict = self.setup_run(root, pair=pair)
+            evidence = root / "evidence" / f"{verdict.stem}.json"
+            platform = {"manifest_sha256": "22" * 32, "boot_image_sha256": "11" * 32,
+                        "raw_capture_sha256": "33" * 32}
+            wire = dict(json.loads(evidence.read_bytes()), platform_lock_sha256=platform["manifest_sha256"],
+                        raw_capture_sha256=platform["raw_capture_sha256"],
+                        run_id=1, test_id=pair[0], proof_class="ARCH_A53")
+            wire = json.dumps(wire).encode()
+            evidence.write_bytes(wire)
+            record = bytearray(verdict.read_bytes())
+            record[256:288] = hashlib.sha256(wire).digest()
+            record[288:] = hashlib.sha256(b"CYX/VERDICT/v4" + record[:288]).digest()
+            verdict.write_bytes(record)
+            manifest = json.loads(self.frozen_evidence(raw, 1, wire))
+            manifest["proofs"][0]["platform_lock_sha256"] = platform["manifest_sha256"]
+            raw = json.dumps(manifest).encode()
+
+            def verify(lock):
+                return v.aggregate(raw, v.digest(raw), root, a53_lock=lock)
+
+            self.assertEqual(verify(None)["ARCH_A53"]["counts"]["INVALID_EVIDENCE"], 1)
+            for key in platform:
+                different = {**platform, key: "44" * 32}
+                self.assertEqual(verify(different)["ARCH_A53"]["counts"]["INVALID_EVIDENCE"], 1)
+            report = verify(platform)
+            self.assertEqual(report["ARCH_A53"]["counts"]["PASS"], 1)
+            self.assertEqual(report["ARCH_A53"]["complete_ids"], 1)
+            self.assertEqual(report["G4_QEMU"]["counts"]["NOT_RUN"], 262)
+            self.assertEqual(report["G4_QEMU"]["by_class"]["STATIC_EL1"]["NOT_RUN"], 51)
 
 if __name__=="__main__":unittest.main()

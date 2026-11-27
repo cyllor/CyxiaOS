@@ -73,6 +73,54 @@ pub const MAX_LOCKS_PER_IRQ_OFF: usize = 8;
 /// tests pin its value and source.
 pub const MAX_TRY_INTERVALS: usize = 4;
 
+/// One measured mask-to-restore interval. Acquisition overhead includes all
+/// time outside the effective work, even when the acquisition fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IrqOffTiming {
+    pub work_ns: u64,
+    pub overhead_ns: u64,
+    pub total_ns: u64,
+}
+
+impl IrqOffTiming {
+    pub const WORK_EXCEEDED: u8 = 1;
+    pub const ACQUISITION_EXCEEDED: u8 = 2;
+    pub const IRQ_OFF_EXCEEDED: u8 = 4;
+
+    pub fn from_ticks(
+        before_mask: u64,
+        work_start: u64,
+        work_end: u64,
+        after_restore: u64,
+        frequency: u64,
+    ) -> Result<Self, Error> {
+        if frequency == 0
+            || before_mask > work_start
+            || work_start > work_end
+            || work_end > after_restore
+        {
+            return Err(Error::Clock);
+        }
+        let to_ns = |ticks: u64| {
+            let ns = (u128::from(ticks) * 1_000_000_000).div_ceil(u128::from(frequency));
+            u64::try_from(ns).map_err(|_| Error::Clock)
+        };
+        let work = work_end - work_start;
+        let total = after_restore - before_mask;
+        Ok(Self {
+            work_ns: to_ns(work)?,
+            overhead_ns: to_ns(total - work)?,
+            total_ns: to_ns(total)?,
+        })
+    }
+
+    pub fn exceeded(self) -> u8 {
+        (u8::from(self.work_ns > WORK_BUDGET_NS) * Self::WORK_EXCEEDED)
+            | (u8::from(self.overhead_ns > ACQUISITION_BUDGET_NS) * Self::ACQUISITION_EXCEEDED)
+            | (u8::from(self.total_ns > IRQ_OFF_BUDGET_NS) * Self::IRQ_OFF_EXCEEDED)
+    }
+}
+
 /// Which measurement scope a begin/end interval represents. The G1 freeze
 /// instrumentation opens these scopes around the real enforcement points;
 /// single and multiple locks share one interval budget (spec L1548), so the
@@ -406,6 +454,32 @@ impl CriticalSectionMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_irq_off_sample_charges_all_overhead_to_one_interval() {
+        let within = IrqOffTiming::from_ticks(10_000, 12_000, 57_000, 60_000, 1_000_000_000)
+            .expect("valid native timestamp order");
+        assert_eq!(within.work_ns, 45_000);
+        assert_eq!(within.overhead_ns, 5_000);
+        assert_eq!(within.total_ns, 50_000);
+        assert_eq!(within.exceeded(), 0);
+
+        let overhead = IrqOffTiming::from_ticks(0, 6, 6, 6, 1_000_000).unwrap();
+        assert_eq!(overhead.work_ns, 0);
+        assert_eq!(overhead.exceeded(), IrqOffTiming::ACQUISITION_EXCEEDED);
+        let total = IrqOffTiming::from_ticks(0, 6, 52, 53, 1_000_000).unwrap();
+        assert_eq!(
+            total.exceeded(),
+            IrqOffTiming::ACQUISITION_EXCEEDED
+                | IrqOffTiming::WORK_EXCEEDED
+                | IrqOffTiming::IRQ_OFF_EXCEEDED
+        );
+        assert_eq!(
+            IrqOffTiming::from_ticks(10, 20, 19, 30, 1_000_000),
+            Err(Error::Clock)
+        );
+        assert_eq!(IrqOffTiming::from_ticks(1, 1, 1, 1, 0), Err(Error::Clock));
+    }
 
     fn settle(kind: SectionKind, start: u64, end: u64) -> Settlement {
         let mut m = CriticalSectionMeter::new();

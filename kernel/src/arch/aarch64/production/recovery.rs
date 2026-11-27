@@ -7,8 +7,10 @@
 //! path. EL0 exception observations never supply checkpoint facts.
 //!
 //! UNSAFE BOUNDARY REGISTRATION:
-//! * CPU0 initializes GATE and SLOTS once before starting the secondaries.
-//!   READY publishes initialization. Only synchronous CPU0 code accesses GATE.
+//! * CPU0 initializes SLOTS once before entering EL0. The diagnostic boot
+//!   also initializes GATE before the secondaries start and uses staged
+//!   facts. The signed resident boot has no staged gate. READY publishes
+//!   initialization. Only synchronous CPU0 code accesses GATE.
 //! * Each CPU exclusively owns its accumulator in SLOTS while running EL0.
 //!   CPU0 can take a worker's slot only after observing QUIT, its quiescent
 //!   business gate and its STOPPED release. That worker disabled its timer,
@@ -28,7 +30,10 @@ use super::{
 use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use cyxia_kernel_core::control_plane::Identity;
 use cyxia_kernel_core::security::Error;
+#[cfg(feature = "v020-production-signed-resident")]
+use cyxia_kernel_core::security::durable_role_epoch_v0199::ConfirmedBootPolicy;
 use cyxia_kernel_core::security::recovery_proof_v2::{
     ACCUMULATOR_COUNT, CheckpointPairFacts, DegradedEvent, DegradedEventKind, RecoveryAccumulator,
     RecoveryGate, RecoveryState,
@@ -42,6 +47,7 @@ const SECONDARIES: u64 = ((1 << ACCUMULATOR_COUNT) - 1) & !1;
 const FATAL_RECORD_REJECTED: u64 = 0x5731_1320;
 const FATAL_INIT: u64 = 0x5731_1321;
 const FATAL_GATE: u64 = 0x5731_1322;
+#[cfg(not(feature = "v020-production-signed-resident"))]
 const FATAL_NO_SLOT: u64 = 0x5731_1323;
 const FATAL_PROBE: u64 = 0x5731_1324;
 const FATAL_TAKEOVER: u64 = 0x5731_1325;
@@ -54,7 +60,7 @@ struct StagedGate {
     pair: CheckpointPairFacts,
 }
 
-static mut GATE: MaybeUninit<StagedGate> = MaybeUninit::uninit();
+static mut GATE: Option<StagedGate> = None;
 static mut SLOTS: [Slot; ACCUMULATOR_COUNT] =
     [const { Slot(MaybeUninit::uninit()) }; ACCUMULATOR_COUNT];
 static READY: AtomicBool = AtomicBool::new(false);
@@ -78,18 +84,13 @@ const fn staged_pair() -> CheckpointPairFacts {
     }
 }
 
-/// Build the gate and the four accumulators. CPU0, once, before SMP bring-up.
-fn init(boot_epoch: u64) -> Result<(), Error> {
+/// Build the four accumulators. CPU0, once, before running any EL0.
+fn init(boot_epoch: u64, gate: Option<StagedGate>) -> Result<(), Error> {
     if cyxia_arch_aarch64::cpu::slot() != 0 {
         return Err(Error::Unauthorized);
     }
     if INIT_CLAIMED.swap(true, Ordering::AcqRel) {
         return Err(Error::Busy);
-    }
-    let pair = staged_pair();
-    let gate = RecoveryGate::new(boot_epoch, PROTECTION_GENERATION, SUPER, &pair)?;
-    if gate.state() != RecoveryState::Verified {
-        return Err(Error::Invalid);
     }
     let mut accs = [const { MaybeUninit::<RecoveryAccumulator>::uninit() }; ACCUMULATOR_COUNT];
     for (cpu, acc) in accs.iter_mut().enumerate() {
@@ -100,10 +101,10 @@ fn init(boot_epoch: u64) -> Result<(), Error> {
         )?);
     }
     // SAFETY: INIT_CLAIMED makes this the only initialization; it runs on CPU0
-    // before any secondary CPU starts or any EL0 role runs, so no other
-    // reference to GATE or SLOTS exists. Only raw addr_of_mut! places are used.
+    // before any EL0 role runs. Secondaries in the signed profile are parked;
+    // no reference to GATE or SLOTS exists. Use only raw addr_of_mut! places.
     unsafe {
-        addr_of_mut!(GATE).write(MaybeUninit::new(StagedGate { gate, pair }));
+        addr_of_mut!(GATE).write(gate);
         for (cpu, acc) in accs.into_iter().enumerate() {
             addr_of_mut!(SLOTS[cpu]).write(Slot(acc));
         }
@@ -114,21 +115,38 @@ fn init(boot_epoch: u64) -> Result<(), Error> {
 
 /// run()'s entry hook: a failed init stops the boot fail-closed.
 pub(super) fn init_or_fatal() {
-    if init(BOOT).is_err() {
+    let pair = staged_pair();
+    let gate = RecoveryGate::new(BOOT, PROTECTION_GENERATION, SUPER, &pair)
+        .unwrap_or_else(|_| fatal(FATAL_INIT));
+    if gate.state() != RecoveryState::Verified
+        || init(BOOT, Some(StagedGate { gate, pair })).is_err()
+    {
         fatal(FATAL_INIT);
     }
 }
 
-fn event_digest(cpu: u32, esr: u64, far: u64) -> [u8; 32] {
+/// Initialize audit ownership after the real signed pair allocates this boot.
+/// The proof summarizes retained faults and carries no permission to reopen.
+#[cfg(feature = "v020-production-signed-resident")]
+pub(super) fn init_signed(policy: &ConfirmedBootPolicy<'_>) -> Result<(), Error> {
+    init(policy.boot_epoch(), None)
+}
+
+fn event_digest(cpu: u32, actor: Option<Identity>, esr: u64, far: u64) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(esr.to_le_bytes());
     h.update(far.to_le_bytes());
     h.update(cpu.to_le_bytes());
+    if let Some(actor) = actor {
+        h.update(actor.id.to_le_bytes());
+        h.update(actor.generation.to_le_bytes());
+    }
     h.finalize().into()
 }
 
 /// Record one EL0 fault into the faulting CPU's own accumulator. Runs in that
 /// CPU's exception context; `cpu` must be the current CPU slot.
+#[cfg(not(feature = "v020-production-signed-resident"))]
 pub(crate) fn record_fault(cpu: u32, esr: u64, far: u64) {
     let i = cyxia_arch_aarch64::cpu::slot();
     if i >= ACCUMULATOR_COUNT {
@@ -136,12 +154,30 @@ pub(crate) fn record_fault(cpu: u32, esr: u64, far: u64) {
         fatal(FATAL_NO_SLOT);
     }
     // REJECTED/EVENTS are indexed by the CURRENT CPU only, never by `cpu`.
-    if cpu as usize != i
-        || !READY.load(Ordering::Acquire)
-        || TAKEN.load(Ordering::Acquire) & (1 << i) != 0
-    {
+    if cpu as usize != i || record_event(i, None, esr, far).is_err() {
         REJECTED[i].fetch_add(1, Ordering::Release);
-        return;
+    }
+}
+
+/// The signed resident turn has authenticated the live EL0 root and stopped
+/// the task. Retain its identity from the private scheduler, not user bytes.
+#[cfg(feature = "v020-production-signed-resident")]
+pub(super) fn record_role_failure(actor: Identity, esr: u64, far: u64) -> Result<(), Error> {
+    if cyxia_arch_aarch64::cpu::slot() != 0 || !actor.valid() {
+        return Err(Error::Unauthorized);
+    }
+    // FAR is defined for the relevant abort classes only, when FnV is clear.
+    let far = if matches!(esr >> 26, 0x20 | 0x24) && esr & (1 << 10) == 0 {
+        far
+    } else {
+        0
+    };
+    record_event(0, Some(actor), esr, far)
+}
+
+fn record_event(i: usize, actor: Option<Identity>, esr: u64, far: u64) -> Result<(), Error> {
+    if !READY.load(Ordering::Acquire) || TAKEN.load(Ordering::Acquire) & (1 << i) != 0 {
+        return Err(Error::Unauthorized);
     }
     // SAFETY: slot i was initialized before READY (Acquire above) and is only
     // referenced by CPU i until its final STOPPED release; an
@@ -150,17 +186,14 @@ pub(crate) fn record_fault(cpu: u32, esr: u64, far: u64) {
     let ev = DegradedEvent {
         kind: DegradedEventKind::OtherCritical,
         event_id: acc.proof().last_event_id.saturating_add(1),
-        event_digest: event_digest(cpu, esr, far),
-        object_id: 0,
-        object_generation: 1,
+        event_digest: event_digest(i as u32, actor, esr, far),
+        object_id: actor.map_or(0, |id| id.id),
+        object_generation: actor.map_or(1, |id| id.generation),
         failure_code: (esr >> 26) as u32,
     };
-    match acc.record(&ev) {
-        Ok(()) => EVENTS[i].store(acc.proof().total_count, Ordering::Release),
-        Err(_) => {
-            REJECTED[i].fetch_add(1, Ordering::Release);
-        }
-    }
+    acc.record(&ev)?;
+    EVENTS[i].store(acc.proof().total_count, Ordering::Release);
+    Ok(())
 }
 
 /// Scoped access to the recovery gate: `None` before init or off CPU0. The
@@ -173,8 +206,7 @@ fn with_gate<R>(f: impl FnOnce(&mut StagedGate) -> R) -> Option<R> {
     // (checked) reaches here, CPU0 code is synchronous, and `with_gate` is
     // never called re-entrantly from inside `f`, so this is the only live
     // reference for the duration of `f`.
-    let gate = unsafe { (*addr_of_mut!(GATE)).assume_init_mut() };
-    Some(f(gate))
+    unsafe { (*addr_of_mut!(GATE)).as_mut().map(f) }
 }
 
 /// Re-evaluate the EL1 facts at the side-effect boundary, including on retries.

@@ -70,11 +70,14 @@ v0199-cpu0-svc-selftest = ["v0199-advice-e2e-selftest"]
 # The production entry shares fixed SMP bring-up. Native diagnostic builds
 # opt in to bounded ABI3/trap, network and scratch-media evidence.
 v020-production = ["smp-selftest"]
+v020-panic-stop-selftest = ["v020-production"]
+v020-panic-stop-late-selftest = ["v020-panic-stop-selftest"]
 v020-production-diagnostic = ["v020-production", "dep:sha2", "sec-n-native"]
 v020-production-media-staging = ["v020-production-diagnostic", "prototype-memory"]
-v020-production-authenticated-net = ["v020-production-diagnostic"]
+v020-production-authenticated-net = ["v020-production-diagnostic", "dep:zeroize"]
 v020-production-media-reopen = ["v020-production-media-staging"]
 v020-production-media-signed = ["v020-production-media-staging"]
+v020-production-signed-resident = ["v020-production-media-signed"]
 # Separate signed baseline-v1 file owner on one dedicated test disk.
 v020-production-fsync-scratch = ["v020-production-media-signed"]
 v020-production-media-envelopes = ["v020-production-media-staging"]
@@ -90,6 +93,8 @@ v020-production-frame-pool = ["v020-production-diagnostic"]
 v0199-control-bringup = ["v0199-cpu0-role-selftest"]
 # Same diagnostic program inventory with the normative RAM topology; not G0.
 v0199-control-bringup-1g = ["v0199-control-bringup", "prototype-memory"]
+# Consecutive native role windows with real slot backpressure evidence.
+v0199-control-load-selftest = ["v0199-control-bringup-1g"]
 # Separate native scratch journal, never a production mounted filesystem.
 v0199-epoch-disk-selftest = ["v0199-cpu0-role-selftest", "prototype-memory", "dep:sha2"]
 # Adds an independent, dedicated VirtIO RNG to the epoch effect fixture.
@@ -179,6 +184,7 @@ cyxia-driver-virtio = { path = "../crates/driver-virtio" }
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 cyxia-peer-billing = { path = "../crates/peer-billing", optional = true }
 sha2 = { version = "=0.10.9", default-features = false, optional = true }
+zeroize = { version = "=1.9.2", default-features = false, optional = true }
 cyxia-cluster-transport = { path = "../crates/cluster-transport", optional = true }
 # Single-machine native transport (relocated smoltcp stack). Optional; only the
 # sec-n-native feature activates it, and only with the `smoltcp` feature so the

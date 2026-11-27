@@ -3,6 +3,10 @@
 //! engine; a wire message cannot manufacture VerifiedTls.
 use super::Error;
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
+
+pub mod entropy;
+pub mod pending_tls;
 
 pub const MAX_SOURCES: usize = 32;
 pub const MAX_PENDING: u8 = 4;
@@ -391,37 +395,42 @@ const SYN_CONSUMED_SLOTS: usize = 64;
 /// HMAC-SHA256 (RFC 2104) over the audited `sha2` core; no allocation.
 /// Required by 安§0.8 for the keyed bucket mapping and the cookie MAC.
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut block = [0u8; 64];
+    hmac_sha256_parts(key, &[message])
+}
+
+fn hmac_sha256_parts(key: &[u8], message: &[&[u8]]) -> [u8; 32] {
+    let mut block = Zeroizing::new([0u8; 64]);
     if key.len() > 64 {
-        block[..32].copy_from_slice(&Sha256::digest(key));
+        let mut digest = Sha256::digest(key);
+        block[..32].copy_from_slice(&digest);
+        digest[..].zeroize();
     } else {
         block[..key.len()].copy_from_slice(key);
     }
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
+    let mut ipad = Zeroizing::new([0x36u8; 64]);
+    let mut opad = Zeroizing::new([0x5cu8; 64]);
     for i in 0..64 {
         ipad[i] ^= block[i];
         opad[i] ^= block[i];
     }
     let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(message);
-    let inner = inner.finalize();
+    inner.update(ipad.as_slice());
+    for part in message {
+        inner.update(part);
+    }
+    let mut inner = inner.finalize();
     let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner);
+    outer.update(opad.as_slice());
+    outer.update(inner.as_slice());
+    inner[..].zeroize();
     outer.finalize().into()
 }
 
 /// HKDF-SHA256 (RFC 5869) Extract+Expand to one 32-byte purpose subkey.
 /// Salt is the RFC default of HashLen zero bytes (contract choice 4).
 fn hkdf_subkey(secret: &[u8], label: &[u8]) -> [u8; 32] {
-    debug_assert!(label.len() < 64);
-    let prk = hmac_sha256(&[0u8; 32], secret);
-    let mut info = [0u8; 64];
-    info[..label.len()].copy_from_slice(label);
-    info[label.len()] = 1;
-    hmac_sha256(&prk, &info[..=label.len()])
+    let prk = Zeroizing::new(hmac_sha256(&[0u8; 32], secret));
+    hmac_sha256_parts(prk.as_slice(), &[label, &[1]])
 }
 
 /// Branchless equality of two 24-bit MAC values (no early exit).

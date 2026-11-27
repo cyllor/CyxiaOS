@@ -15,8 +15,7 @@
 //! in that single CPU0 turn loop; no IRQ handler, DMA or secondary CPU touches
 //! these statics. The EL0 entry mechanism (user::enter_immutable) is
 //! arch-aarch64's registered boundary; this module only calls it.
-//! * GUEST_FRAMES / GUEST_LEAVES / GUEST_MID / GUEST_ROOT / SHARED / GUEST_STACK
-//!   (static mut): CPU0-only. GUEST_FRAMES code/rodata pages are written once at
+//! * GUEST address space (static mut): CPU0-only. Its code/rodata is written once at
 //!   load then sealed RO through the boot direct-map (break-before-make + TLBI);
 //!   bss/stack/shared pages are writable only by CPU0 between phases. Every &mut
 //!   is created and consumed within one synchronous CPU0 call; no aliasing.
@@ -26,7 +25,7 @@
 //! * Broker state (CONN_EPOCH, CONNECTED, STALL_AFTER_POLL, POLL_COUNT, OP_COUNTS,
 //!   CLOSE_SEEN, YIELD_RUN, ENTROPY_STATE, QUIESCENCE_REFUSED, HANDSHAKE_POLLS,
 //!   CONN_SOURCE, POLLED_EPOCH, ADMISSION_RECEIPT, RELAYED_BYTES,
-//!   STREAM_CLOSED, RETIREMENT)
+//!   STREAM_CLOSED, RETIREMENT, PENDING_TLS, TLS_AUTHENTICATED_EPOCH)
 //!   (static mut): CPU0-only, read/written only by the functions below and the
 //!   by-value accessors; no reference escapes.
 //! * load_guest()/map_page()/seal_page()/sync_code(): raw addr_of! arithmetic over
@@ -39,8 +38,13 @@
 //! * asm!("dsb/tlbi/ic"): bounded TLB/cache maintenance; options(nostack).
 #[path = "sec_n_broker/receipt.rs"]
 mod receipt;
+#[cfg(feature = "v020-production-authenticated-net")]
+#[path = "sec_n_broker/signer.rs"]
+pub(super) mod signer;
 
 use super::*;
+#[cfg(feature = "v020-production-authenticated-net")]
+use cyxia_kernel_core::security::network::pending_tls::{PendingLimit, PendingTls};
 use cyxia_net_transport::device::{self, Port};
 
 // Trusted monotonic clocks from the EL1 architectural timer (the same source the
@@ -48,7 +52,7 @@ use cyxia_net_transport::device::{self, Port};
 pub(crate) fn now_ms() -> u64 {
     timer::ticks() / (timer::frequency() / 1000).max(1)
 }
-fn now_ns() -> u64 {
+pub(crate) fn now_ns() -> u64 {
     ((u128::from(timer::ticks()) * 1_000_000_000) / u128::from(timer::frequency().max(1)))
         .min(u128::from(u64::MAX)) as u64
 }
@@ -81,6 +85,10 @@ const OP_ADMISSION_GRANTED: u64 = 0x100;
 const OP_POLL_NORMAL_CLOSE: u64 = 0x101;
 #[cfg(feature = "v020-production-authenticated-net")]
 const OP_ADMISSION_RETIRED: u64 = 0x102;
+#[cfg(feature = "v020-production-authenticated-net")]
+const OP_TLS_CERTIFICATE_VERIFY: u64 = 0x103;
+#[cfg(feature = "v020-production-authenticated-net")]
+const OP_TLS_AUTHENTICATED: u64 = 0x104;
 
 const DIRECT_TLS_CIPHERTEXT: u64 = 1;
 // Shared-page field offsets (exact protected layout, see abi.rs const asserts).
@@ -133,19 +141,60 @@ const MID_COUNT: usize = LAST_MID - FIRST_MID + 1;
 const GUEST_ASID: u8 = 0x40; // distinct from probes 0x80..0x83 / roles 0x90..0x9f.
 
 #[repr(C, align(4096))]
-struct Frames([Page; FRAME_CAP]);
+struct AddressSpace<const FRAMES: usize, const STACK: usize> {
+    frames: [Page; FRAMES],
+    leaves: [Page; MID_COUNT],
+    mid: Page,
+    root: Page,
+    shared: [Page; SHARED_PAGES],
+    stack: [Page; STACK],
+}
+
+impl<const FRAMES: usize, const STACK: usize> AddressSpace<FRAMES, STACK> {
+    const ZERO: Self = Self {
+        frames: [const { Page::ZERO }; FRAMES],
+        leaves: [const { Page::ZERO }; MID_COUNT],
+        mid: Page::ZERO,
+        root: Page::ZERO,
+        shared: [const { Page::ZERO }; SHARED_PAGES],
+        stack: [const { Page::ZERO }; STACK],
+    };
+
+    /// Caller supplies one boot-pinned address space owned by CPU0.
+    unsafe fn memory(space: *mut Self) -> Memory {
+        unsafe {
+            Memory {
+                frames: core::ptr::addr_of_mut!((*space).frames).cast(),
+                frame_count: FRAMES,
+                leaves: core::ptr::addr_of_mut!((*space).leaves).cast(),
+                mid: core::ptr::addr_of_mut!((*space).mid),
+                root: core::ptr::addr_of_mut!((*space).root),
+                shared: core::ptr::addr_of_mut!((*space).shared).cast(),
+                stack: core::ptr::addr_of_mut!((*space).stack).cast(),
+                stack_pages: STACK,
+            }
+        }
+    }
+}
+
+struct Memory {
+    frames: *mut Page,
+    frame_count: usize,
+    leaves: *mut Page,
+    mid: *mut Page,
+    root: *mut Page,
+    shared: *mut Page,
+    stack: *mut Page,
+    stack_pages: usize,
+}
+
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
-static mut GUEST_FRAMES: Frames = Frames([const { Page::ZERO }; FRAME_CAP]);
-#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
-static mut GUEST_LEAVES: [Page; MID_COUNT] = [const { Page::ZERO }; MID_COUNT];
-#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
-static mut GUEST_MID: Page = Page::ZERO;
-#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
-static mut GUEST_ROOT: Page = Page::ZERO;
-#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
-static mut SHARED: [Page; SHARED_PAGES] = [const { Page::ZERO }; SHARED_PAGES];
-#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
-static mut GUEST_STACK: [Page; STACK_PAGES] = [const { Page::ZERO }; STACK_PAGES];
+static mut GUEST: AddressSpace<FRAME_CAP, STACK_PAGES> = AddressSpace::ZERO;
+
+fn guest_memory() -> Memory {
+    // SAFETY: the CPU0 broker is the sole owner of the pinned guest address space.
+    unsafe { AddressSpace::memory(core::ptr::addr_of_mut!(GUEST)) }
+}
 
 // CPU0-only broker/accounting state.
 static mut CONN_EPOCH: u64 = 1;
@@ -180,6 +229,10 @@ enum Retirement {
 }
 #[cfg(feature = "v020-production-authenticated-net")]
 static mut RETIREMENT: Retirement = Retirement::Open;
+#[cfg(feature = "v020-production-authenticated-net")]
+static mut PENDING_TLS: Option<PendingTls> = None;
+#[cfg(feature = "v020-production-authenticated-net")]
+static mut TLS_AUTHENTICATED_EPOCH: u64 = 0;
 
 fn le16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
@@ -239,30 +292,24 @@ fn sync_code(addr: u64, bytes: usize) {
         core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack));
     }
 }
-fn frame_ptr(index: usize) -> *mut u8 {
-    assert!(index < FRAME_CAP);
-    unsafe {
-        core::ptr::addr_of_mut!(GUEST_FRAMES.0)
-            .cast::<Page>()
-            .add(index)
-            .cast::<u8>()
+impl Memory {
+    fn frame_ptr(&self, index: usize) -> *mut u8 {
+        assert!(index < self.frame_count);
+        unsafe { self.frames.add(index).cast() }
     }
-}
-fn map_page(va: u64, pa: u64, write: bool, execute: bool) {
-    let mid = (va >> 21) as usize;
-    assert!(
-        (FIRST_MID..=LAST_MID).contains(&mid),
-        "guest VA outside fixture leaves"
-    );
-    let leaf = unsafe {
-        core::ptr::addr_of_mut!(GUEST_LEAVES)
-            .cast::<Page>()
-            .add(mid - FIRST_MID)
-    };
-    let entry = ((va >> 12) & 511) as usize;
-    let desc = mmu::encode_user_leaf(PhysAddr(pa), write, execute).unwrap();
-    unsafe {
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*leaf).0[entry]), desc);
+
+    fn map_page(&self, va: u64, pa: u64, write: bool, execute: bool) {
+        let mid = (va >> 21) as usize;
+        assert!(
+            (FIRST_MID..=LAST_MID).contains(&mid),
+            "guest VA outside fixture leaves"
+        );
+        let leaf = unsafe { self.leaves.add(mid - FIRST_MID) };
+        let entry = ((va >> 12) & 511) as usize;
+        let desc = mmu::encode_user_leaf(PhysAddr(pa), write, execute).unwrap();
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!((*leaf).0[entry]), desc);
+        }
     }
 }
 
@@ -279,7 +326,10 @@ pub(crate) struct Layout {
 /// admission contract (pie_image_v0199) deliberately rejects ET_EXEC, so this
 /// loader parses the fixed-address guest directly and never grants capabilities.
 pub(crate) fn load_guest() -> Layout {
-    let b = GUEST_ELF;
+    load_image(GUEST_ELF, &guest_memory())
+}
+
+fn load_image(b: &[u8], memory: &Memory) -> Layout {
     assert!(b.len() >= 64 && &b[0..4] == b"\x7fELF" && b[4] == 2 && b[5] == 1 && b[6] == 1);
     assert_eq!(le16(b, 16), 2, "guest must be ET_EXEC fixed-address");
     assert_eq!(le16(b, 18), 183, "guest must be AArch64");
@@ -289,7 +339,7 @@ pub(crate) fn load_guest() -> Layout {
     assert!(ph_num > 0 && ph_num <= 16 && ph_off + ph_num * 56 <= b.len());
     // First pass: bound the total VA span and locate the writable (bss) segment.
     let mut max_end = 0u64;
-    let mut bss_first = FRAME_CAP;
+    let mut bss_first = memory.frame_count;
     let mut bss_end = 0usize;
     for i in 0..ph_num {
         let at = ph_off + i * 56;
@@ -304,7 +354,10 @@ pub(crate) fn load_guest() -> Layout {
         max_end = max_end.max(end);
         let first = ((va - IMAGE_BASE_VA) / PAGE as u64) as usize;
         let last = end.div_ceil(PAGE as u64) as usize - (IMAGE_BASE_VA / PAGE as u64) as usize;
-        assert!(last <= FRAME_CAP, "guest image exceeds fixture frame pool");
+        assert!(
+            last <= memory.frame_count,
+            "guest image exceeds fixture frame pool"
+        );
         if flags & 2 != 0 {
             // Writable segment: this guest's only RW LOAD is the zero-file bss.
             assert_eq!(le64(b, at + 32), 0, "fixture expects bss-only RW LOAD");
@@ -313,7 +366,7 @@ pub(crate) fn load_guest() -> Layout {
         }
     }
     let used_frames = (max_end.div_ceil(PAGE as u64) - IMAGE_BASE_VA / PAGE as u64) as usize;
-    assert!(used_frames <= FRAME_CAP && bss_end <= used_frames);
+    assert!(used_frames <= memory.frame_count && bss_end <= used_frames);
     // Second pass: copy file bytes into the VA-indexed frames and map each page.
     for i in 0..ph_num {
         let at = ph_off + i * 56;
@@ -333,41 +386,42 @@ pub(crate) fn load_guest() -> Layout {
         let pages = mem.div_ceil(PAGE);
         // Copy file bytes (bss has file == 0 and stays zero).
         if file != 0 {
-            let dst = unsafe { core::slice::from_raw_parts_mut(frame_ptr(first), file) };
+            let dst = unsafe { core::slice::from_raw_parts_mut(memory.frame_ptr(first), file) };
             dst.copy_from_slice(&b[off..off + file]);
         }
         for p in 0..pages {
             let index = first + p;
-            let pa = phys(frame_ptr(index) as u64);
+            let address = memory.frame_ptr(index) as u64;
+            let pa = phys(address);
             if !write {
                 // Seal the kernel direct-map alias RO/RX before publishing the
                 // user leaf; no writable alias of guest code/rodata remains.
                 seal_page(pa);
                 if execute {
-                    sync_code(frame_ptr(index) as u64, PAGE);
+                    sync_code(address, PAGE);
                 }
             }
-            map_page(va + p as u64 * PAGE as u64, pa, write, execute);
+            memory.map_page(va + p as u64 * PAGE as u64, pa, write, execute);
         }
     }
     // Shared broker page (RW, never executable).
     for p in 0..SHARED_PAGES {
-        let pa = phys(unsafe { core::ptr::addr_of_mut!(SHARED).cast::<Page>().add(p) as u64 });
-        map_page(SHARED_VA + p as u64 * PAGE as u64, pa, true, false);
+        let pa = phys(unsafe { memory.shared.add(p) as u64 });
+        memory.map_page(SHARED_VA + p as u64 * PAGE as u64, pa, true, false);
     }
     // Guarded guest stack (RW). Pages below STACK_VA stay unmapped as a guard.
-    for p in 0..STACK_PAGES {
-        let pa = phys(unsafe { core::ptr::addr_of_mut!(GUEST_STACK).cast::<Page>().add(p) as u64 });
-        map_page(STACK_VA + p as u64 * PAGE as u64, pa, true, false);
+    for p in 0..memory.stack_pages {
+        let pa = phys(unsafe { memory.stack.add(p) as u64 });
+        memory.map_page(STACK_VA + p as u64 * PAGE as u64, pa, true, false);
     }
     // Publish root -> mid -> leaves.
     unsafe {
-        let mid_pa = phys(core::ptr::addr_of!(GUEST_MID) as u64);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(GUEST_ROOT.0[0]), mid_pa | 3);
+        let mid_pa = phys(memory.mid as u64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*memory.root).0[0]), mid_pa | 3);
         for i in 0..MID_COUNT {
-            let leaf_pa = phys(core::ptr::addr_of!(GUEST_LEAVES).cast::<Page>().add(i) as u64);
+            let leaf_pa = phys(memory.leaves.add(i) as u64);
             core::ptr::write_volatile(
-                core::ptr::addr_of_mut!(GUEST_MID.0[FIRST_MID + i]),
+                core::ptr::addr_of_mut!((*memory.mid).0[FIRST_MID + i]),
                 leaf_pa | 3,
             );
         }
@@ -382,7 +436,7 @@ pub(crate) fn load_guest() -> Layout {
 }
 
 fn shared_ptr() -> *mut u8 {
-    core::ptr::addr_of_mut!(SHARED).cast::<u8>()
+    guest_memory().shared.cast()
 }
 fn shared_read(off: u64) -> u64 {
     unsafe { core::ptr::read_volatile(shared_ptr().add(off as usize).cast::<u64>()) }
@@ -405,10 +459,16 @@ fn shared_put(off: u64, bytes: &[u8]) {
 /// kernel-local node pin presented to the guest (wrong value => identity negative).
 #[cfg(feature = "v0199-sec-n-selftest")]
 pub(crate) fn stage_shared(local: [u8; 32], connected: bool, conn_epoch: u64) {
-    stage_connection(local, connected, conn_epoch, SOURCE_IP);
+    stage_connection(local, connected, conn_epoch, SOURCE_IP, now_ns());
 }
 
-pub(crate) fn stage_connection(local: [u8; 32], connected: bool, conn_epoch: u64, source: u32) {
+pub(crate) fn stage_connection(
+    local: [u8; 32],
+    connected: bool,
+    conn_epoch: u64,
+    source: u32,
+    accepted_ns: u64,
+) {
     let p = shared_ptr();
     unsafe { core::ptr::write_bytes(p, 0, SHARED_PAGES * PAGE) };
     shared_write(OFF_MAGIC, SVC_MAGIC);
@@ -417,7 +477,7 @@ pub(crate) fn stage_connection(local: [u8; 32], connected: bool, conn_epoch: u64
     shared_write(OFF_SERVICE_GEN, SERVICE_GEN);
     shared_write(OFF_UNIX_SECONDS, UNIX_SECONDS);
     shared_write(OFF_MONOTONIC_MS, now_ms());
-    shared_write(OFF_MONOTONIC_NS, now_ns());
+    shared_write(OFF_MONOTONIC_NS, accepted_ns);
     shared_put(OFF_LOCAL_NODE, &local);
     shared_put(OFF_PEER_NODE, &PEER_NODE);
     shared_write(OFF_CONN_EPOCH, conn_epoch);
@@ -438,6 +498,12 @@ pub(crate) fn stage_connection(local: [u8; 32], connected: bool, conn_epoch: u64
         #[cfg(feature = "v020-production-authenticated-net")]
         {
             RETIREMENT = Retirement::Open;
+            TLS_AUTHENTICATED_EPOCH = 0;
+            PENDING_TLS = if connected {
+                PendingTls::new(accepted_ns)
+            } else {
+                None
+            };
         }
     }
 }
@@ -445,15 +511,12 @@ pub(crate) fn stage_connection(local: [u8; 32], connected: bool, conn_epoch: u64
 /// Re-zero the guest bss + stack between phases so each phase is a fresh guest
 /// (allocator, NEXT_SESSION atomic and stack state reset). Code/rodata stay sealed.
 pub(crate) fn reset_guest_data(layout: &Layout) {
+    let memory = guest_memory();
     for i in layout.bss_first..layout.bss_end {
-        unsafe { core::ptr::write_bytes(frame_ptr(i), 0, PAGE) };
+        unsafe { core::ptr::write_bytes(memory.frame_ptr(i), 0, PAGE) };
     }
     unsafe {
-        core::ptr::write_bytes(
-            core::ptr::addr_of_mut!(GUEST_STACK).cast::<u8>(),
-            0,
-            STACK_PAGES * PAGE,
-        );
+        core::ptr::write_bytes(memory.stack.cast::<u8>(), 0, STACK_PAGES * PAGE);
     }
 }
 
@@ -472,8 +535,12 @@ fn allowed(op: u64, len: u64, arg0: u64) -> bool {
     match op {
         OP_ENTROPY | OP_READ => arg0 == 0,
         #[cfg(feature = "v020-production-authenticated-net")]
-        OP_POLL_NORMAL_CLOSE | OP_ADMISSION_RETIRED => {
+        OP_POLL_NORMAL_CLOSE | OP_ADMISSION_RETIRED | OP_TLS_AUTHENTICATED => {
             len == receipt::WIRE_BYTES as u64 && arg0 == 0
+        }
+        #[cfg(feature = "v020-production-authenticated-net")]
+        OP_TLS_CERTIFICATE_VERIFY => {
+            len == cyxia_contracts::tls_signer::SIGNATURE_BYTES as u64 && arg0 == 0
         }
         OP_ADMISSION_GRANTED => len == receipt::WIRE_BYTES as u64 && arg0 == 0,
         OP_WRITE => arg0 == DIRECT_TLS_CIPHERTEXT && len != 0,
@@ -512,7 +579,12 @@ pub(crate) fn fixture_entropy(out: &mut [u8]) -> bool {
 
 /// Service one SVC 0x43 broker request from the shared page. The kernel never
 /// touches sequence/magic/version/epoch/generation (the guest re-validates them).
-fn broker<P: Port>(port: &mut P, entropy: &mut EntropyFill<'_>, close_poll: Option<ClosePoll<P>>) {
+fn broker<P: Port>(
+    port: &mut P,
+    entropy: &mut EntropyFill<'_>,
+    close_poll: Option<ClosePoll<P>>,
+    #[cfg(feature = "v020-production-authenticated-net")] signer: Option<&mut signer::Signer>,
+) {
     let op = shared_read(OFF_OP);
     let len = shared_read(OFF_LEN);
     let arg0 = shared_read(OFF_ARG0);
@@ -547,10 +619,19 @@ fn broker<P: Port>(port: &mut P, entropy: &mut EntropyFill<'_>, close_poll: Opti
         #[cfg(feature = "v020-production-authenticated-net")]
         OP_POLL_NORMAL_CLOSE | OP_ADMISSION_RETIRED => broker_normal_close(port, close_poll, op),
         #[cfg(feature = "v020-production-authenticated-net")]
+        OP_TLS_CERTIFICATE_VERIFY => broker_certificate_verify(signer),
+        #[cfg(feature = "v020-production-authenticated-net")]
+        OP_TLS_AUTHENTICATED => broker_tls_authenticated(signer),
+        #[cfg(feature = "v020-production-authenticated-net")]
         OP_READ | OP_WRITE if unsafe { RETIREMENT } != Retirement::Open => reply(0, ST_FAILED),
         OP_ADMISSION_GRANTED => broker_admission_granted(),
         OP_READ | OP_WRITE if !unsafe { CONNECTED } => reply(0, ST_EOF),
-        OP_READ => broker_read(port, len),
+        OP_READ => broker_read(
+            port,
+            len,
+            #[cfg(feature = "v020-production-authenticated-net")]
+            signer.is_some(),
+        ),
         OP_WRITE => broker_write(port, len),
         OP_CLOSE => {
             unsafe { CONNECTED = false };
@@ -562,6 +643,73 @@ fn broker<P: Port>(port: &mut P, entropy: &mut EntropyFill<'_>, close_poll: Opti
             shared_write(OFF_LEN, 0);
         }
     }
+}
+
+#[cfg(feature = "v020-production-authenticated-net")]
+fn broker_certificate_verify(signer: Option<&mut signer::Signer>) {
+    let (connected, epoch, source, grant, state, deadline_ns) = unsafe {
+        (
+            CONNECTED,
+            CONN_EPOCH,
+            CONN_SOURCE,
+            ADMISSION_RECEIPT,
+            RETIREMENT,
+            PENDING_TLS.map_or(0, |pending| pending.deadline().0),
+        )
+    };
+    if !connected
+        || grant != Some((epoch, source))
+        || state != Retirement::Open
+        || unsafe { TLS_AUTHENTICATED_EPOCH } != 0
+    {
+        return reply(0, ST_FAILED);
+    }
+    let mut transcript = [0; cyxia_contracts::tls_signer::TRANSCRIPT_BYTES];
+    shared_bytes(OFF_PAYLOAD, &mut transcript);
+    match signer.and_then(|signer| signer.certificate_verify(epoch, deadline_ns, transcript)) {
+        Some(signature) => {
+            shared_put(OFF_PAYLOAD, &signature);
+            shared_write(OFF_ARG0, 0);
+            reply(signature.len() as u64, ST_OK);
+        }
+        None => reply(0, ST_FAILED),
+    }
+}
+
+#[cfg(feature = "v020-production-authenticated-net")]
+fn broker_tls_authenticated(signer: Option<&mut signer::Signer>) {
+    let mut wire = [0u8; receipt::WIRE_BYTES];
+    shared_bytes(OFF_PAYLOAD, &mut wire);
+    let (connected, epoch, polled, source, grant, state, authenticated, expires) = unsafe {
+        (
+            CONNECTED,
+            CONN_EPOCH,
+            POLLED_EPOCH,
+            CONN_SOURCE,
+            ADMISSION_RECEIPT,
+            RETIREMENT,
+            TLS_AUTHENTICATED_EPOCH,
+            PENDING_TLS.map_or(0, |pending| pending.deadline().0),
+        )
+    };
+    if state != Retirement::Open
+        || now_ns() >= expires
+        || grant != Some((epoch, source))
+        || !signer.is_some_and(|signer| signer.issued_for(epoch))
+        || receipt::validate(&wire, connected, epoch, polled, source, authenticated != 0) != grant
+    {
+        return reply(0, ST_FAILED);
+    }
+    // This request comes from the sealed TLS verifier after client
+    // CertificateVerify and Finished, not from a transport message.
+    unsafe { TLS_AUTHENTICATED_EPOCH = epoch };
+    report(
+        "V020_SEC_N_VERIFIER_AUTHENTICATED",
+        epoch,
+        u64::from(source),
+        1,
+    );
+    reply(0, ST_OK);
 }
 
 fn reply(len: u64, status: u64) {
@@ -616,7 +764,7 @@ fn broker_normal_close<P: Port>(port: &mut P, close_poll: Option<ClosePoll<P>>, 
         )
     };
     let identity = receipt::validate(&wire, connected, epoch, polled, source, false);
-    if identity.is_none() || identity != grant {
+    if identity.is_none() || identity != grant || unsafe { TLS_AUTHENTICATED_EPOCH } != epoch {
         return reply(0, ST_FAILED);
     }
     match (op, state) {
@@ -677,7 +825,11 @@ fn broker_poll(normal_close: bool) {
 /// port never dequeues bytes the guest cannot take. A port that still returns
 /// more (a frame port) or fails ends the connection; bytes are never dropped
 /// silently.
-fn broker_read<P: Port>(port: &mut P, len: u64) {
+fn broker_read<P: Port>(
+    port: &mut P,
+    len: u64,
+    #[cfg(feature = "v020-production-authenticated-net")] authenticated_profile: bool,
+) {
     let limit = len as usize;
     if limit == 0 {
         return reply(0, ST_AGAIN); // nothing deliverable: dequeue nothing.
@@ -685,6 +837,18 @@ fn broker_read<P: Port>(port: &mut P, len: u64) {
     let mut frame = [0u8; device::MTU];
     match port.receive_up_to(&mut frame, limit) {
         Ok(Some(n)) if n != 0 && n <= limit && n <= frame.len() => {
+            #[cfg(feature = "v020-production-authenticated-net")]
+            if authenticated_profile && unsafe { TLS_AUTHENTICATED_EPOCH } == 0 {
+                let Some(mut pending) = (unsafe { PENDING_TLS }) else {
+                    return reply(0, ST_FAILED);
+                };
+                // The device poll may finish after the timer boundary. Never
+                // publish late input or renew an already expired window.
+                if !pending.record_read(now_ns()) {
+                    return reply(0, ST_FAILED);
+                }
+                unsafe { PENDING_TLS = Some(pending) };
+            }
             shared_put(OFF_PAYLOAD, &frame[..n]);
             unsafe { RELAYED_BYTES += n as u64 };
             reply(n as u64, ST_OK);
@@ -719,19 +883,43 @@ fn disconnect() {
 /// One bounded EL0 entry. Returns the trapped context kind/esr. Mirrors smp.rs
 /// execute() but uses the immutable-root entry (no per-SVC global TLBI) because the
 /// guest page-table descriptors never change while it runs.
-fn step(ctx: &mut user::Context, root: u64) {
+fn step(ctx: &mut user::Context, root: u64, asid: u8, latest_tick: u64) {
     let quantum = (timer::frequency() / 1000).max(1);
     unsafe {
-        timer::arm(timer::ticks().saturating_add(quantum));
-        user::enter_immutable(ctx, root, GUEST_ASID);
+        timer::arm(timer::ticks().saturating_add(quantum).min(latest_tick));
+        user::enter_immutable(ctx, root, asid);
         cpu::disable_timer();
     }
+}
+
+#[cfg(feature = "v020-production-authenticated-net")]
+fn ticks_at_ns(ns: u64) -> u64 {
+    (u128::from(ns) * u128::from(timer::frequency()))
+        .div_ceil(1_000_000_000)
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(feature = "v020-production-authenticated-net")]
+fn pending_timeout(pending: PendingTls, observed_ns: u64, dispatched: u64) -> GuestStop {
+    let (expires_ns, limit) = pending.deadline();
+    let code = match limit {
+        PendingLimit::Handshake => 903,
+        PendingLimit::RecordIdle => 904,
+    };
+    report(
+        "V020_SEC_N_PENDING_TIMEOUT",
+        code,
+        expires_ns - pending.accepted_ns(),
+        observed_ns - pending.accepted_ns(),
+    );
+    GuestStop { code, dispatched }
 }
 
 /// Why a bounded guest run ended without parking.
 #[derive(Clone, Copy)]
 pub(crate) struct GuestStop {
-    /// 900 unexpected EL0 fault, 901 non-0x43 SVC, 902 SVC budget exhausted.
+    /// 900 unexpected EL0 fault, 901 non-0x43 SVC, 902 SVC budget exhausted,
+    /// 903 kernel-owned TLS handshake deadline, 904 pending TLS input idle.
     pub(crate) code: u64,
     /// SVC dispatches performed before the stop (read by production only; the
     /// fixture halts on `code`).
@@ -762,7 +950,15 @@ pub(crate) fn try_run_until_park<P: Port>(
     entropy: &mut EntropyFill<'_>,
     budget: u64,
 ) -> Result<u64, GuestStop> {
-    run_guest(layout, port, entropy, budget, None)
+    run_guest(
+        layout,
+        port,
+        entropy,
+        budget,
+        None,
+        #[cfg(feature = "v020-production-authenticated-net")]
+        None,
+    )
 }
 
 pub(crate) fn run_guest<P: Port>(
@@ -771,13 +967,31 @@ pub(crate) fn run_guest<P: Port>(
     entropy: &mut EntropyFill<'_>,
     budget: u64,
     close_poll: Option<ClosePoll<P>>,
+    #[cfg(feature = "v020-production-authenticated-net")] mut signer: Option<&mut signer::Signer>,
 ) -> Result<u64, GuestStop> {
-    let root = phys(core::ptr::addr_of!(GUEST_ROOT) as u64);
+    let root = phys(guest_memory().root as u64);
     let mut ctx = fresh_context(layout);
     let mut dispatched = 0u64;
     let stop = |code, dispatched| Err(GuestStop { code, dispatched });
     for _ in 0..budget {
-        step(&mut ctx, root);
+        #[cfg(feature = "v020-production-authenticated-net")]
+        let (pending, latest_tick) =
+            if signer.is_some() && unsafe { TLS_AUTHENTICATED_EPOCH == 0 && !CLOSE_SEEN } {
+                let Some(pending) = (unsafe { PENDING_TLS }) else {
+                    return stop(903, dispatched);
+                };
+                let now = now_ns();
+                let deadline_ns = pending.deadline().0;
+                if now >= deadline_ns {
+                    return Err(pending_timeout(pending, now, dispatched));
+                }
+                (Some(pending), ticks_at_ns(deadline_ns))
+            } else {
+                (None, u64::MAX)
+            };
+        #[cfg(not(feature = "v020-production-authenticated-net"))]
+        let latest_tick = u64::MAX;
+        step(&mut ctx, root, GUEST_ASID, latest_tick);
         if ctx.kind == 9 {
             continue; // private PPI preemption; resume.
         }
@@ -788,7 +1002,19 @@ pub(crate) fn run_guest<P: Port>(
         if iss != 0x43 {
             return stop(901, dispatched); // only SVC 0x43 is admitted for this guest.
         }
-        broker(port, entropy, close_poll);
+        #[cfg(feature = "v020-production-authenticated-net")]
+        if let Some(pending) = pending
+            && timer::ticks() >= latest_tick
+        {
+            return Err(pending_timeout(pending, now_ns(), dispatched));
+        }
+        broker(
+            port,
+            entropy,
+            close_poll,
+            #[cfg(feature = "v020-production-authenticated-net")]
+            signer.as_deref_mut(),
+        );
         dispatched += 1;
         // ELR already points past the trapped SVC; resume with no register return
         // (the broker ABI carries results in the shared page, not x0).

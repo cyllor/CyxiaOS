@@ -79,7 +79,7 @@ fn verify_target(t: Target) -> Result<(), Error> {
     // The fixture executor has one protected target. Settlement independently
     // checked the actual installed weight before retaining the terminal record.
     let b = binding();
-    if !b.active || t != target() || unsafe { addr_of!(EXEC_TARGET.0.0[0]).read_volatile() } != 4 {
+    if !b.active || t != target() || EXEC_TARGET.installed_weight(PLAN_VERSION) != Some(4) {
         return Err(Error::NotReady);
     }
     let terminal = unsafe { (&*gate_ptr()).terminal_summary(SUPER, PLAN_SEQ) }?;

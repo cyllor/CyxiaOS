@@ -11,6 +11,7 @@ pub mod gpu;
 pub mod input_buffer;
 pub mod net;
 pub mod queue;
+pub mod reset;
 pub mod rng;
 pub mod snapshot;
 

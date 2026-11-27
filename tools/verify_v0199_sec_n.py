@@ -236,30 +236,34 @@ def cargo_prefix() -> str:
     return f'. "{cargo_env}" && ' if cargo_env.is_file() else ""
 
 
-def build_guest() -> None:
+def build_guest(isolated_signer: bool = False) -> None:
     """Provision the fixed test identity and build the release local-echo guest.
 
     Shared with tools/verify_v020_production.py: the production kernel
     include_bytes!-embeds this exact fixture-identity guest ELF.
     """
     env = dict(os.environ)
-    ident = Path(tempfile.mkdtemp(prefix="cyx-sec-n-ident-"))
-    shutil.copy(ROOT / "crates/net-transport/tests/fixtures/b-test-cert.der", ident / "cert.der")
-    shutil.copy(ROOT / "crates/net-transport/tests/fixtures/b-test-key.der", ident / "key.der")
-    (ident / "peer.pin").write_bytes(PEER_NODE)
-    guest_env = dict(env)
-    guest_env.update({
-        "CC_aarch64_unknown_none": "clang",
-        "CFLAGS_aarch64_unknown_none":
-            "--target=aarch64-none-elf -ffreestanding -fno-stack-protector "
-            "-mno-outline-atomics -DRING_CORE_NOSTDLIBINC",
-        "RUSTFLAGS": "-C relocation-model=static -C code-model=large -C strip=debuginfo",
-        "CYXIA_LOCAL_ECHO_IDENTITY": str(ident),
-    })
-    subprocess.run(
-        cargo_prefix() + "cargo build --release --locked --offline -p cyxia-local-echo "
-        "--features guest --target aarch64-unknown-none",
-        shell=True, cwd=ROOT, env=guest_env, check=True, executable="/bin/bash")
+    with tempfile.TemporaryDirectory(prefix="cyx-sec-n-ident-") as temporary:
+        ident = Path(temporary)
+        fixtures = ROOT / "crates/net-transport/tests/fixtures"
+        shutil.copy(fixtures / "b-test-cert.der", ident / "cert.der")
+        if isolated_signer:
+            shutil.copy(fixtures / "b-test-key.der", ident / "key.der")
+        (ident / "peer.pin").write_bytes(PEER_NODE)
+        guest_env = dict(env)
+        guest_env.update({
+            "CC_aarch64_unknown_none": "clang",
+            "CFLAGS_aarch64_unknown_none":
+                "--target=aarch64-none-elf -ffreestanding -fno-stack-protector "
+                "-mno-outline-atomics -DRING_CORE_NOSTDLIBINC",
+            "RUSTFLAGS": "-C relocation-model=static -C code-model=large -C strip=debuginfo",
+            "CYXIA_LOCAL_ECHO_IDENTITY": str(ident),
+        })
+        feature = "guest-signer" if isolated_signer else "guest"
+        subprocess.run(
+            cargo_prefix() + "cargo build --release --locked --offline -p cyxia-local-echo "
+            f"--features {feature} --target aarch64-unknown-none",
+            shell=True, cwd=ROOT, env=guest_env, check=True, executable="/bin/bash")
 
 
 def build() -> Path:

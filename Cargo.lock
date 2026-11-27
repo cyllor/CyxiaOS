@@ -177,6 +177,7 @@ dependencies = [
  "cyxia-prototype",
  "cyxia-shell",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]
@@ -188,15 +189,18 @@ dependencies = [
  "cyxia-prototype",
  "ed25519-dalek",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]
 name = "cyxia-local-echo"
 version = "0.1.0"
 dependencies = [
+ "cyxia-contracts",
  "cyxia-net-transport",
  "cyxia-prototype",
  "getrandom",
+ "ring",
  "rustls",
 ]
 

@@ -13,6 +13,8 @@ from pathlib import Path
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests/fixtures/v020-signed-scratch/config.bin"
 FSYNC_FIXTURE = FIXTURE.with_name("fsync-config.bin")
+RECEIPT_QUERY_FIXTURE = FIXTURE.with_name("fsync-receipt-query.bin")
+FSYNC_CLIENT_FIXTURE = FIXTURE.with_name("fsync-client.bin")
 UUID = b"CYX-W11-STAGING!"
 FSYNC_UUID = b"CYX-FSYNC-TEST!!"
 FSYNC_POLICY = b"CYX-SCRATCH-FSYNC/v1:inode=1,principal=1"
@@ -21,6 +23,19 @@ SEED = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031c
 # Three empty test-only lists. The guest accepts precisely these twelve bytes.
 CATALOG = (b"scratch/test/rules/1", b"scratch/test/security/1", b"scratch/test/keys/1")
 EXPECTED_SHA256 = "ffff2c6b9fde3b5311c4df1c871ff6b3830817fd1d76e0a1fb4bc07aaa369bcf"
+
+
+def receipt_query_policy(fsync_wire):
+    return (b"CYX-SCRATCH-FILE-RECEIPT-QUERY/v1:fsync="
+            + hashlib.sha256(fsync_wire).hexdigest().encode("ascii")
+            + b",principal=1,generation=1,holder_role=11,file_service=12,ipc_send=1")
+
+
+def fsync_client_policy(fsync_wire):
+    return (b"CYX-SCRATCH-FILE-FSYNC-CLIENT/v1:fsync="
+            + hashlib.sha256(fsync_wire).hexdigest().encode("ascii")
+            + b",principal=1,generation=1,holder_role=11,file_service=12,ipc_send=1,"
+              b"inode=1,inode_generation=1,file_rights=0x2300")
 
 
 def sha(data):
@@ -63,6 +78,20 @@ class SignedScratchVector(unittest.TestCase):
             encoded = signed_vector(Path(directory), FSYNC_UUID, FSYNC_POLICY)
             self.assertEqual(FSYNC_FIXTURE.read_bytes(), encoded)
             self.assertNotEqual(sha(encoded).hex(), EXPECTED_SHA256)
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL required for independent encoder")
+    def test_receipt_query_qualification_binds_the_existing_fsync_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            encoded = signed_vector(Path(directory), FSYNC_UUID,
+                                    receipt_query_policy(FSYNC_FIXTURE.read_bytes()))
+            self.assertEqual(RECEIPT_QUERY_FIXTURE.read_bytes(), encoded)
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL required for independent encoder")
+    def test_fsync_client_qualification_binds_the_existing_fsync_policy_and_acl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            encoded = signed_vector(Path(directory), FSYNC_UUID,
+                                    fsync_client_policy(FSYNC_FIXTURE.read_bytes()))
+            self.assertEqual(FSYNC_CLIENT_FIXTURE.read_bytes(), encoded)
 
 
 if __name__ == "__main__":

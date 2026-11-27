@@ -3,6 +3,7 @@ use super::{BUFFER, HEADER, MAX_FRAME, Net};
 use crate::{
     DiagnosticStage as Stage, Error, Platform, Transport,
     queue::{BatchMemory, BatchQueue, NotifyFeedback, NotifyRequest, NotifyStats, Token},
+    reset::{DeviceState, ResetProof},
 };
 /// Exactly one device-verified TX used-ring completion retained by the
 /// dedicated native adapter until its protected upper owner acknowledges.
@@ -17,43 +18,88 @@ pub struct BatchedNet {
     rx: BatchQueue,
     tx: BatchQueue,
     mac: [u8; 6],
+    strict_features: bool,
     received: Option<(Token, usize)>,
     completed_tx: Option<TxReceipt>,
-    failed: bool,
+    state: DeviceState,
     last_completed: u64,
     hooks: Option<(NotifyRequest, NotifyFeedback)>,
     command_version: u64,
 }
 impl BatchedNet {
     pub fn initialize(
+        t: Transport,
+        rx: &'static mut BatchMemory,
+        tx: &'static mut BatchMemory,
+        p: &impl Platform,
+    ) -> Result<Self, Error> {
+        Self::initialize_inner(t, rx, tx, None, p)
+    }
+
+    /// Admit the V0.20 native net profile with only MAC and VERSION_1,
+    /// and check the deployment MAC before advertising any DMA descriptors.
+    pub fn initialize_native(
+        t: Transport,
+        rx: &'static mut BatchMemory,
+        tx: &'static mut BatchMemory,
+        expected_mac: [u8; 6],
+        p: &impl Platform,
+    ) -> Result<Self, Error> {
+        Self::initialize_inner(t, rx, tx, Some(expected_mac), p)
+    }
+
+    fn initialize_inner(
         mut t: Transport,
         rx: &'static mut BatchMemory,
         tx: &'static mut BatchMemory,
+        expected_mac: Option<[u8; 6]>,
         p: &impl Platform,
     ) -> Result<Self, Error> {
         if t.device_id() != 1 {
             return Err(Error::Device);
         }
-        Net::negotiate(&mut t, p)?;
-        let mac = Net::read_mac(&t, p)?;
-        let rx = BatchQueue::configure(&mut t, rx, 0, p)?;
-        let tx = BatchQueue::configure(&mut t, tx, 1, p)?;
-        t.start(p)?;
+        let strict_features = expected_mac.is_some();
+        Net::negotiate(&mut t, p, !strict_features)?;
+        let configured =
+            (|t: &mut Transport, rx: &'static mut BatchMemory, tx: &'static mut BatchMemory| {
+                let mac = Net::read_mac(t, p)?;
+                if expected_mac.is_some_and(|expected| expected != mac) {
+                    return Err(Error::Device);
+                }
+                let rx = BatchQueue::configure(t, rx, 0, p)?;
+                let tx = BatchQueue::configure(t, tx, 1, p)?;
+                t.start(p)?;
+                Ok((mac, rx, tx))
+            })(&mut t, rx, tx);
+        let (mac, rx, tx) = match configured {
+            Ok(configured) => configured,
+            Err(error) => {
+                t.fail();
+                p.barrier();
+                return Err(error);
+            }
+        };
         let mut net = Self {
             transport: t,
             rx,
             tx,
             mac,
+            strict_features,
             received: None,
             completed_tx: None,
-            failed: false,
+            state: DeviceState::Live,
             last_completed: 0,
             hooks: None,
             command_version: 0,
         };
         for _ in 0..net.rx.capacity() {
-            net.rx
-                .enqueue(&mut net.transport, &[], BUFFER, false, true, p)?;
+            if let Err(error) = net
+                .rx
+                .enqueue(&mut net.transport, &[], BUFFER, false, true, p)
+            {
+                net.fail(p);
+                return Err(error);
+            }
         }
         Ok(net)
     }
@@ -66,15 +112,15 @@ impl BatchedNet {
         }
     }
     fn healthy(&mut self, p: &impl Platform) -> Result<(), Error> {
+        if self.state != DeviceState::Live {
+            return Err(Error::Device);
+        }
         if let Some((request, _)) = self.hooks
             && let Some(c) = request(p.now_ns())
             && c.version != self.command_version
         {
             self.set_notify_policy(c.batch, c.version, c.until_ns, p.now_ns())?;
             self.command_version = c.version;
-        }
-        if self.failed {
-            return Err(Error::Device);
         }
         if self.transport.check().is_err() {
             self.fail(p);
@@ -83,16 +129,41 @@ impl BatchedNet {
         Ok(())
     }
     fn fail(&mut self, p: &impl Platform) {
-        self.failed = true;
+        self.state = DeviceState::Failed;
         self.rx.poison(&mut self.transport, p);
         self.tx.poison(&mut self.transport, p);
         self.report(p, false);
+    }
+    /// Permanently stop this one-shot native NIC owner. The caller retains
+    /// this outcome for retries. RX/TX buffers and credits stay in custody.
+    pub fn stop_native(
+        &mut self,
+        boot_epoch: u64,
+        platform: &impl Platform,
+    ) -> Result<[ResetProof; 2], Error> {
+        if !self.strict_features {
+            return Err(Error::Unsupported);
+        }
+        if boot_epoch == 0 {
+            return Err(Error::Address);
+        }
+        if self.state == DeviceState::ResetAttempted {
+            return Err(Error::Busy);
+        }
+        self.state = DeviceState::ResetAttempted;
+        self.rx.fence();
+        self.tx.fence();
+        self.transport
+            .observe_mmio_reset(1, &[0, 1], platform)
+            .map(|observed| {
+                [0, 1].map(|id| ResetProof::for_first_generation(boot_epoch, 1, id, observed))
+            })
     }
     /// Conservative device TX settle witness, only after every used-ring
     /// completion was validated and every matching token acknowledged.
     /// Pending/UNKNOWN TX or a held receipt forbids normal credit retirement.
     pub fn tx_quiescent(&self) -> bool {
-        !self.failed && self.completed_tx.is_none() && self.tx.is_quiescent()
+        self.state == DeviceState::Live && self.completed_tx.is_none() && self.tx.is_quiescent()
     }
     pub fn mac(&self) -> [u8; 6] {
         self.mac
@@ -261,7 +332,13 @@ impl BatchedNet {
         let valid = (HEADER + 14..=BUFFER).contains(&c.len)
             && self.rx.completed_response(c.token).is_ok_and(|page| {
                 let [flags, gso] = page.get16(0).to_le_bytes();
-                flags & 7 == 0 && gso == 0 && page.get16(10) == 1
+                let buffers = page.get16(10);
+                // QEMU 10.2's non-mergeable receive path leaves num_buffers
+                // unwritten. The zero-initialized field then stays zero.
+                // In this profile the device still gets one bounded descriptor.
+                flags & 7 == 0
+                    && gso == 0
+                    && (buffers == 1 || (self.strict_features && buffers == 0))
             });
         if !valid {
             self.fail(p);
@@ -352,9 +429,10 @@ mod tests {
             rx,
             tx,
             mac: [2, 0, 0, 0, 0, 1],
+            strict_features: false,
             received: None,
             completed_tx: None,
-            failed: false,
+            state: DeviceState::Live,
             last_completed: 0,
             hooks: None,
             command_version: 0,
@@ -386,6 +464,16 @@ mod tests {
         }
     }
     const GOOD_HEADER: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+
+    #[test]
+    fn native_rx_accepts_one_frame_when_qemu_leaves_buffer_count_unwritten() {
+        let (mut net, platform, rx, _) = fixture();
+        net.strict_features = true;
+        device_receive(rx, 0, [0; HEADER], &[0x5a; 64], 76);
+        let mut out = [0; 64];
+        assert_eq!(net.receive(&mut out, &platform), Ok(Some(64)));
+        assert_eq!(out, [0x5a; 64]);
+    }
 
     #[test]
     fn rx_owner_fits_below_one_receive_buffer() {

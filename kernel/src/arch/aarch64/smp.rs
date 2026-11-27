@@ -220,7 +220,8 @@ const PRIVATE_SPACES: usize = C * 2
     } else {
         0
     };
-const STACK_BYTES: usize = 4096 + 65536;
+const EXEC_STACK_BYTES: usize = crate::machine::SMP_EXEC_STACK_BYTES;
+const STACK_BYTES: usize = 4096 + EXEC_STACK_BYTES;
 const CODE: u64 = 0x10000;
 const DATA: u64 = 0x20000;
 const STACK: u64 = 0x30000;
@@ -230,7 +231,11 @@ const STACK: u64 = 0x30000;
 static CYXIA_SMP_PROFILE: [u64; 6] = [1, 4, 8, 1, 0, 0];
 const REQUIRED: usize = 4; // Test configuration only; never an AI core-count rule.
 
-core::arch::global_asm!(include_str!("../../../../crates/arch-aarch64/src/secondary.S"), max_cpus=const C);
+core::arch::global_asm!(
+    include_str!("../../../../crates/arch-aarch64/src/secondary.S"),
+    max_cpus = const C,
+    exec_stack_pages = const EXEC_STACK_BYTES / 4096,
+);
 core::arch::global_asm!(
     include_str!("smp_user.S"),
     d02_enabled = const cfg!(feature = "v0199-epoch-disk-selftest") as u8,
@@ -348,6 +353,7 @@ unsafe extern "C" {
     #[cfg(feature = "v0199-advice-e2e-selftest")]
     static v0199_advice_user_end: u8;
 }
+#[cfg(not(feature = "v020-production-signed-resident"))]
 fn index(slot: usize, plane: Plane) -> usize {
     slot * 2 + usize::from(plane == Plane::Control)
 }
@@ -385,23 +391,28 @@ pub(crate) fn gic() -> &'static Gic {
     }
 }
 fn report_payload<'a>(data: &'a mut [u8], label: &str, a: u64, b: u64, c: u64) -> &'a [u8] {
-    use core::fmt::Write;
-    struct Text<'a> {
-        data: &'a mut [u8],
-        n: usize,
-    }
-    impl Write for Text<'_> {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            let end = self.n + s.len();
-            let out = self.data.get_mut(self.n..end).ok_or(core::fmt::Error)?;
-            out.copy_from_slice(s.as_bytes());
-            self.n = end;
-            Ok(())
+    // All resident reports use this fixed decimal format. Direct writes
+    // keep the EL1 telemetry call graph independent of formatter vtables.
+    let mut used = label.len();
+    data[..used].copy_from_slice(label.as_bytes());
+    for (prefix, mut value) in [(b" a=", a), (b" b=", b), (b" c=", c)] {
+        let mut decimal = [0; 20];
+        let mut start = decimal.len();
+        loop {
+            start -= 1;
+            decimal[start] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
         }
+        let after_prefix = used + prefix.len();
+        data[used..after_prefix].copy_from_slice(prefix);
+        used = after_prefix + decimal.len() - start;
+        data[after_prefix..used].copy_from_slice(&decimal[start..]);
     }
-    let mut text = Text { data, n: 0 };
-    writeln!(&mut text, "{label} a={a} b={b} c={c}").unwrap();
-    &text.data[..text.n]
+    data[used] = b'\n';
+    &data[..=used]
 }
 fn report(label: &str, a: u64, b: u64, c: u64) {
     // CPU0 alone owns the framed UART writer; secondary CPUs publish atomics.
@@ -474,8 +485,9 @@ fn record_fault(code: u64, kind: u64, frame: Option<&super::ExceptionFrame>) {
     bank[0].store(0x4359_534d_5046_4131, Ordering::Release);
 }
 fn stop_failed(code: u64) -> ! {
-    let slot = cpu::slot();
-    FAILURES[slot].store(code, Ordering::Release);
+    if let Some(failure) = cpu::registered_slot().and_then(|slot| FAILURES.get(slot)) {
+        failure.store(code, Ordering::Release);
+    }
     super::halt()
 }
 /// Handle only this profile's private timer and EL0 traps. No production global
@@ -510,11 +522,14 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
                     }
                     #[cfg(not(feature = "unified-runtime"))]
                     cpu::disable_timer();
-                    #[cfg(all(
-                        feature = "v020-production",
-                        not(feature = "v020-production-diagnostic")
+                    #[cfg(any(
+                        feature = "v020-production-signed-resident",
+                        all(
+                            feature = "v020-production",
+                            not(feature = "v020-production-diagnostic")
+                        )
                     ))]
-                    if slot == 0 {
+                    if slot == 0 && kind == 5 {
                         timer::arm(production::timer_deadline());
                     }
                 }
@@ -565,9 +580,12 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
             IrqAck::Spurious => {
                 prototype_runtime::irq_exit(slot);
             }
-            #[cfg(all(
-                feature = "v020-production",
-                not(feature = "v020-production-diagnostic")
+            #[cfg(any(
+                feature = "v020-production-signed-resident",
+                all(
+                    feature = "v020-production",
+                    not(feature = "v020-production-diagnostic")
+                )
             ))]
             IrqAck::Spurious if kind == 5 => {}
             #[cfg(not(feature = "unified-runtime"))]
@@ -575,6 +593,7 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
         }
         #[cfg(any(
             feature = "unified-runtime",
+            feature = "v020-production-signed-resident",
             all(
                 feature = "v020-production",
                 not(feature = "v020-production-diagnostic")
@@ -683,6 +702,7 @@ fn bring_up_production(info: &BootInfo) {
     for (slot, affinity) in AFFINITIES.iter().enumerate().take(topo.count) {
         affinity.store(topo.affinity[slot], Ordering::Release);
     }
+    crate::machine::panic_stop::register_cpu(gic(), 0);
     BOOT_READY.store(true, Ordering::Release);
     unsafe {
         core::arch::asm!("dsb sy", options(nostack));
@@ -703,7 +723,20 @@ fn bring_up_production(info: &BootInfo) {
     }
     let online = (1 << REQUIRED) - 1;
     wait(|| ONLINE.load(Ordering::Acquire) == online);
+    crate::machine::panic_stop::publish_ready(online);
     report("SMP_BOOT_OK", topo.count as u64, online, 0);
+    #[cfg(feature = "v020-panic-stop-selftest")]
+    crate::machine::panic_stop::exercise();
+}
+
+// SAFETY: called only after the stop coordinator acquires its registered
+// four-CPU ready state. Each CPU published its own GIC interface before that.
+#[cfg(feature = "v020-production")]
+pub(super) unsafe fn gic_for_terminal_stop(slot: usize) -> Option<&'static Gic> {
+    if slot >= REQUIRED {
+        return None;
+    }
+    unsafe { (&*core::ptr::addr_of!(GICS).cast::<Option<Gic>>().add(slot)).as_ref() }
 }
 fn context(i: usize) -> user::Context {
     let mut ctx = user::Context::empty();
@@ -834,10 +867,14 @@ fn fixture_context_valid(ctx: &user::Context, i: usize) -> bool {
     }
     valid != 0
 }
-#[cfg(not(feature = "unified-runtime"))]
+#[cfg(all(
+    not(feature = "unified-runtime"),
+    not(feature = "v020-production-signed-resident")
+))]
 fn fixture_yielded(ctx: &user::Context) -> bool {
     ctx.kind == 9
 }
+#[cfg(not(feature = "v020-production-signed-resident"))]
 fn probes(slot: usize, i: usize) {
     // Probe an EL1-only address, an unmapped private address, code write, NX data,
     // and the user stack guard. A successful access/SVC is failure, not evidence.
@@ -895,6 +932,8 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
             .cast::<Option<Gic>>()
             .add(slot) = Some(controller);
     }
+    #[cfg(feature = "v020-production")]
+    crate::machine::panic_stop::register_cpu(gic(), slot);
     #[cfg(feature = "unified-runtime")]
     {
         crate::domain_platform::register_ipi_cpu(gic(), slot).expect("IPI CPU registration");
@@ -908,11 +947,16 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
     #[cfg(feature = "unified-runtime")]
     crate::boot_recovery::formal::el1();
     ONLINE.fetch_or(1 << slot, Ordering::Release);
+    #[cfg(feature = "v020-panic-stop-late-selftest")]
+    crate::machine::panic_stop::hold_healthy_peer_until_result(slot);
     #[cfg(feature = "register-v15-selftest")]
     register_evidence::worker(slot);
-    #[cfg(all(
-        feature = "v020-production",
-        not(feature = "v020-production-diagnostic")
+    #[cfg(any(
+        feature = "v020-production-signed-resident",
+        all(
+            feature = "v020-production",
+            not(feature = "v020-production-diagnostic")
+        )
     ))]
     {
         // Startup has yet to authorize any business EL0. The parked CPUs stay
@@ -922,16 +966,22 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
             timer::idle();
         }
     }
-    #[cfg(any(
-        not(feature = "v020-production"),
-        feature = "v020-production-diagnostic"
+    #[cfg(all(
+        not(feature = "v020-production-signed-resident"),
+        any(
+            not(feature = "v020-production"),
+            feature = "v020-production-diagnostic"
+        )
     ))]
     secondary_work(slot)
 }
 
-#[cfg(any(
-    not(feature = "v020-production"),
-    feature = "v020-production-diagnostic"
+#[cfg(all(
+    not(feature = "v020-production-signed-resident"),
+    any(
+        not(feature = "v020-production"),
+        feature = "v020-production-diagnostic"
+    )
 ))]
 fn secondary_work(slot: usize) -> ! {
     let mut contexts = [context(slot * 2), context(slot * 2 + 1)];

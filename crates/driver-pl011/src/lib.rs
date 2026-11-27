@@ -50,21 +50,90 @@ impl Pl011 {
         }
         Ok(Some(value as u8))
     }
-}
-impl ConsoleOps for Pl011 {
-    fn try_write(&mut self, data: &[u8]) -> Result<usize, PlatformError> {
+
+    /// One nonblocking TX attempt of at most 64 bytes. Stop on the first full
+    /// FIFO or when the caller's nonblocking deadline check returns false.
+    /// The check runs before both the status read and the data write.
+    pub fn try_write_before(&mut self, data: &[u8], mut permitted: impl FnMut() -> bool) -> usize {
         let mut n = 0;
         for &byte in data.iter().take(64) {
-            if unsafe { core::ptr::read_volatile((self.base + 0x18) as *const u32) } & 0x20 != 0 {
+            if !permitted()
+                || unsafe { core::ptr::read_volatile((self.base + 0x18) as *const u32) } & 0x20 != 0
+                || !permitted()
+            {
                 break;
             }
             unsafe { self.write(0, byte as u32) }
             n += 1;
         }
+        n
+    }
+}
+impl ConsoleOps for Pl011 {
+    fn try_write(&mut self, data: &[u8]) -> Result<usize, PlatformError> {
+        let n = self.try_write_before(data, || true);
         if n == 0 && !data.is_empty() {
             Err(PlatformError::Again)
         } else {
             Ok(n)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(align(4096))]
+    struct Page([u32; 1024]);
+
+    #[test]
+    fn full_fifo_is_checked_once_and_never_written() {
+        let mut page = Page([0; 1024]);
+        page.0[0] = 0x5a;
+        page.0[6] = 0x20;
+        let mut checks = 0;
+        // SAFETY: the aligned page models device registers for this test.
+        let mut uart = unsafe {
+            Pl011::attach(UartResource {
+                base: PhysAddr(page.0.as_mut_ptr() as u64),
+                len: 4096,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            uart.try_write_before(b"terminal", || {
+                checks += 1;
+                true
+            }),
+            0
+        );
+        assert_eq!(checks, 1);
+        assert_eq!(page.0[0], 0x5a);
+        assert_eq!(uart.try_write(b"default"), Err(PlatformError::Again));
+    }
+
+    #[test]
+    fn elapsed_deadline_between_status_and_data_leaves_the_unsent_suffix() {
+        let mut page = Page([0; 1024]);
+        let mut checks = 0;
+        // SAFETY: the aligned page models device registers for this test.
+        let mut uart = unsafe {
+            Pl011::attach(UartResource {
+                base: PhysAddr(page.0.as_mut_ptr() as u64),
+                len: 4096,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            uart.try_write_before(b"abc", || {
+                checks += 1;
+                checks <= 3
+            }),
+            1
+        );
+        assert_eq!(checks, 4);
+        assert_eq!(page.0[0], u32::from(b'a'));
+        assert_eq!(uart.try_write(&[0xff; 65]), Ok(64));
     }
 }

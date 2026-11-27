@@ -1,9 +1,6 @@
 # V0.20 验收覆盖矩阵说明（127 个稳定 ID）
 
-**状态：仅覆盖映射（coverage mapping）。全部 127 项稳定 ID 的原生验收判定保持 NOT_RUN；
-G0 待复审、G1=NOT_READY、G2/G3 未运行、G4-QEMU/G5-ARCH=NOT_RUN。
-本文与配套工具不声称任何 ID PASS；宿主测试与原生机制夹具证据均为部分覆盖，
-原生夹具 PASS ≠ G4 验收（安§7.6、设计§7 同口径）。**
+覆盖映射中的 127 项原生验收判定均为 `NOT_RUN`。G0 待复审，G1 为 `NOT_READY`，G2/G3 和 G4-QEMU 为 `NOT_RUN`。宿主测试与原生机制夹具记录部分覆盖。V0.20 的最终验收门槛是 G4-QEMU。[V0.20 验收约束](../design/v0.20-native-local-system.md#7-验收与发布)
 
 配套工具：`tools/acceptance_coverage.py`（人工核定数据表，确定性输出，无 cargo/QEMU 依赖）。
 完整逐 ID 矩阵由该工具生成：
@@ -30,7 +27,7 @@ python3 -B tools/acceptance_coverage.py --strict   # 证据路径缺失即失败
   - 安§7.3 必测交错调度矩阵（L10956 起）：J01–J13 共 13 项跨域联合用例。
   - 安§7.4 强制证明矩阵（L11133 起）：每 ID 的 RUNTIME_QEMU/STATIC_EL1/MODEL_CHECK/ARCH_A53
     类别归属；安§7.6（L11299）：127 项均 NOT_RUN。
-- `docs/design/v0.20-native-local-system.md` §7（L80–92）：同口径 127 ID 与 G0–G5 门槛状态；
+- `docs/design/v0.20-native-local-system.md` §7：同口径 127 ID 与 G0–G4 门槛状态。
   快照新增断言建立独立需求追溯、保留原 ID，不得以旧测试 PASS 冒充新断言通过。
 
 注意：仓库根 `CyxiaOS-architecture-review-coverage.json` 的 A01/S01 等条目属于旧架构评审
@@ -43,7 +40,7 @@ python3 -B tools/acceptance_coverage.py --strict   # 证据路径缺失即失败
 | 状态 | 含义 |
 |---|---|
 | FIXTURE | 存在原生 QEMU 机制夹具证据（可伴随宿主证据）：`kernel/src/arch/aarch64/v0199_*.rs` 门控自检、`smp.rs` fixed_cpu0_fixture、boot/selftest 故障探针，及 `tools/verify_smp.py`、`verify_v0199_cpu0_roles.py`、`verify_v0199_eight_packages.py`（bringup）、`verify_v0199_advice_e2e.py`、`verify_v0199_epoch_disk.py`、`verify_v16_a10_matrix_v4.py`、`verify_native_net.py`、`verify_v13_tcp.py`、`boot_reboot_contract.py` 等校验器 |
-| HOST | 仅宿主测试证据：`crates/*/tests/`、内联 `#[cfg(test)]` 模块、`tests/host/*.rs` harness（经 `tools/host_prototype_library.py` 对 prototype rlib 编译） |
+| HOST | 宿主侧测试或静态检查，包括 `crates/*/tests/`、内联 `#[cfg(test)]`、`tests/host/*.rs` 和链接 ELF 的静态子检查 |
 | GAP | 未发现任何演练该 ID 主题的测试/夹具 |
 
 证据路径均经存在性核验（工具 `--strict` 通过）；高频引用的测试函数名经 grep 逐一确认。
@@ -72,57 +69,36 @@ python3 -B tools/acceptance_coverage.py --strict   # 证据路径缺失即失败
 
 ## 3. 覆盖统计（工具实测输出）
 
-总计 127：**HOST=71，FIXTURE=44，GAP=12**。
+共 127 个 ID，已有 **82 项宿主侧证据和 45 项 QEMU 机制证据**。每项均登记了至少一条相关证据路径。
 
 | 族 | 项数 | HOST | FIXTURE | GAP | GAP ID |
 |---|---:|---:|---:|---:|---|
-| SEC-P 进程 | 13 | 5 | 7 | 1 | P11 |
-| SEC-F 文件 | 13 | 8 | 3 | 2 | F07、F12 |
-| SEC-M 内存 | 15 | 7 | 6 | 2 | M11、M12 |
-| SEC-N 网络 | 16 | 10 | 2 | 4 | N07、N09、N10、N13 |
-| SEC-D 设备 | 14 | 11 | 1 | 2 | D08、D10 |
-| SEC-S 系统调用 | 13 | 9 | 3 | 1 | S10 |
+| SEC-P 进程 | 13 | 6 | 7 | 0 | — |
+| SEC-F 文件 | 13 | 10 | 3 | 0 | — |
+| SEC-M 内存 | 15 | 9 | 6 | 0 | — |
+| SEC-N 网络 | 16 | 14 | 2 | 0 | — |
+| SEC-D 设备 | 14 | 12 | 2 | 0 | — |
+| SEC-S 系统调用 | 13 | 10 | 3 | 0 | — |
 | J 跨域 | 13 | 8 | 5 | 0 | — |
 | A 回归 | 13 | 2 | 11 | 0 | — |
 | E 回归 | 11 | 8 | 3 | 0 | — |
 | H 回归 | 6 | 3 | 3 | 0 | — |
 
-- 安全 97 项（84 SEC + 13 J）：HOST=58，FIXTURE=27，GAP=12。
+- 安全 97 项（84 SEC + 13 J）：HOST=69，FIXTURE=28，GAP=0。
 - 回归 30 项（A13 + E11 + H6）：HOST=13，FIXTURE=17，GAP=0。
-- **全部 12 个 GAP 都落在 84 项 SEC 单域安全集内**；J 与 A/E/H 均有至少部分证据。
-- 没有任何 ID 达到完整验收覆盖：FIXTURE 仅机制夹具范围，HOST 仅契约/模型层。
+- SEC-D08 在同一签名测试卷上对照 VirtIO FLUSH 开关。关闭时挂载被拒绝，设备零 I/O，卷摘要一致。开启后冷重开确认下一 BootEpoch。[SEC-D08 运行验证器](../../tools/verify_v0199_d08_flush.py)
+- 正式 G4 证据的归档要求和当前状态见第 8 节。
 
-## 4. 阻断 G4 的关键 GAP（12 项，按影响排序）
+## 4. 从已覆盖子场景到正式验证的缺口
 
-1. **SEC-N09 / SEC-N10 / SEC-N13 —— SYN 防洪与可用性负载整体缺失（最高优先）**
-   全仓库无 SYN-ACK 令牌/16 桶/challenge ACK 机制（grep `syn_cookie|syn_bucket|challenge_ack`
-   零命中），§13.8 冻结环境可用性负载（N10-B 100 源 W≤300ms、N13-A/B W≤600ms、
-   ≥95/100 成功率、逐桶滑窗包络）无任何夹具。N13 属 MODEL_CHECK 强制类别。
-   网络防洪验收轨道整体未起步。
-2. **SEC-M11 / SEC-M12 —— A53 无 PAN 复制窗口与应急栈机制缺失**
-   无 EL1 误引用用户 VA 的 copy 窗口/临时映射测试（M11），无 SP_ELx guard fault/
-   每 CPU emergency 栈切换/scratch 转存嵌套机制或测试（M12，全仓库搜索仅无关 sp_el0 读取）。
-   两者属 STATIC_EL1 强制类别（M12 另涉 ARCH_A53），是内存安全架构证明的硬缺口。
-3. **SEC-P11 —— WFI/WFE/CTR_EL0/AArch32 陷入处理未实现未测**
-   `exceptions.rs` 无 WFI/AArch32 处理；无 ELR+4 合法陷入、yield/只读模拟、
-   AArch32 拒绝、保存帧不泄漏测试。
-4. **SEC-S10 —— 查询不可区分性未测**
-   无测试断言"不存在对象 vs 真实无权对象"跨权限返回相同外部拒绝；
-   cap 查找拒绝错误 holder 但从未比较两种情形（防对象存在性探测）。
-5. **SEC-F07 / SEC-F12 —— 文件并发/配额两个主题无演练**
-   D04 档位切换×fsync 并发（事务不可拆、元数据闭包）无测试；
-   单组 8 持久票据满仅拒本组、≥9 次易失 WRITE 不占票据、其他组/恢复继续无测试
-   （收据存储仅扫描类测试）。
-6. **SEC-D08 / SEC-D10 —— 设备边界门存在但未测**
-   无 FLUSH 拒绝可写 mount 的生产门已存在（`driver-virtio/src/block.rs:49`、
-   `block/batched.rs:54`），但测试夹具恒提供 FLUSH，拒绝路径零演练；
-   SPI 无进展 999/1000 屏蔽/安静恢复与特殊 ID 不错误 EOI（原生屏蔽路径在 smp.rs、
-   driver-gicv2 acknowledge/end）均未测。
-7. **SEC-N07 —— 密钥/报文日志探测无断言**
-   无"关键秘密不存在于日志或 AI 可读快照"的测试；tls_duplex 的 TestSecret KeyLog
-   仅用于伪造测试记录，方向相反。
+- SEC-N07、N09、N10 和 N13 已复跑宿主诊断、会话和预算契约。实际原生网络准入、冻结负载、关闭回收及 AI 遥测证据仍待交付。
+- SEC-M11 和 M12 已复跑临时 copy 窗口和应急栈契约。原生 EL1 接线及其运行、静态证明仍待交付。
+- SEC-P11 和 S09 已在链接 ELF 核对 16 个异常向量、两处 `VBAR_EL1` 写入和整数异常帧。AArch32 拒绝、WFI/WFE、CTR_EL0、SVC 写回权限和运行时上下文证据仍待交付。[EL1 异常向量检查器](../../tools/check_v0199_el1_vectors.py)
+- SEC-S10 已复跑查询返回等价契约。原生 `task_query` 与文件查询入口的证据仍待交付。
+- SEC-F07 和 F12 已复跑切档事务与分组票据测试。文件服务的原生并发、落盘与恢复证据仍待交付。
+- SEC-D10 已复跑中断屏蔽和恢复契约。GICv2 实际路径及静态证明仍待交付。
 
-## 5. GAP 之外的结构性薄弱点（同样阻断 G4，不得因"有覆盖"误判）
+## 5. 历史盘点中的结构性薄弱点
 
 - **全部 13 项 J 跨域用例无真实原生多域交错**：宿主 `integration_tests.rs`（j01–j12）
   文件头明确声明不构成安全验收；现有夹具只覆盖单域腿（smp drain、epoch-disk 守恒、
@@ -158,9 +134,8 @@ python3 -B tools/acceptance_coverage.py --strict   # 证据路径缺失即失败
 - 一处命名陷阱已登记：`process.rs` 的 `sec_p07_exiting_cannot_take_new_references`
   测试名与规范 SEC-P07 主题不符（实为退出引用主题），已按主题归入 SEC-P05 证据。
 - 设计§6 称 policy_lock "13 项宿主测试"，实测内联 `#[test]` 为 12 项；以实测为准。
-- 本矩阵不判定 RUNTIME_QEMU/STATIC_EL1/MODEL_CHECK/ARCH_A53 任何证明类别；
-  类别归属见安§7.4 强制证明矩阵。G4-QEMU 须 G0/G1 完成且 127 项各自规定的强制类别
-  全部 PASS；当前 G1=NOT_READY，两阶段均 NOT_RUN，状态不因本矩阵改变。
+- 各用例的证明类别见基线安§7.4。G4-QEMU 须完成 G0/G1，并提交 127 项各自适用的
+  `RUNTIME_QEMU`、`STATIC_EL1` 和 `MODEL_CHECK` 裁决。`ARCH_A53` 适用于另行发起的实体平台验收。
 
 ## 7. 第九波契约补全注记（T10 同步，2026-11-25，进行中、未提交）
 
@@ -194,3 +169,30 @@ crates/kernel-core/src/security/recovery_proof_v2.rs（32 项测试，原生 EL1
 LATER）；「TLS 常量与规范分歧（握手 30s）」→ HANDSHAKE_TIMEOUT_MS 已改 3_000 并加
 编译期 pin（空闲双限等其余 reconciliation 以 T5 最终落地为准）。§4/§5 的其余描述
 仍按 HEAD 已提交状态有效。
+
+## 8. 正式证据归档
+
+安§7.4 对 127 个稳定 ID 要求 127 份 `RUNTIME_QEMU`、51 份 `STATIC_EL1` 和 84 份 `MODEL_CHECK`，
+G4 共 262 份。G5 在同一证据集上另核对 26 份 `ARCH_A53`。正式发布还须核实 G0/G1 完成及冻结清单的签发权限。
+[归档复验记录](v020-g4-archive-recheck.md) · [实体平台取证交接](v020-a53-platform-handoff.md)
+
+收到已认证的运行清单、清单摘要和原始归档后，按 G4 范围检查完整性。汇总按证明类型输出 PASS、FAIL、NOT_RUN
+以及非法归档计数。缺证据时保留 NOT_RUN，证据对象的身份、字节数和 SHA-256 均由汇总器复核。
+
+```sh
+python3 -B tools/verify_v0199_verdicts.py --scope g4 \
+  --manifest "$FROZEN_RUN_MANIFEST" --manifest-sha256 "$AUTHENTICATED_RUN_SHA256" \
+  --evidence-root "$VERDICT_ARCHIVE" --output "$REPORT_PATH"
+```
+
+两个可独立重放的子检查为 A06/SEC-M08 的 ELF 指令检查和 H05 的有界决策与发布检查。子检查报告记录实际输入与
+工具摘要，待有权判定器与其余必需证据共同出具正式 Verdict。
+
+```sh
+python3 -B tools/check_v0199_el1_fp.py --elf "$KERNEL_ELF" --elf-sha256 "$KERNEL_SHA256" \
+  --objdump-sha256 "$OBJDUMP_SHA256" --output "$STATIC_REPORT_DIR"
+cargo build --locked --offline -p cyxia-kernel-core --example v0199_h05_model_check
+target/debug/examples/v0199_h05_model_check > "$OBSERVED_TSV"
+python3 -B tools/check_v0199_h05_model.py --observed "$OBSERVED_TSV" \
+  --harness target/debug/examples/v0199_h05_model_check --output "$MODEL_REPORT_PATH"
+```

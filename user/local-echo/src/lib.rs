@@ -16,6 +16,8 @@ pub mod broker_surface {
     pub const ADMISSION_GRANTED: u64 = 0x100;
     pub const POLL_NORMAL_CLOSE: u64 = 0x101;
     pub const ADMISSION_RETIRED: u64 = 0x102;
+    pub const TLS_CERTIFICATE_VERIFY: u64 = 0x103;
+    pub const TLS_AUTHENTICATED: u64 = 0x104;
     pub const ADMISSION_RECEIPT_BYTES: usize = 12;
     pub const PAYLOAD: usize = 4096;
     /// Reserved ciphertext writes bypass the old cluster task/output queue
@@ -29,8 +31,11 @@ pub mod broker_surface {
         }
         match op {
             ENTROPY | READ => arg0 == 0,
-            ADMISSION_GRANTED | POLL_NORMAL_CLOSE | ADMISSION_RETIRED => {
+            ADMISSION_GRANTED | POLL_NORMAL_CLOSE | ADMISSION_RETIRED | TLS_AUTHENTICATED => {
                 len == ADMISSION_RECEIPT_BYTES && arg0 == 0
+            }
+            TLS_CERTIFICATE_VERIFY => {
+                len == cyxia_contracts::tls_signer::SIGNATURE_BYTES && arg0 == 0
             }
             WRITE => arg0 == DIRECT_TLS_CIPHERTEXT && len != 0,
             TIME | POLL | CLOSE | YIELD => len == 0 && arg0 == 0,

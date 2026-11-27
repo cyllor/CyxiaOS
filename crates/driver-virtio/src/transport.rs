@@ -1,6 +1,6 @@
 //! Typed VirtIO register operations shared by modern MMIO and PCI transports.
 //! PCI register widths and read-to-clear ISR semantics are preserved here.
-use crate::{Error, Platform};
+use crate::{Error, Platform, reset::RESET_DEADLINE_NS};
 use core::ptr::{read_volatile, write_volatile};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -358,6 +358,52 @@ impl Transport {
     pub fn fail(&mut self) {
         self.set_status(self.status() | 128);
     }
+
+    /// Poll a terminal reset after the serialized owner has fenced every old
+    /// queue. Use one deadline for status and readiness across all queues.
+    pub(crate) fn observe_mmio_reset(
+        &mut self,
+        device_id: u32,
+        queues: &[u16],
+        platform: &impl Platform,
+    ) -> Result<u64, Error> {
+        if !matches!(self.backend, Backend::Mmio(_)) {
+            return Err(Error::Unsupported);
+        }
+        if device_id == 0 || self.device_id() != device_id {
+            return Err(Error::Device);
+        }
+        let started = platform.now_ns();
+        let now_within_deadline = || {
+            let now = platform.now_ns();
+            now.checked_sub(started)
+                .filter(|elapsed| *elapsed < RESET_DEADLINE_NS)
+                .map(|_| now)
+                .ok_or(Error::Timeout)
+        };
+        self.set_status(0);
+        platform.barrier();
+        loop {
+            now_within_deadline()?;
+            if self.device_id() != device_id {
+                return Err(Error::Device);
+            }
+            if self.status() == 0 {
+                let mut disabled = true;
+                for &queue in queues {
+                    self.select_queue(u32::from(queue))?;
+                    platform.barrier();
+                    disabled &= !self.queue_enabled();
+                }
+                platform.barrier();
+                if disabled && self.status() == 0 && self.device_id() == device_id {
+                    return now_within_deadline();
+                }
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     pub(crate) fn check(&self) -> Result<(), Error> {
         if self.status() & (64 | 128) != 0 {
             Err(Error::Device)

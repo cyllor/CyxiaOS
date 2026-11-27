@@ -58,6 +58,38 @@ impl EpochBlockIo for Disk {
 static STAGING_OWNER: Mutex<()> = Mutex::new(());
 
 #[test]
+fn signed_unified_genesis_matches_the_independent_full_image_vector() {
+    use cyxia_kernel_core::security::file_media_v0199::BLOCK_COUNT;
+    use sha2::{Digest, Sha256};
+
+    let _owner = STAGING_OWNER.lock().unwrap();
+    let mut disk = Disk::default();
+    let verified = signed::verify(signed::WIRE, &mut [0; 1024]).unwrap();
+    let sb = volume::format(&mut disk, Some(&verified), AllocatedEnvelopes).unwrap();
+    let mut hash = Sha256::new();
+    let zero = [0; BLOCK_BYTES];
+    for block in 0..BLOCK_COUNT {
+        hash.update(disk.blocks.get(&block).unwrap_or(&zero));
+    }
+    assert_eq!(
+        format!("{:x}", hash.finalize()),
+        include_str!("../../../tools/fixtures/v020-g1-genesis.sha256").trim(),
+    );
+
+    let before_mount = (disk.writes, disk.flushes);
+    let config = Some(&verified);
+    assert_eq!(reopen::identify(&mut disk), Ok(sb));
+    let mounted = volume::mount(&mut disk, sb, config, AllocatedEnvelopes).unwrap();
+    assert_eq!(mounted.security.offline_config_hash, verified.digest());
+    assert_eq!(mounted.boot.boot_epoch, 0);
+    assert_eq!(mounted.system_blocks, 151);
+    assert_eq!(mounted.structure.live_inodes, 9);
+    assert_eq!(mounted.structure.directory_entries, 0);
+    assert_eq!(mounted.receipts.occupied, 0);
+    assert_eq!((disk.writes, disk.flushes), before_mount);
+}
+
+#[test]
 fn staging_rejects_a_dirty_journal_tail_before_granting_a_boot_epoch() {
     let _owner = STAGING_OWNER.lock().unwrap();
     let mut disk = Disk::default();

@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import struct
 import verify_smp
-from v0199_budget_trace import TRACE_BYTES, verify_trace
+from v0199_budget_trace import TRACE_BYTES, verify_sustained, verify_trace
 
 ROLES=(6,7,2,8,9,3,10,11)
 MAGIC=0x43595838424f4f54
@@ -41,7 +41,8 @@ def relative_count(elf:bytes,sidecar:bytes)->int:
 class Bringup:
     post_uart_seal=True
     completion=b'V0199_EIGHT_PACKAGE_BOOTSTRAP_PASS cpus=4 roles=8 production=false\n'
-    def __init__(self, packages:Path, qemu_sha256:str, patch_sha256:str):
+    def __init__(self, packages:Path, qemu_sha256:str, patch_sha256:str, sustained_load=False):
+        self.sustained_load = sustained_load
         self.expected={role:hashlib.sha256((packages/f'v0199-role-{role}.elf').read_bytes()).digest()
                        for role in ROLES}
         verify_smp.require(len(set(self.expected.values()))==8,'role packages are not distinct')
@@ -78,8 +79,13 @@ class Bringup:
         ]
         recovery_slices = (sum(struct.unpack_from("<8Q", page, 56 * 8)),
                            max(struct.unpack_from("<8Q", page, 64 * 8)))
-        return verify_trace(path.read_bytes(), summary, replacement_roles, recovery_slices,
-                            boot_accounting=self.boot_accounting)
+        raw = path.read_bytes()
+        measures = verify_trace(raw, summary, replacement_roles, recovery_slices,
+                                boot_accounting=self.boot_accounting)
+        if self.sustained_load:
+            windows = list(struct.iter_unpack('<6Q', page[80 * 8:128 * 8]))
+            measures.update(verify_sustained(raw, windows))
+        return measures
     @staticmethod
     def metadata():
         return dict(scope='v0199-eight-distinct-native-bootstrap-packages',
@@ -207,6 +213,17 @@ class Bringup:
             reported=business[slot-1]
             require(reported[0]==slot and 2<=reported[1]<=progress and reported[2]==0,
                     'business progress evidence mismatch')
+        sustained = rows('V0199_BOOTSTRAP_SUSTAINED')
+        if self.sustained_load:
+            magic, count, *progress = words[72:80]
+            require(magic == 0x4359584c4f414431 and count == 8
+                    and sustained == [(count, words[80], words[122])],
+                    'sustained workload seal and UART differ')
+            for slot in range(1, 4):
+                require(0 < progress[slot - 1] < progress[slot + 2] <= words[17 + slot * 4],
+                        'business CPU failed to progress during sustained control work')
+        else:
+            require(not sustained and not any(words[72:128]), 'unexpected sustained workload evidence')
         elapsed,accounted,upper,crossings,start_ns,end_ns,*classes=words[481:493]
         require(0<elapsed==accounted==sum(classes) and all(cost>0 for cost in classes),
                 'unclassified or duplicated CPU0 PMU time')
@@ -262,9 +279,10 @@ def main():
     p.add_argument('--ram-mib',type=int,choices=(256,1024),default=256)
     p.add_argument('--qemu-sha256',required=True)
     p.add_argument('--patch-sha256',required=True)
+    p.add_argument('--sustained-load', action='store_true', help='require eight native load windows')
     p.add_argument('--qmp-stdio',action='store_true',help='use owned pipes instead of a Unix socket')
     a=p.parse_args()
-    result=verify_smp.run(a.elf,a.output,45,4,acceptance=Bringup(a.packages,a.qemu_sha256,a.patch_sha256),ram_mib=a.ram_mib,qmp_stdio=a.qmp_stdio)
+    result=verify_smp.run(a.elf,a.output,45,4,acceptance=Bringup(a.packages,a.qemu_sha256,a.patch_sha256,a.sustained_load),ram_mib=a.ram_mib,qmp_stdio=a.qmp_stdio)
     print(json.dumps(result,indent=2))
     return 0 if result['status']=='PASS' else 1
 if __name__=='__main__':

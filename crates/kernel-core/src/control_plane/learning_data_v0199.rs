@@ -6,7 +6,7 @@ use super::{
     Error, Identity,
     action_schema_v2::ActionV2,
     advice_disposition_v1::AdviceDispositionV1,
-    apply_report_v1::{ActionStatus, ApplyReportV1},
+    apply_report_v1::{ActionStatus, ApplyReportV1, PlanKey},
     candidate_registry_v0199::FrozenCandidates,
     decision_record_v3::{DecisionRecordV3, DecisionSource},
     feedback_v0199::{CausalLabel, FeedbackRecord},
@@ -43,6 +43,42 @@ impl SchemaBinding {
             .all(|h| *h != [0; 32])
     }
 }
+/// Stable native keys and exact bytes are distinct checks. A changed report
+/// timestamp or a different archived pair digest cannot release the same
+/// native operation again under the same boot/controller authority chain.
+#[derive(Clone, Copy)]
+struct ReceiptEvidence {
+    plan: PlanKey,
+    decision_seq: u64,
+    action_index: u16,
+    target: Identity,
+    digest: [u8; 32],
+}
+impl ReceiptEvidence {
+    fn from_verified(
+        decision: DecisionRecordV3,
+        report: ApplyReportV1<'_>,
+        feedback: &FeedbackRecord,
+    ) -> Self {
+        Self {
+            plan: report.key,
+            decision_seq: decision.decision_seq,
+            action_index: report.action_index,
+            target: report.target,
+            digest: feedback.evidence_digest(),
+        }
+    }
+    fn reuses(self, other: Self) -> bool {
+        let same_decision_key = self.plan.boot_epoch == other.plan.boot_epoch
+            && self.plan.controller_epoch == other.plan.controller_epoch
+            && self.decision_seq == other.decision_seq;
+        let same_apply_id = self.plan == other.plan
+            && self.action_index == other.action_index
+            && self.target == other.target;
+        same_decision_key || same_apply_id || self.digest == other.digest
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Sample {
     group: ReplayGroup,
@@ -50,8 +86,8 @@ pub struct Sample {
     domain: u16,
     input: [i16; 64],
     reward: Reward,
-    candidate_receipt: [u8; 32],
-    baseline_receipt: [u8; 32],
+    candidate_receipt: ReceiptEvidence,
+    baseline_receipt: ReceiptEvidence,
     pair: [u8; 32],
 }
 impl Sample {
@@ -123,9 +159,9 @@ impl Sample {
         let input = operations_features(&snap, Candidate { a1, a2, cpu })
             .map_err(|_| Error::Invalid)?
             .values;
-        let candidate_receipt = feedback.evidence_digest();
-        let baseline_receipt = baseline.evidence_digest();
-        if candidate_receipt == baseline_receipt {
+        let candidate_receipt = ReceiptEvidence::from_verified(decision, report, feedback);
+        let baseline_receipt = ReceiptEvidence::from_verified(base, base_report, baseline);
+        if candidate_receipt.reuses(baseline_receipt) {
             return Err(Error::Denied);
         }
         let pair = verify_archived_pair(
@@ -252,7 +288,7 @@ fn duplicates(a: &Sample, b: &Sample) -> bool {
     a.pair == b.pair
         || [a.candidate_receipt, a.baseline_receipt]
             .iter()
-            .any(|h| *h == b.candidate_receipt || *h == b.baseline_receipt)
+            .any(|r| r.reuses(b.candidate_receipt) || r.reuses(b.baseline_receipt))
 }
 fn digest(samples: &[Sample], schemas: SchemaBinding) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -276,8 +312,8 @@ fn digest(samples: &[Sample], schemas: SchemaBinding) -> [u8; 32] {
         }
         h.update(s.reward.value.to_bits().to_le_bytes());
         h.update(s.pair);
-        h.update(s.candidate_receipt);
-        h.update(s.baseline_receipt);
+        h.update(s.candidate_receipt.digest);
+        h.update(s.baseline_receipt.digest);
     }
     h.finalize().into()
 }
@@ -1026,6 +1062,20 @@ mod tests {
             },
         };
         let key = offset + i as u64;
+        let receipt = |sequence| ReceiptEvidence {
+            plan: PlanKey {
+                boot_epoch: 1,
+                controller_epoch: 1,
+                plan_seq: sequence,
+            },
+            decision_seq: sequence,
+            action_index: 0,
+            target: Identity {
+                id: 15,
+                generation: 1,
+            },
+            digest: id(sequence),
+        };
         Sample {
             group: ReplayGroup {
                 seed: key,
@@ -1044,16 +1094,15 @@ mod tests {
                 clipped_cost: F64::ZERO,
                 value: F64::ZERO,
             },
-            candidate_receipt: id(key * 3),
-            baseline_receipt: id(key * 3 + 1),
+            candidate_receipt: receipt(key * 3),
+            baseline_receipt: receipt(key * 3 + 1),
             pair: id(key * 3 + 2),
         }
     }
     #[test]
     fn both_replay_sides_require_exact_frozen_action_and_causal_evidence() {
         use crate::control_plane::{
-            apply_report_v1::{MAX_APPLY_REPORT_BYTES, PlanKey},
-            candidate_registry_v0199::CatalogEntry,
+            apply_report_v1::MAX_APPLY_REPORT_BYTES, candidate_registry_v0199::CatalogEntry,
         };
         use cyxia_control_model::native_v0199::SnapshotReplyV3;
         let snapshot = SnapshotReplyV3 {
@@ -1469,11 +1518,41 @@ mod tests {
             TrainingData::freeze(&rows[..119], SCHEMAS),
             Err(Error::NotReady)
         ));
-        rows[119].baseline_receipt = rows[0].candidate_receipt;
-        assert!(matches!(
-            TrainingData::freeze(&rows, SCHEMAS),
-            Err(Error::Denied)
-        ));
+        let reused = rows[0].candidate_receipt;
+        let original = rows[119].baseline_receipt;
+        for conflicting in [
+            // Same bytes, same native decision relabelled under a different
+            // plan, or same apply work relabelled under a different decision.
+            ReceiptEvidence {
+                digest: reused.digest,
+                ..original
+            },
+            ReceiptEvidence {
+                decision_seq: reused.decision_seq,
+                ..original
+            },
+            ReceiptEvidence {
+                plan: reused.plan,
+                ..original
+            },
+        ] {
+            rows[119].baseline_receipt = conflicting;
+            assert!(matches!(
+                TrainingData::freeze(&rows, SCHEMAS),
+                Err(Error::Denied)
+            ));
+        }
+        // Identical local sequence numbers after a new durable boot refer
+        // to different operations. The complete native key disambiguates.
+        rows[119].baseline_receipt = ReceiptEvidence {
+            plan: PlanKey {
+                boot_epoch: 2,
+                ..reused.plan
+            },
+            decision_seq: reused.decision_seq,
+            ..original
+        };
+        assert!(TrainingData::freeze(&rows, SCHEMAS).is_ok());
     }
     #[test]
     fn ordered_training_and_holdout_consumed_even_on_failed_verifier() {
@@ -1542,6 +1621,22 @@ mod tests {
             Err(Error::Denied)
         ));
         holdout[0].group = group;
+        let original = holdout[0].baseline_receipt;
+        holdout[0].baseline_receipt.decision_seq = rows[0].candidate_receipt.decision_seq;
+        assert!(matches!(
+            ledger.validate(
+                validator,
+                &active,
+                &model,
+                &training,
+                &holdout,
+                |_| panic!("shared training decision must not consume validation rows"),
+                |_, _, _, _| panic!("shared training decision must not reach validation"),
+            ),
+            Err(Error::Denied)
+        ));
+        assert_eq!(ledger.len, 0);
+        holdout[0].baseline_receipt = original;
         assert!(matches!(
             ledger.validate(
                 validator,
