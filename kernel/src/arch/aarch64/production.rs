@@ -875,7 +875,8 @@ fn advice_dispatch(role_index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFra
         )
     };
     let cpu = cpu::slot();
-    if cpu != 0 || member.ttbr0_root == 0 || trapped_ttbr0() != member.ttbr0_root {
+    let expected = member.ttbr0_root | (u64::from(user::dynamic_asid()) << 48);
+    if cpu != 0 || member.ttbr0_root == 0 || trapped_ttbr0() != expected {
         return E_AUTH as u64;
     }
     match x8 {

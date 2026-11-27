@@ -18,7 +18,11 @@ cyxia_secondary_start:
  b.ne secondary_halt
  msr tpidr_el1, x19
  msr cntp_ctl_el0, xzr
+.if {software_pan}
+ ldr x0, =0x00000002b5593519
+.else
  ldr x0, =0x00000002b5193519
+.endif
  msr tcr_el1, x0
  mov x0, #0xff
  msr mair_el1, x0
@@ -55,10 +59,15 @@ secondary_high:
  ldr x0, =exception_vectors
  msr vbar_el1, x0
  isb
+.if {software_pan}
+ ldr x0, =empty_l1
+ msr ttbr0_el1, x0
+.else
  mrs x0, tcr_el1
  orr x0, x0, #0x80
  dsb ishst
  msr tcr_el1, x0
+.endif
  isb
  tlbi vmalle1
  dsb ish

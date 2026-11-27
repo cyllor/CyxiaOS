@@ -78,15 +78,9 @@ pub(super) fn ns_from_ticks(ticks: u64) -> u64 {
     assert!(f != 0);
     u64::try_from(u128::from(ticks) * 1_000_000_000 / u128::from(f)).expect("monotonic ns")
 }
-/// EL1 state from the current lower-EL exception, before capture switches
-/// away from the user address space.
+/// The vector's saved root/ASID from the current lower-EL exception.
 pub(super) fn trapped_ttbr0() -> u64 {
-    let ttbr0: u64;
-    // SAFETY: this vector handler reads its current architectural context.
-    unsafe {
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nomem, nostack, preserves_flags));
-    }
-    ttbr0
+    cyxia_arch_aarch64::user::captured_user_root()
 }
 
 // ---- PIE loader (mirrors v0199_control_bringup::load, no PMU metering) ----

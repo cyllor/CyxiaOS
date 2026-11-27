@@ -27,6 +27,9 @@ UART = HEADER + ROW * 4
 UART_STATUS = {1: "queued", 2: "fifo_full", 3: "unavailable", 4: "deadline", 5: "console_unconfirmed"}
 SCRATCH_FATAL = 400
 SOFTWARE_STOP_KIND = 16
+PAGE = 4096
+RAM_BASE = 0x40000000
+READONLY_RAM_PAGE = 0x0060000000000783
 
 
 def stopped_cpus(qmp, park):
@@ -122,6 +125,23 @@ def validate_uart(data, wire, stop):
     }, b"".join(frames)
 
 
+def check_empty_root(raw, qmp, dump):
+    try:
+        empty = symbol(raw, "empty_l1")["pa"]
+    except ValueError as error:
+        if str(error) == "missing symbol empty_l1":
+            return None
+        raise
+    require(empty >= RAM_BASE and empty % PAGE == 0, "PAN root address is outside aligned RAM")
+    qmp.execute("pmemsave", {"val": empty, "size": PAGE, "filename": str(dump)})
+    require(dump.read_bytes() == bytes(PAGE), "live PAN L1 is not empty")
+    leaf = symbol(raw, "ram_l3")["pa"] + (empty - RAM_BASE) // PAGE * 8
+    qmp.execute("pmemsave", {"val": leaf, "size": 8, "filename": str(dump)})
+    descriptor, = struct.unpack("<Q", dump.read_bytes())
+    require(descriptor == (empty | READONLY_RAM_PAGE), "PAN root has a writable or executable RAM alias")
+    return {"empty_root_pa": f"{empty:#x}", "root_bytes_zero": PAGE, "alias_leaf": f"{descriptor:#x}"}
+
+
 def verify(elf, output, qemu_digest, timeout, late_peer=False):
     require(1 <= timeout <= 120, "invalid test deadline")
     raw = elf.read_bytes()
@@ -193,7 +213,7 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
                 (output / "native-stop-evidence.bin").write_bytes(record)
                 report.update(validate_record(record, late_peer))
                 qmp.execute("pmemsave", {
-                    "val": scratch["pa"] + report["owner"] * 4096 + SCRATCH_FATAL,
+                    "val": scratch["pa"] + report["owner"] * PAGE + SCRATCH_FATAL,
                     "size": 56, "filename": str(data),
                 })
                 state, kind, _, _, _, _, reason = struct.unpack("<7Q", data.read_bytes())
@@ -209,6 +229,7 @@ def verify(elf, output, qemu_digest, timeout, late_peer=False):
                 report["terminal_registers_first"] = stopped_cpus(qmp, park)
                 time.sleep(0.02)
                 report["terminal_registers_second"] = stopped_cpus(qmp, park)
+                report["software_pan_root"] = check_empty_root(raw, qmp, data)
                 read_uart()
                 report["owner_uart"], serial = validate_uart(record, bytes(wire), report)
                 require(elf.read_bytes() == raw, "kernel ELF changed during the run")

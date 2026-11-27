@@ -67,6 +67,7 @@ core::arch::global_asm!(
     ram_table_count = const cyxia_platform_virt::RAM_MIB / 2,
     ram_tables_bytes = const cyxia_platform_virt::RAM_MIB / 2 * 4096,
     exec_stack_bytes = const BOOT_EXEC_STACK_BYTES,
+    software_pan = const cfg!(feature = "v020-production") as u8,
 );
 // Versioned loader contract, retained in the ELF's read-only load segment.
 #[used]
@@ -84,6 +85,7 @@ core::arch::global_asm!(
         feature = "legacy-desktop",
         not(feature = "smp-selftest")
     )) as u8,
+    software_pan = const cfg!(feature = "v020-production") as u8,
 );
 unsafe extern "C" {
     #[cfg(not(feature = "smp-selftest"))]

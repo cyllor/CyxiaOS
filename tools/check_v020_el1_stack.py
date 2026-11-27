@@ -177,6 +177,7 @@ def inspect(raw, metadata, disassembly, require_stack_notes=False):
         "secondary_execution_stack_bytes": (LIMIT if vectors["primary_exec_stack_bytes"] == LIMIT
                                             else 64 * 1024),
         "entry_frame_bytes": vectors["frame_bytes"],
+        "software_pan": vectors["software_pan"],
         "nested_dispatch_limit": 2,
         "reachable_functions": count,
         "reachable_functions_with_compiler_note": count - len(no_notes),

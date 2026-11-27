@@ -240,6 +240,7 @@ core::arch::global_asm!(
     include_str!("../../../../crates/arch-aarch64/src/secondary.S"),
     max_cpus = const C,
     exec_stack_pages = const EXEC_STACK_BYTES / 4096,
+    software_pan = const cfg!(feature = "v020-production") as u8,
 );
 core::arch::global_asm!(
     include_str!("smp_user.S"),

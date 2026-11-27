@@ -6,8 +6,8 @@
 cyxia_enter_user:
  // Preserve the soft-float caller's state. EL0 cannot address this kernel stack.
  // Frame: x19-x30 [0,96), DAIF 96, Context* 104, CPACR 112, TPIDR_EL0 120,
- // restore-FP flag 128, invalidate flag 136. x1 is zero only for an
- // integer-only fault probe; x2 is zero only for a boot-immutable ASID root.
+ // restore-FP flag 128, legacy invalidate flag 136. x1 is zero only for an
+ // integer-only probe. Software PAN receives the packed user root + ASID in x2.
  sub sp, sp, #144
  stp x19, x20, [sp, #0]
  stp x21, x22, [sp, #16]
@@ -21,7 +21,9 @@ cyxia_enter_user:
  mov x30, x0
  str x30, [sp, #104]
  str x1, [sp, #128]
+.if {software_pan} == 0
  str x2, [sp, #136]
+.endif
  cbz x1, .Luser_features_configured
  mrs x9, cpacr_el1
  str x9, [sp, #112]
@@ -70,6 +72,18 @@ cyxia_enter_user:
  ldr x9, =EXCEPTION_ADMISSION_CLOSED
  ldar x9, [x9]
  cbnz x9, .Luser_admission_closed
+.if {software_pan}
+ // Global trusted mappings remain valid for the short epilogue below.
+ and x9, x2, #0x0000ffffffffffff
+ msr ttbr0_el1, x9
+ isb
+ and x9, x2, #0xffff000000000000
+ mrs x10, ttbr1_el1
+ bic x10, x10, #0xffff000000000000
+ orr x10, x10, x9
+ msr ttbr1_el1, x10
+ isb
+.endif
  ldp x0, x1, [x30, #0]
  ldp x2, x3, [x30, #16]
  ldp x4, x5, [x30, #32]
@@ -97,6 +111,7 @@ cyxia_user_return:
  // Exception dispatcher has selected EL1h with interrupts masked.
  msr daifset, #15
  ldr x10, [sp, #128]
+.if {software_pan} == 0
  ldr x11, [sp, #136]
  // Revoke low-address translations before saving state or allowing reclamation.
  mrs x9, tcr_el1
@@ -111,6 +126,7 @@ cyxia_user_return:
  dsb ish
  isb
 .Luser_low_walks_revoked:
+.endif
  // Its integer-only Rust/IRQ path has left the complete user FP/TLS bank intact.
  ldr x30, [sp, #104]
  cbz x10, .Luser_integer_save
