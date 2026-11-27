@@ -108,7 +108,7 @@ pub(super) fn root_pa(index: usize) -> u64 {
 pub(super) fn role_asid(index: usize) -> u8 {
     (0xA0 + index) as u8
 }
-fn high_leaf(pa: u64) -> *mut u64 {
+pub(super) fn high_leaf(pa: u64) -> *mut u64 {
     assert!(pa.is_multiple_of(PAGE as u64) && pa >= cyxia_platform_virt::RAM_BASE);
     let offset = (pa - cyxia_platform_virt::RAM_BASE) / PAGE as u64;
     assert!(offset < (cyxia_platform_virt::RAM_MIB * 1024 * 1024 / PAGE as u64));

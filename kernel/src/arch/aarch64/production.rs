@@ -132,9 +132,13 @@ use meter::ExecTarget;
 mod net;
 #[path = "production/role_loader.rs"]
 mod role_loader;
+#[cfg(feature = "v020-production-frame-pool")]
+use role_loader::high_leaf;
+#[cfg(cyxia_signed_resident)]
+use role_loader::ns_from_ticks;
 use role_loader::{
     BACKING, Backing, COPY, COPY_BUFFER, CopyBuffer, PIE_CAP, TABLES, Tables, load_role_with_identity,
-    now_ns, ns_from_ticks, pie_context, role_asid, root_pa, stack_span, tlbi, trapped_ttbr0,
+    now_ns, pie_context, role_asid, root_pa, stack_span, tlbi, trapped_ttbr0,
 };
 #[cfg(feature = "v020-production-live-control")]
 #[path = "production/observations.rs"]
