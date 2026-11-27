@@ -202,6 +202,15 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         self.queue.poison(&mut self.transport, p);
     }
 
+    /// Stop software submissions when the foreground owner has lost its
+    /// execution budget. Preserve every exact token for a recovery owner.
+    pub fn fence_for_recovery(&mut self) {
+        if self.state == DeviceState::Live {
+            self.state = DeviceState::Failed;
+            self.queue.fence();
+        }
+    }
+
     /// Best-effort terminal stop under the existing exclusive MMIO owner.
     /// Completion/FLUSH obligations remain in custody, including after the
     /// device and its old queue read back disabled.
@@ -656,6 +665,33 @@ mod tests {
         assert_eq!(block.acknowledge(token), Err(Error::Response));
         assert_eq!(block.retained_requests(), (1, 0));
         assert_eq!(block.free(), block.capacity() - 1);
+    }
+
+    #[test]
+    fn recovery_fence_retains_pending_block_without_more_transport_io() {
+        let (mut block, platform, _) = fixture();
+        platform.clock.set(1_000_000);
+        let read = Operation::Read(0);
+        let token = block
+            .begin(read, &[0; 512], true, false, &platform)
+            .unwrap();
+        let published = block.notify_stats().published;
+
+        block.fence_for_recovery();
+
+        assert_eq!(
+            block.pending[usize::from(token.slot)],
+            Some((token, read, 1))
+        );
+        assert_eq!(block.retained_requests(), (1, 0));
+        assert_eq!(
+            block.begin(read, &[0; 512], true, false, &platform),
+            Err(Error::Device)
+        );
+        assert_eq!(block.drain(&platform), Err(Error::Device));
+        assert_eq!(block.acknowledge(token), Err(Error::Response));
+        assert_eq!(block.notify_stats().published, published);
+        assert_eq!(block.transport.status(), 15);
     }
 
     #[test]

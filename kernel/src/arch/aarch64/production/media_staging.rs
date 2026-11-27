@@ -248,36 +248,54 @@ pub(super) fn ordinary_file_refusal() -> Option<i64> {
 
 /// EpochBlockIo adapter over the shared scratch plumbing, bounded to the
 /// 512 MiB v1 image, with device-operation counters.
-struct Disk {
+struct Disk<'a> {
     device: &'static mut scratch_blk::ScratchBlock,
+    #[cfg_attr(not(cyxia_startup_catalog), allow(dead_code))]
+    checkpoint: Option<&'a mut dyn FnMut() -> Result<(), SecurityError>>,
     reads: u64,
     writes: u64,
     flushes: u64,
 }
-impl EpochBlockIo for Disk {
-    fn read(&mut self, block: u32, out: &mut [u8; BLOCK_BYTES]) -> Result<(), SecurityError> {
+
+impl Disk<'_> {
+    fn sectors(
+        &mut self,
+        block: u32,
+        write: Option<&[u8; BLOCK_BYTES]>,
+        out: &mut [u8; BLOCK_BYTES],
+    ) -> Result<(), SecurityError> {
         if block >= BLOCK_COUNT {
             return Err(SecurityError::Invalid);
         }
-        scratch_blk::sectors(self.device, u64::from(block) * 8, None, out)?;
+        let first_sector = u64::from(block) * 8;
+        #[cfg(cyxia_startup_catalog)]
+        if let Some(meter) = self.checkpoint.as_deref_mut() {
+            return scratch_blk::sectors_metered(self.device, first_sector, write, out, meter);
+        }
+        scratch_blk::sectors(self.device, first_sector, write, out)
+    }
+}
+
+impl EpochBlockIo for Disk<'_> {
+    fn read(&mut self, block: u32, out: &mut [u8; BLOCK_BYTES]) -> Result<(), SecurityError> {
+        self.sectors(block, None, out)?;
         self.reads += 1;
         Ok(())
     }
     fn write(&mut self, block: u32, data: &[u8; BLOCK_BYTES]) -> Result<(), SecurityError> {
-        if block >= BLOCK_COUNT {
-            return Err(SecurityError::Invalid);
-        }
         let mut scratch = [0; BLOCK_BYTES];
-        scratch_blk::sectors(
-            self.device,
-            u64::from(block) * 8,
-            Some(data),
-            &mut scratch,
-        )?;
+        self.sectors(block, Some(data), &mut scratch)?;
         self.writes += 1;
         Ok(())
     }
     fn flush(&mut self) -> Result<(), SecurityError> {
+        #[cfg(cyxia_startup_catalog)]
+        if let Some(meter) = self.checkpoint.as_deref_mut() {
+            scratch_blk::flush_metered(self.device, meter)?;
+        } else {
+            scratch_blk::flush(self.device)?;
+        }
+        #[cfg(not(cyxia_startup_catalog))]
         scratch_blk::flush(self.device)?;
         self.flushes += 1;
         Ok(())
@@ -544,7 +562,7 @@ fn run_chain(
 }
 
 /// One-shot staging run on CPU0 with business-role admission closed.
-#[cfg(feature = "v020-production-diagnostic")]
+#[cfg(all(feature = "v020-production-diagnostic", not(cyxia_startup_catalog)))]
 pub(super) fn stage(
     info: &BootInfo,
     #[cfg(all(
@@ -557,19 +575,15 @@ pub(super) fn stage(
         info,
         #[cfg(cyxia_signed_resident)]
         None,
-        #[cfg(all(
-            feature = "v020-production-fsync-scratch",
-            not(cyxia_signed_resident)
-        ))]
+        #[cfg(all(feature = "v020-production-fsync-scratch", not(cyxia_signed_resident)))]
         file_client,
     )
 }
 
 pub(super) fn stage_with_policy(
     info: &BootInfo,
-    #[cfg(cyxia_signed_resident)] verified: Option<
-        VerifiedOfflineConfig<'static>,
-    >,
+    #[cfg(cyxia_signed_resident)] verified: Option<VerifiedOfflineConfig<'static>>,
+    #[cfg(cyxia_startup_catalog)] checkpoint: &mut dyn FnMut() -> Result<(), SecurityError>,
     #[cfg(all(
         feature = "v020-production-fsync-scratch",
         not(cyxia_signed_resident)
@@ -578,6 +592,11 @@ pub(super) fn stage_with_policy(
 ) -> StagingOutcome {
     let mut out = StagingOutcome::default();
     if STAGED.swap(true, Ordering::AcqRel) {
+        return out;
+    }
+    // Start the prepaid slice before probing or configuring the transport.
+    #[cfg(cyxia_startup_catalog)]
+    if checkpoint().is_err() {
         return out;
     }
     let device = match scratch_blk::attach(info) {
@@ -590,21 +609,19 @@ pub(super) fn stage_with_policy(
     };
     let mut disk = Disk {
         device,
+        #[cfg(cyxia_startup_catalog)]
+        checkpoint: Some(checkpoint),
+        #[cfg(not(cyxia_startup_catalog))]
+        checkpoint: None,
         reads: 0,
         writes: 0,
         flushes: 0,
     };
-    #[cfg(not(any(
-        cyxia_signed_resident,
-        feature = "v020-production-fsync-scratch"
-    )))]
+    #[cfg(not(any(cyxia_signed_resident, feature = "v020-production-fsync-scratch")))]
     {
         out.chain_complete = run_chain(&mut disk, &mut out).is_some();
     }
-    #[cfg(all(
-        feature = "v020-production-fsync-scratch",
-        not(cyxia_signed_resident)
-    ))]
+    #[cfg(all(feature = "v020-production-fsync-scratch", not(cyxia_signed_resident)))]
     {
         out.chain_complete = run_chain(&mut disk, &mut out, file_client).is_some();
     }

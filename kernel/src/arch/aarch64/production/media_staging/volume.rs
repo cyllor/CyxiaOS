@@ -178,13 +178,13 @@ pub(super) fn security(config: Config<'_>) -> SecurityStateStoreV2 {
 
 /// Include the D1.5 heads in the formatter's first metadata flush. The full
 /// zero scan has passed and the baseline superblocks are still unpublished.
-struct EnvelopeFormatDisk<'a> {
-    disk: &'a mut Disk,
+struct EnvelopeFormatDisk<'a, 'meter> {
+    disk: &'a mut Disk<'meter>,
     fs_uuid: [u8; 16],
     pending: bool,
 }
 
-impl EpochBlockIo for EnvelopeFormatDisk<'_> {
+impl EpochBlockIo for EnvelopeFormatDisk<'_, '_> {
     fn read(&mut self, block: u32, out: &mut [u8; BLOCK_BYTES]) -> Result<(), SecurityError> {
         self.disk.read(block, out)
     }
