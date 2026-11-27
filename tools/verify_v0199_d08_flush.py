@@ -177,7 +177,8 @@ def seal_seed_capture(seed: dict, seed_dir: Path, disk: Path) -> None:
     }
     # Successful budget capture has its own stopped bytes and QMP transcript.
     # Failed-progress capture is separately recorded by the resident verifier.
-    for name in ("cpu0-budget-trace.bin", "budget-qmp.jsonl", "role-syscall-abi.bin"):
+    for name in ("cpu0-budget-trace.bin", "budget-qmp.jsonl", "role-syscall-abi.bin",
+                 "decision-returns.bin"):
         if (seed_dir / name).is_file():
             seed["capture_sha256"][name] = sha(seed_dir / name)
     seed["preserved_disk_sha256"] = preserve_disk(disk, seed_dir / "scratch-after.raw", sha(disk))

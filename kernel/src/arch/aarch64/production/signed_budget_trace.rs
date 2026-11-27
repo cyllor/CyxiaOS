@@ -46,6 +46,52 @@ static V020_SIGNED_CPU_BUDGET_TRACE: Evidence = Evidence {
     rows: [const { [const { AtomicU64::new(0) }; ROW_WORDS] }; CAPACITY],
 };
 
+// D08 uses the older signed scratch lifecycle profile, whose Decision grant
+// allows one captured return. The existing budget rows count returns but do
+// not distinguish a timer from a syscall. Keep a small read-only diagnostic
+// prefix separate from the accounting wire format. CPU0 is the sole writer;
+// EL0 cannot map it. The count publishes only complete records.
+#[cfg(not(cyxia_startup_catalog))]
+const DECISION_RETURN_CAPACITY: usize = 32;
+
+#[cfg(not(cyxia_startup_catalog))]
+#[repr(C)]
+struct DecisionReturns {
+    count: AtomicU64,
+    rows: [[AtomicU64; 6]; DECISION_RETURN_CAPACITY],
+}
+
+#[cfg(not(cyxia_startup_catalog))]
+#[unsafe(no_mangle)]
+static V020_SIGNED_DECISION_RETURNS: DecisionReturns = DecisionReturns {
+    count: AtomicU64::new(0),
+    rows: [const { [const { AtomicU64::new(0) }; 6] }; DECISION_RETURN_CAPACITY],
+};
+
+#[cfg(not(cyxia_startup_catalog))]
+pub(super) fn record_decision_return(
+    start_wall: u64,
+    index: usize,
+    context: &cyxia_arch_aarch64::user::Context,
+) {
+    let evidence = &V020_SIGNED_DECISION_RETURNS;
+    let count = evidence.count.load(Ordering::Relaxed) as usize;
+    let Some(row) = evidence.rows.get(count) else {
+        return;
+    };
+    for (cell, word) in row.iter().zip([
+        start_wall,
+        index as u64,
+        context.kind,
+        context.esr,
+        context.pc,
+        context.regs[8],
+    ]) {
+        cell.store(word, Ordering::Relaxed);
+    }
+    evidence.count.store((count + 1) as u64, Ordering::Release);
+}
+
 pub(super) struct Trace {
     next: usize,
     first_role_window: Option<u64>,

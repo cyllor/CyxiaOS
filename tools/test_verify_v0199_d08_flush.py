@@ -1,6 +1,7 @@
 """Check that a refused writable mount requires corroborating device evidence."""
 
 import copy
+import struct
 from pathlib import Path
 import tempfile
 import unittest
@@ -104,6 +105,26 @@ class FlushGateTests(unittest.TestCase):
                 check.preserve_disk(disk, root / "short.raw", check.sha(disk))
 
 
+    def test_decision_return_prefix(self):
+        raw = bytearray(resident.DECISION_RETURN_BYTES)
+        struct.pack_into("<Q", raw, 0, 2)
+        row = resident.DECISION_RETURN_ROW
+        row.pack_into(raw, 8, 100, 2, 9, 0, 0x10000, 4)
+        row.pack_into(raw, 8 + row.size, 200, 3, 8, 0x15 << 26, 0x10004, 2)
+        # Stopped mid-write: ignore an unpublished row, not a complete one.
+        row.pack_into(raw, 8 + 2 * row.size, 300, 2, 8, 0, 0, 4)
+        parsed = resident.decode_decision_returns(raw)
+        self.assertEqual([item["kind"] for item in parsed], [9, 8])
+        self.assertEqual([item["x8"] for item in parsed], [4, 2])
+        for offset, value in ((0, 33), (16, 5), (24, 0), (8 + row.size, 99)):
+            with self.subTest(offset=offset):
+                malformed = bytearray(raw)
+                struct.pack_into("<Q", malformed, offset, value)
+                with self.assertRaises(ValueError):
+                    resident.decode_decision_returns(malformed)
+        with self.assertRaises(ValueError):
+            resident.decode_decision_returns(raw[:-1])
+
     def test_failed_progress_trace_retains_raw_capture(self):
         for late_error in (False, True):
             with self.subTest(late_error=late_error), tempfile.TemporaryDirectory() as d:
@@ -112,6 +133,8 @@ class FlushGateTests(unittest.TestCase):
                 def capture(socket_path, elf, output, deadline):
                     (output / resident.TRACE_FILE).write_bytes(b"raw trace fixture")
                     (output / "budget-qmp.jsonl").write_bytes(b"raw QMP fixture")
+                    (output / "role-syscall-abi.bin").write_bytes(b"raw ABI fixture")
+                    (output / resident.DECISION_RETURN_FILE).write_bytes(b"raw return fixture")
                     if late_error:
                         raise ValueError("ABI mismatch after pmemsave")
                     return {"budget_trace_sha256": check.sha(output / resident.TRACE_FILE)}
@@ -122,7 +145,8 @@ class FlushGateTests(unittest.TestCase):
                     self.assertEqual(result["status"], "CAPTURE_ERROR" if late_error else "CAPTURED")
                     self.assertEqual(result["capture_sha256"], {
                         name: check.sha(root / "failed-progress" / name)
-                        for name in (resident.TRACE_FILE, "budget-qmp.jsonl")
+                        for name in (resident.TRACE_FILE, "budget-qmp.jsonl",
+                                     "role-syscall-abi.bin", resident.DECISION_RETURN_FILE)
                     })
                     if late_error:
                         self.assertIn("ABI mismatch", result["error"])

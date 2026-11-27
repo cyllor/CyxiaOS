@@ -1137,6 +1137,12 @@ fn run_quantum(
         }
         let captured_ttbr0 = capture & !CAPTURED;
         *returned += 1;
+        // Capture the real lower-EL return before it is emulated or decoded.
+        // This is charged inside the existing Decision turn, not a new grant.
+        #[cfg(not(cyxia_startup_catalog))]
+        if grant.accounting_scope().0 == Class::Decision {
+            budget_trace::record_decision_return(start.wall, index, &task.context);
+        }
         match execution.handle_return(&mut task.context) {
             Return::Timer | Return::Yield => break,
             Return::Emulated => {}
