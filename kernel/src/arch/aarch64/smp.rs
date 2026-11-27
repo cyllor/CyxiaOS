@@ -370,7 +370,7 @@ fn phys(address: u64) -> u64 {
         .checked_sub(super::HIGH)
         .expect("high kernel pointer")
 }
-#[cfg(feature = "unified-runtime")]
+#[cfg(any(feature = "unified-runtime", feature = "v020-production-diagnostic"))]
 fn builtin_asid(root: u64) -> u8 {
     let first = phys(core::ptr::addr_of!(ROOTS) as u64);
     let stride = core::mem::size_of::<Page>() as u64;
@@ -851,7 +851,17 @@ fn execute(ctx: &mut user::Context, i: usize) {
         #[cfg(not(feature = "unified-runtime"))]
         {
             timer::arm(timer::ticks().saturating_add(quantum));
-            user::enter(ctx, phys(root));
+            let root = phys(root);
+            #[cfg(feature = "v020-production-diagnostic")]
+            if i < C * 2 {
+                // init_memory installs these immutable, non-global mappings
+                // before CPU_ON. Their tables and frames stay pinned for the boot.
+                user::enter_immutable(ctx, root, builtin_asid(root));
+            } else {
+                user::enter(ctx, root);
+            }
+            #[cfg(not(feature = "v020-production-diagnostic"))]
+            user::enter(ctx, root);
             cpu::disable_timer();
         }
     }
