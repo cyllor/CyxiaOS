@@ -5,7 +5,8 @@
 //! the disk's boot/security pair is confirmed. No service capability is
 //! installed and protected calls never reach the legacy diagnostic bridge.
 //! The locked per-vCPU QEMU PMU provides CPU debits, while the physical
-//! timer enforces separate wall deadlines.
+//! timer enforces separate wall deadlines. After the durable media handoff,
+//! one continuous CPU0 cursor covers both prepaid turns and EL1 coordination.
 
 use super::{
     BootInfo, E_AUTH, E_FORMAT, Error, ExceptionFrame, IRQS, Identity, NativeRole,
@@ -18,7 +19,7 @@ use core::sync::atomic::AtomicU64;
 use cyxia_kernel_core::{
     console::OutputQueue,
     control_plane::{
-        role_budget_v0199::{CLASS_LIMITS, Class, Cpu0BudgetLedger, Turn, WINDOW_NS},
+        role_budget_v0199::{CLASS_LIMITS, Class, Cpu0BudgetLedger, Settlement, Turn, WINDOW_NS},
         role_manifest_v0199::ValidatedRoleManifest,
     },
     security::{
@@ -36,6 +37,7 @@ const DENIED: u16 = 1 << 3;
 const EVIDENCE_WINDOWS: u64 = 4;
 const RECOVERY_NS: u64 = CLASS_LIMITS[Class::Recovery as usize];
 const CONSOLE_TURN_NS: u64 = 1_000_000;
+const CONSOLE_RETRY_NS: u64 = 1_000_000;
 const MAX_WALL_NS: u64 = 50_000_000;
 const FATAL_ROLE_CONTEXT: u64 = 0x5731_1340;
 const NO_MEDIA: &[u8] =
@@ -73,6 +75,11 @@ enum Fault {
         ended: u64,
         deadline: u64,
     },
+    Coordination {
+        used: u64,
+        ended: u64,
+        crossed: bool,
+    },
 }
 
 impl From<Error> for Fault {
@@ -81,24 +88,163 @@ impl From<Error> for Fault {
     }
 }
 
-struct Sample {
-    wall: u64,
+#[derive(Clone, Copy)]
+pub(super) struct Sample {
+    pub(super) wall: u64,
     cpu_tick: u64,
 }
 
 impl Sample {
-    fn now() -> Self {
-        Self {
-            wall: now_ns(),
-            cpu_tick: timer::cpu_ticks(),
+    fn now() -> Result<Self, Error> {
+        let frequency = timer::frequency();
+        if frequency == 0 {
+            return Err(Error::Clock);
         }
+        let tick_ns = 1_000_000_000u64.div_ceil(frequency);
+        // As in the native budget harness, bracket the PMU observation
+        // inside one aligned window, including the final timer quantum.
+        for _ in 0..8 {
+            let before = now_ns();
+            let cpu_tick = timer::cpu_ticks();
+            let wall = now_ns().checked_add(tick_ns).ok_or(Error::Clock)?;
+            if before < wall && before / WINDOW_NS == wall / WINDOW_NS {
+                return Ok(Self { wall, cpu_tick });
+            }
+        }
+        Err(Error::Clock)
     }
 
-    fn cpu_elapsed(&self) -> Result<u64, Error> {
-        timer::cpu_ticks()
-            .checked_sub(self.cpu_tick)
+    fn cpu_since(&self, tick: u64) -> Result<u64, Error> {
+        self.cpu_tick
+            .checked_sub(tick)
             .map(timer::cpu_ns)
             .ok_or(Error::Clock)
+    }
+
+    pub(super) fn account_gap(
+        &mut self,
+        ledger: &mut Cpu0BudgetLedger,
+    ) -> Result<Settlement, Error> {
+        let end = Self::now()?;
+        let actual = end.cpu_since(self.cpu_tick)?;
+        let receipt = ledger.account_coordination_gap(cpu::slot(), self.wall, end.wall, actual)?;
+        *self = end;
+        Ok(receipt)
+    }
+
+    pub(super) fn settle(
+        &mut self,
+        ledger: &mut Cpu0BudgetLedger,
+        grant: Turn,
+    ) -> Result<Settlement, Error> {
+        let end = Self::now()?;
+        let actual = end.cpu_since(self.cpu_tick)?;
+        let receipt = ledger.settle(cpu::slot(), grant, actual, end.wall)?;
+        *self = end;
+        Ok(receipt)
+    }
+}
+
+struct Continuous {
+    cursor: Sample,
+    initial_tick: u64,
+    initial_spent: u64,
+    idle_ns: u64,
+}
+
+struct Budget {
+    ledger: Cpu0BudgetLedger,
+    continuous: Option<Continuous>,
+}
+
+impl Budget {
+    fn begin_continuous(&mut self) -> Result<(), Error> {
+        let cursor = Sample::now()?;
+        let initial_spent = self.ledger.lifetime_total()?;
+        self.ledger
+            .start_continuous_after_bootstrap_recovery(cpu::slot(), cursor.wall, || Ok(()))?;
+        self.continuous = Some(Continuous {
+            cursor,
+            initial_tick: cursor.cpu_tick,
+            initial_spent,
+            idle_ns: 0,
+        });
+        Ok(())
+    }
+
+    fn sample_gap(&mut self) -> Result<Sample, Fault> {
+        let Some(continuous) = self.continuous.as_mut() else {
+            return Ok(Sample::now()?);
+        };
+        let receipt = continuous.cursor.account_gap(&mut self.ledger)?;
+        if receipt.overrun {
+            return Err(Fault::Coordination {
+                used: receipt.actual_ns,
+                ended: continuous.cursor.wall,
+                crossed: receipt.crossed_window,
+            });
+        }
+        Ok(continuous.cursor)
+    }
+
+    fn settle(&mut self, grant: Turn, start: Sample) -> Result<u64, Fault> {
+        let mut end = start;
+        let receipt = end.settle(&mut self.ledger, grant)?;
+        if let Some(continuous) = self.continuous.as_mut() {
+            continuous.cursor = end;
+        }
+        let actor = || grant.accounting_scope().1.map_or(0, |(_, actor)| actor.id);
+        if receipt.actual_ns > grant.reserved_ns() {
+            return Err(Fault::Budget {
+                actor: actor(),
+                used: receipt.actual_ns,
+                prepaid: grant.reserved_ns(),
+            });
+        }
+        if receipt.overrun || receipt.crossed_window {
+            return Err(Fault::Deadline {
+                actor: actor(),
+                ended: end.wall,
+                deadline: grant.deadline_ns(),
+            });
+        }
+        Ok(receipt.actual_ns)
+    }
+
+    fn idle_until(&mut self, deadline_ns: u64) -> Result<(), Fault> {
+        let start = self.sample_gap()?;
+        if wait_until(deadline_ns)? {
+            let end = self.sample_gap()?;
+            if let Some(continuous) = self.continuous.as_mut() {
+                continuous.idle_ns = continuous
+                    .idle_ns
+                    .checked_add(end.cpu_since(start.cpu_tick)?)
+                    .ok_or(Error::Exhausted)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn queue_evidence(&self, pending: &mut OutputQueue<128>) -> Result<(), Error> {
+        let continuous = self.continuous.as_ref().ok_or(Error::NotReady)?;
+        let observed = continuous.cursor.cpu_since(continuous.initial_tick)?;
+        let charged = self
+            .ledger
+            .lifetime_total()?
+            .checked_sub(continuous.initial_spent)
+            .ok_or(Error::Clock)?;
+        if observed != charged {
+            return Err(Error::Clock);
+        }
+        let mut text = [0; 96];
+        let payload = report_payload(
+            &mut text,
+            "V020_SIGNED_RESIDENT_CPU",
+            observed,
+            charged,
+            continuous.idle_ns,
+        );
+        enqueue_resident_frame(pending, payload).map_err(|_| Error::Denied)
     }
 }
 
@@ -154,40 +300,15 @@ fn reservation(role: Role) -> (Class, u16, u64) {
     }
 }
 
-fn settle(ledger: &mut Cpu0BudgetLedger, grant: Turn, start: &Sample) -> Result<u64, Fault> {
-    let used = start.cpu_elapsed()?;
-    let end = now_ns();
-    let receipt = ledger.settle(0, grant, used, end)?;
-    let actor = || grant.accounting_scope().1.map_or(0, |(_, actor)| actor.id);
-    if used > grant.reserved_ns() {
-        return Err(Fault::Budget {
-            actor: actor(),
-            used,
-            prepaid: grant.reserved_ns(),
-        });
-    }
-    if receipt.overrun || receipt.crossed_window {
-        return Err(Fault::Deadline {
-            actor: actor(),
-            ended: end,
-            deadline: grant.deadline_ns(),
-        });
-    }
-    Ok(used)
-}
-
-fn startup_work<T>(
-    ledger: &mut Cpu0BudgetLedger,
-    step: u64,
-    work: impl FnOnce() -> T,
-) -> Result<T, Fault> {
+fn startup_work<T>(budget: &mut Budget, step: u64, work: impl FnOnce() -> T) -> Result<T, Fault> {
     let (start, grant) = loop {
-        let start = Sample::now();
+        let start = budget.sample_gap()?;
+        let next = next_boundary(start.wall)?;
         if WINDOW_NS - start.wall % WINDOW_NS < MAX_WALL_NS {
-            wait_for_tick();
+            budget.idle_until(next)?;
             continue;
         }
-        match ledger.reserve_kernel_with_wall(
+        match budget.ledger.reserve_kernel_with_wall(
             0,
             Class::Recovery,
             RECOVERY_NS,
@@ -195,12 +316,12 @@ fn startup_work<T>(
             start.wall,
         ) {
             Ok(grant) => break (start, grant),
-            Err(Error::Exhausted) => wait_for_tick(),
+            Err(Error::Exhausted) => budget.idle_until(next)?,
             Err(error) => return Err(error.into()),
         }
     };
     let result = work();
-    let used = settle(ledger, grant, &start)?;
+    let used = budget.settle(grant, start)?;
     if used == 0 {
         return Err(Error::Clock.into());
     }
@@ -213,15 +334,15 @@ fn turn(
     manifest: &ValidatedRoleManifest<'_>,
     index: usize,
     task: &mut Task,
-    ledger: &mut Cpu0BudgetLedger,
+    budget: &mut Budget,
 ) -> Result<(), Fault> {
-    let start = Sample::now();
+    let start = budget.sample_gap()?;
     if start.wall < task.wake_ns {
         return Ok(());
     }
     let member = manifest.manifest().members[index];
     let (class, domain, quota) = reservation(member.role);
-    let grant = match ledger.reserve_indexed_role_with_wall(
+    let grant = match budget.ledger.reserve_indexed_role_with_wall(
         manifest,
         index,
         member.actor,
@@ -243,7 +364,7 @@ fn turn(
     } else {
         Err(Error::Denied)
     };
-    settle(ledger, grant, &start)?;
+    budget.settle(grant, start)?;
     result.map_err(Into::into)
 }
 
@@ -267,7 +388,11 @@ fn run_quantum(
         let wall_left = grant
             .deadline_ns()
             .saturating_sub(ns_from_ticks(wall_ticks));
-        let cpu_left = grant.reserved_ns().saturating_sub(start.cpu_elapsed()?);
+        let cpu_ns = timer::cpu_ticks()
+            .checked_sub(start.cpu_tick)
+            .map(timer::cpu_ns)
+            .ok_or(Error::Clock)?;
+        let cpu_left = grant.reserved_ns().saturating_sub(cpu_ns);
         let remaining = cpu_left.min(wall_left).saturating_sub(exit_margin_ns);
         let ticks = (u128::from(remaining) * u128::from(timer::frequency()) / 1_000_000_000) as u64;
         if ticks == 0 {
@@ -300,9 +425,9 @@ fn run_tasks(
     info: &BootInfo,
     policy: &ConfirmedBootPolicy<'_>,
     manifest: &ValidatedRoleManifest<'_>,
-    ledger: &mut Cpu0BudgetLedger,
+    budget: &mut Budget,
     pending: &mut OutputQueue<128>,
-) -> Result<(), Fault> {
+) -> Result<core::convert::Infallible, Fault> {
     let mut uart = resident::attach_console(info);
     let mut tasks: [Task; ROLE_COUNT] = core::array::from_fn(|index| Task {
         context: pie_context(index),
@@ -313,17 +438,20 @@ fn run_tasks(
     let mut proof_window = next_window + EVIDENCE_WINDOWS;
     let mut console_window = next_window;
     let mut command = 0;
+    let mut budget_frame = false;
     loop {
-        let window = now_ns() / WINDOW_NS;
+        let now = now_ns();
+        let window = now / WINDOW_NS;
         if window >= next_window {
             next_window = window + 1;
             for (index, task) in tasks.iter_mut().enumerate() {
-                turn(policy, manifest, index, task, ledger)?;
+                turn(policy, manifest, index, task, budget)?;
             }
         }
-        if window >= console_window || pending.pending() != 0 {
-            let start = Sample::now();
-            match ledger.reserve_kernel_with_wall(
+        let mut wake = next_boundary(now)?;
+        if window >= console_window || pending.pending() != 0 || budget_frame {
+            let start = budget.sample_gap()?;
+            match budget.ledger.reserve_kernel_with_wall(
                 0,
                 Class::Coordination,
                 CONSOLE_TURN_NS,
@@ -332,12 +460,14 @@ fn run_tasks(
             ) {
                 Ok(grant) => {
                     console_window = window + 1;
-                    let result = if pending.pending() == 0 && window >= proof_window {
-                        proof_window = window + EVIDENCE_WINDOWS;
-                        queue_progress(&mut tasks, window, pending)
-                    } else {
-                        Ok(())
-                    };
+                    let result = queue_activity(
+                        &mut tasks,
+                        window,
+                        &mut proof_window,
+                        &mut budget_frame,
+                        budget,
+                        pending,
+                    );
                     if result.is_ok() {
                         resident::poll_console(
                             &mut uart,
@@ -346,15 +476,42 @@ fn run_tasks(
                             IRQS[0].load(Ordering::Acquire),
                         );
                     }
-                    settle(ledger, grant, &start)?;
+                    budget.settle(grant, start)?;
                     result?;
+                    if pending.pending() != 0 || budget_frame {
+                        wake =
+                            wake.min(now_ns().checked_add(CONSOLE_RETRY_NS).ok_or(Error::Clock)?);
+                    }
                 }
                 Err(Error::Exhausted) => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        wait_for_tick();
+        // Role dispatch and new console polls are once per aligned window.
+        // Recheck sooner only to finish a queued frame with remaining credit.
+        budget.idle_until(wake)?;
     }
+}
+
+fn queue_activity(
+    tasks: &mut [Task; ROLE_COUNT],
+    window: u64,
+    proof_window: &mut u64,
+    budget_frame: &mut bool,
+    budget: &Budget,
+    pending: &mut OutputQueue<128>,
+) -> Result<(), Error> {
+    if pending.pending() == 0 {
+        if *budget_frame {
+            budget.queue_evidence(pending)?;
+            *budget_frame = false;
+        } else if window >= *proof_window {
+            queue_progress(tasks, window, pending)?;
+            *proof_window = window + EVIDENCE_WINDOWS;
+            *budget_frame = true;
+        }
+    }
+    Ok(())
 }
 
 fn queue_progress(
@@ -382,11 +539,25 @@ fn queue_progress(
     enqueue_resident_frame(pending, payload).map_err(|_| Error::Denied)
 }
 
-fn wait_for_tick() {
+fn next_boundary(now_ns: u64) -> Result<u64, Error> {
+    (now_ns / WINDOW_NS)
+        .checked_add(1)
+        .and_then(|window| window.checked_mul(WINDOW_NS))
+        .ok_or(Error::Clock)
+}
+
+fn wait_until(deadline_ns: u64) -> Result<bool, Error> {
+    let deadline = u64::try_from(
+        (u128::from(deadline_ns) * u128::from(timer::frequency())).div_ceil(1_000_000_000),
+    )
+    .map_err(|_| Error::Clock)?;
+    if timer::ticks() >= deadline {
+        return Ok(false);
+    }
     // SAFETY: the boot GIC handler rearms CPU0's EL1 timer. This
     // wait leaves the stopped EL0 contexts untouched.
     unsafe {
-        timer::arm(resident::timer_deadline());
+        timer::arm(deadline);
         timer::enable_irqs();
     }
     timer::idle();
@@ -400,6 +571,7 @@ fn wait_for_tick() {
         );
         cpu::disable_timer();
     }
+    Ok(true)
 }
 
 fn identities(policy: &ConfirmedBootPolicy<'_>) -> Result<[Identity; ROLE_COUNT], Error> {
@@ -416,7 +588,7 @@ fn identities(policy: &ConfirmedBootPolicy<'_>) -> Result<[Identity; ROLE_COUNT]
     Ok(identities)
 }
 
-fn fence(info: &BootInfo, ledger: Cpu0BudgetLedger, pending: OutputQueue<128>, fault: Fault) -> ! {
+fn fence(info: &BootInfo, budget: Budget, pending: OutputQueue<128>, fault: Fault) -> ! {
     let witness = match fault {
         Fault::Operation(error) => ("V020_SIGNED_RESIDENT_FAULT", [error as u64, 0, 0]),
         Fault::Budget {
@@ -429,9 +601,24 @@ fn fence(info: &BootInfo, ledger: Cpu0BudgetLedger, pending: OutputQueue<128>, f
             ended,
             deadline,
         } => ("V020_SIGNED_RESIDENT_DEADLINE", [actor, ended, deadline]),
+        Fault::Coordination {
+            used,
+            ended,
+            crossed,
+        } => (
+            "V020_SIGNED_RESIDENT_COORD_OVERRUN",
+            [used, ended, u64::from(crossed)],
+        ),
     };
     // Finish any retained serial suffix before the read-only status banner.
-    resident::serve_with_queue(info, Some(FENCED), ledger, pending, Some(witness))
+    resident::serve_with_queue(
+        info,
+        Some(FENCED),
+        budget.ledger,
+        pending,
+        Some(witness),
+        budget.continuous.map(|continuous| continuous.cursor),
+    )
 }
 
 pub(super) fn run(info: &BootInfo) -> ! {
@@ -444,36 +631,43 @@ pub(super) fn run(info: &BootInfo) -> ! {
     gic()
         .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
         .expect("CPU0 timer PPI");
-    let mut ledger = Cpu0BudgetLedger::new();
-    let config = match startup_work(&mut ledger, 1, media_staging::verify_scratch_config) {
+    let mut budget = Budget {
+        ledger: Cpu0BudgetLedger::new(),
+        continuous: None,
+    };
+    let config = match startup_work(&mut budget, 1, media_staging::verify_scratch_config) {
         Ok(Ok(config)) => config,
-        Ok(Err(_)) => resident::serve(info, Some(FENCED), ledger),
-        Err(fault) => fence(info, ledger, OutputQueue::new(), fault),
+        Ok(Err(_)) => resident::serve(info, Some(FENCED), budget.ledger),
+        Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     };
     // This existing scratch formatter and paired BootEpoch transport owns
     // its per-request I/O deadlines. It is a pre-admission diagnostic, with
     // no role or service grant outstanding.
     let mut staged = media_staging::stage_with_policy(info, Some(config));
     let Some(boot) = staged.resident_boot.take() else {
-        resident::serve(info, Some(NO_MEDIA), ledger);
+        resident::serve(info, Some(NO_MEDIA), budget.ledger);
     };
     let Ok(policy) = boot.policy() else {
-        resident::serve(info, Some(FENCED), ledger);
+        resident::serve(info, Some(FENCED), budget.ledger);
     };
     if policy.boot_epoch() != staged.confirmed_epoch {
-        resident::serve(info, Some(FENCED), ledger);
+        resident::serve(info, Some(FENCED), budget.ledger);
     }
-    let Ok(actors) = identities(&policy) else {
-        resident::serve(info, Some(FENCED), ledger);
+    if let Err(error) = budget.begin_continuous() {
+        fence(info, budget, OutputQueue::new(), error.into());
+    }
+    let actors = match identities(&policy) {
+        Ok(actors) => actors,
+        Err(error) => fence(info, budget, OutputQueue::new(), error.into()),
     };
     if recovery::init_signed(&policy).is_err() {
-        resident::serve(info, Some(FENCED), ledger);
+        fence(info, budget, OutputQueue::new(), Error::Denied.into());
     }
-    let members = match startup_work(&mut ledger, 2, || {
+    let members = match startup_work(&mut budget, 2, || {
         core::array::from_fn(|index| load_role_with_identity(index, actors[index].generation, 0, 0))
     }) {
         Ok(members) => members,
-        Err(fault) => fence(info, ledger, OutputQueue::new(), fault),
+        Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     };
     let manifest = NativeRoleManifest {
         online_mask: profile::ONLINE,
@@ -484,8 +678,9 @@ pub(super) fn run(info: &BootInfo) -> ! {
             + 1024 * 1024,
         other_control_ns_per_100ms: 10_000_000,
     };
-    let Ok(manifest) = manifest.validated() else {
-        resident::serve(info, Some(FENCED), ledger);
+    let manifest = match manifest.validated() {
+        Ok(manifest) => manifest,
+        Err(error) => fence(info, budget, OutputQueue::new(), error.into()),
     };
     report(
         "V020_SIGNED_RESIDENT_BOOT",
@@ -502,8 +697,6 @@ pub(super) fn run(info: &BootInfo) -> ! {
         );
     }
     let mut pending = OutputQueue::new();
-    match run_tasks(info, &policy, &manifest, &mut ledger, &mut pending) {
-        Err(fault) => fence(info, ledger, pending, fault),
-        Ok(()) => resident::serve(info, Some(FENCED), ledger),
-    }
+    let Err(fault) = run_tasks(info, &policy, &manifest, &mut budget, &mut pending);
+    fence(info, budget, pending, fault)
 }

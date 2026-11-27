@@ -29,6 +29,18 @@ RECOVERY_NS = 8_000_000
 PMU_PATCH = Path(__file__).resolve().parent / "qemu/cyxia-per-vcpu-pmu.patch"
 
 
+def verify_resident_budget(lines: list, progress: list) -> list:
+    samples = rows(lines, "V020_SIGNED_RESIDENT_CPU")
+    require(len(progress) - 1 <= len(samples) <= len(progress),
+            "missing continuous CPU0 accounting for signed role progress")
+    require(all(0 < idle < observed == ledger < 2**64 for observed, ledger, idle in samples),
+            "native PMU delta, idle work and continuous CPU0 ledger disagree")
+    require(all(right[0] > left[0] and right[2] > left[2]
+                for left, right in zip(samples, samples[1:])),
+            "continuous CPU0 accounting did not survive aligned windows")
+    return samples
+
+
 def verify_disk(path: Path, epoch: int, roles: list) -> str:
     policy = verify_signed_disk(path, epoch)
     with path.open("rb") as disk:
@@ -90,7 +102,8 @@ def boot(binary: str, elf: Path, output: Path, timeout: float,
                         "missing medium did not retain the read-only resident service")
                 require(not any(line.startswith(("V020_SIGNED_RESIDENT_BOOT ",
                                                  "V020_SIGNED_RESIDENT_ROLE ",
-                                                 "V020_SIGNED_RESIDENT_PROGRESS "))
+                                                 "V020_SIGNED_RESIDENT_PROGRESS ",
+                                                 "V020_SIGNED_RESIDENT_CPU "))
                                 for line in lines), "EL0 roles started without confirmed media")
                 if disk is not None:
                     io = rows(lines, "V020_W11_MEDIA_IO")
@@ -195,6 +208,11 @@ def main() -> int:
                 if name == "blank_reopen":
                     require(sha(disk) == blank_digest, "rejected scratch medium changed")
                     run["unchanged_media_sha256"] = blank_digest
+                if epoch is not None:
+                    serial = (args.output / name / "serial.txt").read_text(encoding="utf-8")
+                    run["cpu0_pmu_ledger_idle_ns"] = verify_resident_budget(
+                        serial.splitlines(), run["progress"]
+                    )
         summary["status"] = "PASS"
     except (ValueError, OSError, struct.error) as error:
         summary["error"] = f"{type(error).__name__}: {error}"

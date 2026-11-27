@@ -7,6 +7,8 @@
 
 #[cfg(not(feature = "v020-production-signed-resident"))]
 use super::bring_up_production;
+#[cfg(feature = "v020-production-signed-resident")]
+use super::signed_resident::Sample;
 use super::{
     BootInfo, FAILURES, IRQS, ONLINE, Ordering, STOPPED, TIMER_IRQ, cpu, gic, report_payload, timer,
 };
@@ -42,6 +44,8 @@ const CATALOG_RECOVERY_NS: u64 =
 struct ResidentBudget {
     ledger: Cpu0BudgetLedger,
     frequency: u64,
+    #[cfg(feature = "v020-production-signed-resident")]
+    native_cursor: Option<Sample>,
 }
 
 impl ResidentBudget {
@@ -50,8 +54,19 @@ impl ResidentBudget {
             .map_err(|_| Error::Clock)
     }
 
+    fn begin(&mut self) -> Result<u64, Error> {
+        #[cfg(feature = "v020-production-signed-resident")]
+        if let Some(cursor) = self.native_cursor.as_mut() {
+            // Read-only containment carries the same cursor and ledger.
+            // The ledger still enforces its remaining coordination credit.
+            cursor.account_gap(&mut self.ledger)?;
+            return Ok(cursor.wall);
+        }
+        self.now_ns()
+    }
+
     fn diagnostic_turn(&mut self, work: impl FnOnce()) -> Result<Option<Settlement>, Error> {
-        let start = self.now_ns()?;
+        let start = self.begin()?;
         let reservation =
             self.ledger
                 .reserve_readonly_diagnostic(cpu::slot(), CONSOLE_TURN_NS, start);
@@ -64,6 +79,10 @@ impl ResidentBudget {
     }
 
     fn settle(&mut self, start: u64, grant: Turn) -> Result<Settlement, Error> {
+        #[cfg(feature = "v020-production-signed-resident")]
+        if let Some(cursor) = self.native_cursor.as_mut() {
+            return cursor.settle(&mut self.ledger, grant);
+        }
         let end = self.now_ns()?;
         // The generic counter provides a conservative elapsed-time debit
         // for a foreground turn, with one tick of rounding margin.
@@ -77,7 +96,7 @@ impl ResidentBudget {
     #[cfg(cyxia_startup_catalog)]
     fn verify_startup_envelope(&mut self) -> Result<(bool, Settlement), Error> {
         let (started, grant) = loop {
-            let now = self.now_ns()?;
+            let now = self.begin()?;
             match self
                 .ledger
                 .reserve_kernel(cpu::slot(), Class::Recovery, CATALOG_RECOVERY_NS, now)
@@ -161,7 +180,15 @@ pub(super) fn serve(
     _startup_override: Option<&'static [u8]>,
     ledger: Cpu0BudgetLedger,
 ) -> ! {
-    serve_with_queue(info, _startup_override, ledger, OutputQueue::new(), None)
+    serve_with_queue(
+        info,
+        _startup_override,
+        ledger,
+        OutputQueue::new(),
+        None,
+        #[cfg(feature = "v020-production-signed-resident")]
+        None,
+    )
 }
 
 pub(super) fn attach_console(info: &BootInfo) -> Pl011 {
@@ -180,11 +207,17 @@ pub(super) fn serve_with_queue(
     ledger: Cpu0BudgetLedger,
     mut pending: OutputQueue<128>,
     mut fault: Option<(&'static str, [u64; 3])>,
+    #[cfg(feature = "v020-production-signed-resident")] native_cursor: Option<Sample>,
 ) -> ! {
     let mut uart = attach_console(info);
     let frequency = timer::frequency();
     assert_ne!(frequency, 0);
-    let mut budget = ResidentBudget { ledger, frequency };
+    let mut budget = ResidentBudget {
+        ledger,
+        frequency,
+        #[cfg(feature = "v020-production-signed-resident")]
+        native_cursor,
+    };
     gic()
         .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
         .expect("CPU0 timer PPI");

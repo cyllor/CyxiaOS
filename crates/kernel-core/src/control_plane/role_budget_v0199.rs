@@ -139,6 +139,40 @@ impl Cpu0BudgetLedger {
         {
             return Err(Error::Busy);
         }
+        self.bind_continuous_origin(initial_ns, verify_origin)
+    }
+
+    /// Begin continuous accounting when the native, pre-admission bootstrap
+    /// has settled its single initial EL1 Recovery grant and finished the
+    /// media handoff. Keep that grant's lifetime and current-window charges.
+    /// No running, prior ordinary, or already continuous ledger can rebase.
+    pub fn start_continuous_after_bootstrap_recovery(
+        &mut self,
+        cpu: usize,
+        initial_ns: u64,
+        verify_origin: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if cpu != CONTROL_CPU {
+            return Err(Error::Denied);
+        }
+        if self.continuous || self.active.is_some() || self.serial != 1 {
+            return Err(Error::Busy);
+        }
+        let recovery_spent = self.lifetime_spent(Class::Recovery);
+        if recovery_spent == 0 || self.lifetime_total()? != recovery_spent {
+            return Err(Error::Denied);
+        }
+        self.bind_continuous_origin(initial_ns, verify_origin)
+    }
+
+    fn bind_continuous_origin(
+        &mut self,
+        initial_ns: u64,
+        verify_origin: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if initial_ns < self.last_ns {
+            return Err(Error::Clock);
+        }
         verify_origin()?;
         self.last_ns = initial_ns;
         self.continuous = true;
@@ -934,6 +968,67 @@ mod tests {
         q.settle(0, t, 10, 140).unwrap();
         assert_eq!(q.lifetime_total(), Ok(25));
     }
+    #[test]
+    fn bootstrap_recovery_handoff_preserves_the_existing_window_and_continuity() {
+        let mut q = Cpu0BudgetLedger::new();
+        let recovery = q
+            .reserve_kernel(0, Class::Recovery, 8_000_000, 10_000_000)
+            .unwrap();
+        q.settle(0, recovery, 700_000, 11_000_000).unwrap();
+        let origin = 12_000_000;
+        assert_eq!(
+            q.start_continuous_after_bootstrap_recovery(0, origin, || Err(Error::Denied)),
+            Err(Error::Denied)
+        );
+        assert_eq!(
+            q.start_continuous_after_bootstrap_recovery(1, origin, || Ok(())),
+            Err(Error::Denied)
+        );
+        assert_eq!(
+            q.start_continuous_after_bootstrap_recovery(0, 10_000_000, || Ok(())),
+            Err(Error::Clock)
+        );
+        q.start_continuous_after_bootstrap_recovery(0, origin, || Ok(()))
+            .unwrap();
+        assert_eq!(q.spent(Class::Recovery), 700_000);
+        assert_eq!(
+            q.reserve_kernel(0, Class::Recovery, 8_000_000, origin),
+            Err(Error::Exhausted)
+        );
+        let gap = q
+            .account_coordination_gap(0, origin, WINDOW_NS + 10, 300_000)
+            .unwrap();
+        assert!(gap.crossed_window && !gap.overrun);
+        assert_eq!(q.lifetime_total(), Ok(1_000_000));
+        assert_eq!(
+            q.start_continuous_after_bootstrap_recovery(0, WINDOW_NS + 20, || Ok(())),
+            Err(Error::Busy)
+        );
+        assert_eq!(
+            q.reserve_kernel(0, Class::Coordination, 100, WINDOW_NS + 20),
+            Err(Error::Clock)
+        );
+        assert!(q.ordinary_closed());
+    }
+
+    #[test]
+    fn only_a_settled_bootstrap_recovery_can_handoff_continuous_accounting() {
+        let mut q = Cpu0BudgetLedger::new();
+        let recovery = q.reserve_kernel(0, Class::Recovery, 100, 10).unwrap();
+        assert_eq!(
+            q.start_continuous_after_bootstrap_recovery(0, 20, || Ok(())),
+            Err(Error::Busy)
+        );
+        q.settle(0, recovery, 10, 110).unwrap();
+        q.reserve_kernel(0, Class::Coordination, 100, 110)
+            .and_then(|grant| q.settle(0, grant, 0, 120))
+            .unwrap();
+        assert_eq!(
+            q.start_continuous_after_bootstrap_recovery(0, 120, || Ok(())),
+            Err(Error::Busy)
+        );
+    }
+
     #[test]
     fn measured_role_turn_retains_exact_boundary_charge_and_closes_real_overrun() {
         let m = manifest();
