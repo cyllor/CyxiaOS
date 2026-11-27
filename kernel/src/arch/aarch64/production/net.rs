@@ -353,6 +353,7 @@ fn relay(
             Some(&mut signer),
         );
         sec_n_broker::discard_guest_session(&layout, identity.boot_epoch);
+        signer.discard();
         outcome
     }
     #[cfg(not(feature = "v020-production-authenticated-net"))]
@@ -363,6 +364,16 @@ fn relay(
 
 /// One-shot SEC-N service run on CPU0 (after the advice chain).
 pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity) -> NetOutcome {
+    #[cfg(feature = "v020-production-authenticated-net")]
+    if let Err(error) = identity.qualify_packages() {
+        report(
+            "V020_SEC_N_PACKAGE_REJECTED",
+            identity.boot_epoch,
+            error as u64,
+            0,
+        );
+        return NetOutcome::default();
+    }
     let outcome = match net_device::with_device(info, identity.boot_epoch, |dev| {
         serve_attached_network(info, dev, identity)
     }) {

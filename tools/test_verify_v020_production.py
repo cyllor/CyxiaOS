@@ -508,6 +508,7 @@ class W11Validation(unittest.TestCase):
             "V020_SEC_N_SIGNER_SPACE a=65 b=17 c=0",
             "V020_SEC_N_SIGNER_REPLY a=1 b=1 c=1",
             f"V020_SEC_N_VERIFIER_AUTHENTICATED a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
+            "V020_SEC_N_SIGNER_DISCARDED a=1 b=1 c=21",
             f"V020_W13_NET_RETIRE a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
         ]
         self.rejects("isolated ingress parser", words=words, lines=lines, modes=modes)
@@ -515,6 +516,9 @@ class W11Validation(unittest.TestCase):
             "V020_SEC_N_PARSER_SPACE a=66 b=6 c=1",
             "V020_SEC_N_PARSER_FRAMES a=13 b=12 c=1",
         ]
+        self.rejects("TLS package qualification", words=words, lines=lines, modes=modes)
+        lines.insert(lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0"),
+                     "V020_SEC_N_PACKAGE_AUTHORITY a=1 b=1 c=1")
         obs = self.check(words=words, lines=lines, modes=modes)
         self.assertEqual(obs["native_parser_accepted_frames"], 12)
         self.assertEqual(obs["tls_drbg_guest_bytes"], 96)
@@ -562,17 +566,31 @@ class W11Validation(unittest.TestCase):
             "V020_SEC_N_SIGNER_SPACE a=65 b=17 c=0",
             "V020_SEC_N_SIGNER_REPLY a=1 b=1 c=1",
             f"V020_SEC_N_VERIFIER_AUTHENTICATED a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
+            "V020_SEC_N_SIGNER_DISCARDED a=1 b=1 c=21",
         ]
         lines += [
             "V020_SEC_N_PARSER_SPACE a=66 b=6 c=1",
             "V020_SEC_N_PARSER_FRAMES a=10 b=10 c=0",
         ]
+        lines.insert(lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0"),
+                     "V020_SEC_N_PACKAGE_AUTHORITY a=1 b=1 c=1")
         modes = v.Modes(authenticated_net=True, orderly_close=False)
         self.assertEqual(self.check(words=words, lines=lines, modes=modes)["native_admission_retirements"], 0)
         self.rejects("retirement proof", words=words, lines=lines, modes=v.Modes(authenticated_net=True))
         words[176] = 1
         lines.append(f"V020_W13_NET_RETIRE a=1 b={v.QEMU_GATEWAY_IPV4} c=1")
         self.rejects("retirement proof", words=words, lines=lines, modes=modes)
+
+    def test_unqualified_packages_fence_device_and_listener(self):
+        modes = v.Modes(authenticated_net=True)
+        words = w11_words()
+        words[138:143] = [0] * 5
+        lines = [line for line in w11_lines()
+                 if not line.startswith(("V020_W11_NET_", "V020_SEC_D_NET_RESET_"))]
+        lines += ["V020_SEC_N_PACKAGE_REJECTED a=1 b=1 c=0"]
+        self.rejects("V020_SEC_N_PACKAGE_REJECTED", words=words, lines=lines, modes=modes)
+        lines += ["V020_W11_NET_LISTEN a=7 b=0 c=0"]
+        self.rejects("before device ownership", words=words, lines=lines, modes=modes)
 
     def test_rng_missing_cannot_fall_back_to_listening(self):
         modes = v.Modes(authenticated_net=True)

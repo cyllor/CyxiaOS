@@ -52,7 +52,10 @@ pub(super) mod signer;
 
 use super::*;
 #[cfg(feature = "v020-production-authenticated-net")]
-use cyxia_kernel_core::security::network::tls_deadline::{Limit, Phase, TlsWindow};
+use cyxia_kernel_core::security::network::{
+    TlsInstallation,
+    tls_deadline::{Limit, Phase, TlsWindow},
+};
 use cyxia_net_transport::device::{self, Port};
 
 // Trusted monotonic clocks from the EL1 architectural timer (the same source the
@@ -140,7 +143,7 @@ pub(crate) struct BootIdentity {
     pub(crate) boot_epoch: u64,
     verifier_generation: u64,
     #[cfg(feature = "v020-production-authenticated-net")]
-    key_generation: u64,
+    tls: TlsInstallation,
 }
 
 impl BootIdentity {
@@ -152,7 +155,16 @@ impl BootIdentity {
         boot_epoch: 1,
         verifier_generation: 1,
         #[cfg(feature = "v020-production-authenticated-net")]
-        key_generation: 1,
+        tls: TlsInstallation {
+            verifier_generation: 1,
+            signer_generation: 1,
+            key_generation: 1,
+            key_manifest_hash: [
+                0xb0, 0x01, 0x79, 0xae, 0x6e, 0xd2, 0xc6, 0xad, 0x68, 0x4f, 0x29, 0x5f, 0x30, 0x83,
+                0x21, 0x9c, 0x57, 0xa6, 0x75, 0x0b, 0x58, 0xd0, 0xf5, 0x55, 0x0d, 0x6f, 0x71, 0x68,
+                0x64, 0x66, 0xf2, 0xa8,
+            ],
+        },
     };
 
     #[cfg(feature = "v020-production-media-signed")]
@@ -165,8 +177,33 @@ impl BootIdentity {
             boot_epoch: installation.authorize(config, state).ok()?,
             verifier_generation: installation.verifier_generation,
             #[cfg(feature = "v020-production-authenticated-net")]
-            key_generation: installation.key_generation,
+            tls: installation,
         })
+    }
+
+    /// A diagnostic credential qualification, rooted in the public scratch
+    /// test boot key. Signed-media callers first authenticate the same
+    /// installation against the committed BootEpoch and key catalogue.
+    #[cfg(feature = "v020-production-authenticated-net")]
+    pub(crate) fn qualify_packages(self) -> Result<(), cyxia_kernel_core::security::Error> {
+        // RFC 8032 test vector 1, the existing signed scratch trust root.
+        const PUBLIC_KEY: &[u8; 32] = &[
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+        const SIGNATURE: &[u8; 64] = include_bytes!(
+            "../../../../target/aarch64-unknown-none/release/cyxia-tls-packages.sig"
+        );
+        self.tls
+            .qualify_packages(PUBLIC_KEY, SIGNATURE, GUEST_ELF, signer::SIGNER_ELF)?;
+        report(
+            "V020_SEC_N_PACKAGE_AUTHORITY",
+            self.boot_epoch,
+            self.tls.verifier_generation,
+            self.tls.key_generation,
+        );
+        Ok(())
     }
 }
 
@@ -599,9 +636,22 @@ pub(crate) fn discard_guest_session(layout: &Layout, boot_epoch: u64) {
         TLS_WINDOW = None;
         TLS_AUTHENTICATED_EPOCH = 0;
         EMPTY_ACTIVE_READ = false;
-        core::ptr::addr_of_mut!((*memory.root).0[0]).write_volatile(0);
         CONN_EPOCH
     };
+    let pages = discard_role_space(&memory, layout);
+    report(
+        "V020_SEC_N_VERIFIER_DISCARDED",
+        boot_epoch,
+        conn_epoch,
+        pages as u64,
+    );
+}
+
+#[cfg(feature = "v020-production-authenticated-net")]
+fn discard_role_space(memory: &Memory, layout: &Layout) -> usize {
+    // SAFETY: the caller owns this stopped, pinned role root and its
+    // writable backing. No subsequent entry can reach its pages.
+    unsafe { core::ptr::addr_of_mut!((*memory.root).0[0]).write_volatile(0) };
     tlbi();
     // The loader admits one BSS-only writable LOAD. Volatile page writes
     // cover its exact extent and every private stack and shared page.
@@ -617,13 +667,7 @@ pub(crate) fn discard_guest_session(layout: &Layout, boot_epoch: u64) {
         }
         core::arch::asm!("dsb ishst", options(nostack));
     }
-    let pages = layout.bss_end.saturating_sub(layout.bss_first) + memory.stack_pages + SHARED_PAGES;
-    report(
-        "V020_SEC_N_VERIFIER_DISCARDED",
-        boot_epoch,
-        conn_epoch,
-        pages as u64,
-    );
+    layout.bss_end.saturating_sub(layout.bss_first) + memory.stack_pages + SHARED_PAGES
 }
 
 fn fresh_context(layout: &Layout) -> user::Context {

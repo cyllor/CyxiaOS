@@ -138,6 +138,7 @@ PRODUCTION_SOURCES = [
     "crates/kernel-core/src/security/boot_epoch_v1.rs",
     "crates/kernel-core/src/security/network/entropy.rs",
     "crates/kernel-core/src/security/network/tls_deadline.rs",
+    "crates/kernel-core/src/security/network/tls_packages.rs",
     "crates/kernel-core/src/security/startup_catalog_v0199.rs",
     "crates/kernel-core/src/security/startup_catalog_v0199/profile.rs",
     "crates/kernel-core/src/security/durable_role_epoch_v0199.rs",
@@ -189,6 +190,8 @@ PRODUCTION_SOURCES = [
     "user/local-echo/build.rs",
     "user/local-echo/linker.ld",
     "tools/verify_v020_production.py",
+    "tools/verify_v0199_sec_n.py",
+    "tools/test_v020_signed_scratch_vector.py",
     "tools/verify_v020_fsync_scratch.py",
     "tools/qmp_stdio.py",
     "tools/v020_production_media.py",
@@ -447,6 +450,17 @@ class Production:
                     and not any(line.startswith(("V020_W11_NET_", "V020_SEC_N_", "V020_SEC_D_NET_RESET_"))
                                 for line in lines), "network started without signed media custody")
             raise ValueError("guest reported V020_W11_MEDIA_STAGING_INCOMPLETE: a staging step failed")
+        rejected_packages = rows("V020_SEC_N_PACKAGE_REJECTED")
+        if rejected_packages:
+            require(self.modes.authenticated_net and len(rejected_packages) == 1
+                    and rejected_packages[0][0] > 0 and rejected_packages[0][1] > 0
+                    and rejected_packages[0][2] == 0 and not any(words[138:143])
+                    and words[160] == words[176] == 0
+                    and not any(line.startswith(("V020_W11_NET_", "V020_SEC_D_NET_RESET_"))
+                                for line in lines)
+                    and not rows("V020_SEC_N_SIGNER_SPACE"),
+                    "TLS package rejection did not fence the network before device ownership")
+            raise ValueError("V020_SEC_N_PACKAGE_REJECTED: both packaged credentials required")
         extensions = validate_extensions(words, lines, self.modes)
         wave11 = validate_w11(words, lines, serial, self.staging, snapshot_calls, self.modes,
                               pending_fsync_blocks=pending_fsync_blocks,
@@ -831,6 +845,30 @@ def supervisor_copy_windows(elf, qmp, output, lines, *, snapshot_lists=None, fil
     }
 
 
+def signer_retirement(elf, qmp, output, image_pages, retired_pages):
+    """Independently verify that the stopped Signer's root and writable pages are zero."""
+    require = verify_smp.require
+    page = 4096
+    frames, leaves, tables, shared, stack = 64, 9, 2, 4, 16
+    space = symbol(elf, "V020_SEC_N_SIGNER_SPACE_PAGES")
+    base = space["pa"]
+    require(base % page == 0 and space["size"] == (frames + leaves + tables + shared + stack) * page,
+            "unexpected private Signer address space geometry")
+    root = base + (frames + leaves + 1) * page
+    bss = retired_pages - shared - stack
+    require(0 <= bss < image_pages <= frames, "invalid retired Signer data range")
+
+    def erased(name, address, pages):
+        if pages:
+            path = output / f"signer-{name}.bin"
+            qmp.execute("pmemsave", {"val": address, "size": pages * page, "filename": str(path)})
+            require(path.read_bytes() == bytes(pages * page), f"Signer {name} was not erased")
+
+    erased("root-and-mailbox-stack", root, 1 + shared + stack)
+    erased("bss", base + (image_pages - bss) * page, bss)
+    return {"root_pa": hex(root), "root_invalid": True, "writable_pages_scrubbed": retired_pages}
+
+
 def ingress_mappings(elf, qmp, output, image_pages):
     """Read the stopped parser's actual tree and every resulting leaf."""
     require = verify_smp.require
@@ -1101,6 +1139,11 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                         report["ingress_mappings"] = ingress_mappings(
                             elf.read_bytes(), qmp, output,
                             report["observations"]["native_parser_image_pages"],
+                        )
+                        report["signer_retirement"] = signer_retirement(
+                            elf.read_bytes(), qmp, output,
+                            report["observations"]["native_signer_image_pages"],
+                            report["observations"]["native_signer_discarded_pages"],
                         )
                         require(peer is not None, "missing authenticated host peer")
                         peer.join(timeout=min(max(end - time.monotonic(), 0), PEER_WAIT_SECONDS))

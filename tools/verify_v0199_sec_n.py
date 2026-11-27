@@ -44,6 +44,7 @@ import time
 import verify_smp
 from run_qemu import Qmp
 from transport import FrameDecoder
+from test_v020_signed_scratch_vector import CATALOG, sign_scratch_fixture
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -264,6 +265,16 @@ def build_guest(isolated_signer: bool = False) -> None:
             cargo_prefix() + "cargo build --release --locked --offline -p cyxia-local-echo "
             f"--features {feature} --target aarch64-unknown-none",
             shell=True, cwd=ROOT, env=guest_env, check=True, executable="/bin/bash")
+        if isolated_signer:
+            release = ROOT / GUEST_ELF
+            signer = release.with_name("cyxia-echo-signer")
+            message = (b"CYX/TLS-PACKAGES/v1" + struct.pack("<QQQ", 1, 1, 1)
+                       + hashlib.sha256(CATALOG[2]).digest()
+                       + hashlib.sha256(release.read_bytes()).digest()
+                       + hashlib.sha256(signer.read_bytes()).digest())
+            signature = sign_scratch_fixture(ident, message)
+            verify_smp.require(len(signature) == 64, "invalid TLS fixture qualification")
+            release.with_name("cyxia-tls-packages.sig").write_bytes(signature)
 
 
 def build() -> Path:

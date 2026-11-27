@@ -9,6 +9,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub mod entropy;
 pub mod tls_deadline;
+mod tls_packages;
 
 pub const MAX_SOURCES: usize = 32;
 pub const MAX_PENDING: u8 = 4;
