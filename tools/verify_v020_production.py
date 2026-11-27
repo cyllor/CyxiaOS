@@ -130,7 +130,7 @@ PRODUCTION_SOURCES = [
     "crates/kernel-core/src/security/recovery_proof_v2.rs",
     "crates/kernel-core/src/security/boot_epoch_v1.rs",
     "crates/kernel-core/src/security/network/entropy.rs",
-    "crates/kernel-core/src/security/network/pending_tls.rs",
+    "crates/kernel-core/src/security/network/tls_deadline.rs",
     "crates/kernel-core/src/security/durable_role_epoch_v0199.rs",
     "crates/kernel-core/src/security/epoch_redo_v0199.rs",
     "crates/kernel-core/src/security/offline_config_v1.rs",

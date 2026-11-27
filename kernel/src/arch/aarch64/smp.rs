@@ -513,6 +513,8 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
         let ack = gic().acknowledge();
         match ack {
             IrqAck::Active { id, .. } if id as u64 == TIMER_IRQ.load(Ordering::Relaxed) => {
+                #[cfg(feature = "v020-production-authenticated-net")]
+                let active_poll;
                 unsafe {
                     #[cfg(feature = "unified-runtime")]
                     if HEARTBEAT[slot].load(Ordering::Acquire) {
@@ -522,6 +524,10 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
                     }
                     #[cfg(not(feature = "unified-runtime"))]
                     cpu::disable_timer();
+                    #[cfg(feature = "v020-production-authenticated-net")]
+                    {
+                        active_poll = slot == 0 && kind == 5 && sec_n_broker::rearm_active_poll_timer();
+                    }
                     #[cfg(any(
                         feature = "v020-production-signed-resident",
                         all(
@@ -543,6 +549,10 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
                 gic().end(ack);
                 #[cfg(feature = "prototype-runtime")]
                 prototype_runtime::irq_exit(slot);
+                #[cfg(feature = "v020-production-authenticated-net")]
+                if active_poll {
+                    return;
+                }
             }
             #[cfg(feature = "unified-runtime")]
             IrqAck::Active { id: 0, .. } => {
@@ -588,6 +598,12 @@ pub fn exception(frame: &mut super::ExceptionFrame, kind: u64) {
                 )
             ))]
             IrqAck::Spurious if kind == 5 => {}
+            #[cfg(all(
+                feature = "v020-production-authenticated-net",
+                not(feature = "unified-runtime")
+            ))]
+            IrqAck::Spurious
+                if slot == 0 && kind == 5 && sec_n_broker::rearm_active_poll_timer() => return,
             #[cfg(not(feature = "unified-runtime"))]
             _ => fatal(10 + kind),
         }
