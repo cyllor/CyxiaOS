@@ -109,6 +109,7 @@ use cyxia_kernel_core::security::{
 use sha2::{Digest, Sha256};
 
 #[cfg(any(
+    feature = "v020-production-live-control",
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch"
@@ -142,8 +143,6 @@ use meter::ExecTarget;
 mod net;
 #[path = "production/role_loader.rs"]
 mod role_loader;
-#[cfg(feature = "v020-production-frame-pool")]
-use role_loader::high_leaf;
 #[cfg(cyxia_signed_resident)]
 use role_loader::ns_from_ticks;
 use role_loader::{
@@ -1176,11 +1175,12 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         0,
         "only boot CPU0 owns the production control plane"
     );
+    #[cfg(not(feature = "v020-production-frame-pool"))]
     frames::register_or_fatal();
     #[cfg(feature = "v020-production-frame-pool")]
     let reserved_info = {
         let mut reserved = *info;
-        frames::prove_pool_or_fatal(&mut reserved);
+        frames::prepare_pool_or_fatal(&mut reserved);
         reserved
     };
     #[cfg(feature = "v020-production-frame-pool")]
@@ -1234,6 +1234,8 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(PIE_MEMBERS), pie_members);
     }
+    #[cfg(all(feature = "v020-production-frame-pool", feature = "prototype-memory"))]
+    frames::prove_dense_pool_or_fatal(&pie_manifest);
     report(
         "V020_PROD_PIE_LOAD",
         ROLE_COUNT as u64,
@@ -1577,11 +1579,12 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         )
         .expect("claim apply work");
     let work = ApplyWorkV1::decode(frame.bytes()).expect("apply work");
-    let timing = EXEC_TARGET
+    let target_lock = EXEC_TARGET
         .commit(prepared.expect("reserved target install"))
         .expect("D01 install without waiting");
-    let fault = match timing {
-        Some(t) => {
+    let fault = match target_lock {
+        Some(sample) => {
+            let t = sample.timing;
             report(
                 "V020_SEC_S_TARGET_LOCK",
                 t.work_ns,
@@ -1883,6 +1886,9 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     frames::publish();
     recovery::publish();
     meter::publish();
+    if let Some(sample) = target_lock {
+        sample.publish();
+    }
     net::publish(&net_outcome);
     #[cfg(feature = "v020-production-media-staging")]
     media_staging::publish(&staging_outcome);

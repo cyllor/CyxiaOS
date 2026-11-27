@@ -19,6 +19,8 @@
 //!   load then sealed RO through the boot direct-map (break-before-make + TLBI);
 //!   bss/stack/shared pages are writable only by CPU0 between phases. Every &mut
 //!   is created and consumed within one synchronous CPU0 call; no aliasing.
+//!   After the authenticated relay returns, CPU0 invalidates this stopped
+//!   root and wipes writable pages. No page is returned to a frame allocator.
 //!   Under v020-production they live in the dedicated `.bss.sec_n` link section
 //!   covered by the production FrameMeta Arena registration for that pinned
 //!   section. Device descriptor custody is tracked separately by its driver.
@@ -226,6 +228,10 @@ struct Memory {
 }
 
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
+#[cfg_attr(
+    feature = "v020-production-authenticated-net",
+    unsafe(export_name = "V020_SEC_N_VERIFIER_SPACE")
+)]
 static mut GUEST: AddressSpace<FRAME_CAP, STACK_PAGES> = AddressSpace::ZERO;
 
 fn guest_memory() -> Memory {
@@ -402,8 +408,9 @@ fn load_image(b: &[u8], memory: &Memory) -> Layout {
         if flags & 2 != 0 {
             // Writable segment: this guest's only RW LOAD is the zero-file bss.
             assert_eq!(le64(b, at + 32), 0, "fixture expects bss-only RW LOAD");
-            bss_first = bss_first.min(first);
-            bss_end = bss_end.max(last);
+            assert_eq!(bss_end, 0, "fixture expects a single writable LOAD");
+            bss_first = first;
+            bss_end = last;
         }
     }
     let used_frames = (max_end.div_ceil(PAGE as u64) - IMAGE_BASE_VA / PAGE as u64) as usize;
@@ -568,6 +575,46 @@ pub(crate) fn reset_guest_data(layout: &Layout) {
     unsafe {
         core::ptr::write_bytes(memory.stack.cast::<u8>(), 0, STACK_PAGES * PAGE);
     }
+}
+
+/// Called by the sole relay owner on every terminal return from the guest.
+/// Preserve completion evidence while dropping live broker authority.
+#[cfg(feature = "v020-production-authenticated-net")]
+pub(crate) fn discard_guest_session(layout: &Layout, boot_epoch: u64) {
+    let memory = guest_memory();
+    // SAFETY: the synchronous EL0 entry has returned. No other actor or
+    // device accesses this private root, image, stack or broker mailbox.
+    let conn_epoch = unsafe {
+        CONNECTED = false;
+        POLLED_EPOCH = 0;
+        TLS_WINDOW = None;
+        TLS_AUTHENTICATED_EPOCH = 0;
+        EMPTY_ACTIVE_READ = false;
+        core::ptr::addr_of_mut!((*memory.root).0[0]).write_volatile(0);
+        CONN_EPOCH
+    };
+    tlbi();
+    // The loader admits one BSS-only writable LOAD. Volatile page writes
+    // cover its exact extent and every private stack and shared page.
+    unsafe {
+        for i in layout.bss_first..layout.bss_end {
+            memory.frames.add(i).write_volatile(Page::ZERO);
+        }
+        for i in 0..memory.stack_pages {
+            memory.stack.add(i).write_volatile(Page::ZERO);
+        }
+        for i in 0..SHARED_PAGES {
+            memory.shared.add(i).write_volatile(Page::ZERO);
+        }
+        core::arch::asm!("dsb ishst", options(nostack));
+    }
+    let pages = layout.bss_end.saturating_sub(layout.bss_first) + memory.stack_pages + SHARED_PAGES;
+    report(
+        "V020_SEC_N_VERIFIER_DISCARDED",
+        boot_epoch,
+        conn_epoch,
+        pages as u64,
+    );
 }
 
 fn fresh_context(layout: &Layout) -> user::Context {
@@ -948,7 +995,10 @@ fn broker_write<P: Port>(port: &mut P, len: u64) {
 #[cfg(feature = "v020-production-authenticated-net")]
 pub(crate) fn admits_next_transmit() -> bool {
     // The same CPU0 foreground owns both the TCP turn and this snapshot.
-    unsafe { TLS_WINDOW }.is_some_and(|window| window.admits_io_at(now_ns()))
+    let (connected, retirement, window) = unsafe { (CONNECTED, RETIREMENT, TLS_WINDOW) };
+    connected
+        && retirement == Retirement::Open
+        && window.is_some_and(|window| window.admits_io_at(now_ns()))
 }
 
 /// The port reported a closed/reset/failed stream: the connection is over.
@@ -1114,8 +1164,18 @@ pub(crate) fn run_guest<P: Port>(
     close_poll: Option<ClosePoll<P>>,
     #[cfg(feature = "v020-production-authenticated-net")] mut signer: Option<&mut signer::Signer>,
 ) -> Result<u64, GuestStop> {
+    struct SavedContext(user::Context);
+    impl Drop for SavedContext {
+        fn drop(&mut self) {
+            // SAFETY: EL0 has returned and the owner still has exclusive
+            // access to the saved context, even on a terminal error.
+            unsafe { core::ptr::write_volatile(&mut self.0, user::Context::empty()) };
+        }
+    }
+
     let root = phys(guest_memory().root as u64);
-    let mut ctx = fresh_context(layout);
+    let mut saved = SavedContext(fresh_context(layout));
+    let ctx = &mut saved.0;
     let mut dispatched = 0u64;
     let stop = |code, dispatched| Err(GuestStop { code, dispatched });
     for _ in 0..budget {
@@ -1136,7 +1196,7 @@ pub(crate) fn run_guest<P: Port>(
             };
         #[cfg(not(feature = "v020-production-authenticated-net"))]
         let latest_tick = u64::MAX;
-        step(&mut ctx, root, GUEST_ASID, latest_tick);
+        step(ctx, root, GUEST_ASID, latest_tick);
         if ctx.kind == 9 {
             continue; // private PPI preemption; resume.
         }

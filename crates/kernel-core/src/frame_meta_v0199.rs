@@ -162,7 +162,8 @@ pub struct Ledger<'a> {
     fixed_total: u32,
     // Bounded static mode: the table covers exactly `fixed_count` registered
     // permanent regions tiling the whole row window; there is no ordinary
-    // free pool. Full-RAM mode keeps fixed_count == 4 and static_mode false.
+    // free pool. Full-RAM mode keeps its four fixed ranges first, followed by
+    // optional typed subregions of the permanent boot arena.
     static_mode: bool,
     // Bounded pool-accounting mode: rows mirror a frames::FramePool geometry
     // and transition only through the PoolBridge recording helpers; the
@@ -220,6 +221,8 @@ fn sparse_records(base: u64, limit: u64, regions: &[StaticRegion]) -> Result<Spa
     }
     Ok((fixed, classes, total))
 }
+const ROW_BATCH: usize = 1024;
+
 impl<'a> Ledger<'a> {
     /// fixed = actual pinned boot/kernel/DMA arena, FrameMeta table,
     /// control pool, progress pool. Ranges must be disjoint. Firmware
@@ -231,6 +234,20 @@ impl<'a> Ledger<'a> {
         fixed: [MemoryRegion; 4],
         firmware: &[MemoryRegion],
     ) -> Result<Self, Error> {
+        Self::initialize_checkpointed(rows, ram, fixed, firmware, &mut || Ok(()))
+            .map(|(ledger, _)| ledger)
+    }
+
+    /// Report progress before every bounded row batch. A failing checkpoint
+    /// leaves the caller responsible for the unpublished backing.
+    pub fn initialize_checkpointed(
+        rows: &'a mut [FrameMeta],
+        ram: MemoryRegion,
+        fixed: [MemoryRegion; 4],
+        firmware: &[MemoryRegion],
+        checkpoint: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(Self, Inventory), Error> {
+        checkpoint()?;
         let base = ram.start.0;
         if rows.len() != COUNT
             || ram.kind != RegionKind::Ram
@@ -264,14 +281,23 @@ impl<'a> Ledger<'a> {
                 return Err(Error::Conflict);
             }
         }
-        if rows.iter().any(|r| *r != FrameMeta::ZERO) {
-            return Err(Error::Busy);
+        for batch in rows.chunks(ROW_BATCH) {
+            checkpoint()?;
+            if batch.iter().any(|r| *r != FrameMeta::ZERO) {
+                return Err(Error::Busy);
+            }
         }
-        rows.fill(FrameMeta::unowned(FREE | DIRTY, 0));
+        for batch in rows.chunks_mut(ROW_BATCH) {
+            checkpoint()?;
+            batch.fill(FrameMeta::unowned(FREE | DIRTY, 0));
+        }
         let mut total = 0u32;
         for r in fixed {
             let (a, b) = span(r, base)?;
-            rows[a..b].fill(FrameMeta::unowned(PERMANENT, 0));
+            for batch in rows[a..b].chunks_mut(ROW_BATCH) {
+                checkpoint()?;
+                batch.fill(FrameMeta::unowned(PERMANENT, 0));
+            }
             total = total.checked_add((b - a) as u32).ok_or(Error::Capacity)?;
         }
         let mut firmware_extra = 0u32;
@@ -282,10 +308,14 @@ impl<'a> Ledger<'a> {
             if a >= b {
                 continue;
             }
-            for row in &mut rows[((a - base) / PAGE) as usize..((b - base) / PAGE) as usize] {
-                if row.flags != PERMANENT {
-                    *row = FrameMeta::unowned(PERMANENT, 0);
-                    firmware_extra += 1;
+            let region = &mut rows[((a - base) / PAGE) as usize..((b - base) / PAGE) as usize];
+            for batch in region.chunks_mut(ROW_BATCH) {
+                checkpoint()?;
+                for row in batch {
+                    if row.flags != PERMANENT {
+                        *row = FrameMeta::unowned(PERMANENT, 0);
+                        firmware_extra += 1;
+                    }
                 }
             }
         }
@@ -305,8 +335,8 @@ impl<'a> Ledger<'a> {
             fixed_count: 4,
             classes: [StaticClass::Arena; MAX_STATIC_REGIONS],
         };
-        l.inventory()?;
-        Ok(l)
+        let inventory = l.inventory_checkpointed(checkpoint)?;
+        Ok((l, inventory))
     }
     /// Bounded static initialization: register physically contiguous
     /// permanent regions into an existing caller-provided FrameMeta table
@@ -414,16 +444,37 @@ impl<'a> Ledger<'a> {
         Ok(l)
     }
 
+    /// Classify permanent pages already covered by the narrow boot arena.
+    /// This grants no additional reservations and leaves inventory totals
+    /// unchanged. A full-RAM ledger can install its static records once.
+    pub fn register_arena_statics(&mut self, regions: &[StaticRegion]) -> Result<u32, Error> {
+        if self.static_mode || self.pool_mode || self.fixed_count != 4 {
+            return Err(Error::Busy);
+        }
+        if regions.is_empty() || regions.len() > MAX_STATIC_REGIONS - 4 {
+            return Err(Error::Invalid);
+        }
+        let arena = self.fixed[0];
+        let end = arena.end().map_err(|_| Error::Invalid)?;
+        let (fixed, classes, total) = sparse_records(arena.start.0, end, regions)?;
+        let count = 4 + regions.len();
+        self.fixed[4..count].copy_from_slice(&fixed[..regions.len()]);
+        self.classes[4..count].copy_from_slice(&classes[..regions.len()]);
+        self.fixed_count = count;
+        Ok(total)
+    }
+
     /// Check that a byte span fits one registered static region of the
     /// required class and that every touched row is permanently pinned.
     /// A gap row is permanent too, but it conveys no backing authority.
     pub fn statically_pinned(&self, span: core::ops::Range<u64>, class: StaticClass) -> bool {
-        if !self.static_mode || span.start >= span.end || span.start < self.base {
+        if self.pool_mode || span.start >= span.end || span.start < self.base {
             return false;
         }
-        if !self.fixed[..self.fixed_count]
+        let start = if self.static_mode { 0 } else { 4 };
+        if !self.fixed[start..self.fixed_count]
             .iter()
-            .zip(&self.classes)
+            .zip(&self.classes[start..])
             .any(|(region, registered)| {
                 *registered == class
                     && region.start.0 <= span.start
@@ -531,36 +582,50 @@ impl<'a> Ledger<'a> {
         Ok(l)
     }
     pub fn inventory(&self) -> Result<Inventory, Error> {
+        self.inventory_checkpointed(&mut || Ok(()))
+    }
+
+    fn inventory_checkpointed(
+        &self,
+        checkpoint: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<Inventory, Error> {
         let mut counts = [0u32; 5];
-        for r in self.rows.iter() {
-            let state = r.flags & STATE;
-            if r.flags & !(STATE | DIRTY | SECRET) != 0 || state > PERMANENT {
-                return Err(Error::Conflict);
-            }
-            // Pool-mode quarantine mirrors the pool's unowned dirty pages
-            // (failed zeroing or completed revocation): fenced from reuse
-            // until a zero proof, with no owner and possibly generation 0.
-            if state == FREE
-                || state == PERMANENT
-                || (self.pool_mode && state == QUARANTINED && r.owner_slot == NONE)
-            {
-                if r.owner_slot != NONE
-                    || r.owner_generation != 0
-                    || !r.empty_refs()
-                    || r.flags & SECRET != 0
-                    || state == PERMANENT && r.flags != PERMANENT
+        for batch in self.rows.chunks(ROW_BATCH) {
+            checkpoint()?;
+            for r in batch {
+                let state = r.flags & STATE;
+                if r.flags & !(STATE | DIRTY | SECRET) != 0 || state > PERMANENT {
+                    return Err(Error::Conflict);
+                }
+                // Pool-mode quarantine mirrors the pool's unowned dirty pages
+                // (failed zeroing or completed revocation): fenced from reuse
+                // until a zero proof, with no owner and possibly generation 0.
+                if state == FREE
+                    || state == PERMANENT
+                    || (self.pool_mode && state == QUARANTINED && r.owner_slot == NONE)
+                {
+                    if r.owner_slot != NONE
+                        || r.owner_generation != 0
+                        || !r.empty_refs()
+                        || r.flags & SECRET != 0
+                        || state == PERMANENT && r.flags != PERMANENT
+                    {
+                        return Err(Error::Conflict);
+                    }
+                } else if r.owner_slot == NONE || r.owner_generation == 0 || r.frame_generation == 0
                 {
                     return Err(Error::Conflict);
                 }
-            } else if r.owner_slot == NONE || r.owner_generation == 0 || r.frame_generation == 0 {
-                return Err(Error::Conflict);
+                counts[state as usize] += 1;
             }
-            counts[state as usize] += 1;
         }
         for r in self.fixed[..self.fixed_count].iter().copied() {
             let (a, b) = span(r, self.base)?;
-            if self.rows[a..b].iter().any(|r| r.flags != PERMANENT) {
-                return Err(Error::Conflict);
+            for batch in self.rows[a..b].chunks(ROW_BATCH) {
+                checkpoint()?;
+                if batch.iter().any(|r| r.flags != PERMANENT) {
+                    return Err(Error::Conflict);
+                }
             }
         }
         // A static ledger (tiled or sparse) has no ordinary pool: every row
@@ -1038,6 +1103,21 @@ mod tests {
         let mut l = Ledger::initialize(&mut rows, ram, fixed, &fw).unwrap();
         let before = l.inventory().unwrap();
         assert_eq!(before.permanent, 16384 + 2560 + 2048 + 2048 + 1);
+        let control = static_region(PAGE, 2 * PAGE, StaticClass::Control);
+        assert_eq!(
+            l.register_arena_statics(&[static_region(
+                64 * 1024 * 1024,
+                PAGE,
+                StaticClass::Control
+            )]),
+            Err(Error::Invalid)
+        );
+        assert_eq!(l.register_arena_statics(&[control]), Ok(2));
+        assert_eq!(l.register_arena_statics(&[control]), Err(Error::Busy));
+        let start = control.region.start.0;
+        assert!(l.statically_pinned(start + PAGE - 1..start + PAGE + 1, StaticClass::Control));
+        assert!(!l.statically_pinned(start - 1..start + 1, StaticClass::Control));
+        assert_eq!(l.inventory().unwrap(), before);
         let h = l
             .reserve(Owner {
                 slot: 1,

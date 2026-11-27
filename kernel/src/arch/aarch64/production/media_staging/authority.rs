@@ -115,7 +115,7 @@ pub(super) fn boot_epoch_owner(
     let mut sb_raw = [0; BLOCK_BYTES];
     disk.read(SECURITY_HOME, &mut state)?;
     disk.read(BOOT_HOME, &mut boot)?;
-    if volume::read_checkpoint(disk, &mut sb_raw)? != checkpoint {
+    if volume::read_checkpoint(disk, &mut sb_raw, config)? != checkpoint {
         return Err(SecurityError::Conflict);
     }
     let next = mounted

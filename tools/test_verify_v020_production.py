@@ -50,6 +50,7 @@ def w11_words(staging: bool = False) -> list:
     if staging:
         words[144:152] = [1] * 8
     words[152:156] = [3, 3184, 1, 68_000]
+    words[156:160] = [1000, 1020, 1032, 1044]
     return words
 
 
@@ -67,7 +68,7 @@ def wave10_lines() -> list:
         f"V020_PROD_PUBLISH a=8 b={SVC64} c=1",
         "V020_PROD_PUBLISH_REPLAY a=8 b=2 c=1",
         f"V020_PROD_RECOVERY_REJECT a=8 b={v.E_AUTH_RESULT} c=1",
-        "V020_SEC_S_TARGET_LOCK a=200 b=500 c=700",
+        "V020_SEC_S_TARGET_LOCK a=192 b=512 c=704",
         "V020_SEC_S_TARGET_INSTALL a=7 b=4 c=0",
         "V020_PROD_APPLY a=1 b=180 c=4",
         "V020_PROD_SETTLE a=1 b=1 c=2",
@@ -165,7 +166,10 @@ class W11Validation(unittest.TestCase):
         self.assertEqual(obs["recovery_writer_takeovers"], 3)
         self.assertEqual(obs["policy_lock_measured_overruns"], 1)
         self.assertEqual(obs["policy_lock_unmeasured"], 3)
-        self.assertEqual(obs["target_lock_irq_off_ns"], 700)
+        self.assertEqual(obs["target_lock_mask_and_acquire_ns"], 320)
+        self.assertEqual(obs["target_lock_release_and_restore_ns"], 192)
+        self.assertEqual(obs["target_lock_irq_off_ns"], 704)
+        self.assertEqual(obs["target_lock_raw_ticks"], (1000, 1020, 1032, 1044))
         self.assertFalse(obs["target_lock_closed_new_work"])
         self.assertEqual(obs["admission_leases"], 1)
         self.assertTrue(obs["w11_completion_marker"].endswith("staging_ok=0"))
@@ -176,17 +180,49 @@ class W11Validation(unittest.TestCase):
             line for line in lines if not line.startswith("V020_SEC_S_TARGET_LOCK ")
         ])
         late = [
-            "V020_SEC_S_TARGET_LOCK a=200 b=6000 c=6200"
+            "V020_SEC_S_TARGET_LOCK a=192 b=6000 c=6192"
             if line.startswith("V020_SEC_S_TARGET_LOCK ") else line
             for line in lines
         ]
-        self.rejects("target install did not enforce measured budgets", lines=late)
+        words = w11_words()
+        words[159] = 1387
+        self.rejects("target install did not enforce measured budgets", words=words, lines=late)
         closed = [
             "V020_SEC_S_TARGET_INSTALL a=7 b=4 c=2"
             if line.startswith("V020_SEC_S_TARGET_INSTALL ") else line
             for line in late
         ]
-        self.assertTrue(self.check(lines=closed)["target_lock_closed_new_work"])
+        self.assertTrue(self.check(words=words, lines=closed)["target_lock_closed_new_work"])
+
+    def test_requires_raw_lock_counters_and_replays_the_uart_values(self):
+        words = w11_words()
+        words[156:160] = [0] * 4
+        self.rejects("raw D01 target-lock counters", words=words)
+        words[156:160] = [1000, 1020, 1033, 1044]
+        self.rejects("D01 target-lock durations differ from raw counters", words=words)
+
+    def test_target_lock_phase_ticks_preserve_the_combined_budgets(self):
+        for work, release, fault in (
+            (2812, 112, 0),  # 44,992 ns work + 4,992 ns overhead
+            (2812, 113, 2),  # 5,008 ns overhead, exactly 50,000 ns IRQ-off
+            (2812, 114, 6),  # overhead and IRQ-off overrun
+            (2813, 112, 1),  # 45,008 ns work, exactly 50,000 ns IRQ-off
+        ):
+            with self.subTest(work=work, release=release):
+                words = w11_words()
+                words[156:160] = [1000, 1200, 1200 + work, 1200 + work + release]
+                lines = w11_lines()
+                lock_idx = lines.index("V020_SEC_S_TARGET_LOCK a=192 b=512 c=704")
+                overhead = 16 * (200 + release)
+                lines[lock_idx] = (
+                    f"V020_SEC_S_TARGET_LOCK a={16 * work} b={overhead} c={16 * work + overhead}"
+                )
+                lines[lock_idx + 1] = f"V020_SEC_S_TARGET_INSTALL a=7 b=4 c={fault}"
+                obs = self.check(words=words, lines=lines)
+                self.assertEqual(obs["target_lock_mask_and_acquire_ns"], 3200)
+                self.assertEqual(obs["target_lock_release_and_restore_ns"], 16 * release)
+                self.assertEqual(obs["target_lock_overhead_ns"], overhead)
+                self.assertEqual(obs["target_lock_closed_new_work"], bool(fault))
 
     def test_rejects_missing_net_device(self):
         words = w11_words()
@@ -361,7 +397,7 @@ class W11Validation(unittest.TestCase):
         self.rejects("refusal counter", lines=lines)
 
     def test_rejects_nonzero_reserved_tail(self):
-        for at in (156, 159, 161, 177, 188, 189, 190, 191, 195, 199, 211, 223, 231, 236, 252,
+        for at in (161, 177, 188, 189, 190, 191, 195, 199, 211, 223, 231, 236, 252,
                    261, 263, 268, 271, 281, 287, 296, 303, 304, 511):
             words = w11_words()
             words[at] = 1

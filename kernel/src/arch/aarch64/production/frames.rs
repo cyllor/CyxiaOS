@@ -1,5 +1,5 @@
-//! V0.20 wave 11: register the production boot statics in a bounded sparse
-//! FrameMeta ledger before any EL0 entry.
+//! Register the native boot statics before any EL0 entry. The 1 GiB
+//! signed startup and frame-pool lane use the reserved dense table.
 //!
 //! The static ledger registers SMP and PIE page tables as Metadata, role
 //! memory and the copy buffer as Control, and SMP stacks and the pinned
@@ -11,8 +11,9 @@
 //! * ROWS_BACKING (static mut): the only `&mut` to it is created once in
 //!   `register_production_statics`, guarded by the REGISTERED swap, on CPU0
 //!   before any secondary CPU or EL0 role runs. Copy-window builds retain the
-//!   same ledger in PERMANENT_LEDGER and publish it through REGISTERED_PAGES.
-//!   Later checks take shared references only.
+//!   ledger in NATIVE_LEDGER and publish it through REGISTERED_PAGES.
+//! * NATIVE_LEDGER is initialized once. Its RefCell and the underlying rows
+//!   are accessed only by CPU0. An IRQ does not acquire a ledger borrow.
 //! * REGISTERED and the inventory counters (atomics): CPU0 only. REGISTERED
 //!   makes the registration one-shot; the counters carry seal-time evidence.
 //! * `__sec_n_start` / `__sec_n_end` (linker symbols): only their addresses are
@@ -20,29 +21,56 @@
 //! * Registered statics are only addressed via `addr_of!` (no reference is
 //!   formed); their PA is `VA - HIGH`, checked, failing Range on underflow.
 
-#[cfg(feature = "v020-production-diagnostic")]
+#[cfg(any(
+    feature = "v020-production-frame-pool",
+    not(all(cyxia_startup_catalog, feature = "prototype-memory"))
+))]
+use super::super::fatal;
+#[cfg(any(
+    feature = "v020-production-diagnostic",
+    all(cyxia_startup_catalog, feature = "prototype-memory")
+))]
 use super::super::report;
 use super::super::{
-    DATA_PAGES, LEAVES, MIDDLES, PRIVATE_SPACES, Page, ROOTS, STACKS, Stacks, USER_STACKS, fatal,
+    DATA_PAGES, LEAVES, MIDDLES, PRIVATE_SPACES, Page, ROOTS, STACKS, Stacks, USER_STACKS,
 };
 use super::{BACKING, Backing, COPY_BUFFER, CopyBuffer, ROLE_COUNT, TABLES, Tables};
 #[cfg(feature = "v020-production-diagnostic")]
 use super::{EXEC_TARGET, ExecTarget, PLAN_POOL, PLAN_POOL_BYTES, evidence};
-#[cfg(any(
-    feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read",
-    feature = "v020-production-fsync-scratch"
-))]
-use core::mem::MaybeUninit;
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(any(
+    feature = "v020-production-live-control",
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch",
+    all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
+    all(cyxia_startup_catalog, feature = "prototype-memory")
+))]
+use core::{cell::RefCell, mem::MaybeUninit};
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind};
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
+use cyxia_kernel_core::frame_meta_v0199::Inventory;
 use cyxia_kernel_core::frame_meta_v0199::{
-    COUNT, FrameMeta, Inventory, Ledger, PAGE, StaticClass, StaticRegion,
+    COUNT, FrameMeta, Ledger, PAGE, StaticClass, StaticRegion,
 };
 use cyxia_kernel_core::security::Error as LedgerError;
 
-#[cfg(feature = "v020-production-frame-pool")]
+#[cfg(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+))]
+#[path = "frames/dense.rs"]
+mod dense;
+#[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+pub(super) use dense::prepare as prepare_signed;
+#[cfg(all(
+    feature = "v020-production-frame-pool",
+    not(feature = "prototype-memory")
+))]
 #[path = "frames/pool.rs"]
 mod pool;
 
@@ -50,11 +78,19 @@ mod pool;
 /// The authenticated profile also pins a separate 95-page signer address
 /// space. Reserve 128 additional rows for it and surrounding linker gaps.
 /// The largest backing (165 KiB) fits within the FrameMeta reservation.
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 const ROWS: usize = if cfg!(feature = "v020-production-authenticated-net") {
     4096 + 128
 } else {
     4096
 };
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 const _: () = assert!(ROWS <= COUNT);
 const STATICS: usize = if cfg!(feature = "v020-production-diagnostic") {
     12
@@ -62,15 +98,26 @@ const STATICS: usize = if cfg!(feature = "v020-production-diagnostic") {
     10
 };
 /// Fatal code when production static registration fails.
+#[cfg(any(
+    feature = "v020-production-frame-pool",
+    not(all(cyxia_startup_catalog, feature = "prototype-memory"))
+))]
 const FATAL_FRAME_META: u64 = 0x5731_1290;
 
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 static mut ROWS_BACKING: [FrameMeta; ROWS] = [FrameMeta::ZERO; ROWS];
 #[cfg(any(
+    feature = "v020-production-live-control",
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
-    feature = "v020-production-fsync-scratch"
+    feature = "v020-production-fsync-scratch",
+    all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
+    all(cyxia_startup_catalog, feature = "prototype-memory")
 ))]
-static mut PERMANENT_LEDGER: MaybeUninit<Ledger<'static>> = MaybeUninit::uninit();
+static mut NATIVE_LEDGER: MaybeUninit<RefCell<Ledger<'static>>> = MaybeUninit::uninit();
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static REGISTERED_PAGES: AtomicU64 = AtomicU64::new(0);
 static PERMANENT_ROWS: AtomicU64 = AtomicU64::new(0);
@@ -98,8 +145,41 @@ fn region(va: u64, len: usize, class: StaticClass) -> Result<StaticRegion, Error
     })
 }
 
+fn role_storage() -> Result<[StaticRegion; 3], Error> {
+    Ok([
+        region(
+            addr_of!(TABLES) as u64,
+            core::mem::size_of::<[Tables; ROLE_COUNT]>(),
+            StaticClass::Metadata,
+        )?,
+        region(
+            addr_of!(BACKING) as u64,
+            core::mem::size_of::<[Backing; ROLE_COUNT]>(),
+            StaticClass::Control,
+        )?,
+        region(
+            addr_of!(COPY_BUFFER) as u64,
+            core::mem::size_of::<CopyBuffer>(),
+            StaticClass::Control,
+        )?,
+    ])
+}
+
+#[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+pub(super) fn role_storage_registered() -> bool {
+    role_storage().is_ok_and(|regions| {
+        regions.into_iter().all(|entry| {
+            let region = entry.region;
+            region
+                .end()
+                .is_ok_and(|end| statically_pinned_span(region.start.0..end, entry.class))
+        })
+    })
+}
+
 fn statics(service: StaticRegion) -> Result<[StaticRegion; STATICS], Error> {
     use StaticClass::{Arena, Control, Metadata};
+    let [tables, backing, copy] = role_storage()?;
     let spaces = core::mem::size_of::<[Page; PRIVATE_SPACES]>();
     Ok([
         region(addr_of!(ROOTS) as u64, spaces, Metadata)?,
@@ -107,27 +187,15 @@ fn statics(service: StaticRegion) -> Result<[StaticRegion; STATICS], Error> {
         region(addr_of!(LEAVES) as u64, spaces, Metadata)?,
         region(addr_of!(DATA_PAGES) as u64, spaces, Control)?,
         region(addr_of!(USER_STACKS) as u64, spaces, Control)?,
-        region(
-            addr_of!(TABLES) as u64,
-            core::mem::size_of::<[Tables; ROLE_COUNT]>(),
-            Metadata,
-        )?,
-        region(
-            addr_of!(BACKING) as u64,
-            core::mem::size_of::<[Backing; ROLE_COUNT]>(),
-            Control,
-        )?,
+        tables,
+        backing,
         #[cfg(feature = "v020-production-diagnostic")]
         region(
             addr_of!(EXEC_TARGET) as u64,
             core::mem::size_of::<ExecTarget>(),
             Control,
         )?,
-        region(
-            addr_of!(COPY_BUFFER) as u64,
-            core::mem::size_of::<CopyBuffer>(),
-            Control,
-        )?,
+        copy,
         #[cfg(feature = "v020-production-diagnostic")]
         region(addr_of!(PLAN_POOL) as u64, PLAN_POOL_BYTES, Control)?,
         region(
@@ -140,6 +208,10 @@ fn statics(service: StaticRegion) -> Result<[StaticRegion; STATICS], Error> {
 }
 
 /// `[lowest start, highest end)` over the registered regions.
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 fn window(regions: &[StaticRegion]) -> Result<(u64, u64), Error> {
     let mut base = u64::MAX;
     let mut end = 0u64;
@@ -167,6 +239,10 @@ fn service_arena() -> Result<StaticRegion, Error> {
 }
 
 /// Register the production statics once, before any EL0 entry.
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 fn register_production_statics() -> Result<(Inventory, u64), Error> {
     if REGISTERED.swap(true, Ordering::AcqRel) {
         return Err(Error::Once);
@@ -184,34 +260,77 @@ fn register_production_statics() -> Result<(Inventory, u64), Error> {
     let ledger = Ledger::initialize_static_sparse(rows, base, &regions).map_err(Error::Ledger)?;
     let inventory = ledger.inventory().map_err(Error::Ledger)?;
     #[cfg(any(
+        feature = "v020-production-live-control",
         feature = "v020-production-snapshot-catalog",
         feature = "v020-production-file-read",
-        feature = "v020-production-fsync-scratch"
+        feature = "v020-production-fsync-scratch",
+        all(feature = "v020-production-frame-pool", feature = "prototype-memory")
     ))]
-    // SAFETY: sole initialization. The caller release-publishes the ledger
-    // only after this succeeds. Later readers never mutate it.
-    unsafe {
-        addr_of_mut!(PERMANENT_LEDGER).write(MaybeUninit::new(ledger));
-    }
+    install_ledger(ledger);
     Ok((inventory, service.region.len / PAGE))
 }
 
 #[cfg(any(
+    feature = "v020-production-live-control",
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch",
+    all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
+    all(cyxia_startup_catalog, feature = "prototype-memory")
+))]
+fn install_ledger(ledger: Ledger<'static>) {
+    // SAFETY: the exclusive boot claim has already been taken. The caller
+    // publishes REGISTERED_PAGES only after the slot is initialized.
+    unsafe { addr_of_mut!(NATIVE_LEDGER).write(MaybeUninit::new(RefCell::new(ledger))) };
+}
+
+#[cfg(any(
+    feature = "v020-production-live-control",
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch",
+    all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
+    all(cyxia_startup_catalog, feature = "prototype-memory")
+))]
+fn native_ledger() -> Option<&'static RefCell<Ledger<'static>>> {
+    if cyxia_arch_aarch64::cpu::registered_slot() != Some(0)
+        || REGISTERED_PAGES.load(Ordering::Acquire) == 0
+    {
+        return None;
+    }
+    // SAFETY: the acquire observes publication. Only the registered CPU0
+    // foreground and its synchronous SVC dispatcher can borrow this cell.
+    Some(unsafe { (*addr_of!(NATIVE_LEDGER)).assume_init_ref() })
+}
+
+#[cfg(any(
+    feature = "v020-production-live-control",
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch"
 ))]
 pub(super) fn statically_pinned_control_span(span: core::ops::Range<u64>) -> bool {
-    if REGISTERED_PAGES.load(Ordering::Acquire) == 0 {
-        return false;
-    }
-    // SAFETY: the acquire observes the one-shot ledger publication. Its
-    // static rows and region records are never modified after publication.
-    let ledger = unsafe { (*addr_of!(PERMANENT_LEDGER)).assume_init_ref() };
-    ledger.statically_pinned(span, StaticClass::Control)
+    statically_pinned_span(span, StaticClass::Control)
+}
+
+#[cfg(any(
+    feature = "v020-production-live-control",
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch",
+    all(cyxia_startup_catalog, feature = "prototype-memory")
+))]
+fn statically_pinned_span(span: core::ops::Range<u64>, class: StaticClass) -> bool {
+    native_ledger()
+        .and_then(|ledger| ledger.try_borrow().ok())
+        .is_some_and(|ledger| ledger.statically_pinned(span, class))
 }
 
 /// Registered static pages: the class tallies, never the unregistered gaps.
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 fn registered_pages(inv: &Inventory) -> u64 {
     u64::from(inv.arena)
         + u64::from(inv.firmware_extra)
@@ -221,12 +340,18 @@ fn registered_pages(inv: &Inventory) -> u64 {
 }
 
 /// run() entry hook: register or stop the boot (word 129 = 0, fatal).
+#[cfg(not(all(
+    feature = "prototype-memory",
+    any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
+)))]
 pub(super) fn register_or_fatal() {
     match register_production_statics() {
         Ok((inv, service_pages)) if service_pages > 0 => {
-            REGISTERED_PAGES.store(registered_pages(&inv), Ordering::Release);
-            PERMANENT_ROWS.store(u64::from(inv.permanent), Ordering::Release);
-            SERVICE_ARENA_PAGES.store(service_pages, Ordering::Release);
+            publish_counts(
+                registered_pages(&inv),
+                u64::from(inv.permanent),
+                service_pages,
+            );
         }
         _ => {
             #[cfg(feature = "v020-production-diagnostic")]
@@ -236,9 +361,28 @@ pub(super) fn register_or_fatal() {
     }
 }
 
+fn publish_counts(registered: u64, permanent: u64, service_pages: u64) {
+    PERMANENT_ROWS.store(permanent, Ordering::Relaxed);
+    SERVICE_ARENA_PAGES.store(service_pages, Ordering::Relaxed);
+    REGISTERED_PAGES.store(registered, Ordering::Release);
+}
+
 #[cfg(feature = "v020-production-frame-pool")]
-pub(super) fn prove_pool_or_fatal(info: &mut cyxia_contracts::BootInfo) {
-    pool::prove_or_fatal(info);
+pub(super) fn prepare_pool_or_fatal(info: &mut cyxia_contracts::BootInfo) {
+    #[cfg(feature = "prototype-memory")]
+    dense::prepare(info, &mut || Ok(()))
+        .unwrap_or_else(|_| fatal(FATAL_FRAME_META))
+        .publish();
+    #[cfg(not(feature = "prototype-memory"))]
+    {
+        register_or_fatal();
+        pool::prove_or_fatal(info);
+    }
+}
+
+#[cfg(all(feature = "v020-production-frame-pool", feature = "prototype-memory"))]
+pub(super) fn prove_dense_pool_or_fatal(manifest: &super::NativeRoleManifest) {
+    dense::exercise(manifest).unwrap_or_else(|_| fatal(FATAL_FRAME_META + 1));
 }
 
 /// Evidence-seal hook: words 129/130 (the page is zeroed before the seal),
@@ -258,6 +402,11 @@ pub(super) fn publish() {
         permanent.saturating_sub(pages),
     );
     report("V020_W11_FRAME_META_ARENA", arena, pages - arena, 0);
-    #[cfg(feature = "v020-production-frame-pool")]
+    #[cfg(all(
+        feature = "v020-production-frame-pool",
+        not(feature = "prototype-memory")
+    ))]
     pool::publish();
+    #[cfg(all(feature = "v020-production-frame-pool", feature = "prototype-memory"))]
+    dense::publish();
 }

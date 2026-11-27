@@ -78,7 +78,7 @@ fn signed_unified_genesis_matches_the_independent_full_image_vector() {
 
     let before_mount = (disk.writes, disk.flushes);
     let config = Some(&verified);
-    assert_eq!(reopen::identify(&mut disk), Ok(sb));
+    assert_eq!(reopen::identify(&mut disk, config), Ok(sb));
     let mounted = volume::mount(&mut disk, sb, config, AllocatedEnvelopes).unwrap();
     assert_eq!(mounted.security.offline_config_hash, verified.digest());
     assert_eq!(mounted.boot.boot_epoch, 0);
@@ -87,6 +87,84 @@ fn signed_unified_genesis_matches_the_independent_full_image_vector() {
     assert_eq!(mounted.structure.directory_entries, 0);
     assert_eq!(mounted.receipts.occupied, 0);
     assert_eq!((disk.writes, disk.flushes), before_mount);
+}
+
+#[test]
+fn lifecycle_reopen_uses_the_signed_volume_and_generations() {
+    use cyxia_kernel_core::security::offline_config_v1::{
+        CatalogBindings, HEADER, SIGNATURE_LABEL, VerifiedOfflineConfig,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+
+    let _owner = STAGING_OWNER.lock().unwrap();
+    let key = SigningKey::from_bytes(&[0x37; 32]);
+    let uuid = *b"CYX-LIFECYCLE-02";
+    let mut wire = signed::WIRE[..signed::WIRE.len() - 64].to_vec();
+    wire[16..32].copy_from_slice(&uuid);
+    for (at, generation) in [(32, 7u64), (40, 9), (48, 4), (56, 3)] {
+        wire[at..at + 8].copy_from_slice(&generation.to_le_bytes());
+    }
+    for (slot, principal) in wire[HEADER..HEADER + 256].chunks_exact_mut(16).enumerate() {
+        principal[..8].copy_from_slice(&(40 + slot as u64).to_le_bytes());
+        principal[8..].copy_from_slice(&3u64.to_le_bytes());
+    }
+    let payload_hash = Sha256::digest(&wire[HEADER..]);
+    wire[160..192].copy_from_slice(&payload_hash);
+    let bindings = CatalogBindings {
+        rule_generation: 9,
+        security_generation: 4,
+        key_generation: 3,
+        rule_hash: wire[64..96].try_into().unwrap(),
+        security_hash: wire[96..128].try_into().unwrap(),
+        key_manifest_hash: wire[128..160].try_into().unwrap(),
+    };
+    let signature = key.sign(&[SIGNATURE_LABEL, &wire].concat()).to_bytes();
+    wire.extend_from_slice(&signature);
+    let verified = VerifiedOfflineConfig::verify(
+        &wire,
+        &key.verifying_key().to_bytes(),
+        bindings,
+        &mut [0; 1024],
+        |header, _, lists| signed::verify_lifecycle_payload(header, lists),
+    )
+    .unwrap();
+    let config = Some(&verified);
+
+    let mut disk = Disk::default();
+    let first = volume::format(&mut disk, config, LegacyZero).unwrap();
+    let mount = volume::mount(&mut disk, first, config, LegacyZero).unwrap();
+    assert_eq!(mount.security.fs_uuid, uuid);
+    assert_eq!(mount.security.offline_config_generation, 7);
+    assert_eq!(mount.security.rule_min_generation, 9);
+    assert_eq!(mount.security.security_min_generation, 4);
+    assert_eq!(mount.security.key_generation, 3);
+    assert_eq!(
+        authority::boot_epoch(&mut disk, first, &mount.security, config),
+        Ok(1)
+    );
+
+    let other = signed::verify(signed::WIRE, &mut [0; 1024]).unwrap();
+    let io_before = (disk.writes, disk.flushes);
+    assert_eq!(
+        reopen::identify(&mut disk, Some(&other)),
+        Err(Error::Conflict)
+    );
+    assert_eq!((disk.writes, disk.flushes), io_before);
+
+    let selected = reopen::identify(&mut disk, config).unwrap();
+    let (checkpoint, mount) = reopen::recover(&mut disk, selected, config, LegacyZero).unwrap();
+    assert_eq!((checkpoint.fs_uuid, mount.boot.boot_epoch), (uuid, 1));
+    assert_eq!(mount.security.offline_config_hash, verified.digest());
+    let (_, owner) =
+        authority::boot_epoch_owner(&mut disk, checkpoint, &mount.security, config).unwrap();
+    assert_eq!(
+        owner
+            .confirmed_boot_policy(&verified)
+            .unwrap()
+            .boot_epoch(),
+        2
+    );
 }
 
 #[test]
@@ -140,13 +218,13 @@ fn staging_rejects_a_dirty_journal_tail_before_granting_a_boot_epoch() {
         let crc = crc32c_zeroed(raw, 76).unwrap();
         raw[76..80].copy_from_slice(&crc.to_le_bytes());
     }
-    assert_eq!(reopen::identify(&mut disk), Err(Error::Conflict));
+    assert_eq!(reopen::identify(&mut disk, None), Err(Error::Conflict));
     disk.blocks.insert(0, saved_headers[0]);
     disk.blocks.get_mut(&1).unwrap()[76] ^= 1;
-    assert!(reopen::identify(&mut disk).is_err());
+    assert!(reopen::identify(&mut disk, None).is_err());
     disk.blocks.insert(1, saved_headers[1]);
     let mut blank = Disk::default();
-    assert!(reopen::identify(&mut blank).is_err());
+    assert!(reopen::identify(&mut blank, None).is_err());
     assert_eq!((blank.writes, blank.flushes), (0, 0));
 
     // A malformed transaction, a nonempty tail and a foreign committed policy
@@ -181,7 +259,7 @@ fn staging_rejects_a_dirty_journal_tail_before_granting_a_boot_epoch() {
         .collect::<BTreeMap<_, _>>();
     // Two reopens exercise both slots of the alternating checkpoint.
     for prior in 1..=2 {
-        let selected = reopen::identify(&mut disk).unwrap();
+        let selected = reopen::identify(&mut disk, None).unwrap();
         let before = (disk.writes, disk.flushes);
         let (checkpoint, mounted) = reopen::recover(&mut disk, selected, None, LegacyZero).unwrap();
         assert_eq!(checkpoint.generation, prior + 1);

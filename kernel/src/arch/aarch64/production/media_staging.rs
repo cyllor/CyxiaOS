@@ -325,7 +325,20 @@ pub(super) fn verify_scratch_config() -> Result<VerifiedOfflineConfig<'static>, 
     // SAFETY: the serialized CPU0 foreground owns this scratch outside
     // package loading. The Ed25519 verifier wipes the borrowed span.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!(super::COPY_BUFFER.0) };
-    #[cfg(any(cyxia_signed_scratch_catalog, cyxia_startup_catalog))]
+    #[cfg(any(
+        cyxia_startup_catalog,
+        all(
+            cyxia_signed_scratch_catalog,
+            not(feature = "v020-production-fsync-scratch")
+        )
+    ))]
+    let config = startup_catalog::verify_policy(scratch, |header, _, lists| {
+        signed::verify_lifecycle_payload(header, lists)
+    });
+    #[cfg(all(
+        cyxia_signed_scratch_catalog,
+        feature = "v020-production-fsync-scratch"
+    ))]
     let config = startup_catalog::verify_policy(scratch, |header, principals, lists| {
         signed::verify_scratch_payload(header, principals, lists, signed::PAYLOAD)
     });
@@ -384,7 +397,7 @@ fn run_chain(
     // also require recovery if it returns with uncertain media completion.
     out.mount_requires_recovery = REOPEN;
     let sb = if REOPEN {
-        reopen::identify(disk)
+        reopen::identify(disk, config)
     } else {
         volume::format(disk, config, LAYOUT)
     };
@@ -424,22 +437,19 @@ fn run_chain(
         ];
     }
     out.prior_epoch = mounted.boot.boot_epoch;
-    #[cfg(not(cyxia_signed_resident))]
+    let allocated = authority::boot_epoch_owner(disk, checkpoint, &mounted.security, config);
+    out.confirmed_epoch = step(
+        4,
+        allocated.as_ref().map(|(epoch, _)| *epoch).map_err(|e| *e),
+    )?;
+    let (_, resident_epochs) = allocated.ok()?;
+    #[cfg(any(feature = "v020-production-media-signed", cyxia_startup_catalog))]
     {
-        out.confirmed_epoch = step(
-            4,
-            authority::boot_epoch(disk, checkpoint, &mounted.security, config),
-        )?;
+        let policy = resident_epochs.confirmed_boot_policy(&verified).ok()?;
+        scratch_blk::bind_confirmed_epoch(&policy).ok()?;
     }
-    #[cfg(cyxia_signed_resident)]
-    let resident_epochs = {
-        let allocated = authority::boot_epoch_owner(disk, checkpoint, &mounted.security, config);
-        out.confirmed_epoch = step(
-            4,
-            allocated.as_ref().map(|(epoch, _)| *epoch).map_err(|e| *e),
-        )?;
-        allocated.ok()?.1
-    };
+    #[cfg(not(any(feature = "v020-production-media-signed", cyxia_startup_catalog)))]
+    let _ = resident_epochs;
     #[cfg(cyxia_startup_catalog)]
     {
         let committed = authority::verified_pair_state(disk, checkpoint, config).ok()?;
@@ -628,6 +638,14 @@ pub(super) fn stage_with_policy(
     #[cfg(cyxia_signed_resident)]
     {
         out.chain_complete = run_chain(&mut disk, &mut out, verified).is_some();
+    }
+    if super::recovery::contain_terminal_block(out.confirmed_epoch) {
+        out.mount_requires_recovery = true;
+        out.chain_complete = false;
+        #[cfg(cyxia_signed_resident)]
+        {
+            out.resident_boot = None;
+        }
     }
     #[cfg(any(
         feature = "v020-production-file-read",

@@ -6,7 +6,8 @@
 //!
 //! CPU0 exclusively initializes or accesses the stores between PIE turns or
 //! synchronously inside the stopped caller's SVC. No references cross a turn.
-//! User addresses are translated through stack_span before bounded copies.
+//! Recovery audit frames use the CPU0 copy window and the stopped Supervisor's
+//! checked private stack. D01 snapshot replies use their own fixed role spans.
 
 use super::*;
 use core::ptr::{addr_of, addr_of_mut};
@@ -295,6 +296,13 @@ pub(super) fn drive(contexts: &mut [user::Context; ROLE_COUNT], manifest: &Nativ
             evidence::put(evidence::W13_AUDIT_RELEASED, released);
             evidence::put(evidence::W13_AUDIT_REPLAYS, replays);
             report("V020_W13_AUDIT_SESSION", audit, released, replays);
+            let (reads, writes, closed) = copy_window::audit_closed_counts();
+            report(
+                "V020_SEC_S_AUDIT_COPY_WINDOW",
+                reads,
+                writes,
+                u64::from(closed),
+            );
             evidence::put(evidence::W12_SNAPSHOT_ROLES, mask);
             evidence::put(evidence::W12_SNAPSHOT_SEQUENCE, seq);
             evidence::put(evidence::W12_CONTROL_EARLY_REFUSALS, early);

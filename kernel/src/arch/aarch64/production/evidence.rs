@@ -57,6 +57,8 @@ pub const W11_RECOVERY_WRITER_TAKEOVERS: usize = 152;
 pub const W11_FRAME_META_ARENA_PAGES: usize = 153;
 pub const W11_POLICY_LOCK_MEASURED_OVERRUNS: usize = 154;
 pub const W11_POLICY_LOCK_MAX_ELAPSED_NS: usize = 155;
+/// Four raw CNT[P]CT ticks, published by CPU0 after restoring IRQ state.
+pub const W11_TARGET_LOCK_COUNTERS: usize = 156;
 
 #[cfg(feature = "v020-production-authenticated-net")]
 pub const W12_SEC_N_RNG_BYTES: usize = 160;

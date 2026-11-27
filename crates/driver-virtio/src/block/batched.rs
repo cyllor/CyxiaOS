@@ -17,6 +17,21 @@ pub struct BlockCompletion {
     pub notify_version: u64,
     pub latency_ns: u64,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedBlock {
+    pub token: Token,
+    pub operation: Operation,
+    pub completed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockTerminalCustody {
+    /// A confirmed MMIO stop or its error. Neither proves a WRITE or FLUSH.
+    pub reset: Option<Result<u64, Error>>,
+    pub requests: [Option<RetainedBlock>; MAX_CHAINS],
+}
+
 pub type BatchedBlock = BatchedBlockIo<SECTOR_BYTES>;
 
 /// A queue whose read and write commands transfer a fixed whole number of
@@ -29,6 +44,7 @@ pub struct BatchedBlockIo<const BYTES: usize> {
     read_only: bool,
     pending: [Option<(Token, Operation, u64)>; MAX_CHAINS],
     state: DeviceState,
+    reset: Option<Result<u64, Error>>,
     last_completed: u64,
 }
 impl<const BYTES: usize> BatchedBlockIo<BYTES> {
@@ -141,6 +157,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
             read_only,
             pending: [None; MAX_CHAINS],
             state: DeviceState::Live,
+            reset: None,
             last_completed: 0,
         })
     }
@@ -174,6 +191,25 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
             })
     }
 
+    /// Read old requests after the owner has permanently fenced submission.
+    /// Only a verified and retained block completion sets `completed`.
+    pub fn terminal_custody(&self) -> Option<BlockTerminalCustody> {
+        matches!(
+            self.state,
+            DeviceState::RecoveryFenced | DeviceState::ResetAttempted
+        )
+        .then(|| BlockTerminalCustody {
+            reset: self.reset,
+            requests: self.pending.map(|request| {
+                request.map(|(token, operation, time)| RetainedBlock {
+                    token,
+                    operation,
+                    completed: time == COMPLETED_RETAINED,
+                })
+            }),
+        })
+    }
+
     pub fn free(&self) -> usize {
         self.queue.free()
     }
@@ -205,8 +241,8 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
     /// Stop software submissions when the foreground owner has lost its
     /// execution budget. Preserve every exact token for a recovery owner.
     pub fn fence_for_recovery(&mut self) {
-        if self.state == DeviceState::Live {
-            self.state = DeviceState::Failed;
+        if matches!(self.state, DeviceState::Live | DeviceState::Failed) {
+            self.state = DeviceState::RecoveryFenced;
             self.queue.fence();
         }
     }
@@ -215,12 +251,17 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
     /// Completion/FLUSH obligations remain in custody, including after the
     /// device and its old queue read back disabled.
     pub fn stop_failed_mmio(&mut self, p: &impl Platform) -> Option<Result<u64, Error>> {
-        if self.state != DeviceState::Failed {
+        if !matches!(
+            self.state,
+            DeviceState::Failed | DeviceState::RecoveryFenced
+        ) {
             return None;
         }
         self.state = DeviceState::ResetAttempted;
         self.queue.fence();
-        Some(self.transport.observe_mmio_reset(2, &[0], p))
+        let result = self.transport.observe_mmio_reset(2, &[0], p);
+        self.reset = Some(result);
+        Some(result)
     }
     fn read_capacity(t: &Transport, p: &impl Platform) -> Result<(u32, u64), Error> {
         for _ in 0..8 {
@@ -388,6 +429,14 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         {
             return Err(Error::Response);
         }
+        // A checked completion remains ACKable after an ordinary failure.
+        // Recovery handoff or a reset attempt freezes the entire ledger.
+        if matches!(
+            self.state,
+            DeviceState::RecoveryFenced | DeviceState::ResetAttempted
+        ) {
+            return Err(Error::Device);
+        }
         self.queue.release(token)?;
         self.pending[at] = None;
         Ok(())
@@ -412,6 +461,7 @@ mod tests {
         feature_banks: Option<[u32; 2]>,
         reject_features: bool,
         complete_mmio_reset: bool,
+        clock_step_ns: u64,
     }
     unsafe impl Platform for Host {
         fn diagnostic_stage(&self, stage: u64) {
@@ -460,7 +510,9 @@ mod tests {
             self.clock.get() / 1_000_000
         }
         fn now_ns(&self) -> u64 {
-            self.clock.get()
+            let now = self.clock.get();
+            self.clock.set(now.saturating_add(self.clock_step_ns));
+            now
         }
     }
     fn fixture() -> (BatchedBlock, Host, usize) {
@@ -477,6 +529,7 @@ mod tests {
             feature_banks: None,
             reject_features: false,
             complete_mmio_reset: false,
+            clock_step_ns: 0,
         };
         mmio.put32(0, 0x74726976);
         mmio.put32(4, 2);
@@ -497,6 +550,7 @@ mod tests {
                 read_only: false,
                 pending: [None; 8],
                 state: DeviceState::Live,
+                reset: None,
                 last_completed: 0,
             },
             p,
@@ -523,6 +577,7 @@ mod tests {
             feature_banks: Some([low, 1]),
             reject_features,
             complete_mmio_reset: false,
+            clock_step_ns: 0,
         };
         (mmio, platform, Box::leak(Box::new(BatchMemory::zeroed())))
     }
@@ -660,8 +715,16 @@ mod tests {
         platform.complete_mmio_reset = true;
         platform.clock.set(123_000);
         assert_eq!(block.stop_failed_mmio(&platform), Some(Ok(123_000)));
+        let custody = block.terminal_custody().unwrap();
+        assert_eq!(custody.reset, Some(Ok(123_000)));
+        let held = custody.requests[token.slot as usize].unwrap();
+        assert_eq!(
+            (held.token, held.operation, held.completed),
+            (token, Operation::Write(0), false)
+        );
         assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (0, 0));
         assert_eq!(block.stop_failed_mmio(&platform), None);
+        assert_eq!(block.terminal_custody(), Some(custody));
         assert_eq!(block.acknowledge(token), Err(Error::Response));
         assert_eq!(block.retained_requests(), (1, 0));
         assert_eq!(block.free(), block.capacity() - 1);
@@ -679,6 +742,12 @@ mod tests {
 
         block.fence_for_recovery();
 
+        let custody = block.terminal_custody().unwrap();
+        assert_eq!(custody.reset, None);
+        assert_eq!(
+            custody.requests[usize::from(token.slot)].unwrap().token,
+            token
+        );
         assert_eq!(
             block.pending[usize::from(token.slot)],
             Some((token, read, 1))
@@ -692,6 +761,39 @@ mod tests {
         assert_eq!(block.acknowledge(token), Err(Error::Response));
         assert_eq!(block.notify_stats().published, published);
         assert_eq!(block.transport.status(), 15);
+    }
+
+    #[test]
+    fn terminal_block_custody_cannot_release_a_request_after_reset_timeout() {
+        let (mut block, mut platform, base) = fixture();
+        let operation = Operation::Read(0);
+        let mut bytes = [0; 512];
+        let token = block
+            .begin(operation, &bytes, true, false, &platform)
+            .unwrap();
+        unsafe { complete(base, token.slot, true, 0) };
+        assert_eq!(
+            block.poll(&mut bytes, &platform).unwrap().unwrap().token,
+            token
+        );
+        block.fence_for_recovery();
+        assert_eq!(block.acknowledge(token), Err(Error::Device));
+        platform.clock_step_ns = 25_000_000;
+        assert_eq!(block.stop_failed_mmio(&platform), Some(Err(Error::Timeout)));
+        let custody = block.terminal_custody().unwrap();
+        assert_eq!(custody.reset, Some(Err(Error::Timeout)));
+        assert_eq!(
+            custody.requests[usize::from(token.slot)],
+            Some(RetainedBlock {
+                token,
+                operation,
+                completed: true
+            })
+        );
+        assert_eq!(block.acknowledge(token), Err(Error::Device));
+        assert_eq!(block.stop_failed_mmio(&platform), None);
+        assert_eq!(block.terminal_custody(), Some(custody));
+        assert_eq!(block.retained_requests(), (0, 1));
     }
 
     #[test]

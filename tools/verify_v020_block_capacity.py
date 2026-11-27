@@ -93,6 +93,23 @@ def resize_during_reopen(binary, elf, output, disk, timeout):
             require(len(stopped) == 1 and stopped[0][:2] == (2, 0) and stopped[0][2] > 0
                     and len(custody) == 1 and custody[0][2] == 1,
                     "block owner did not retain custody and observe a real reset")
+            recovery = rows(lines, "V020_SEC_D_BLOCK_RECOVERY")
+            handoff = rows(lines, "V020_SEC_D_BLOCK_HANDOFF")
+            chains = rows(lines, "V020_SEC_D_BLOCK_RECOVERY_CHAIN")
+            ops = rows(lines, "V020_SEC_D_BLOCK_RECOVERY_OP")
+            require(len(handoff) == 1
+                    and 0x0a000000 <= handoff[0][0] < 0x0a200000
+                    and handoff[0][0] % 512 == 0 and handoff[0][1:] == (2, 0)
+                    and rows(lines, "V020_W11_MEDIA_RECOVERY_REQUIRED") == [(0, 0, 0)]
+                    and recovery == [(0, 1, stopped[0][2])]
+                    and len(chains) == len(ops) == sum(custody[0][:2])
+                    and len({slot for slot, _, _ in chains}) == len(chains)
+                    and all(slot < 8 and generation > 0 and complete in (0, 1)
+                            for slot, generation, complete in chains)
+                    and sum(complete for _, _, complete in chains) == custody[0][1]
+                    and [slot for slot, _, _ in chains] == [slot for slot, _, _ in ops]
+                    and all(kind == 1 and sector < SCRATCH_BYTES // 512 for _, kind, sector in ops),
+                    "block recovery readback lost the reset result or original read tokens")
             require(len(io) == 1 and io[0][1:] == (0, 0)
                     and after["wr_operations"] == after["flush_operations"] == 0,
                     "resize issued writes or FLUSH to the original volume")
@@ -103,6 +120,8 @@ def resize_during_reopen(binary, elf, output, disk, timeout):
                     "resize granted authority before the volume was reconciled")
             require(decoder.loss == decoder.corrupt == 0, "resize UART capture was incomplete")
             return {"before": prior, "after": after, "guest_io": io[0], "retained_custody": custody[0],
+                    "recovery_handoff": handoff[0],
+                    "recovery_chains": chains, "recovery_operations": ops,
                     "mmio_reset": stopped[0], "boot_epoch_granted": False}
         finally:
             shutdown(proc, qmp)

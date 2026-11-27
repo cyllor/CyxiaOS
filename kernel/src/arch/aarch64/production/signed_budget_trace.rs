@@ -10,9 +10,20 @@ const CAPACITY: usize = if cfg!(cyxia_startup_catalog) {
 } else {
     1024
 };
-const VERSION: u64 = if cfg!(cyxia_startup_catalog) { 2 } else { 1 };
+const DENSE_FRAMES: bool = cfg!(all(cyxia_startup_catalog, feature = "prototype-memory"));
+const VERSION: u64 = if DENSE_FRAMES {
+    3
+} else if cfg!(cyxia_startup_catalog) {
+    2
+} else {
+    1
+};
 const MAGIC: u64 = 0x4359_5832_5342_5544;
-const HEADER_WORDS: usize = 20;
+const HEADER_WORDS: usize = if DENSE_FRAMES { 22 } else { 20 };
+#[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+const FRAME_START: usize = 20;
+#[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+const FRAME_END: usize = 21;
 const ROW_WORDS: usize = 8;
 const CLASSES: [Class; 6] = [
     Class::Operations,
@@ -68,9 +79,19 @@ impl Trace {
         }
     }
 
+    #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+    pub(super) fn begin_frames(&self) {
+        V020_SIGNED_CPU_BUDGET_TRACE.header[FRAME_START].store(self.next as u64, Ordering::Relaxed);
+    }
+
+    #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+    pub(super) fn finish_frames(&self) {
+        V020_SIGNED_CPU_BUDGET_TRACE.header[FRAME_END].store(self.next as u64, Ordering::Relaxed);
+    }
+
     #[cfg(cyxia_startup_catalog)]
     pub(super) fn begin_media(&self) {
-        // Version 2 begins at early startup. These two fields instead index
+        // The default trace begins at early startup. These two fields instead index
         // the contiguous span that owns exclusive use of the boot disk.
         V020_SIGNED_CPU_BUDGET_TRACE.header[7].store(self.next as u64, Ordering::Relaxed);
     }
@@ -147,7 +168,7 @@ impl Trace {
         ]) {
             cell.store(word, Ordering::Relaxed);
         }
-        for (cell, class) in header[14..].iter().zip(CLASSES) {
+        for (cell, class) in header[14..20].iter().zip(CLASSES) {
             let mut debit = ledger.lifetime_spent(class);
             if class == Class::Recovery {
                 debit -= self.opening_recovery;

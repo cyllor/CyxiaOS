@@ -31,6 +31,20 @@ const WEIGHT_BITS: u32 = u16::BITS;
 
 pub(super) struct PreparedWeight(u64);
 
+#[derive(Clone, Copy)]
+pub(super) struct TargetLockSample {
+    pub(super) timing: IrqOffTiming,
+    counters: [u64; 4],
+}
+
+impl TargetLockSample {
+    pub(super) fn publish(self) {
+        for (offset, tick) in self.counters.into_iter().enumerate() {
+            evidence::put(evidence::W11_TARGET_LOCK_COUNTERS + offset, tick);
+        }
+    }
+}
+
 /// The fixture's protected D01 target, in its existing registered page. The
 /// release store installs the version and weight together; observers need
 /// only one acquire load. A clock fault or overrun closes later admissions.
@@ -91,7 +105,10 @@ impl ExecTarget {
     /// fixture leaves IRQ masked. Mask its sole enabled timer source first
     /// so that the measured interval starts from genuinely unmasked DAIF.I
     /// without a pending fixture timer entering an inactive EL0 context.
-    pub(super) fn commit(&self, prepared: PreparedWeight) -> Result<Option<IrqOffTiming>, Error> {
+    pub(super) fn commit(
+        &self,
+        prepared: PreparedWeight,
+    ) -> Result<Option<TargetLockSample>, Error> {
         if cpu::slot() != 0
             || VECTOR_CALLER[0].load(Ordering::Acquire) != CALLER_NONE
             || self.closed.load(Ordering::Acquire)
@@ -136,7 +153,14 @@ impl ExecTarget {
         }
         // A measured overrun after the release store does not erase an
         // installed root or turn an accepted effect into a failed one.
-        installed.map(|()| timing)
+        // Keep the original counters beside the settlement until the
+        // foreground publishes its final sealed evidence page.
+        installed.map(|()| {
+            timing.map(|timing| TargetLockSample {
+                timing,
+                counters: [before, work_start, work_end, after],
+            })
+        })
     }
 
     #[inline(never)]

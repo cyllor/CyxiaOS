@@ -282,14 +282,16 @@ fn relay(
     #[cfg(feature = "v020-production-authenticated-net")]
     {
         let mut signer = sec_n_broker::signer::Signer::load(identity);
-        sec_n_broker::run_guest(
+        let outcome = sec_n_broker::run_guest(
             &layout,
             &mut port,
             entropy,
             GUEST_SVC_BUDGET,
             Some(StreamPort::poll_normal_close),
             Some(&mut signer),
-        )
+        );
+        sec_n_broker::discard_guest_session(&layout, identity.boot_epoch);
+        outcome
     }
     #[cfg(not(feature = "v020-production-authenticated-net"))]
     {

@@ -162,15 +162,26 @@ fn principals(config: Config<'_>) -> [Principal; 16] {
 }
 
 pub(super) fn security(config: Config<'_>) -> SecurityStateStoreV2 {
+    let (fs_uuid, config_generation, rule_generation, security_generation, key_generation) = config
+        .map_or((UUID, 1, 1, 1, 1), |config| {
+            let header = config.header();
+            (
+                header.fs_uuid,
+                header.generation,
+                header.rule_generation,
+                header.security_generation,
+                header.key_generation,
+            )
+        });
     SecurityStateStoreV2 {
-        fs_uuid: UUID,
+        fs_uuid,
         state_generation: 1,
-        rule_min_generation: 1,
-        security_min_generation: 1,
-        key_generation: 1,
+        rule_min_generation: rule_generation,
+        security_min_generation: security_generation,
+        key_generation,
         isolated_service_bitmap: 0,
         last_boot_epoch: 0,
-        offline_config_generation: 1,
+        offline_config_generation: config_generation,
         offline_config_hash: config.map_or([0x5a; 32], VerifiedOfflineConfig::digest),
         service_generations: [1; 16],
     }
@@ -178,13 +189,13 @@ pub(super) fn security(config: Config<'_>) -> SecurityStateStoreV2 {
 
 /// Include the D1.5 heads in the formatter's first metadata flush. The full
 /// zero scan has passed and the baseline superblocks are still unpublished.
-struct EnvelopeFormatDisk<'a, 'meter> {
-    disk: &'a mut Disk<'meter>,
+struct EnvelopeFormatDisk<'a, D> {
+    disk: &'a mut D,
     fs_uuid: [u8; 16],
     pending: bool,
 }
 
-impl EpochBlockIo for EnvelopeFormatDisk<'_, '_> {
+impl<D: EpochBlockIo> EpochBlockIo for EnvelopeFormatDisk<'_, D> {
     fn read(&mut self, block: u32, out: &mut [u8; BLOCK_BYTES]) -> Result<(), SecurityError> {
         self.disk.read(block, out)
     }
@@ -227,7 +238,7 @@ pub(super) fn format(
         config.check_committed(&security)?;
     }
     let manifest = FormatManifest {
-        fs_uuid: UUID,
+        fs_uuid: security.fs_uuid,
         root_block: ROOT,
         system: SYSTEM,
         principals: principals(config),
@@ -280,7 +291,7 @@ pub(super) fn format(
         }
     };
     let expected = SuperblockV1 {
-        fs_uuid: UUID,
+        fs_uuid: manifest.fs_uuid,
         generation: 1,
         checkpoint_lsn: 0,
         log_epoch: 1,
@@ -536,8 +547,9 @@ pub(super) fn validate_homes(
     let system_blocks = snapshots.system_blocks();
     let files = u16::from(snapshots.has_file());
     let live_inodes = if snapshots.allocated() { 9 } else { 5 } + files;
-    if e.security != expected_state(epoch, config)?
-        || e.boot.fs_uuid != UUID
+    let expected = expected_state(epoch, config)?;
+    if e.security != expected
+        || e.boot.fs_uuid != expected.fs_uuid
         || e.boot.boot_epoch != epoch
         || e.structure.live_inodes != live_inodes
         || e.structure.data_blocks != system_blocks + 1 + u32::from(files)
@@ -649,7 +661,9 @@ fn verify_snapshot_envelopes(disk: &mut Disk, fs_uuid: [u8; 16]) -> Result<(), S
 pub(super) fn read_checkpoint(
     disk: &mut Disk,
     raw: &mut [u8; BLOCK_BYTES],
+    config: Config<'_>,
 ) -> Result<SuperblockV1, SecurityError> {
+    let fs_uuid = config.map_or(UUID, |config| config.header().fs_uuid);
     let mut other = [0; BLOCK_BYTES];
     disk.read(0, raw)?;
     disk.read(1, &mut other)?;
@@ -659,7 +673,9 @@ pub(super) fn read_checkpoint(
     // The formatter writes identical generation 1 headers. Later checkpoints
     // alternate copies and each fixture checks its exact committed boundary.
     for copy in [a, b] {
-        if copy.fs_uuid != UUID || copy.log_epoch != copy.generation || !checkpoint_lsn_valid(copy)
+        if copy.fs_uuid != fs_uuid
+            || copy.log_epoch != copy.generation
+            || !checkpoint_lsn_valid(copy)
         {
             return Err(SecurityError::Conflict);
         }

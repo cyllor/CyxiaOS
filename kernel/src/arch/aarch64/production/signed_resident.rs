@@ -44,7 +44,7 @@ const CONSOLE_TURN_NS: u64 = 1_000_000;
 const CONSOLE_RETRY_NS: u64 = 1_000_000;
 const MAX_WALL_NS: u64 = 50_000_000;
 #[cfg(cyxia_startup_catalog)]
-const MEDIA_OPERATION_MARGIN_NS: u64 = 2_000_000;
+const STARTUP_OPERATION_MARGIN_NS: u64 = 2_000_000;
 const FATAL_ROLE_CONTEXT: u64 = 0x5731_1340;
 const NO_MEDIA: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=signed_media_unavailable command=status\n";
@@ -322,10 +322,10 @@ impl Budget {
     }
 }
 
-/// Prepay bounded media batches before issuing transport operations. The
-/// active slice also pays for the filesystem work between I/O boundaries.
+/// Prepay each batch before touching startup state. The same grant covers
+/// the work between checkpoints, including transport and filesystem work.
 #[cfg(cyxia_startup_catalog)]
-struct MediaBudget<'a> {
+struct RecoveryBatches<'a> {
     budget: &'a mut Budget,
     active: Option<(Sample, Turn)>,
     fault: Option<Fault>,
@@ -334,7 +334,17 @@ struct MediaBudget<'a> {
 }
 
 #[cfg(cyxia_startup_catalog)]
-impl MediaBudget<'_> {
+impl<'a> RecoveryBatches<'a> {
+    fn new(budget: &'a mut Budget) -> Self {
+        Self {
+            budget,
+            active: None,
+            fault: None,
+            batches: 0,
+            charged: 0,
+        }
+    }
+
     fn settle_batch(&mut self) -> Result<(), Fault> {
         if let Some((start, grant)) = self.active.take() {
             let used = self.budget.settle(grant, start, 0)?;
@@ -350,8 +360,8 @@ impl MediaBudget<'_> {
                 .checked_sub(start.cpu_tick)
                 .map(timer::cpu_ns)
                 .ok_or(Error::Clock)?;
-            if elapsed < grant.reserved_ns() - MEDIA_OPERATION_MARGIN_NS
-                && now_ns().saturating_add(MEDIA_OPERATION_MARGIN_NS) < grant.deadline_ns()
+            if elapsed < grant.reserved_ns() - STARTUP_OPERATION_MARGIN_NS
+                && now_ns().saturating_add(STARTUP_OPERATION_MARGIN_NS) < grant.deadline_ns()
             {
                 return Ok(());
             }
@@ -371,23 +381,39 @@ impl MediaBudget<'_> {
         })
     }
 
-    fn finish(mut self, confirmed_epoch: u64) -> Result<(), Fault> {
+    fn finish(mut self) -> Result<(u64, u64), Fault> {
         self.settle_batch()?;
         if let Some(fault) = self.fault {
             return Err(fault);
         }
-        if confirmed_epoch != 0 {
-            let continuous = self.budget.continuous.as_mut().ok_or(Error::NotReady)?;
-            continuous.trace.finish_media(confirmed_epoch);
-            report(
-                "V020_SIGNED_MEDIA_BUDGET",
-                self.batches,
-                self.charged,
-                RECOVERY_NS,
-            );
-        }
-        Ok(())
+        Ok((self.batches, self.charged))
     }
+}
+
+#[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+fn register_frames(info: &mut BootInfo, budget: &mut Budget) -> Result<(), Fault> {
+    budget
+        .continuous
+        .as_ref()
+        .ok_or(Error::NotReady)?
+        .trace
+        .begin_frames();
+    let mut work = RecoveryBatches::new(budget);
+    let registration = frames::prepare_signed(info, &mut || work.checkpoint());
+    let (batches, used) = work.finish()?;
+    let registration = registration.map_err(|_| Error::Denied)?;
+    if used == 0 {
+        return Err(Error::Clock.into());
+    }
+    budget
+        .continuous
+        .as_ref()
+        .ok_or(Error::NotReady)?
+        .trace
+        .finish_frames();
+    registration.publish();
+    report("V020_SIGNED_FRAME_META_BUDGET", batches, used, RECOVERY_NS);
+    Ok(())
 }
 
 impl Task {
@@ -785,6 +811,7 @@ pub(super) fn run(info: &BootInfo) -> ! {
     };
     #[cfg(cyxia_startup_catalog)]
     let (early_start, early_grant) = budget.begin_boot().expect("early Recovery budget");
+    #[cfg(not(all(cyxia_startup_catalog, feature = "prototype-memory")))]
     frames::register_or_fatal();
     bring_up_production(info);
     gic()
@@ -795,6 +822,16 @@ pub(super) fn run(info: &BootInfo) -> ! {
         Ok(used) => report("V020_SIGNED_RESIDENT_RECOVERY", 0, used, RECOVERY_NS),
         Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     }
+    #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+    let reserved = {
+        let mut reserved = *info;
+        if let Err(fault) = register_frames(&mut reserved, &mut budget) {
+            fence(info, budget, OutputQueue::new(), fault);
+        }
+        reserved
+    };
+    #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+    let info = &reserved;
     let config = match startup_work(&mut budget, 1, media_staging::verify_scratch_config) {
         Ok(Ok(config)) => config,
         // A valid catalog for a different policy can still be inspected by
@@ -813,21 +850,25 @@ pub(super) fn run(info: &BootInfo) -> ! {
             .expect("active boot meter")
             .trace
             .begin_media();
-        let mut media = MediaBudget {
-            budget: &mut budget,
-            active: None,
-            fault: None,
-            batches: 0,
-            charged: 0,
-        };
+        let mut media = RecoveryBatches::new(&mut budget);
         let staged =
             media_staging::stage_with_policy(info, Some(config), &mut || media.checkpoint());
         let confirmed_epoch = staged
             .resident_boot
             .as_ref()
             .map_or(0, |_| staged.confirmed_epoch);
-        if let Err(fault) = media.finish(confirmed_epoch) {
-            fence(info, budget, OutputQueue::new(), fault);
+        let (batches, used) = match media.finish() {
+            Ok(debit) => debit,
+            Err(fault) => fence(info, budget, OutputQueue::new(), fault),
+        };
+        if confirmed_epoch != 0 {
+            budget
+                .continuous
+                .as_ref()
+                .expect("active boot meter")
+                .trace
+                .finish_media(confirmed_epoch);
+            report("V020_SIGNED_MEDIA_BUDGET", batches, used, RECOVERY_NS);
         }
         staged
     };
@@ -853,10 +894,21 @@ pub(super) fn run(info: &BootInfo) -> ! {
     if recovery::init_signed(&policy).is_err() {
         fence(info, budget, OutputQueue::new(), Error::Denied.into());
     }
-    let members = match startup_work(&mut budget, 2, || {
-        core::array::from_fn(|index| load_role_with_identity(index, actors[index].generation, 0, 0))
-    }) {
-        Ok(members) => members,
+    let members = match startup_work(
+        &mut budget,
+        2,
+        || -> Result<[NativeRole; ROLE_COUNT], Error> {
+            #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+            if !frames::role_storage_registered() {
+                return Err(Error::Denied);
+            }
+            Ok(core::array::from_fn(|index| {
+                load_role_with_identity(index, actors[index].generation, 0, 0)
+            }))
+        },
+    ) {
+        Ok(Ok(members)) => members,
+        Ok(Err(error)) => fence(info, budget, OutputQueue::new(), error.into()),
         Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     };
     let other_protected_pool_bytes =
