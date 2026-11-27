@@ -2,19 +2,23 @@ use std::{env, fs, io::Read, path::Path};
 
 // These immutable inputs are supported by the default resident image and the
 // explicit signed scratch resident profile. Verification runs in the guest.
-pub(super) fn build() {
+pub(super) fn build() -> bool {
     const DIR: &str = "CYXIA_STARTUP_CATALOG_DIR";
     println!("cargo:rustc-check-cfg=cfg(cyxia_startup_catalog)");
     println!("cargo:rustc-check-cfg=cfg(cyxia_signed_scratch_catalog)");
+    println!("cargo:rustc-check-cfg=cfg(cyxia_signed_resident)");
     println!("cargo:rerun-if-env-changed={DIR}");
     let signed_scratch = env::var_os("CARGO_FEATURE_V020_PRODUCTION_SIGNED_RESIDENT").is_some();
+    if signed_scratch {
+        println!("cargo:rustc-cfg=cyxia_signed_resident");
+    }
     if env::var_os("CARGO_FEATURE_V020_PRODUCTION").is_none()
         || (env::var_os("CARGO_FEATURE_V020_PRODUCTION_DIAGNOSTIC").is_some() && !signed_scratch)
     {
-        return;
+        return false;
     }
     let Some(catalog) = env::var_os(DIR) else {
-        return;
+        return false;
     };
     let input = Path::new(&catalog);
     let out = env::var_os("OUT_DIR").expect("startup build output directory");
@@ -46,6 +50,10 @@ pub(super) fn build() {
         "cyxia_startup_catalog"
     };
     println!("cargo:rustc-cfg={cfg}");
+    if !signed_scratch {
+        println!("cargo:rustc-cfg=cyxia_signed_resident");
+    }
+    !signed_scratch
 }
 
 fn load(directory: &Path, name: &str, min: usize, max: usize) -> Vec<u8> {

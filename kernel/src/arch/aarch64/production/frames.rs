@@ -19,14 +19,14 @@
 //! * Registered statics are only addressed via `addr_of!` (no reference is
 //!   formed); their PA is `VA - HIGH`, checked, failing Range on underflow.
 
+#[cfg(feature = "v020-production-diagnostic")]
+use super::super::report;
 use super::super::{
     DATA_PAGES, LEAVES, MIDDLES, PRIVATE_SPACES, Page, ROOTS, STACKS, Stacks, USER_STACKS, fatal,
-    report,
 };
-use super::{
-    BACKING, Backing, COPY_BUFFER, CopyBuffer, EXEC_TARGET, ExecTarget, PLAN_POOL, PLAN_POOL_BYTES,
-    ROLE_COUNT, TABLES, Tables, evidence,
-};
+use super::{BACKING, Backing, COPY_BUFFER, CopyBuffer, ROLE_COUNT, TABLES, Tables};
+#[cfg(feature = "v020-production-diagnostic")]
+use super::{EXEC_TARGET, ExecTarget, PLAN_POOL, PLAN_POOL_BYTES, evidence};
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind};
@@ -49,7 +49,11 @@ const ROWS: usize = if cfg!(feature = "v020-production-authenticated-net") {
     4096
 };
 const _: () = assert!(ROWS <= COUNT);
-const STATICS: usize = 12;
+const STATICS: usize = if cfg!(feature = "v020-production-diagnostic") {
+    12
+} else {
+    10
+};
 /// Fatal code when production static registration fails.
 const FATAL_FRAME_META: u64 = 0x5731_1290;
 
@@ -100,6 +104,7 @@ fn statics(service: StaticRegion) -> Result<[StaticRegion; STATICS], Error> {
             core::mem::size_of::<[Backing; ROLE_COUNT]>(),
             Control,
         )?,
+        #[cfg(feature = "v020-production-diagnostic")]
         region(
             addr_of!(EXEC_TARGET) as u64,
             core::mem::size_of::<ExecTarget>(),
@@ -110,6 +115,7 @@ fn statics(service: StaticRegion) -> Result<[StaticRegion; STATICS], Error> {
             core::mem::size_of::<CopyBuffer>(),
             Control,
         )?,
+        #[cfg(feature = "v020-production-diagnostic")]
         region(addr_of!(PLAN_POOL) as u64, PLAN_POOL_BYTES, Control)?,
         region(
             addr_of!(STACKS) as u64,
@@ -186,6 +192,7 @@ pub(super) fn register_or_fatal() {
             SERVICE_ARENA_PAGES.store(service_pages, Ordering::Release);
         }
         _ => {
+            #[cfg(feature = "v020-production-diagnostic")]
             evidence::put(evidence::W11_FRAME_META, 0);
             fatal(FATAL_FRAME_META);
         }
@@ -199,6 +206,7 @@ pub(super) fn prove_pool_or_fatal(info: &mut cyxia_contracts::BootInfo) {
 
 /// Evidence-seal hook: words 129/130 (the page is zeroed before the seal),
 /// plus the serial row with the permanent and unregistered gap row counts.
+#[cfg(feature = "v020-production-diagnostic")]
 pub(super) fn publish() {
     let pages = REGISTERED_PAGES.load(Ordering::Acquire);
     let permanent = PERMANENT_ROWS.load(Ordering::Acquire);

@@ -23,7 +23,9 @@
 //! * CPU0 increments GATE_REJECTS on an in-vector RECOVERY_REQUIRED refusal,
 //!   and samples the parent advice gate via gate_ptr() between EL0 turns.
 
+#[cfg(feature = "v020-production-diagnostic")]
 use super::super::{FAULT_PROBES, GATES, QUIT, STOPPED, fatal, report};
+#[cfg(feature = "v020-production-diagnostic")]
 use super::{
     ACCEPT_COUNT, BOOT, E_AUTH, PUB, ROLE_COUNT, SUPER, SVC_OUT, advice_carrier, evidence, gate_ptr,
 };
@@ -32,46 +34,61 @@ use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use cyxia_kernel_core::control_plane::Identity;
 use cyxia_kernel_core::security::Error;
-#[cfg(feature = "v020-production-signed-resident")]
+#[cfg(cyxia_signed_resident)]
 use cyxia_kernel_core::security::durable_role_epoch_v0199::ConfirmedBootPolicy;
 use cyxia_kernel_core::security::recovery_proof_v2::{
-    ACCUMULATOR_COUNT, CheckpointPairFacts, DegradedEvent, DegradedEventKind, RecoveryAccumulator,
-    RecoveryGate, RecoveryState,
+    ACCUMULATOR_COUNT, DegradedEvent, DegradedEventKind, RecoveryAccumulator,
+};
+#[cfg(feature = "v020-production-diagnostic")]
+use cyxia_kernel_core::security::recovery_proof_v2::{
+    CheckpointPairFacts, RecoveryGate, RecoveryState,
 };
 use sha2::{Digest, Sha256};
 
 /// Protection generation of the staged boot (first generation).
+#[cfg(feature = "v020-production-diagnostic")]
 const PROTECTION_GENERATION: u64 = 1;
 const INITIAL_WRITER_GENERATION: u64 = 1;
+#[cfg(feature = "v020-production-diagnostic")]
 const SECONDARIES: u64 = ((1 << ACCUMULATOR_COUNT) - 1) & !1;
+#[cfg(feature = "v020-production-diagnostic")]
 const FATAL_RECORD_REJECTED: u64 = 0x5731_1320;
+#[cfg(feature = "v020-production-diagnostic")]
 const FATAL_INIT: u64 = 0x5731_1321;
+#[cfg(feature = "v020-production-diagnostic")]
 const FATAL_GATE: u64 = 0x5731_1322;
-#[cfg(not(feature = "v020-production-signed-resident"))]
+#[cfg(all(feature = "v020-production-diagnostic", not(cyxia_signed_resident)))]
 const FATAL_NO_SLOT: u64 = 0x5731_1323;
+#[cfg(feature = "v020-production-diagnostic")]
 const FATAL_PROBE: u64 = 0x5731_1324;
+#[cfg(feature = "v020-production-diagnostic")]
 const FATAL_TAKEOVER: u64 = 0x5731_1325;
 
 #[repr(C, align(64))]
 struct Slot(MaybeUninit<RecoveryAccumulator>);
 
+#[cfg(feature = "v020-production-diagnostic")]
 struct StagedGate {
     gate: RecoveryGate,
     pair: CheckpointPairFacts,
 }
 
+#[cfg(feature = "v020-production-diagnostic")]
 static mut GATE: Option<StagedGate> = None;
 static mut SLOTS: [Slot; ACCUMULATOR_COUNT] =
     [const { Slot(MaybeUninit::uninit()) }; ACCUMULATOR_COUNT];
 static READY: AtomicBool = AtomicBool::new(false);
 static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
 static EVENTS: [AtomicU64; ACCUMULATOR_COUNT] = [const { AtomicU64::new(0) }; ACCUMULATOR_COUNT];
+#[cfg(feature = "v020-production-diagnostic")]
 static REJECTED: [AtomicU64; ACCUMULATOR_COUNT] = [const { AtomicU64::new(0) }; ACCUMULATOR_COUNT];
 static TAKEN: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "v020-production-diagnostic")]
 static GATE_REJECTS: AtomicU64 = AtomicU64::new(0);
 
 /// The staged initial pair: both copies valid, same FS UUID, the fresh-image
 /// identical initial pair, relation provable. Every adverse fact is false.
+#[cfg(feature = "v020-production-diagnostic")]
 const fn staged_pair() -> CheckpointPairFacts {
     CheckpointPairFacts {
         first_valid: true,
@@ -85,7 +102,10 @@ const fn staged_pair() -> CheckpointPairFacts {
 }
 
 /// Build the four accumulators. CPU0, once, before running any EL0.
-fn init(boot_epoch: u64, gate: Option<StagedGate>) -> Result<(), Error> {
+fn init(
+    boot_epoch: u64,
+    #[cfg(feature = "v020-production-diagnostic")] gate: Option<StagedGate>,
+) -> Result<(), Error> {
     if cyxia_arch_aarch64::cpu::slot() != 0 {
         return Err(Error::Unauthorized);
     }
@@ -104,6 +124,7 @@ fn init(boot_epoch: u64, gate: Option<StagedGate>) -> Result<(), Error> {
     // before any EL0 role runs. Secondaries in the signed profile are parked;
     // no reference to GATE or SLOTS exists. Use only raw addr_of_mut! places.
     unsafe {
+        #[cfg(feature = "v020-production-diagnostic")]
         addr_of_mut!(GATE).write(gate);
         for (cpu, acc) in accs.into_iter().enumerate() {
             addr_of_mut!(SLOTS[cpu]).write(Slot(acc));
@@ -114,6 +135,7 @@ fn init(boot_epoch: u64, gate: Option<StagedGate>) -> Result<(), Error> {
 }
 
 /// run()'s entry hook: a failed init stops the boot fail-closed.
+#[cfg(feature = "v020-production-diagnostic")]
 pub(super) fn init_or_fatal() {
     let pair = staged_pair();
     let gate = RecoveryGate::new(BOOT, PROTECTION_GENERATION, SUPER, &pair)
@@ -127,9 +149,13 @@ pub(super) fn init_or_fatal() {
 
 /// Initialize audit ownership after the real signed pair allocates this boot.
 /// The proof summarizes retained faults and carries no permission to reopen.
-#[cfg(feature = "v020-production-signed-resident")]
+#[cfg(cyxia_signed_resident)]
 pub(super) fn init_signed(policy: &ConfirmedBootPolicy<'_>) -> Result<(), Error> {
-    init(policy.boot_epoch(), None)
+    init(
+        policy.boot_epoch(),
+        #[cfg(feature = "v020-production-diagnostic")]
+        None,
+    )
 }
 
 fn event_digest(cpu: u32, actor: Option<Identity>, esr: u64, far: u64) -> [u8; 32] {
@@ -146,7 +172,7 @@ fn event_digest(cpu: u32, actor: Option<Identity>, esr: u64, far: u64) -> [u8; 3
 
 /// Record one EL0 fault into the faulting CPU's own accumulator. Runs in that
 /// CPU's exception context; `cpu` must be the current CPU slot.
-#[cfg(not(feature = "v020-production-signed-resident"))]
+#[cfg(all(feature = "v020-production-diagnostic", not(cyxia_signed_resident)))]
 pub(crate) fn record_fault(cpu: u32, esr: u64, far: u64) {
     let i = cyxia_arch_aarch64::cpu::slot();
     if i >= ACCUMULATOR_COUNT {
@@ -161,7 +187,7 @@ pub(crate) fn record_fault(cpu: u32, esr: u64, far: u64) {
 
 /// The signed resident turn has authenticated the live EL0 root and stopped
 /// the task. Retain its identity from the private scheduler, not user bytes.
-#[cfg(feature = "v020-production-signed-resident")]
+#[cfg(cyxia_signed_resident)]
 pub(super) fn record_role_failure(actor: Identity, esr: u64, far: u64) -> Result<(), Error> {
     if cyxia_arch_aarch64::cpu::slot() != 0 || !actor.valid() {
         return Err(Error::Unauthorized);
@@ -198,6 +224,7 @@ fn record_event(i: usize, actor: Option<Identity>, esr: u64, far: u64) -> Result
 
 /// Scoped access to the recovery gate: `None` before init or off CPU0. The
 /// `&mut` never escapes `f`, so no caller can hold an aliasing reference.
+#[cfg(feature = "v020-production-diagnostic")]
 fn with_gate<R>(f: impl FnOnce(&mut StagedGate) -> R) -> Option<R> {
     if !READY.load(Ordering::Acquire) || cyxia_arch_aarch64::cpu::slot() != 0 {
         return None;
@@ -210,6 +237,7 @@ fn with_gate<R>(f: impl FnOnce(&mut StagedGate) -> R) -> Option<R> {
 }
 
 /// Re-evaluate the EL1 facts at the side-effect boundary, including on retries.
+#[cfg(feature = "v020-production-diagnostic")]
 pub(super) fn publish_allowed() -> bool {
     let state = with_gate(|staged| staged.gate.raise(&staged.pair));
     if state == Some(RecoveryState::RecoveryRequired) {
@@ -220,6 +248,7 @@ pub(super) fn publish_allowed() -> bool {
 
 /// Withdraw the second staged validation witness, then issue the real 0x41.
 /// The probe changes the input only. The vector must latch the state itself.
+#[cfg(feature = "v020-production-diagnostic")]
 pub(super) fn publish_probe(pub_space: usize, pub_args: [u64; 6]) {
     // SAFETY: CPU0 control plane; the gate reference is consumed immediately
     // and no in-vector dispatch is running between these synchronous calls.
@@ -269,6 +298,7 @@ pub(super) fn publish_probe(pub_space: usize, pub_args: [u64; 6]) {
 
 /// EL1 consumes each stopped producer's retained proof on CPU0. The published
 /// event counts provide independent watermarks for the generation transition.
+#[cfg(feature = "v020-production-diagnostic")]
 pub(super) fn takeover_stopped() {
     if cyxia_arch_aarch64::cpu::slot() != 0
         || !READY.load(Ordering::Acquire)
@@ -323,6 +353,7 @@ pub(super) fn handed_off_proofs()
 }
 
 /// Seal the actual proof counts and the measured refusal / handoff outcomes.
+#[cfg(feature = "v020-production-diagnostic")]
 pub(super) fn publish() {
     if REJECTED.iter().any(|r| r.load(Ordering::Acquire) != 0) {
         fatal(FATAL_RECORD_REJECTED);

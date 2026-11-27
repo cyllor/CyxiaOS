@@ -656,6 +656,11 @@ pub(super) fn run(info: &BootInfo) -> ! {
     };
     let config = match startup_work(&mut budget, 1, media_staging::verify_scratch_config) {
         Ok(Ok(config)) => config,
+        // A valid catalog for a different policy can still be inspected by
+        // the read-only diagnostics. It cannot reach the SIM mount or EL0.
+        #[cfg(cyxia_startup_catalog)]
+        Ok(Err(_)) => resident::serve(info, None, budget.ledger),
+        #[cfg(not(cyxia_startup_catalog))]
         Ok(Err(_)) => resident::serve(info, Some(FENCED), budget.ledger),
         Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     };
@@ -688,13 +693,14 @@ pub(super) fn run(info: &BootInfo) -> ! {
         Ok(members) => members,
         Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     };
+    let other_protected_pool_bytes =
+        core::mem::size_of::<[super::Tables; ROLE_COUNT]>() + super::COPY + 1024 * 1024;
+    #[cfg(feature = "v020-production-diagnostic")]
+    let other_protected_pool_bytes = other_protected_pool_bytes + super::PLAN_POOL_BYTES;
     let manifest = NativeRoleManifest {
         online_mask: profile::ONLINE,
         members,
-        other_protected_pool_bytes: core::mem::size_of::<[super::Tables; ROLE_COUNT]>()
-            + super::COPY
-            + super::PLAN_POOL_BYTES
-            + 1024 * 1024,
+        other_protected_pool_bytes,
         other_control_ns_per_100ms: 10_000_000,
     };
     let manifest = match manifest.validated() {

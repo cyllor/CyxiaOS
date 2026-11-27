@@ -72,7 +72,7 @@ fn observe(kind: u64, sector: u64, latency_ns: u64) {
 }
 
 /// Worst completion latency in microseconds as `(read, write, flush)`.
-#[cfg(feature = "v020-production-media-staging")]
+#[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
 pub(crate) fn max_latency_us() -> (u64, u64, u64) {
     let us = |k: usize| MAX_LATENCY_NS[k].load(Ordering::Relaxed) / 1_000;
     (us(0), us(1), us(2))
@@ -80,7 +80,7 @@ pub(crate) fn max_latency_us() -> (u64, u64, u64) {
 
 /// Per kind `(read, write, flush)`: sector of the worst request and the number
 /// of completions at or above 50 ms.
-#[cfg(feature = "v020-production-media-staging")]
+#[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
 pub(crate) fn latency_detail() -> ([u64; 3], [u64; 3]) {
     let at = |a: &[AtomicU64; 3]| core::array::from_fn(|k| a[k].load(Ordering::Relaxed));
     (at(&MAX_LATENCY_SECTOR), at(&SLOW))
@@ -117,7 +117,7 @@ fn driver(sector: u64, kind: u64, phase: u64) -> impl FnOnce(DriverError) -> Sec
 /// First recorded scratch failure as `(driver code, sector, site)`; `None` if
 /// no request failed. Driver codes are `cyxia_driver_virtio::Error` order + 1
 /// (Address=1 .. Timeout=6, Device=7, Response=8, Exhausted=9).
-#[cfg(feature = "v020-production-media-staging")]
+#[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
 pub(crate) fn last_error() -> Option<(u64, u64, u64)> {
     let site = LAST_ERROR_SITE.load(Ordering::Relaxed);
     (site != 0).then(|| {

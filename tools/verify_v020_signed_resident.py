@@ -22,9 +22,9 @@ from v020_production_media import (
     BLOCK_BYTES, REDO_HEADER_BYTES, SECURITY_REDO, STAGING_UUID, verify_signed_disk,
 )
 from v020_production_modes import rows
-from v020_production_qemu import STAGING_RAM, create_scratch, sha
+from v020_production_qemu import create_scratch, sha
 from v020_snapshot_envelopes import DATA_START, crc32c_zeroed
-from verify_smp import require
+from verify_smp import boot_ram_mib, require
 
 
 ROLES = (6, 7, 2, 8, 9, 3, 10, 11)
@@ -100,8 +100,9 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
     data = bytearray()
     lines = []
     decoder = FrameDecoder()
+    ram = boot_ram_mib(elf.read_bytes())
     argv = [binary, "-machine", "virt-10.2,gic-version=2,secure=off,virtualization=off",
-            "-cpu", "cortex-a53", "-smp", "4", "-m", STAGING_RAM, "-accel", "tcg,thread=multi",
+            "-cpu", "cortex-a53", "-smp", "4", "-m", f"{ram}M", "-accel", "tcg,thread=multi",
             "-display", "none", "-monitor", "none", "-nic", "none", "-serial", "stdio",
             "-kernel", str(elf), "-no-reboot"]
     if disk is not None:

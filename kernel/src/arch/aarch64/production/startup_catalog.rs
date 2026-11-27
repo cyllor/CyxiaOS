@@ -3,7 +3,7 @@
 
 #[cfg(cyxia_startup_catalog)]
 use cyxia_kernel_core::security::offline_config_v1::MAX_SIGNED_BYTES;
-#[cfg(cyxia_signed_scratch_catalog)]
+#[cfg(cyxia_signed_resident)]
 use cyxia_kernel_core::security::offline_config_v1::{
     ConfigHeader, Principal, VerifiedOfflineConfig,
 };
@@ -50,7 +50,7 @@ pub(super) fn authenticate() -> Result<(), Error> {
 
 /// The signed scratch owner supplies the existing scratch buffer and checks
 /// its own accepted policy shape before the storage stage may start.
-#[cfg(cyxia_signed_scratch_catalog)]
+#[cfg(cyxia_signed_resident)]
 pub(super) fn verify_policy(
     scratch: &mut [u8],
     verify_payload: impl FnOnce(&ConfigHeader, &[Principal; 16], &[u8]) -> Result<(), Error>,

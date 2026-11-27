@@ -556,7 +556,10 @@ class NativeSecurityWiring(unittest.TestCase):
         # The default resident has no fixture dependencies. The explicit
         # diagnostic build retains the SvcV3Bridge exception-vector coverage.
         manifest = source(ROOT / "kernel/Cargo.toml")
-        self.assertIn('v020-production = ["smp-selftest"]', manifest)
+        startup_features = next(line for line in manifest.splitlines() if line.startswith("v020-production = "))
+        self.assertIn('"smp-selftest"', startup_features)
+        self.assertIn('"dep:sha2"', startup_features)
+        self.assertNotIn("diagnostic", startup_features)
         self.assertIn('v020-production-diagnostic = ["v020-production", "dep:sha2", "sec-n-native"]', manifest)
         boot = source(ROOT / "kernel/src/arch/aarch64/boot.rs")
         self.assertIn('feature = "v020-production"))]\n    smp::production::run(&info);', boot)
@@ -583,6 +586,9 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn('compile_error!("v020-production requires the plain smp-selftest profile");', smp)
         self.assertIn('#[cfg(feature = "v020-production-diagnostic")]\n#[path = "production.rs"]', smp)
         self.assertIn('#[path = "production/resident.rs"]', smp)
+        self.assertIn('#[cfg(cyxia_startup_catalog)]\n#[path = "production/authorized.rs"]', smp)
+        authorized = source(ROOT / "kernel/src/arch/aarch64/production/authorized.rs")
+        self.assertIn("signed_resident::run(info)", authorized)
         # The role catalog is built for the diagnostic feature.
         build = source(ROOT / "kernel/build/aarch64.rs")
         self.assertIn('env::var_os("CARGO_FEATURE_V020_PRODUCTION_DIAGNOSTIC").is_some()', build)

@@ -54,9 +54,13 @@ mod v0199_advice_e2e;
 #[cfg(feature = "v020-production-diagnostic")]
 #[path = "production.rs"]
 pub(crate) mod production;
+#[cfg(cyxia_startup_catalog)]
+#[path = "production/authorized.rs"]
+pub(crate) mod production;
 #[cfg(all(
     feature = "v020-production",
-    not(feature = "v020-production-diagnostic")
+    not(feature = "v020-production-diagnostic"),
+    not(cyxia_startup_catalog)
 ))]
 #[path = "production/resident.rs"]
 pub(crate) mod production;
@@ -140,7 +144,8 @@ mod v0199_format_fixture;
 // v020 opt-in media-staging lane (production/media_staging.rs).
 #[cfg(any(
     feature = "v0199-format-selftest",
-    feature = "v020-production-media-staging"
+    feature = "v020-production-media-staging",
+    cyxia_startup_catalog
 ))]
 #[path = "scratch_blk.rs"]
 mod scratch_blk;
@@ -353,7 +358,7 @@ unsafe extern "C" {
     #[cfg(feature = "v0199-advice-e2e-selftest")]
     static v0199_advice_user_end: u8;
 }
-#[cfg(not(feature = "v020-production-signed-resident"))]
+#[cfg(not(cyxia_signed_resident))]
 fn index(slot: usize, plane: Plane) -> usize {
     slot * 2 + usize::from(plane == Plane::Control)
 }
@@ -760,6 +765,7 @@ pub(super) unsafe fn gic_for_terminal_stop(slot: usize) -> Option<&'static Gic> 
     }
     unsafe { (&*core::ptr::addr_of!(GICS).cast::<Option<Gic>>().add(slot)).as_ref() }
 }
+#[cfg(not(cyxia_startup_catalog))]
 fn context(i: usize) -> user::Context {
     let mut ctx = user::Context::empty();
     ctx.pc = CODE;
@@ -812,6 +818,7 @@ fn builtin_capture_index(slot: usize) -> Option<usize> {
         usize::try_from(encoded).ok()
     }
 }
+#[cfg(not(cyxia_startup_catalog))]
 fn execute(ctx: &mut user::Context, i: usize) {
     let root = unsafe { core::ptr::addr_of!(ROOTS).cast::<Page>().add(i) as u64 };
     let quantum = (timer::frequency() / 1000).max(1);
@@ -891,12 +898,12 @@ fn fixture_context_valid(ctx: &user::Context, i: usize) -> bool {
 }
 #[cfg(all(
     not(feature = "unified-runtime"),
-    not(feature = "v020-production-signed-resident")
+    not(cyxia_signed_resident)
 ))]
 fn fixture_yielded(ctx: &user::Context) -> bool {
     ctx.kind == 9
 }
-#[cfg(not(feature = "v020-production-signed-resident"))]
+#[cfg(not(cyxia_signed_resident))]
 fn probes(slot: usize, i: usize) {
     // Probe an EL1-only address, an unmapped private address, code write, NX data,
     // and the user stack guard. A successful access/SVC is failure, not evidence.
