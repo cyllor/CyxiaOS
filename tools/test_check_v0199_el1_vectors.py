@@ -17,6 +17,7 @@ class VectorChecks(unittest.TestCase):
             "SMP_STACK_TOPS": 0x1D000,
             "EXCEPTION_ADMISSION_CLOSED": 0x44000,
             "exception_dispatch": 0x16000,
+            "exception_quiescent_stop": 0x16100,
             "high_entry": 0x17000,
             "secondary_high": 0x17100,
             "secondary_high_halt": 0x17150,
@@ -28,7 +29,7 @@ class VectorChecks(unittest.TestCase):
             symbols[name] = start
             start += 4 * len(ops)
 
-        instructions = {symbols["exception_dispatch"]: "ret"}
+        instructions = {symbols["exception_dispatch"]: "ret", symbols["exception_quiescent_stop"]: "wfe"}
         literals = {}
 
         def write(pc, ops):

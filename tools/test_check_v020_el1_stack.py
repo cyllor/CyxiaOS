@@ -23,10 +23,10 @@ class LinkedEl1Stacks(unittest.TestCase):
 
     def test_frame_depth_includes_machine_builtin_without_note(self):
         roots, count, no_notes = self.measure([
-            "sub sp,sp,#0x1,lsl #12", "bl 0x4000", "add sp,sp,#0x1,lsl #12", "ret",
+            "sub sp,sp,#0x1,lsl #12", "bl 0x5000", "add sp,sp,#0x1,lsl #12", "ret",
         ])
         self.assertEqual(roots["boot_entry"], {"path": ["boot_entry", "builtin"], "bytes": 4112})
-        self.assertEqual(count, 4)
+        self.assertEqual(count, 5)
         self.assertEqual(no_notes, ["builtin"])
 
     def test_growing_back_edge_and_unclassified_indirect_call_fail(self):
@@ -34,6 +34,12 @@ class LinkedEl1Stacks(unittest.TestCase):
             self.measure(["sub sp,sp,#0x10", "b 0x1000"])
         with self.assertRaisesRegex(ValueError, "unmeasured control transfer"):
             self.measure(["blr x0", "ret"])
+
+    def test_unreachable_noreturn_trap_and_live_trap_are_distinguished(self):
+        roots, _, _ = self.measure(["b 0x1000", "brk #0x1"])
+        self.assertEqual(roots["boot_entry"]["bytes"], 0)
+        with self.assertRaisesRegex(ValueError, "reachable compiler trap"):
+            self.measure(["brk #0x1"])
 
     def test_stack_writeback_and_unmeasured_register_update(self):
         self.assertEqual(stack_change("str x0,[sp],#-0x10", "f"), 16)

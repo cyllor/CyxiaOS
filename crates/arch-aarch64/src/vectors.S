@@ -105,7 +105,7 @@ exception_entry:
 
  ldr x2, =EXCEPTION_ADMISSION_CLOSED
  ldar x2, [x2]
- cbnz x2, exception_emergency
+ cbnz x2, exception_stop_observed
  // Only current-EL SP_EL1 and lower AArch64 sync/IRQ may dispatch.
  cmp x1, #4
  b.lo exception_emergency
@@ -206,7 +206,7 @@ exception_use_stack:
  ldr x2, =EXCEPTION_ADMISSION_CLOSED
  ldar x2, [x2]
  ldr x1, [x30, #FRAME_KIND]
- cbnz x2, exception_emergency
+ cbnz x2, exception_stop_observed
  ldp x2, x3, [x30, #248]
  and x4, x3, #0x1f
  cbz x4, exception_restore_user
@@ -247,6 +247,11 @@ exception_restore_status:
  ldr x30, [x30, #240]
  eret
 
+exception_stop_observed:
+ // This CPU observed someone else's closure. It cannot elect itself in
+ // place of the initiating fault even if it reaches the coordinator first.
+ orr x1, x1, #0x80
+ b exception_emergency
 exception_busy:
  // A fault during scratch transfer is terminal. A second exception on
  // the emergency path only marks the incomplete record and stops.
@@ -283,7 +288,10 @@ exception_emergency:
  add x2, x0, #SCRATCH_FATAL_STATE
  mov x3, #2
  stlr x3, [x2]
- b exception_stop
+ // The normal stack is untouched and the minimal fault record is sealed.
+ // The terminal coordinator cannot return or start ordinary work.
+ mov x0, x1
+ b exception_quiescent_stop
 exception_unregistered:
  // No trusted scratch address for this CPU. Publish closure only.
 exception_close_admission:
@@ -308,6 +316,25 @@ exception_register_stack:
  add x3, x3, x0, lsl #12
  stp x1, x2, [x3, #SCRATCH_EXEC_BASE]
  ret
+
+.if {stop_selftest}
+.global cyxia_request_quiescent_stop
+cyxia_request_quiescent_stop:
+ // The explicit healthy boot fixture takes the same controlled terminal
+ // path on a registered CPU, with no deliberately corrupted state.
+ msr daifset, #15
+ mrs x2, contextidr_el1
+ cmp x2, #4
+ b.hs exception_unregistered
+ ldr x0, =__exception_scratch
+ add x0, x0, x2, lsl #12
+ ldr x1, [x0, #SCRATCH_BUSY]
+ cbnz x1, exception_close_admission
+ mov x1, #1
+ str x1, [x0, #SCRATCH_BUSY]
+ mov x1, #16
+ b exception_emergency
+.endif
 .ltorg
 
 .global probe_read

@@ -99,6 +99,7 @@ def stack_gate_sequences(symbols):
     gate = symbols["EXCEPTION_ADMISSION_CLOSED"]
     stacks = symbols["__exception_stacks"]
     emergency = symbols["exception_emergency"]
+    observed = symbols["exception_stop_observed"]
     select = symbols["exception_select_stack"]
     copies = [
         instruction for offset in range(0, 320, 16)
@@ -112,7 +113,7 @@ def stack_gate_sequences(symbols):
             "mrs x2,esr_el1", "mrs x3,far_el1", "stp x2,x3,[x0,#0x108]",
             "str xzr,[x0,#0x118]", "mrs x2,sp_el0", "mov x3,sp", "stp x2,x3,[x0,#0x120]",
             "mrs x2,tpidr_el0", "stp x2,x1,[x0,#0x130]", ("x2", gate), "ldar x2,[x2]",
-            f"cbnz x2,{emergency:#x}", "cmp x1,#0x4", f"b.lo {emergency:#x}",
+            f"cbnz x2,{observed:#x}", "cmp x1,#0x4", f"b.lo {emergency:#x}",
             "cmp x1,#0xa", f"b.hs {emergency:#x}", "cmp x1,#0x6", f"b.eq {emergency:#x}",
             "cmp x1,#0x7", f"b.eq {emergency:#x}", "ldr x2,[x0,#0x168]",
             f"cbz x2,{symbols['exception_outer']:#x}",
@@ -142,7 +143,7 @@ def stack_gate_sequences(symbols):
             "str x2,[x0,#0x168]", "stp x4,x6,[x0,#0x180]", "mov sp,x6",
             "str xzr,[x0,#0x160]", "mov x0,sp", f"bl {symbols['exception_dispatch']:#x}",
             "mov x30,sp", "ldr x0,[x30,#0x140]", "mov x2,#0x1", "str x2,[x0,#0x160]",
-            ("x2", gate), "ldar x2,[x2]", "ldr x1,[x30,#0x138]", f"cbnz x2,{emergency:#x}",
+            ("x2", gate), "ldar x2,[x2]", "ldr x1,[x30,#0x138]", f"cbnz x2,{observed:#x}",
             "ldp x2,x3,[x30,#0xf8]", "and x4,x3,#0x1f", f"cbz x4,{symbols['exception_restore_user']:#x}",
             "cmp x4,#0x5", f"b.ne {emergency:#x}", f"b {symbols['exception_restore_status']:#x}",
         ],
@@ -154,6 +155,7 @@ def stack_gate_sequences(symbols):
             "str x2,[x0,#0x168]", "mov sp,x3", *register_pairs("ldp", "x30"),
             "str xzr,[x0,#0x160]", "ldp x0,x1,[x30]", "ldr x30,[x30,#0xf0]", "eret",
         ],
+        "exception_stop_observed": ["orr x1,x1,#0x80", f"b {emergency:#x}"],
         "exception_busy": [
             "ldr x2,[x0,#0x190]", f"cbz x2,{emergency:#x}", "mov x2,#0x3", "str x2,[x0,#0x190]",
             f"b {symbols['exception_unregistered']:#x}",
@@ -165,7 +167,7 @@ def stack_gate_sequences(symbols):
             ("x5", gate), "mov x4,#0x1", "stlr x4,[x5]", "str x1,[x0,#0x198]", "str x3,[x0,#0x1a0]",
             "mrs x2,elr_el1", "mrs x3,esr_el1", "stp x2,x3,[x0,#0x1a8]", "mrs x2,far_el1",
             "str x2,[x0,#0x1b8]", "add x2,x0,#0x190", "mov x3,#0x2", "stlr x3,[x2]",
-            f"b {symbols['exception_stop']:#x}",
+            "mov x0,x1", f"b {symbols['exception_quiescent_stop']:#x}",
         ],
         "exception_unregistered": [("x0", gate), "mov x1,#0x1", "stlr x1,[x0]"],
         "exception_stop": [
@@ -182,7 +184,7 @@ def stack_gate_sequences(symbols):
 STACK_GATE_LABELS = (
     "exception_entry", "exception_outer", "exception_check_sp", "exception_select_stack",
     "exception_irq_stack", "exception_use_stack", "exception_restore_user", "exception_restore_status",
-    "exception_busy", "exception_emergency", "exception_unregistered", "exception_stop",
+    "exception_stop_observed", "exception_busy", "exception_emergency", "exception_unregistered", "exception_stop",
     "exception_register_stack",
 )
 
@@ -190,6 +192,8 @@ STACK_GATE_LABELS = (
 def check_stack_gate(instructions, symbols, read_literal):
     elf64.require(instructions.get(symbols["exception_dispatch"]) is not None,
                   "dispatcher is not executable code")
+    elf64.require(instructions.get(symbols["exception_quiescent_stop"]) is not None,
+                  "terminal stop coordinator is not executable code")
     next_entry = symbols["exception_entry"]
     for name, expected in stack_gate_sequences(symbols).items():
         elf64.require(symbols[name] == next_entry, f"unexpected instructions before {name}")
@@ -247,7 +251,7 @@ def inspect(raw, disassembly):
 
     table = address("exception_vectors")
     symbols = {name: address(name) for name in (*STACK_GATE_LABELS, *WRITER_OFFSETS,
-               "exception_dispatch", "__exception_scratch", "__exception_stacks",
+               "exception_dispatch", "exception_quiescent_stop", "__exception_scratch", "__exception_stacks",
                "__stack_base", "__stack_top", "SMP_STACK_TOPS", "secondary_high_halt",
                "EXCEPTION_ADMISSION_CLOSED")}
     for base, size in (("__exception_scratch", 4 * PAGE), ("__exception_stacks", 4 * STACK_BANK_BYTES)):

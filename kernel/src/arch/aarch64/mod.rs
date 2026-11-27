@@ -20,6 +20,7 @@ use cyxia_contracts::*;
 mod boot;
 mod console;
 mod exceptions;
+pub(crate) mod panic_stop;
 #[cfg(any(
     feature = "v020-production-signed-resident",
     all(
@@ -41,6 +42,7 @@ pub(crate) const HIGH: u64 = cyxia_platform_virt::HIGH_BASE;
 const BOUNDED_DEFAULT_STACKS: bool = cfg!(all(
     feature = "v020-production",
     not(feature = "v020-production-diagnostic"),
+    not(feature = "v020-panic-stop-selftest"),
     not(cyxia_startup_catalog),
     not(debug_assertions),
 ));
@@ -82,6 +84,7 @@ core::arch::global_asm!(
         feature = "legacy-desktop",
         not(feature = "smp-selftest")
     )) as u8,
+    stop_selftest = const cfg!(feature = "v020-panic-stop-selftest") as u8,
 );
 unsafe extern "C" {
     #[cfg(not(feature = "smp-selftest"))]

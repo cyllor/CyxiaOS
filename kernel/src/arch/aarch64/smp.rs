@@ -702,6 +702,7 @@ fn bring_up_production(info: &BootInfo) {
     for (slot, affinity) in AFFINITIES.iter().enumerate().take(topo.count) {
         affinity.store(topo.affinity[slot], Ordering::Release);
     }
+    crate::machine::panic_stop::register_cpu(gic(), 0);
     BOOT_READY.store(true, Ordering::Release);
     unsafe {
         core::arch::asm!("dsb sy", options(nostack));
@@ -722,7 +723,20 @@ fn bring_up_production(info: &BootInfo) {
     }
     let online = (1 << REQUIRED) - 1;
     wait(|| ONLINE.load(Ordering::Acquire) == online);
+    crate::machine::panic_stop::publish_ready(online);
     report("SMP_BOOT_OK", topo.count as u64, online, 0);
+    #[cfg(feature = "v020-panic-stop-selftest")]
+    crate::machine::panic_stop::exercise();
+}
+
+// SAFETY: called only after the stop coordinator acquires its registered
+// four-CPU ready state. Each CPU published its own GIC interface before that.
+#[cfg(feature = "v020-production")]
+pub(super) unsafe fn gic_for_terminal_stop(slot: usize) -> Option<&'static Gic> {
+    if slot >= REQUIRED {
+        return None;
+    }
+    unsafe { (&*core::ptr::addr_of!(GICS).cast::<Option<Gic>>().add(slot)).as_ref() }
 }
 fn context(i: usize) -> user::Context {
     let mut ctx = user::Context::empty();
@@ -918,6 +932,8 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
             .cast::<Option<Gic>>()
             .add(slot) = Some(controller);
     }
+    #[cfg(feature = "v020-production")]
+    crate::machine::panic_stop::register_cpu(gic(), slot);
     #[cfg(feature = "unified-runtime")]
     {
         crate::domain_platform::register_ipi_cpu(gic(), slot).expect("IPI CPU registration");
@@ -931,6 +947,8 @@ extern "C" fn secondary_entry(slot: usize) -> ! {
     #[cfg(feature = "unified-runtime")]
     crate::boot_recovery::formal::el1();
     ONLINE.fetch_or(1 << slot, Ordering::Release);
+    #[cfg(feature = "v020-panic-stop-late-selftest")]
+    crate::machine::panic_stop::hold_healthy_peer_until_result(slot);
     #[cfg(feature = "register-v15-selftest")]
     register_evidence::worker(slot);
     #[cfg(any(

@@ -20,8 +20,9 @@ else:
     from check_v0199_el1_vectors import FRAME_BYTES, inspect as inspect_vectors
     from doctor import llvm_dir
 
-ROOTS = ("boot_entry", "secondary_entry", "exception_dispatch")
+ROOTS = ("boot_entry", "secondary_entry", "exception_dispatch", "exception_quiescent_stop")
 LIMIT = 16 * 1024
+EMERGENCY_LIMIT = 8 * 1024
 SP_ARITHMETIC = re.compile(r"(add|sub) sp,sp,#(0x[0-9a-f]+|\d+)(?:,lsl #12)?")
 SP_PRE = re.compile(r"\[sp,#(-?(?:0x[0-9a-f]+|\d+))\]!")
 SP_POST = re.compile(r"\[sp\],#(-?(?:0x[0-9a-f]+|\d+))$")
@@ -90,7 +91,8 @@ def linked_frames(metadata, instructions, require_stack_notes=False):
             change = stack_change(op, name)
             elf64.require(abs(change) % 16 == 0, f"unaligned stack operation in {name}")
             mnemonic = op.split()[0]
-            elf64.require(not (mnemonic != "ret" and mnemonic.startswith(("br", "blr", "eret", "ret")))
+            elf64.require(not (mnemonic not in ("ret", "brk")
+                               and mnemonic.startswith(("br", "blr", "eret", "ret")))
                           and not op.startswith(("ret ", "msr spsel,", "msr sp_el0,")),
                           f"unmeasured control transfer in {name} at {pc:#x}: {op}")
             branch = DIRECT_BRANCH.fullmatch(op)
@@ -111,6 +113,7 @@ def linked_frames(metadata, instructions, require_stack_notes=False):
                 continue
             seen[pc] = height
             mnemonic, change, target = operations[pc]
+            elf64.require(mnemonic != "brk", f"reachable compiler trap in {name} at {pc:#x}")
             height += change
             elf64.require(height >= 0, f"stack restored above its entry SP in {name}")
             frame = max(frame, height)
@@ -152,13 +155,15 @@ def inspect(raw, metadata, disassembly, require_stack_notes=False):
     dispatch = roots["exception_dispatch"]["bytes"]
     trap_reserve = 2 * (FRAME_BYTES + dispatch)
     execution = max(roots[entry]["bytes"] for entry in ROOTS[:2]) + trap_reserve
+    emergency = roots["exception_quiescent_stop"]["bytes"]
     return {
-        "status": "PASS" if max(execution, trap_reserve) <= LIMIT else "FAIL",
+        "status": "PASS" if max(execution, trap_reserve) <= LIMIT and emergency <= EMERGENCY_LIMIT else "FAIL",
         "scope": "linked-default-aarch64-el1-direct-call-stack-subcheck",
         "formal_verdict": False,
         "frozen_limit_bytes": LIMIT,
         "execution_bound_bytes": execution,
         "irq_bound_bytes": trap_reserve,
+        "emergency_bound_bytes": emergency,
         "primary_execution_stack_bytes": vectors["primary_exec_stack_bytes"],
         "secondary_execution_stack_bytes": (LIMIT if vectors["primary_exec_stack_bytes"] == LIMIT
                                             else 64 * 1024),

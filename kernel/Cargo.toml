@@ -70,6 +70,8 @@ v0199-cpu0-svc-selftest = ["v0199-advice-e2e-selftest"]
 # The production entry shares fixed SMP bring-up. Native diagnostic builds
 # opt in to bounded ABI3/trap, network and scratch-media evidence.
 v020-production = ["smp-selftest"]
+v020-panic-stop-selftest = ["v020-production"]
+v020-panic-stop-late-selftest = ["v020-panic-stop-selftest"]
 v020-production-diagnostic = ["v020-production", "dep:sha2", "sec-n-native"]
 v020-production-media-staging = ["v020-production-diagnostic", "prototype-memory"]
 v020-production-authenticated-net = ["v020-production-diagnostic", "dep:zeroize"]
