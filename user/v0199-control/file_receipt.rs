@@ -9,10 +9,6 @@ pub(super) const ID: u64 = 0x0100_0000_0000_0001;
 pub(super) const EAGAIN: i64 = -13;
 #[cfg(file_receipt_query_probe)]
 const ESTALE: i64 = -4;
-const FSYNC_RESULT_DIGEST: [u8; 32] = [
-    0x5d, 0xc3, 0x8e, 0xe0, 0xd6, 0xb0, 0x13, 0xc1, 0xda, 0xcf, 0x94, 0xfe, 0x88, 0x5b, 0xde, 0x18,
-    0x6a, 0xdd, 0xfd, 0x5b, 0x96, 0xde, 0x59, 0xe7, 0xaa, 0x5d, 0x59, 0x83, 0xee, 0xe9, 0x5f, 0x9c,
-];
 
 pub(super) fn receipt_key() -> [u8; 56] {
     let mut key = [0; 56];
@@ -52,7 +48,7 @@ fn query(request: &[u8; 88], reply: &mut [u8; 128]) -> i64 {
     )
 }
 
-pub(super) fn receipt_is_expected(reply: &[u8; 128]) -> bool {
+pub(super) fn receipt_is_committed(reply: &[u8; 128]) -> bool {
     let field = |at| u64::from_le_bytes(reply[at..at + 8].try_into().unwrap());
     reply[..8] == [0x52, 0x46, 0x59, 0x43, 3, 0, 128, 0]
         && field(8) == ID
@@ -64,7 +60,7 @@ pub(super) fn receipt_is_expected(reply: &[u8; 128]) -> bool {
         && field(56) == 4
         && field(64) == 0
         && field(72) == 0
-        && reply[80..112] == FSYNC_RESULT_DIGEST
+        && reply[80..112] != [0; 32]
         && field(112) == ID
         && field(120) == 7
 }
@@ -78,7 +74,7 @@ pub(super) fn run() -> ! {
     let mut reply = [0xa5; 128];
     loop {
         match query(&wire, &mut reply) {
-            0 if receipt_is_expected(&reply) => break,
+            0 if receipt_is_committed(&reply) => break,
             EAGAIN if reply == [0xa5; 128] => yield_now(),
             _ => reject_startup(),
         }

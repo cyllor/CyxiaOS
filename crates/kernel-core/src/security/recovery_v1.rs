@@ -552,12 +552,36 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
 
     /// Consult the verified overlay before the older checkpoint homes.
     pub fn read_committed(&mut self, home: u32, out: &mut [u8; BLOCK]) -> Result<(), Error> {
+        self.read_view(home, None, out)
+    }
+
+    /// Read the latest after-image only if it belongs to the required
+    /// commit. A checkpoint home carrying identical bytes is insufficient.
+    pub fn read_committed_at(
+        &mut self,
+        home: u32,
+        commit_lsn: u64,
+        out: &mut [u8; BLOCK],
+    ) -> Result<(), Error> {
+        self.read_view(home, Some(commit_lsn), out)
+    }
+
+    fn read_view(
+        &mut self,
+        home: u32,
+        required_commit: Option<u64>,
+        out: &mut [u8; BLOCK],
+    ) -> Result<(), Error> {
         let w = &mut self.workspace;
         let e = w.evidence.ok_or(Error::Unknown)?;
         if !(BITMAP_START..BLOCK_COUNT).contains(&home) {
             return Err(Error::Invalid);
         }
-        let result = if let Some(&row) = w.rows[..w.count].iter().find(|row| row.home == home) {
+        let row = w.rows[..w.count].iter().find(|row| row.home == home);
+        if required_commit.is_some_and(|lsn| row.is_none_or(|row| row.commit_lsn != lsn)) {
+            return Err(Error::Stale);
+        }
+        let result = if let Some(&row) = row {
             read_exact_image(self.io, row, e.superblock.log_epoch, &mut w.raw)
                 .map(|()| &w.raw[64..64 + BLOCK])
         } else {
@@ -577,6 +601,16 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
                 Err(Error::Unknown)
             }
         }
+    }
+
+    /// Replay the same verified view the owner inspected through this
+    /// exclusive session. Every retained image is checked again against
+    /// that scan before replay makes the first write.
+    pub fn checkpoint_verified(
+        self,
+        verify_post_replay: impl FnOnce(&mut I, SuperblockV1) -> Result<(), Error>,
+    ) -> Result<(RecoveryEvidence, SuperblockV1), Error> {
+        checkpoint_scanned(self.io, self.workspace, verify_post_replay)
     }
 }
 
@@ -637,7 +671,16 @@ pub fn recover_checkpoint_with_evidence<I: EpochBlockIo>(
     w: &mut RecoveryWorkspace,
     verify_post_replay: impl FnOnce(&mut I, SuperblockV1) -> Result<(), Error>,
 ) -> Result<(RecoveryEvidence, SuperblockV1), Error> {
-    let e = scan(io, w)?;
+    scan(io, w)?;
+    checkpoint_scanned(io, w, verify_post_replay)
+}
+
+fn checkpoint_scanned<I: EpochBlockIo>(
+    io: &mut I,
+    w: &mut RecoveryWorkspace,
+    verify_post_replay: impl FnOnce(&mut I, SuperblockV1) -> Result<(), Error>,
+) -> Result<(RecoveryEvidence, SuperblockV1), Error> {
+    let e = w.evidence.ok_or(Error::Unknown)?;
     let next = SuperblockV1 {
         fs_uuid: e.superblock.fs_uuid,
         generation: e
@@ -987,7 +1030,18 @@ mod tests {
                 .unwrap();
             assert_eq!(committed.transaction(), plan);
             let mut read = [0; BLOCK];
-            writer.read_committed(DATA_HOME, &mut read).unwrap();
+            assert_eq!(
+                writer.read_committed_at(INDEX_HOME + 1, plan.commit_lsn, &mut read),
+                Err(Error::Stale)
+            );
+            assert_eq!(
+                writer.read_committed_at(DATA_HOME, plan.commit_lsn - 1, &mut read),
+                Err(Error::Stale)
+            );
+            assert!(read == [0; BLOCK]);
+            writer
+                .read_committed_at(DATA_HOME, plan.commit_lsn, &mut read)
+                .unwrap();
             assert!(read == data);
             writer.read_committed(INDEX_HOME, &mut read).unwrap();
             assert!(read == index_image);
@@ -1002,8 +1056,9 @@ mod tests {
             ..Disk::default()
         };
         let mut independent = RecoveryWorkspace::new();
-        let (replayed, next) =
-            recover_checkpoint_with_evidence(&mut reopened, &mut independent, |io, _| {
+        let writer = RedoWriter::open(&mut reopened, &mut independent, sb).unwrap();
+        let (replayed, next) = writer
+            .checkpoint_verified(|io, _| {
                 let mut block = [0; BLOCK];
                 io.read(DATA_HOME, &mut block)?;
                 assert_eq!(hash(&block), receipt.output_digest);

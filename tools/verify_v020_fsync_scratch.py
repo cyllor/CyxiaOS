@@ -82,14 +82,14 @@ def inode_page(done):
     return inode(2, 1, 128, ROOT, 1) + bytes(file) + inode() * 14
 
 
-def operation_digest():
+def operation_digest(contents=FINAL):
     request = struct.pack('<IHHHHIQQQ', 0x43594651, 4, 32, 5, 0, 8, REQUEST_ID, 0, 7)
-    proposal = struct.pack('<6Q', 1, 1, 1 << 13, 1, 1, 1) + sha256(FINAL).digest()
+    proposal = struct.pack('<6Q', 1, 1, 1 << 13, 1, 1, 1) + sha256(contents).digest()
     return sha256(b"CYX/FILE-ADMIT/v3" + struct.pack('<QQ', 1, 1)
                   + sha256(request).digest() + proposal).digest()
 
 
-def receipts(status, final_lsn):
+def receipts(status, final_lsn, contents=FINAL):
     store = bytearray(6 * BLOCK)
     if status == 0:
         return bytes(store)
@@ -99,9 +99,9 @@ def receipts(status, final_lsn):
     put(raw, 0, 'IHH16sQII7Q', 0x43595243, 4, 192, FSYNC_UUID, 1, 0, 1, 0, 1, 1, *binding)
     put(raw, 96, 'HH i I', status, 0, 0, 29 if status == 3 else 0)
     if status >= 2:
-        raw[108:140] = operation_digest()
+        raw[108:140] = operation_digest(contents)
     if status == 3:
-        raw[140:172] = sha256(FINAL).digest()
+        raw[140:172] = sha256(contents).digest()
     put(raw, 172, 'QQ', REQUEST_ID, 1)
     put(raw, 188, 'I', crc(raw))
     store[RECEIPT_AT:RECEIPT_AT + len(raw)] = raw
@@ -131,20 +131,20 @@ def boot_tx(epoch, begin_lsn):
     return tx(epoch, epoch, begin_lsn, [(SECURITY, security_home(epoch)), (BOOT, boot_home(epoch))])
 
 
-def receipt_blocks(status, final_lsn):
-    store = receipts(status, final_lsn)
+def receipt_blocks(status, final_lsn, contents):
+    store = receipts(status, final_lsn, contents)
     return [(RECEIPT, store[:BLOCK]), (RECEIPT + 1, store[BLOCK:2 * BLOCK])]
 
 
-def boot_one_log(final_lsn=FINAL_LSN):
+def boot_one_log(final_lsn=FINAL_LSN, contents=FINAL):
     legacy = final_lsn == LEGACY_FINAL_LSN
     index = [(INDEX, index_page(True))]
     segment_index = [] if legacy else index
     return b''.join((
         boot_tx(1, 1),
-        tx(2, 1, 5, receipt_blocks(1, final_lsn) + index),
-        tx(3, 1, 10, receipt_blocks(2, final_lsn) + segment_index),
-        tx(4, 1, 14 if legacy else 15, [(DATA, FINAL)] + receipt_blocks(3, final_lsn)
+        tx(2, 1, 5, receipt_blocks(1, final_lsn, contents) + index),
+        tx(3, 1, 10, receipt_blocks(2, final_lsn, contents) + segment_index),
+        tx(4, 1, 14 if legacy else 15, [(DATA, contents)] + receipt_blocks(3, final_lsn, contents)
            + segment_index + [(INODE, inode_page(True))]),
     ))
 
@@ -156,9 +156,11 @@ def read(disk, block, size=BLOCK):
     return raw
 
 
-def verify_disk(path, reopened, final_lsn=FINAL_LSN):
+def verify_disk(path, reopened, final_lsn=FINAL_LSN, *, contents=FINAL):
     require(final_lsn in (FINAL_LSN, LEGACY_FINAL_LSN), "unrecognized FSYNC redo closure")
-    expected = boot_tx(2, final_lsn + 1) if reopened else boot_one_log(final_lsn)
+    require(len(contents) == BLOCK and not any(contents[29:]),
+            "expected caller content must be a padded 29-byte file")
+    expected = boot_tx(2, final_lsn + 1) if reopened else boot_one_log(final_lsn, contents)
     done = reopened
     with path.open("rb") as disk:
         require(read(disk, 0) == checkpoint(1, 0)
@@ -171,9 +173,9 @@ def verify_disk(path, reopened, final_lsn=FINAL_LSN):
                 and read(disk, SECURITY) == security_home(int(done)),
                 "FSYNC BootEpoch or signed policy homes differ")
         require(read(disk, INODE) == inode_page(done)
-                and read(disk, DATA) == (FINAL if done else INITIAL),
+                and read(disk, DATA) == (contents if done else INITIAL),
                 "FSYNC inode write sequence or visible data differs")
-        require(read(disk, RECEIPT, 6 * BLOCK) == receipts(3 if done else 0, final_lsn)
+        require(read(disk, RECEIPT, 6 * BLOCK) == receipts(3 if done else 0, final_lsn, contents)
                 and read(disk, INDEX) == index_page(done),
                 "FSYNC receipt or stream index homes differ")
         acl = read(disk, ACL)[64:128]

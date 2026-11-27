@@ -1,13 +1,15 @@
 //! Ordinary native client of the signed scratch file.
 use super::{
     call, clock,
-    file_receipt::{EAGAIN, ENDPOINT, ID, receipt_is_expected, receipt_key},
+    file_receipt::{EAGAIN, ENDPOINT, ID, receipt_is_committed, receipt_key},
     put16, put32, put64, reject_startup, yield_now,
 };
 
 const ROOT: u64 = 0x4649_4c45_0000_0001;
 const FILE: &[u8; 10] = b"readme.txt";
-const CONTENTS: &[u8; 29] = b"CyxiaOS V0.20 durable fsync!\n";
+const CONTENTS: &[u8; 29] = include_bytes!(concat!(env!("OUT_DIR"), "/fsync-client-content.bin"));
+const RESULT_DIGEST: &[u8; 32] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fsync-client-digest.bin"));
 const REPLY_MAGIC: [u8; 8] = [0x52, 0x46, 0x59, 0x43, 3, 0, 128, 0];
 
 fn header<const BYTES: usize>(op: u16, id: u64) -> [u8; BYTES] {
@@ -98,7 +100,8 @@ pub(super) fn run() {
     let mut fsync = header::<40>(5, field(&allocated, 8));
     put64(&mut fsync, 32, write_seq);
     let reply = service::<128>(&fsync, handle);
-    if !receipt_is_expected(&reply)
+    if !receipt_is_committed(&reply)
+        || reply[80..112] != *RESULT_DIGEST
         || field(&reply, 40) != 21
         || service::<128>(&fsync, handle) != reply
     {

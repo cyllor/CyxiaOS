@@ -16,7 +16,8 @@ use cyxia_kernel_core::security::{
     file_auth_context_v1::{AdmissionLedgerV1, AuthContextIssuerV1, AuthorityFacts},
     file_auth_v3::{AdmitRequestV3, FILE_SERVICE_ROLE, TerminalState, Verdict},
     file_format_v1::{
-        SCRATCH_FILE_BLOCK, SCRATCH_FILE_FSYNC_RIGHTS, SCRATCH_FILE_GENERATION, SCRATCH_FILE_INODE,
+        SCRATCH_FILE_BLOCK, SCRATCH_FILE_DATA, SCRATCH_FILE_FSYNC_RIGHTS, SCRATCH_FILE_GENERATION,
+        SCRATCH_FILE_INODE,
     },
     file_fsync_v1::{FsyncJob, FsyncProgress, FsyncWorkspace, commit_segment},
     file_index_v0199::{BLOCK_BYTES as BLOCK, FileStreamIndexV4, SecurityStateStoreV2},
@@ -33,14 +34,11 @@ use cyxia_kernel_core::security::{
     file_service_v4::{REPLY_HEADER, REQUEST_HEADER, REQUEST_MAGIC, REQUEST_VERSION, Request},
     file_structure_v1::{INODE_BYTES, Inode},
     offline_config_v1::VerifiedOfflineConfig,
-    recovery_v1::{
-        RedoImage, RedoTransaction, RedoWriter, recover_checkpoint_with_evidence,
-        retire_checkpointed_log,
-    },
+    recovery_v1::{RedoImage, RedoTransaction, RedoWriter, retire_checkpointed_log},
 };
 use sha2::{Digest, Sha256};
 
-const FILE_BYTES: &[u8; 29] = b"CyxiaOS V0.20 durable fsync!\n";
+const FILE_LEN: usize = SCRATCH_FILE_DATA.len();
 const WRITE_SEQ: u64 = 7;
 const TEST_CAP: u64 = 1;
 const SLOT: usize = 21;
@@ -50,6 +48,8 @@ const BIND_START: u32 = 16;
 const FINAL_START: u32 = 24;
 const LOG_END: u32 = 36;
 const LEGACY_LOG_END: u32 = 32;
+const BOOT_COMMIT_LSN: u64 = 4;
+const ISSUE_COMMIT_LSN: u64 = 9;
 pub(super) const FINAL_LSN: u64 = 21;
 pub(super) const LEGACY_FINAL_LSN: u64 = 19;
 const KEY: ReceiptKey = ReceiptKey {
@@ -76,12 +76,6 @@ fn request_header(raw: &mut [u8], op: u16, id: u64) {
     raw[8..10].copy_from_slice(&op.to_le_bytes());
     raw[12..16].copy_from_slice(&length.to_le_bytes());
     raw[16..24].copy_from_slice(&id.to_le_bytes());
-}
-
-fn frozen_file() -> [u8; BLOCK] {
-    let mut bytes = [0; BLOCK];
-    bytes[..FILE_BYTES.len()].copy_from_slice(FILE_BYTES);
-    bytes
 }
 
 fn fsync_frame() -> [u8; REQUEST_HEADER + 8] {
@@ -216,7 +210,7 @@ fn issue(
                 contents: &index,
             },
         ],
-        |p| reserve(p, ISSUE_START, 8, 2, 9),
+        |p| reserve(p, ISSUE_START, 8, 2, ISSUE_COMMIT_LSN),
     )?;
     Ok(())
 }
@@ -278,11 +272,6 @@ pub(super) fn execute(
     let request = client.request(FSYNC);
     let mut data = [0; BLOCK];
     client.freeze(request, WRITE_SEQ, &mut data)?;
-    if data != frozen_file() {
-        // This scratch profile has one pinned data image and readback
-        // specification. An unrelated write version cannot reach redo.
-        return Err(Error::Unauthorized);
-    }
     let mut issuer = AuthContextIssuerV1::new(1)?;
     let mut flow = freeze(&mut issuer, request.bytes(), request.selector, &data)?;
     let mut ledger = AdmissionLedgerV1::new(1)?;
@@ -326,7 +315,7 @@ pub(super) fn execute(
         return Err(Error::Conflict);
     };
     if receipt.status != 3
-        || receipt.completed_prefix as usize != FILE_BYTES.len()
+        || receipt.completed_prefix as usize != FILE_LEN
         || receipt.commit_lsn != FINAL_LSN
         || !matches!(commit_segment(&mut writer, &job, work, |_| Err(Error::Conflict))?,
                      FsyncProgress::AlreadyDone(same) if same == receipt)
@@ -367,6 +356,9 @@ pub(super) fn execute(
 }
 
 fn final_receipt(data: &[u8; BLOCK], commit_lsn: u64) -> Result<FileReceiptV4, Error> {
+    if data[FILE_LEN..].iter().any(|&byte| byte != 0) {
+        return Err(Error::Conflict);
+    }
     let frame = fsync_frame();
     let frozen = freeze(&mut AuthContextIssuerV1::new(1)?, &frame, TEST_CAP, data)?;
     Ok(FileReceiptV4 {
@@ -375,7 +367,7 @@ fn final_receipt(data: &[u8; BLOCK], commit_lsn: u64) -> Result<FileReceiptV4, E
         commit_lsn,
         write_seq: WRITE_SEQ,
         status: 3,
-        completed_prefix: FILE_BYTES.len() as u32,
+        completed_prefix: FILE_LEN as u32,
         operation_digest: frozen.request().operation_digest,
         output_digest: Sha256::digest(data).into(),
         ..issued_receipt()
@@ -385,10 +377,11 @@ fn final_receipt(data: &[u8; BLOCK], commit_lsn: u64) -> Result<FileReceiptV4, E
 fn verify_block(
     writer: &mut RedoWriter<'_, Disk>,
     home: u32,
+    commit_lsn: u64,
     expected: &[u8; BLOCK],
 ) -> Result<(), Error> {
     let mut raw = [0; BLOCK];
-    writer.read_committed(home, &mut raw)?;
+    writer.read_committed_at(home, commit_lsn, &mut raw)?;
     if &raw != expected {
         return Err(Error::Conflict);
     }
@@ -407,6 +400,11 @@ pub(super) fn recover(
     volume::unified_map(disk, checkpoint, mode)?;
     volume::validate_homes(disk, checkpoint, 0, Some(config), mode)?;
     volume::require_zero_blocks(disk, LOG_END..BITMAP_START)?;
+    let legacy_tail_blank = match volume::require_zero_blocks(disk, LEGACY_LOG_END..LOG_END) {
+        Ok(()) => true,
+        Err(Error::Conflict) => false,
+        Err(error) => return Err(error),
+    };
     let state = authority::verified_pair_state(disk, checkpoint, Some(config))?;
 
     // Build exact intended after-images from the sealed genesis view.
@@ -423,57 +421,62 @@ pub(super) fn recover(
     let crc = crc32c_zeroed(file, 252)?;
     file[252..].copy_from_slice(&crc.to_le_bytes());
     issued_index(&mut index)?;
-    let data = frozen_file();
     // SAFETY: the second CPU0 boot borrows the same exclusive static areas.
     let workspace = unsafe { reopen::workspace() };
     let image = unsafe { &mut *core::ptr::addr_of_mut!(RECEIPTS) };
     image.fill(0);
-    let final_lsn = {
-        let mut writer = RedoWriter::open(disk, workspace, checkpoint)?;
-        let summary = writer.evidence().ok_or(Error::Conflict)?;
-        // Keep cold readback for the previous, exact signed test-media cut.
-        // Newly written FSYNC segments include the unchanged stream index.
-        if summary.transactions != 4
-            || summary.distinct_home_blocks != 7
-            || !matches!(summary.last_commit_lsn, FINAL_LSN | LEGACY_FINAL_LSN)
-        {
-            return Err(Error::Conflict);
-        }
-        let receipt = final_receipt(&data, summary.last_commit_lsn)?;
-        image[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES].copy_from_slice(&receipt.encode()?);
-        // All seven expected homes actually change from the strictly checked
-        // genesis view. Exact equality plus the union count excludes any
-        // other target before replay is allowed to write.
-        verify_block(&mut writer, volume::SECURITY_HOME, &state.encode()?)?;
-        verify_block(
-            &mut writer,
-            volume::BOOT_HOME,
-            &BootEpochStoreV1 {
-                fs_uuid: volume::UUID,
-                boot_epoch: 1,
-            }
-            .encode()?,
-        )?;
-        verify_block(&mut writer, INODE_START, &inode)?;
-        verify_block(&mut writer, SCRATCH_FILE_BLOCK, &data)?;
-        verify_block(
-            &mut writer,
-            RECEIPTS_HOME,
-            image[..BLOCK].try_into().unwrap(),
-        )?;
-        verify_block(
-            &mut writer,
-            RECEIPTS_HOME + 1,
-            image[BLOCK..2 * BLOCK].try_into().unwrap(),
-        )?;
-        verify_block(&mut writer, RECEIPTS_HOME + 6, &index)?;
-        summary.last_commit_lsn
-    };
-    if final_lsn == LEGACY_FINAL_LSN {
-        volume::require_zero_blocks(disk, LEGACY_LOG_END..LOG_END)?;
+    let mut writer = RedoWriter::open(disk, workspace, checkpoint)?;
+    let summary = writer.evidence().ok_or(Error::Conflict)?;
+    let final_lsn = summary.last_commit_lsn;
+    if summary.transactions != 4 || summary.distinct_home_blocks != 7 {
+        return Err(Error::Conflict);
     }
+    let index_lsn = match final_lsn {
+        FINAL_LSN => FINAL_LSN,
+        // The legacy segment did not repeat the unchanged issued index.
+        LEGACY_FINAL_LSN if legacy_tail_blank => ISSUE_COMMIT_LSN,
+        _ => return Err(Error::Conflict),
+    };
+    let mut data = [0; BLOCK];
+    writer.read_committed_at(SCRATCH_FILE_BLOCK, final_lsn, &mut data)?;
+    let receipt = final_receipt(&data, final_lsn)?;
+    image[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES].copy_from_slice(&receipt.encode()?);
+    // The seven required homes must be in their respective commits even
+    // when an after-image matches its checkpoint bytes. Together with the
+    // exact union count this excludes unapproved targets before replay.
+    verify_block(
+        &mut writer,
+        volume::SECURITY_HOME,
+        BOOT_COMMIT_LSN,
+        &state.encode()?,
+    )?;
+    verify_block(
+        &mut writer,
+        volume::BOOT_HOME,
+        BOOT_COMMIT_LSN,
+        &BootEpochStoreV1 {
+            fs_uuid: volume::UUID,
+            boot_epoch: 1,
+        }
+        .encode()?,
+    )?;
+    verify_block(&mut writer, INODE_START, final_lsn, &inode)?;
+    verify_block(
+        &mut writer,
+        RECEIPTS_HOME,
+        final_lsn,
+        image[..BLOCK].try_into().unwrap(),
+    )?;
+    verify_block(
+        &mut writer,
+        RECEIPTS_HOME + 1,
+        final_lsn,
+        image[BLOCK..2 * BLOCK].try_into().unwrap(),
+    )?;
+    verify_block(&mut writer, RECEIPTS_HOME + 6, index_lsn, &index)?;
+
     let mut mounted = None;
-    let (chain, next) = recover_checkpoint_with_evidence(disk, workspace, |disk, selected| {
+    let (chain, next) = writer.checkpoint_verified(|disk, selected| {
         if selected != checkpoint {
             return Err(Error::Conflict);
         }
@@ -500,9 +503,6 @@ pub(super) fn readback(
     }
     let mut raw = [0; BLOCK];
     disk.read(SCRATCH_FILE_BLOCK, &mut raw)?;
-    if raw != frozen_file() {
-        return Err(Error::Conflict);
-    }
     let expected = final_receipt(&raw, checkpoint.checkpoint_lsn)?;
     // Derive the static query qualification separately from the signed media
     // policy. Both are pinned to the identical persistent principal.

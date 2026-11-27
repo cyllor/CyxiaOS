@@ -131,6 +131,8 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
     if parsed.state == mount.expected.status
         && parsed.commit_lsn == mount.expected.commit_lsn
         && parsed.write_seq == mount.expected.write_seq
+        && parsed.completed_prefix == mount.expected.completed_prefix
+        && parsed.result_digest == mount.expected.output_digest
     {
         state.checks.recovered =
             Some((mount.caller.boot_epoch, parsed.commit_lsn, parsed.write_seq));

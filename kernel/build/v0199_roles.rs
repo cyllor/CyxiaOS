@@ -27,6 +27,31 @@ fn digest(path: &Path) -> [u8; 32] {
     assert_eq!(h.len(), 64);
     std::array::from_fn(|i| u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap())
 }
+
+/// Acceptance input for the ordinary FSYNC client. The mounted kernel
+/// sees the actual ABI WRITE bytes, independent of this test oracle.
+fn build_fsync_client_fixture(out: &Path) {
+    const DEFAULT: &[u8; 29] = b"CyxiaOS V0.20 durable fsync!\n";
+    const TEST_INPUT: &str = "CYXIA_FSYNC_TEST_CONTENT";
+    println!("cargo:rerun-if-env-changed={TEST_INPUT}");
+    let contents = if let Some(path) = env::var_os(TEST_INPUT) {
+        let path = PathBuf::from(path);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let meta = fs::metadata(&path).expect("FSYNC client fixture metadata");
+        assert!(meta.is_file() && meta.len() == DEFAULT.len() as u64);
+        fs::read(path).expect("FSYNC client fixture input")
+    } else {
+        DEFAULT.to_vec()
+    };
+    assert_eq!(contents.len(), DEFAULT.len(), "FSYNC client file length");
+    let mut page = [0; 4096];
+    page[..contents.len()].copy_from_slice(&contents);
+    let padded = out.join("fsync-client-page.bin");
+    fs::write(&padded, page).unwrap();
+    fs::write(out.join("fsync-client-content.bin"), contents).unwrap();
+    fs::write(out.join("fsync-client-digest.bin"), digest(&padded)).unwrap();
+}
+
 fn extract_relative(b: &[u8]) -> Vec<(u64, u64, i64)> {
     assert!(b.len() >= 64 && b.len() <= 8 * 1024 * 1024 && &b[..4] == b"\x7fELF");
     assert_eq!((b[4], b[5], u16at(b, 16), u16at(b, 18)), (2, 1, 3, 183));
@@ -182,6 +207,9 @@ pub fn build() {
     let file_read = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_READ").is_some();
     let fsync = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FSYNC_SCRATCH").is_some();
     let reopen = env::var_os("CARGO_FEATURE_V020_PRODUCTION_MEDIA_REOPEN").is_some();
+    if fsync && !reopen {
+        build_fsync_client_fixture(&out);
+    }
     let file_sessions = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_SESSIONS").is_some();
     let file_volatile_write =
         env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_VOLATILE_WRITE").is_some();
