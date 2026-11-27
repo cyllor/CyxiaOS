@@ -116,9 +116,15 @@ mod v0199_d05_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_d07_fixture.rs"]
 mod v0199_d07_fixture;
+#[cfg(feature = "v0199-d11-rng-selftest")]
+#[path = "v0199_d11_fixture.rs"]
+mod v0199_d11_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_d15_fixture.rs"]
 mod v0199_d15_fixture;
+#[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_effect_fixture.rs"]
+mod v0199_effect_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_epoch_disk.rs"]
 mod v0199_epoch_disk;

@@ -554,7 +554,12 @@ pub(super) fn run(info: &BootInfo) -> ! {
         new.root,
         boot,
     );
-    super::v0199_d15_fixture::run(boot, gate.boot_epoch());
+    super::v0199_d15_fixture::run(
+        boot,
+        gate.boot_epoch(),
+        #[cfg(feature = "v0199-d11-rng-selftest")]
+        info,
+    );
     assert_eq!((disk.writes, disk.flushes), (11 + 12 * reset, 6 + reset));
     let final_txid = recovered + 2;
     let final_state = scratch

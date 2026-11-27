@@ -229,7 +229,11 @@ fn retain_bytes(at: usize, bytes: &[u8]) {
         SMP_EVIDENCE.words[at + i].store(u64::from_le_bytes(word), Ordering::Relaxed);
     }
 }
-pub(super) fn run(boot: u64, confirmed_boot: Option<u64>) {
+pub(super) fn run(
+    boot: u64,
+    confirmed_boot: Option<u64>,
+    #[cfg(feature = "v0199-d11-rng-selftest")] info: &BootInfo,
+) {
     assert_eq!(cpu::slot(), 0);
     // Diagnostic owner has actual device access; no user cap issuance.
     let base = crate::UART.load(Ordering::Acquire);
@@ -612,4 +616,6 @@ pub(super) fn run(boot: u64, confirmed_boot: Option<u64>) {
         spawn_proof,
     );
     super::v0199_d05_fixture::run(boot, &mut gate, snapshots, inbox, desired);
+    #[cfg(feature = "v0199-d11-rng-selftest")]
+    super::v0199_d11_fixture::run(boot, info, &mut gate, snapshots, inbox, desired);
 }

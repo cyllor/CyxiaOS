@@ -311,6 +311,10 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                 args += ['-global', 'virtio-mmio.force-legacy=false',
                          '-drive', f'file={scratch_disk},if=none,id=epoch,format=raw,cache=none',
                          '-device', 'virtio-blk-device,drive=epoch']
+            if getattr(acceptance, 'dedicated_d11_rng', False):
+                require(scratch_disk is not None, 'dedicated D11 RNG requires the epoch disk fixture')
+                args += ['-object', 'rng-builtin,id=d11-rng',
+                         '-device', 'virtio-rng-device,rng=d11-rng']
             report['argv'] = args
             report['qmp_transport'] = 'stdio' if qmp_stdio else 'unix'
             proc = subprocess.Popen(args, stdin=subprocess.PIPE if qmp_stdio else None,

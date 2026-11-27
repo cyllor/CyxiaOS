@@ -2,6 +2,7 @@
 //! CPU0 owns the registered rule, desired plan, observation and receipt.
 //! CPU1 owns the ordinary IPC endpoint and both short-lived EL0 clients.
 //! Cap selectors and the test rule come from this immutable fixture.
+use super::v0199_effect_fixture::{encode_decision, rule, sha};
 use super::*;
 use cyxia_kernel_core::{
     control_plane::{
@@ -29,7 +30,6 @@ use cyxia_kernel_core::{
         syscall_v3::{ValidatedCall, decode_aarch64_svc_v3},
     },
 };
-use sha2::{Digest, Sha256};
 
 const CTL: Identity = Identity {
     id: 2,
@@ -521,108 +521,6 @@ pub(super) fn worker_step() -> bool {
     true
 }
 
-fn put<const N: usize>(bytes: &mut [u8], at: usize, value: [u8; N]) {
-    bytes[at..at + N].copy_from_slice(&value);
-}
-
-fn sha(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
-
-fn rule() -> [u8; 88] {
-    let mut out = [0; 88];
-    put(&mut out, 0, 0x43595255u32.to_le_bytes());
-    put(&mut out, 4, 2u16.to_le_bytes());
-    put(&mut out, 6, 32u16.to_le_bytes());
-    put(&mut out, 8, SEQ.to_le_bytes());
-    put(&mut out, 16, 1u32.to_le_bytes());
-    put(&mut out, 20, 88u32.to_le_bytes());
-    put(&mut out, 32, 1u32.to_le_bytes());
-    put(&mut out, 36, 5u16.to_le_bytes());
-    put(&mut out, 38, 1u16.to_le_bytes());
-    put(&mut out, 40, TARGET.id.to_le_bytes());
-    put(&mut out, 50, 1u16.to_le_bytes());
-    put(&mut out, 52, 1u16.to_le_bytes());
-    put(&mut out, 56, 56u32.to_le_bytes());
-    put(&mut out, 64, 1u16.to_le_bytes());
-    out[66] = 3;
-    put(&mut out, 72, 8u64.to_le_bytes());
-    out
-}
-
-fn encode_decision(
-    ctx: TrustedRegistrationScope,
-    rule: cyxia_kernel_core::control_plane::rule_profile_v2::RuleMatch,
-    candidate_hash: [u8; 32],
-    payload: &[u8],
-) -> ([u8; 213], [u8; 256]) {
-    let expiry = ctx.sampled_ns + 100_000_000;
-    let mut plan = [0; 213];
-    put(&mut plan, 0, 0x43594c31u32.to_le_bytes());
-    put(&mut plan, 4, 2u16.to_le_bytes());
-    put(&mut plan, 6, 64u16.to_le_bytes());
-    put(&mut plan, 8, 213u32.to_le_bytes());
-    put(&mut plan, 12, 1u16.to_le_bytes());
-    put(&mut plan, 64, 0x43595031u32.to_le_bytes());
-    put(&mut plan, 68, 2u16.to_le_bytes());
-    put(&mut plan, 70, 144u16.to_le_bytes());
-    put(&mut plan, 72, 5u16.to_le_bytes());
-    put(&mut plan, 74, 1u16.to_le_bytes());
-    put(&mut plan, 76, 5u32.to_le_bytes());
-    for (at, value) in [
-        (16, SEQ),
-        (24, ctx.base_plan_version),
-        (40, ctx.controller_epoch),
-        (48, ctx.snapshot_seq),
-        (56, ctx.sampled_ns + 10_000_000_000),
-        (80, ctx.controller_epoch),
-        (88, SEQ),
-        (96, ctx.snapshot_seq),
-        (104, TARGET.id),
-        (112, TARGET.generation),
-        (120, ctx.ledger_generation),
-        (128, ctx.core_generation),
-        (136, expiry),
-    ] {
-        put(&mut plan, at, value.to_le_bytes());
-    }
-    put(&mut plan, 176, candidate_hash);
-    put(&mut plan, 208, rule.fallback_index.to_le_bytes());
-    plan[210..].copy_from_slice(payload);
-    let mut record = [0; 256];
-    put(&mut record, 0, 0x43594431u32.to_le_bytes());
-    put(&mut record, 4, 3u16.to_le_bytes());
-    put(&mut record, 6, 256u16.to_le_bytes());
-    for (at, value) in [
-        (8, ctx.boot_epoch),
-        (16, ctx.controller_epoch),
-        (24, SEQ),
-        (32, SEQ),
-        (40, ctx.snapshot_seq),
-        (48, TARGET.id),
-        (56, TARGET.generation),
-        (64, ctx.ledger_generation),
-        (72, ctx.core_generation),
-        (80, ctx.rules_generation),
-        (144, expiry),
-    ] {
-        put(&mut record, at, value.to_le_bytes());
-    }
-    put(&mut record, 88, rule.rule_id.to_le_bytes());
-    put(&mut record, 94, 5u16.to_le_bytes());
-    put(&mut record, 96, 1u16.to_le_bytes());
-    put(&mut record, 102, rule.fallback_index.to_le_bytes());
-    put(&mut record, 104, u16::MAX.to_le_bytes());
-    put(&mut record, 108, 3u32.to_le_bytes());
-    put(&mut record, 152, rule.allowed_mask.to_le_bytes());
-    put(&mut record, 156, rule.fallback_index.to_le_bytes());
-    put(&mut record, 158, rule.choice_policy.to_le_bytes());
-    put(&mut record, 160, ctx.rules_hash);
-    put(&mut record, 192, sha(&plan));
-    put(&mut record, 224, candidate_hash);
-    (plan, record)
-}
-
 pub(super) fn run(
     boot: u64,
     gate: &mut RegisteredDecisionGate<'_>,
@@ -702,7 +600,7 @@ pub(super) fn run(
         },
     )
     .unwrap();
-    let rules = rule();
+    let rules = rule(target, SEQ, 1, 8, 0);
     let profile = Profile::parse(&rules).unwrap();
     let matched = profile
         .match_candidates(
@@ -731,8 +629,14 @@ pub(super) fn run(
         now_ns: now(),
     };
     assert_eq!(scope.base_plan_version, SEQ - 1);
-    let (plan, decision) =
-        encode_decision(scope, matched, candidates.digest(), local.action_payload);
+    let (plan, decision) = encode_decision::<213>(
+        target,
+        SEQ,
+        scope,
+        matched,
+        candidates.digest(),
+        local.action_payload,
+    );
     let actions = [local];
     let decisions = [decision];
     assert_eq!(
