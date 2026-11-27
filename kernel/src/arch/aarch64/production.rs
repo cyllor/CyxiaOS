@@ -108,6 +108,13 @@ use cyxia_kernel_core::security::{
 };
 use sha2::{Digest, Sha256};
 
+#[cfg(any(
+    feature = "v020-production-snapshot-catalog",
+    feature = "v020-production-file-read",
+    feature = "v020-production-fsync-scratch"
+))]
+#[path = "production/copy_window.rs"]
+mod copy_window;
 #[path = "production/evidence.rs"]
 mod evidence;
 #[cfg(feature = "v020-production-fsync-scratch")]
@@ -1895,6 +1902,19 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         && let Some(view) = staging_outcome.file_receipts
     {
         file_receipt::drive(&mut pie_ctx, &pie_manifest, view);
+    }
+    #[cfg(any(
+        feature = "v020-production-file-read",
+        feature = "v020-production-fsync-scratch"
+    ))]
+    {
+        let (reads, writes, closed) = copy_window::closed_counts();
+        report(
+            "V020_SEC_M_FILE_COPY_WINDOW",
+            reads,
+            writes,
+            u64::from(closed),
+        );
     }
     #[cfg(feature = "v020-production-snapshot-catalog")]
     if staging_outcome.services_ready()

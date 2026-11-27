@@ -740,19 +740,23 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
     }
 
 
-def snapshot_copy_window(elf, qmp, output, lines, lists):
-    try:
-        window = symbol(elf, "__copy_window_l3")
-    except ValueError as error:
-        if str(error) == "missing symbol __copy_window_l3":
-            return None
-        raise
+def supervisor_copy_windows(elf, qmp, output, lines, *, snapshot_lists=None, file_copy=False):
+    window = symbol(elf, "__copy_window_l3")
     require = verify_smp.require
-    witnessed = w11_rows(lines, "V020_SEC_M_COPY_WINDOW")
-    require(len(witnessed) == 1, "missing one Supervisor copy-window witness")
-    reads, writes, closed = witnessed[0]
-    require(lists > 0 and writes == 2 * lists and reads >= writes and closed == 1,
-            "cross-page snapshot copy-window close counts differ")
+    counts = {}
+    if snapshot_lists is not None:
+        witnessed = w11_rows(lines, "V020_SEC_M_COPY_WINDOW")
+        require(len(witnessed) == 1, "missing one Supervisor snapshot copy-window witness")
+        reads, writes, closed = witnessed[0]
+        require(snapshot_lists > 0 and writes == 2 * snapshot_lists and reads >= writes and closed == 1,
+                "cross-page snapshot copy-window close counts differ")
+        counts["snapshot_copy_window"] = (reads, writes)
+    if file_copy:
+        witnessed = w11_rows(lines, "V020_SEC_M_FILE_COPY_WINDOW")
+        require(len(witnessed) == 1, "missing one Supervisor file copy-window witness")
+        reads, writes, closed = witnessed[0]
+        require(reads > 0 and writes > 0 and closed == 1, "invalid file copy-window close counts")
+        counts["file_copy_window"] = (reads, writes)
     page = 4096
     root_index = 258
 
@@ -779,11 +783,14 @@ def snapshot_copy_window(elf, qmp, output, lines, lists):
     branch = read_table("l2", mid)
     require(branch[0] == (leaf | 3) and not any(branch[1:]), "copy window has multiple branches")
     require(not any(read_table("l3", leaf)), "temporary copy translation remained valid")
-    return {
+    readback = {
         "cpu0_root_pa": hex(cpu0), "secondary_root_pa": hex(secondary),
         "copy_l2_pa": hex(mid), "copy_l3_pa": hex(leaf),
-        "read_only_fragments_closed": reads, "writable_fragments_closed": writes,
         "copy_leaf_invalid": True, "secondary_copy_branch_absent": True,
+    }
+    return {
+        scope: dict(readback, read_only_fragments_closed=reads, writable_fragments_closed=writes)
+        for scope, (reads, writes) in counts.items()
     }
 
 
@@ -919,13 +926,13 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                     report["observations"] = acceptance.validate(
                         bytes(decoded), page, len(actual_cpus), pending_fsync_blocks=pending_fsync_blocks,
                         expected_fsync_epoch=expected_fsync_epoch)
-                    if modes.snapshot_catalog:
-                        copy = snapshot_copy_window(
+                    if modes.snapshot_catalog or modes.file_read or modes.fsync_scratch:
+                        report.update(supervisor_copy_windows(
                             elf.read_bytes(), qmp, output, decoded.decode("ascii").splitlines(),
-                            report["observations"]["snapshot_catalog_lists"],
-                        )
-                        if copy is not None:
-                            report["snapshot_copy_window"] = copy
+                            snapshot_lists=(report["observations"]["snapshot_catalog_lists"]
+                                            if modes.snapshot_catalog else None),
+                            file_copy=modes.file_read or modes.fsync_scratch,
+                        ))
                     relay_bytes = report["observations"]["echo_bytes_relayed"]
                     if modes.authenticated_net:
                         require(peer is not None, "missing authenticated host peer")

@@ -1,9 +1,8 @@
-//! CPU0 copy window for the authorized snapshot endpoint's static role stack.
+//! CPU0 copy window for the authorized file and snapshot endpoints.
 //! The stack and page tables are pinned in the image for the entire boot.
 
 use super::{
-    EFAULT, FATAL_CATALOG, NativeRole, Role, cpu, fatal, mmu, phys, role_asid, root_pa, stack_span,
-    trapped_ttbr0,
+    EFAULT, NativeRole, Role, cpu, fatal, mmu, phys, role_asid, root_pa, stack_span, trapped_ttbr0,
 };
 use core::{
     arch::asm,
@@ -20,6 +19,7 @@ const WINDOW_VA: u64 = crate::HIGH + 0x8000_0000;
 const LOCAL_TLBI: u64 = (WINDOW_VA >> 12) & ((1 << 44) - 1);
 const PAGE_MASK: u64 = PAGE_SIZE - 1;
 const NON_GLOBAL: u64 = 1 << 11;
+const FATAL_WINDOW: u64 = 0x5732_1657;
 const _: () = {
     assert!(WINDOW_VA - crate::HIGH >= cyxia_platform_virt::USER_RAM_END);
     assert!((WINDOW_VA >> 30) & 511 == 258);
@@ -176,7 +176,7 @@ impl StackSpan {
             // One CPU0 dispatcher owns the slot with interrupts masked.
             // A stale descriptor cannot be reused or survive a return to EL0.
             if unsafe { entry.read_volatile() } != 0 {
-                fatal(FATAL_CATALOG + 7);
+                fatal(FATAL_WINDOW);
             }
             unsafe {
                 entry.write_volatile(leaf);

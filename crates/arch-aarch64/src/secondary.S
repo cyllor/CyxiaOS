@@ -28,7 +28,7 @@ cyxia_secondary_start:
  msr mair_el1, x0
  ldr x0, =low_l1
  msr ttbr0_el1, x0
-.if {snapshot_copy}
+.if {supervisor_copy}
  ldr x0, =__copy_secondary_l1
 .else
  ldr x0, =high_l1

@@ -125,6 +125,18 @@ def volatile_write_fixture(epoch: int) -> tuple[list, list]:
     return words, lines
 
 
+class CopyWindowEvidence(unittest.TestCase):
+    def test_snapshot_requires_linked_window(self):
+        with patch.object(v, "symbol", side_effect=ValueError("missing symbol __copy_window_l3")):
+            with self.assertRaisesRegex(ValueError, "missing symbol __copy_window_l3"):
+                v.supervisor_copy_windows(b"", None, None, [], snapshot_lists=2)
+
+    def test_file_path_requires_window_witness(self):
+        with patch.object(v, "symbol", return_value={"pa": 4096}):
+            with self.assertRaisesRegex(ValueError, "missing one Supervisor file copy-window witness"):
+                v.supervisor_copy_windows(b"", None, None, [], file_copy=True)
+
+
 class W11Validation(unittest.TestCase):
     def check(self, words=None, lines=None, staging=False, modes=v.Modes()):
         words = w11_words(staging) if words is None else words

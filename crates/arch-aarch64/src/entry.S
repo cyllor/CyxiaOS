@@ -33,14 +33,14 @@ _start:
  str x0, [x1, #8]
  ldr x1, =high_l1
  str x0, [x1, #2056]
-.if {snapshot_copy}
+.if {supervisor_copy}
  ldr x2, =__copy_secondary_l1
  str x0, [x2, #2056]
 .endif
  ldr x0, =dev_l2
  orr x0, x0, #3
  str x0, [x1, #2048]
-.if {snapshot_copy}
+.if {supervisor_copy}
  str x0, [x2, #2048]
  // HIGH + 2 GiB is L1 slot 258, beyond the 1 GiB RAM alias.
  // All secondaries use the parallel root with this slot still invalid.
@@ -85,7 +85,7 @@ _start:
 .if {software_pan}
  ldr x13, =empty_l1
 .endif
-.if {snapshot_copy}
+.if {supervisor_copy}
  ldr x14, =__copy_secondary_l1
  ldr x15, =__copy_window_l2
 .endif
@@ -108,7 +108,7 @@ _start:
  cmp x1, x13
  b.eq .Lreadonly_boot_page
 .endif
-.if {snapshot_copy}
+.if {supervisor_copy}
  cmp x1, x14
  b.eq .Lreadonly_boot_page
  cmp x1, x15
@@ -180,7 +180,7 @@ high_l1: .skip 4096
 .global empty_l1
 empty_l1: .skip 4096
 .endif
-.if {snapshot_copy}
+.if {supervisor_copy}
 .global __copy_secondary_l1
 __copy_secondary_l1: .skip 4096
 .global __copy_window_l2

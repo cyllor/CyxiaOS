@@ -6,9 +6,6 @@
 
 use super::*;
 use core::ptr::{addr_of, addr_of_mut};
-#[path = "copy_window.rs"]
-mod copy_window;
-use copy_window::StackSpan;
 use cyxia_kernel_core::security::{
     file_media_unified_v1::{SNAP_MAX_REPLY_BYTES, SNAP_MAX_REQUEST_BYTES},
     file_service_v4::{REPLY_HEADER, REQUEST_HEADER},
@@ -146,8 +143,8 @@ fn check_grant(state: &mut State, member: NativeRole, cap: u64, selector: u64) -
 }
 
 struct Buffers {
-    source: StackSpan,
-    dest: StackSpan,
+    source: copy_window::StackSpan,
+    dest: copy_window::StackSpan,
     len: usize,
     overlap: bool,
 }
@@ -161,8 +158,8 @@ fn checked_buffers(index: usize, member: NativeRole, args: [u64; 6]) -> Result<B
     if !(REPLY_HEADER..=SNAP_MAX_REPLY_BYTES).contains(&reply_cap) {
         return Err(EFAULT);
     }
-    let source = StackSpan::verify(index, member, args[1], len, false)?;
-    let dest = StackSpan::verify(index, member, args[4], reply_cap, true)?;
+    let source = copy_window::StackSpan::verify(index, member, args[1], len, false)?;
+    let dest = copy_window::StackSpan::verify(index, member, args[4], reply_cap, true)?;
     // Both half-open ends were checked by stack_span.
     let overlap = args[1] < args[4] + args[5] && args[4] < args[1] + args[2];
     Ok(Buffers {
@@ -332,6 +329,11 @@ pub(super) fn drive(
     if cpu::slot() != 0 || manifest.validate().is_err() {
         fatal(FATAL_CATALOG);
     }
+    let (initial_read_windows, initial_write_windows, initial_closed) =
+        copy_window::closed_counts();
+    if !initial_closed {
+        fatal(FATAL_CATALOG + 6);
+    }
     let ops = ROLES
         .iter()
         .position(|&role| role == Role::Operations)
@@ -421,6 +423,8 @@ pub(super) fn drive(
     report("V020_W16_CATALOG", boot, generation, reads);
     report("V020_W16_CATALOG_CHECKS", unready, rejected, stale);
     let (read_windows, write_windows, closed) = copy_window::closed_counts();
+    let read_windows = read_windows.saturating_sub(initial_read_windows);
+    let write_windows = write_windows.saturating_sub(initial_write_windows);
     if !closed || read_windows == 0 || write_windows < reads {
         fatal(FATAL_CATALOG + 6);
     }
