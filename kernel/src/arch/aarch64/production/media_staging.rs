@@ -437,22 +437,19 @@ fn run_chain(
         ];
     }
     out.prior_epoch = mounted.boot.boot_epoch;
-    #[cfg(not(cyxia_signed_resident))]
+    let allocated = authority::boot_epoch_owner(disk, checkpoint, &mounted.security, config);
+    out.confirmed_epoch = step(
+        4,
+        allocated.as_ref().map(|(epoch, _)| *epoch).map_err(|e| *e),
+    )?;
+    let (_, resident_epochs) = allocated.ok()?;
+    #[cfg(any(feature = "v020-production-media-signed", cyxia_startup_catalog))]
     {
-        out.confirmed_epoch = step(
-            4,
-            authority::boot_epoch(disk, checkpoint, &mounted.security, config),
-        )?;
+        let policy = resident_epochs.confirmed_boot_policy(&verified).ok()?;
+        scratch_blk::bind_confirmed_epoch(&policy).ok()?;
     }
-    #[cfg(cyxia_signed_resident)]
-    let resident_epochs = {
-        let allocated = authority::boot_epoch_owner(disk, checkpoint, &mounted.security, config);
-        out.confirmed_epoch = step(
-            4,
-            allocated.as_ref().map(|(epoch, _)| *epoch).map_err(|e| *e),
-        )?;
-        allocated.ok()?.1
-    };
+    #[cfg(not(any(feature = "v020-production-media-signed", cyxia_startup_catalog)))]
+    let _ = resident_epochs;
     #[cfg(cyxia_startup_catalog)]
     {
         let committed = authority::verified_pair_state(disk, checkpoint, config).ok()?;
@@ -642,6 +639,14 @@ pub(super) fn stage_with_policy(
     {
         out.chain_complete = run_chain(&mut disk, &mut out, verified).is_some();
     }
+    if super::recovery::contain_terminal_block(out.confirmed_epoch) {
+        out.mount_requires_recovery = true;
+        out.chain_complete = false;
+        #[cfg(cyxia_signed_resident)]
+        {
+            out.resident_boot = None;
+        }
+    }
     #[cfg(any(
         feature = "v020-production-file-read",
         feature = "v020-production-snapshot-catalog",
@@ -656,7 +661,6 @@ pub(super) fn stage_with_policy(
             0,
         );
     }
-    scratch_blk::report_recovery_custody(out.confirmed_epoch);
     report("V020_W11_MEDIA_IO", disk.reads, disk.writes, disk.flushes);
     let queue = disk.device.notify_stats();
     report(

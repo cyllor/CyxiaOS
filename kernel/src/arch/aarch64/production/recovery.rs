@@ -22,7 +22,12 @@
 //!   The underlying RecoveryProof accumulators remain owned by CPU0.
 //! * CPU0 increments GATE_REJECTS on an in-vector RECOVERY_REQUIRED refusal,
 //!   and samples the parent advice gate via gate_ptr() between EL0 turns.
+//! * BLOCK_HOLD is the CPU0 foreground's immutable terminal custody. The
+//!   scratch owner transfers the sealed record once, then the mount gate
+//!   remains closed. The driver still owns all queue/DMA storage.
 
+#[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
+use super::super::scratch_blk::{self, ScratchTerminalCustody};
 #[cfg(feature = "v020-production-diagnostic")]
 use super::super::{FAULT_PROBES, GATES, QUIT, STOPPED, fatal, report};
 #[cfg(feature = "v020-production-diagnostic")]
@@ -80,11 +85,28 @@ static mut SLOTS: [Slot; ACCUMULATOR_COUNT] =
 static READY: AtomicBool = AtomicBool::new(false);
 static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
 static EVENTS: [AtomicU64; ACCUMULATOR_COUNT] = [const { AtomicU64::new(0) }; ACCUMULATOR_COUNT];
+#[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
+static mut BLOCK_HOLD: Option<&'static ScratchTerminalCustody> = None;
 #[cfg(feature = "v020-production-diagnostic")]
 static REJECTED: [AtomicU64; ACCUMULATOR_COUNT] = [const { AtomicU64::new(0) }; ACCUMULATOR_COUNT];
 static TAKEN: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "v020-production-diagnostic")]
 static GATE_REJECTS: AtomicU64 = AtomicU64::new(0);
+
+/// Accept the sealed transport outcome and retain the same record throughout
+/// this boot. A terminal stop is not proof of an operation's result.
+#[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
+pub(super) fn contain_terminal_block(confirmed_epoch: u64) -> bool {
+    assert_eq!(cyxia_arch_aarch64::cpu::slot(), 0);
+    if let Some(custody) = scratch_blk::take_terminal_custody() {
+        // SAFETY: CPU0 owns this foreground handoff alone. The driver's
+        // one-shot transfer admits just one initialized, immutable record.
+        unsafe { addr_of_mut!(BLOCK_HOLD).write(Some(custody)) };
+        custody.report_handoff(confirmed_epoch);
+    }
+    // SAFETY: same CPU0 owner. Copy only the reference, never the record.
+    unsafe { core::ptr::addr_of!(BLOCK_HOLD).read() }.is_some()
+}
 
 /// The staged initial pair: both copies valid, same FS UUID, the fresh-image
 /// identical initial pair, relation provable. Every adverse fact is false.

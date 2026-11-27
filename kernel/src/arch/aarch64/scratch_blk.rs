@@ -18,8 +18,9 @@
 //!   in the `.bss.sec_n` range registered as permanently pinned static Arena
 //!   pages. This accounts for the storage across requests, independently of
 //!   the device queue's per-request DMA ownership.
-//! * TERMINAL: CPU0 publishes one detached copy of the original requests and
-//!   stop result. Recovery can read it without borrowing the driver's queues.
+//! * TERMINAL: CPU0 seals one detached copy of the original requests and
+//!   stop result. The recovery owner can take that custody once, without
+//!   borrowing the driver's queues or changing any DMA ownership.
 //! * Transport::attach: MMIO window bounded to the virt board's virtio-mmio
 //!   range 0x0a000000..0x0a200000 through the high-half device alias.
 //! * LAST_ERROR_{CODE,SECTOR,SITE}, MAX_LATENCY_{NS,SECTOR}, SLOW (atomics):
@@ -30,13 +31,16 @@ use super::*;
 use crate::virtio_platform::Board;
 use core::{
     mem::MaybeUninit,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    num::NonZeroU64,
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 use cyxia_driver_virtio::{
     Error as DriverError, Platform, Transport,
     block::{BatchedBlockIo, BlockTerminalCustody, Operation, SECTOR_BYTES},
     queue::{BatchMemory, Token},
 };
+#[cfg(any(feature = "v020-production-media-signed", cyxia_startup_catalog))]
+use cyxia_kernel_core::security::durable_role_epoch_v0199::ConfirmedBootPolicy;
 use cyxia_kernel_core::security::{
     Error as SecurityError, file_index_v0199::BLOCK_BYTES, file_media_v0199::BLOCK_COUNT,
 };
@@ -52,50 +56,105 @@ static mut QUEUE: BatchMemory = BatchMemory::zeroed();
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut DEVICE: MaybeUninit<ScratchBlock> = MaybeUninit::uninit();
 static CLAIMED: AtomicBool = AtomicBool::new(false);
-static mut TERMINAL: MaybeUninit<BlockTerminalCustody> = MaybeUninit::uninit();
-static TERMINAL_READY: AtomicBool = AtomicBool::new(false);
+static DEVICE_MMIO: AtomicU64 = AtomicU64::new(0);
+static CONFIRMED_EPOCH: AtomicU64 = AtomicU64::new(0);
+const EMPTY: u8 = 0;
+const SEALED: u8 = 1;
+#[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
+const TRANSFERRED: u8 = 2;
+static TERMINAL_STATE: AtomicU8 = AtomicU8::new(EMPTY);
+static mut TERMINAL: MaybeUninit<ScratchTerminalCustody> = MaybeUninit::uninit();
+
+/// Immutable terminal custody for the one-shot VirtIO block owner (id 2,
+/// queue 0, initial generation). An unbound snapshot is diagnostic only.
+pub(crate) struct ScratchTerminalCustody {
+    mmio: u64,
+    epoch: Option<NonZeroU64>,
+    retained: BlockTerminalCustody,
+}
+
+#[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
+impl ScratchTerminalCustody {
+    pub(crate) fn report_handoff(&self, confirmed_epoch: u64) {
+        // A sealed pre-epoch record cannot inherit the caller's later epoch.
+        // Nor does a disagreement between two in-kernel witnesses authorize
+        // the consumer to call this custody epoch-bound.
+        let epoch = self
+            .epoch
+            .filter(|epoch| epoch.get() == confirmed_epoch)
+            .map_or(0, NonZeroU64::get);
+        let (state, detail) = match self.retained.reset {
+            None => (0, 0),
+            Some(Ok(observed)) => (1, observed),
+            Some(Err(error)) => (2, error as u64),
+        };
+        report("V020_SEC_D_BLOCK_HANDOFF", self.mmio, 2, 0);
+        report("V020_SEC_D_BLOCK_RECOVERY", epoch, state, detail);
+        for request in self.retained.requests.iter().flatten() {
+            let slot = u64::from(request.token.slot);
+            report(
+                "V020_SEC_D_BLOCK_RECOVERY_CHAIN",
+                slot,
+                request.token.generation,
+                u64::from(request.completed),
+            );
+            let (kind, sector) = match request.operation {
+                Operation::Read(sector) => (KIND_READ, sector),
+                Operation::Write(sector) => (KIND_WRITE, sector),
+                Operation::Flush => (KIND_FLUSH, 0),
+            };
+            report("V020_SEC_D_BLOCK_RECOVERY_OP", slot, kind, sector);
+        }
+    }
+}
+
+/// Only the verified policy of the media transaction owner can bind
+/// subsequent terminal custody. A pre-confirmation seal never gains an epoch.
+#[cfg(any(feature = "v020-production-media-signed", cyxia_startup_catalog))]
+pub(crate) fn bind_confirmed_epoch(policy: &ConfirmedBootPolicy<'_>) -> Result<(), SecurityError> {
+    let epoch = NonZeroU64::new(policy.boot_epoch()).ok_or(SecurityError::Unauthorized)?;
+    if cpu::slot() != 0
+        || DEVICE_MMIO.load(Ordering::Relaxed) == 0
+        || TERMINAL_STATE.load(Ordering::Relaxed) != EMPTY
+    {
+        return Err(SecurityError::Unauthorized);
+    }
+    CONFIRMED_EPOCH
+        .compare_exchange(0, epoch.get(), Ordering::Relaxed, Ordering::Relaxed)
+        .map(|_| ())
+        .map_err(|_| SecurityError::Conflict)
+}
 
 fn retain_for_recovery(device: &ScratchBlock) {
     let Some(custody) = device.terminal_custody() else {
         return;
     };
-    if TERMINAL_READY.load(Ordering::Relaxed) {
+    if TERMINAL_STATE.load(Ordering::Relaxed) != EMPTY {
         return;
     }
+    let sealed = ScratchTerminalCustody {
+        mmio: DEVICE_MMIO.load(Ordering::Relaxed),
+        epoch: NonZeroU64::new(CONFIRMED_EPOCH.load(Ordering::Relaxed)),
+        retained: custody,
+    };
     // SAFETY: only the one-shot CPU0 owner publishes, before any recovery
     // readback. IRQ handlers and secondaries never access this record.
-    unsafe { core::ptr::addr_of_mut!(TERMINAL).write(MaybeUninit::new(custody)) };
-    TERMINAL_READY.store(true, Ordering::Release);
+    unsafe { core::ptr::addr_of_mut!(TERMINAL).write(MaybeUninit::new(sealed)) };
+    TERMINAL_STATE.store(SEALED, Ordering::Release);
 }
 
 #[cfg(any(feature = "v020-production-media-staging", cyxia_startup_catalog))]
-pub(crate) fn report_recovery_custody(boot_epoch: u64) {
-    if !TERMINAL_READY.load(Ordering::Acquire) {
-        return;
+pub(crate) fn take_terminal_custody() -> Option<&'static ScratchTerminalCustody> {
+    if cpu::slot() != 0
+        || TERMINAL_STATE
+            .compare_exchange(SEALED, TRANSFERRED, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return None;
     }
-    // SAFETY: publication released the sole writer and the snapshot is Copy.
-    let custody = unsafe { (&*core::ptr::addr_of!(TERMINAL)).assume_init_read() };
-    let (state, detail) = match custody.reset {
-        None => (0, 0),
-        Some(Ok(observed)) => (1, observed),
-        Some(Err(error)) => (2, error as u64),
-    };
-    report("V020_SEC_D_BLOCK_RECOVERY", boot_epoch, state, detail);
-    for request in custody.requests.iter().flatten() {
-        let slot = u64::from(request.token.slot);
-        report(
-            "V020_SEC_D_BLOCK_RECOVERY_CHAIN",
-            slot,
-            request.token.generation,
-            u64::from(request.completed),
-        );
-        let (kind, sector) = match request.operation {
-            Operation::Read(sector) => (KIND_READ, sector),
-            Operation::Write(sector) => (KIND_WRITE, sector),
-            Operation::Flush => (KIND_FLUSH, 0),
-        };
-        report("V020_SEC_D_BLOCK_RECOVERY_OP", slot, kind, sector);
-    }
+    // SAFETY: the acquire observes completed initialization before the seal.
+    // The monotonic terminal state excludes any further writer.
+    Some(unsafe { (&*core::ptr::addr_of!(TERMINAL)).assume_init_ref() })
 }
 
 // First failure of a scratch request, kept so the caller can report the real
@@ -200,7 +259,7 @@ pub(crate) enum AttachError {
     Owner = 6,
 }
 
-fn select(info: &BootInfo) -> Result<Transport, AttachError> {
+fn select(info: &BootInfo) -> Result<(Transport, u64), AttachError> {
     let mut selected = None;
     for resource in &info.virtio[..info.virtio_count] {
         if resource.base.0 < 0x0a000000
@@ -226,7 +285,7 @@ fn select(info: &BootInfo) -> Result<Transport, AttachError> {
             if selected.is_some() {
                 return Err(AttachError::Ambiguous);
             }
-            selected = Some(t);
+            selected = Some((t, resource.base.0));
         }
     }
     selected.ok_or(AttachError::Absent)
@@ -254,7 +313,7 @@ fn attach_with(
     ) -> Result<ScratchBlock, DriverError>,
     deadline_ns: u64,
 ) -> Result<&'static mut ScratchBlock, AttachError> {
-    let transport = select(info)?;
+    let (transport, mmio) = select(info)?;
     if cpu::slot() != 0 || CLAIMED.swap(true, Ordering::AcqRel) {
         return Err(AttachError::Owner);
     }
@@ -284,6 +343,7 @@ fn attach_with(
         .set_notify_policy(2, 1, now.saturating_add(deadline_ns), now)
         .map_err(|_| AttachError::Policy)?;
     device.set_completion_interrupts(false, &Board);
+    DEVICE_MMIO.store(mmio, Ordering::Relaxed);
     Ok(device)
 }
 
@@ -349,6 +409,7 @@ fn finish_io(
     result: Result<(), SecurityError>,
 ) -> Result<(), SecurityError> {
     if result.is_err()
+        && TERMINAL_STATE.load(Ordering::Relaxed) == EMPTY
         && let Some(stop) = device.stop_failed_mmio(&Board)
     {
         retain_for_recovery(device);
