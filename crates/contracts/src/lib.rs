@@ -17,6 +17,7 @@ pub enum ContractError {
     NotReady,
     Capacity,
 }
+pub mod net_ingress;
 pub mod tls_signer;
 pub mod transport;
 pub mod user_layout;

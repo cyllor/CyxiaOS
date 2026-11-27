@@ -89,6 +89,7 @@ PRODUCTION_SOURCES = [
     "kernel/build/v0199_roles.rs",
     "kernel/build/startup_catalog.rs",
     "kernel/src/arch/aarch64/sec_n_broker.rs",
+    "kernel/src/arch/aarch64/sec_n_broker/ingress.rs",
     "kernel/src/arch/aarch64/sec_n_broker/receipt.rs",
     "kernel/src/arch/aarch64/sec_n_broker/signer.rs",
     "kernel/src/arch/aarch64/scratch_blk.rs",
@@ -131,6 +132,7 @@ PRODUCTION_SOURCES = [
     "crates/driver-virtio/src/queue.rs",
     "crates/driver-virtio/src/reset.rs",
     "crates/driver-virtio/src/transport.rs",
+    "crates/contracts/src/net_ingress.rs",
     "crates/contracts/src/tls_signer.rs",
     "crates/kernel-core/src/security/recovery_proof_v2.rs",
     "crates/kernel-core/src/security/boot_epoch_v1.rs",
@@ -167,6 +169,7 @@ PRODUCTION_SOURCES = [
     "crates/kernel-core/src/control_plane/snapshot_store_v3.rs",
     "crates/net-transport/src/admission.rs",
     "crates/net-transport/src/device.rs",
+    "crates/net-transport/src/ingress.rs",
     "crates/net-transport/src/native_tcp.rs",
     "crates/net-transport/src/tcp.rs",
     "crates/net-transport/src/tcp/observe.rs",
@@ -179,6 +182,7 @@ PRODUCTION_SOURCES = [
     "user/v0199-control/file_receipt.rs",
     "user/v0199-control/file_fsync.rs",
     "user/local-echo/src/broker.rs",
+    "user/local-echo/src/ingress.rs",
     "user/local-echo/src/lib.rs",
     "user/local-echo/src/runtime.rs",
     "user/local-echo/src/signer.rs",
@@ -827,6 +831,66 @@ def supervisor_copy_windows(elf, qmp, output, lines, *, snapshot_lists=None, fil
     }
 
 
+def ingress_mappings(elf, qmp, output, image_pages):
+    """Read the stopped parser's actual tree and every resulting leaf."""
+    require = verify_smp.require
+    page = 4096
+    image_slots, mid_first, mid_count, shared_slots, stack_pages = 16, 8, 9, 4, 4
+    space = symbol(elf, "V020_SEC_N_INGRESS_SPACE")
+    base = space["pa"]
+    require(base % page == 0 and space["size"] ==
+            (image_slots + mid_count + 2 + shared_slots + stack_pages) * page,
+            "unexpected private parser address space geometry")
+    leaves = base + image_slots * page
+    mid = leaves + mid_count * page
+    root = mid + page
+    mailbox = root + page
+    stack = mailbox + shared_slots * page
+
+    def read(name, address):
+        path = output / f"ingress-{name}.bin"
+        qmp.execute("pmemsave", {"val": address, "size": page, "filename": str(path)})
+        data = path.read_bytes()
+        require(len(data) == page, "incomplete parser page readback")
+        return data
+
+    def table(name, address):
+        return struct.unpack("<512Q", read(name, address))
+
+    root_entries = table("root", root)
+    require(root_entries[0] == mid | 3 and not any(root_entries[1:]),
+            "unexpected parser root branch")
+    mid_entries = table("mid", mid)
+    expected_mid = {
+        mid_first + index: (leaves + index * page) | 3 for index in range(mid_count)
+    }
+    require(all(entry == expected_mid.get(index, 0)
+                for index, entry in enumerate(mid_entries)), "unexpected parser mid branch")
+
+    xn = 1 << 54
+    readonly = 1 << 7
+    user_base = (1 << 53) | 0xf43
+    valid_va = {0x01000000 + index * page: base + index * page for index in range(image_pages)}
+    mailbox_va = 0x02000000
+    stack_va = 0x01f00000
+    extra = {mailbox_va: mailbox | user_base | xn | readonly}
+    extra.update({stack_va + index * page: (stack + index * page) | user_base | xn
+                  for index in range(stack_pages)})
+    for index in range(mid_count):
+        leaf = table(f"leaf-{index}", leaves + index * page)
+        for slot, entry in enumerate(leaf):
+            va = ((mid_first + index) << 21) | (slot << 12)
+            pa = valid_va.get(va)
+            if pa is None:
+                require(entry == extra.get(va, 0), "parser mapped a foreign or unneeded page")
+            else:
+                require(entry in (pa | user_base | readonly, pa | user_base | readonly | xn),
+                        "parser image moved or mapped writable")
+    require(read("mailbox", mailbox) == bytes(page), "stopped parser mailbox retained bytes")
+    return {"root_pa": hex(root), "mailbox_pa": hex(mailbox), "mailbox_read_only": True,
+            "mailbox_scrubbed": True, "stack_pages": stack_pages, "private_leaves_verified": True}
+
+
 def dense_frame_meta(qmp, output, lines, permanent_observed):
     require = verify_smp.require
 
@@ -1034,6 +1098,10 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                         ))
                     relay_bytes = report["observations"]["echo_bytes_relayed"]
                     if modes.authenticated_net:
+                        report["ingress_mappings"] = ingress_mappings(
+                            elf.read_bytes(), qmp, output,
+                            report["observations"]["native_parser_image_pages"],
+                        )
                         require(peer is not None, "missing authenticated host peer")
                         peer.join(timeout=min(max(end - time.monotonic(), 0), PEER_WAIT_SECONDS))
                         authenticated_echo(peer.result, relay_bytes, modes.orderly_close)

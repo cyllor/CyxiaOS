@@ -510,7 +510,13 @@ class W11Validation(unittest.TestCase):
             f"V020_SEC_N_VERIFIER_AUTHENTICATED a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
             f"V020_W13_NET_RETIRE a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
         ]
+        self.rejects("isolated ingress parser", words=words, lines=lines, modes=modes)
+        lines += [
+            "V020_SEC_N_PARSER_SPACE a=66 b=6 c=1",
+            "V020_SEC_N_PARSER_FRAMES a=13 b=12 c=1",
+        ]
         obs = self.check(words=words, lines=lines, modes=modes)
+        self.assertEqual(obs["native_parser_accepted_frames"], 12)
         self.assertEqual(obs["tls_drbg_guest_bytes"], 96)
         self.assertEqual(obs["virtio_rng_health_samples"], 1024)
         self.assertEqual(obs["tls_drbg_key_epoch"], 1)
@@ -556,6 +562,10 @@ class W11Validation(unittest.TestCase):
             "V020_SEC_N_SIGNER_SPACE a=65 b=17 c=0",
             "V020_SEC_N_SIGNER_REPLY a=1 b=1 c=1",
             f"V020_SEC_N_VERIFIER_AUTHENTICATED a=1 b={v.QEMU_GATEWAY_IPV4} c=1",
+        ]
+        lines += [
+            "V020_SEC_N_PARSER_SPACE a=66 b=6 c=1",
+            "V020_SEC_N_PARSER_FRAMES a=10 b=10 c=0",
         ]
         modes = v.Modes(authenticated_net=True, orderly_close=False)
         self.assertEqual(self.check(words=words, lines=lines, modes=modes)["native_admission_retirements"], 0)

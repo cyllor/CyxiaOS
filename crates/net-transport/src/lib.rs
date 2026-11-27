@@ -22,6 +22,8 @@ pub mod admission;
 #[cfg(feature = "smoltcp")]
 pub mod device;
 pub mod echo;
+#[cfg(feature = "smoltcp")]
+pub mod ingress;
 #[cfg(feature = "tls")]
 pub mod local_echo_tcp;
 #[cfg(feature = "tls")]

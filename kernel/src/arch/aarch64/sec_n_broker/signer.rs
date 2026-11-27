@@ -28,7 +28,7 @@ impl Signer {
         // SAFETY: the single CPU0 network owner loads this address space once.
         // Its key pages are separate from the verifier's virtual address space.
         let memory = unsafe { AddressSpace::memory(core::ptr::addr_of_mut!(SIGNER)) };
-        let layout = load_image(SIGNER_ELF, &memory);
+        let layout = load_image(SIGNER_ELF, &memory, SHARED_PAGES, true);
         report(
             "V020_SEC_N_SIGNER_SPACE",
             u64::from(SIGNER_ASID),

@@ -43,5 +43,7 @@ fn main() {
     if signer {
         println!("cargo:rustc-link-arg-bin=cyxia-echo-signer=-T{dir}/linker.ld");
         println!("cargo:rustc-link-arg-bin=cyxia-echo-signer=-zmax-page-size=4096");
+        println!("cargo:rustc-link-arg-bin=cyxia-echo-ingress=-T{dir}/linker.ld");
+        println!("cargo:rustc-link-arg-bin=cyxia-echo-ingress=-zmax-page-size=4096");
     }
 }
