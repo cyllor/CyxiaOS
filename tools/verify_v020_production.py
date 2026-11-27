@@ -110,6 +110,7 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/media_staging.rs",
     "kernel/src/arch/aarch64/production/media_staging/authority.rs",
     "kernel/src/arch/aarch64/production/media_staging/fsync.rs",
+    "kernel/src/arch/aarch64/production/media_staging/fsync_retire.rs",
     "kernel/src/arch/aarch64/production/media_staging/reopen.rs",
     "kernel/src/arch/aarch64/production/media_staging/signed.rs",
     "kernel/src/arch/aarch64/production/media_staging/volume.rs",
@@ -602,6 +603,15 @@ def check_w11_net(words: tuple, lines: list, serial: bytes) -> None:
             "direct Admission receipt missing or disagrees with the pinned connection")
 
 
+def fsync_checkpoint_retirement_io(row: tuple, commit_lsn: int,
+                                  pending_fsync_blocks: int | None) -> tuple:
+    epoch, lsn, retired = row
+    verify_smp.require(epoch == 1 and lsn == commit_lsn and 0 <= retired <= 32
+                       and retired == pending_fsync_blocks,
+                       "initial FSYNC checkpoint retirement differs from observed log")
+    return 6 + retired, 3 + int(retired != 0)
+
+
 def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
                       snapshot_calls: int, modes: Modes, *,
                       pending_fsync_blocks: int | None = None,
@@ -631,9 +641,14 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     require(lines.count(STAGING_MARKER) == 1,
             "staging marker with golden_vector_pending=1 must appear exactly once")
     steps = w11_rows(lines, "V020_W11_MEDIA_STEP")
+    retirement = w11_rows(lines, "V020_FSYNC_CHECKPOINT_RETIRE")
+    require(not retirement or (modes.fsync_scratch and reopen and epoch == 2
+                               and len(retirement) == 1),
+            "unexpected FSYNC checkpoint retirement")
+    selected_generation = 2 if retirement else epoch - int(reopen)
     live_inodes = (9 if modes.media_unified else 5) + int(modes.file_read or modes.fsync_scratch)
     require([step[:2] for step in steps] == [(index, 1) for index in range(1, 6)]
-            and steps[0][2] == epoch - int(reopen) and steps[1][2] == live_inodes
+            and steps[0][2] == selected_generation and steps[1][2] == live_inodes
             and steps[2][2] == 151 and steps[4][2] == 1,
             "media staging serial steps must show format, mount, map, epoch and admission success")
     require(steps[3][2] == words[148], "media staging BootEpoch disagrees with word 148")
@@ -653,6 +668,8 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
                 )), "BOUND receipt must preserve uncertainty")
         if not reopen:
             expected_io = (4155, 10)
+        elif retirement:
+            expected_io = fsync_checkpoint_retirement_io(retirement[0], 14, pending_fsync_blocks)
         elif epoch == 2:
             require(pending_fsync_blocks in (None, 18), "pre-replay BOUND log block count differs")
             expected_io = (30, 5)  # Five homes, a checkpoint, 18 retirements, six boot records.
@@ -670,7 +687,9 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
             commit in (21, 23) and terminal[0][1] > 0 and low <= terminal[0][2] <= high
         )
         require(terminal == legacy or current, "media staging FSYNC terminal differs")
-        if reopen and epoch > 2:
+        if retirement:
+            expected_io = fsync_checkpoint_retirement_io(retirement[0], commit, pending_fsync_blocks)
+        elif reopen and epoch > 2:
             # Only the earlier BootEpoch pair remains. The two data tails
             # are zero, and the boot-only recovery clears all six log blocks.
             require(pending_fsync_blocks in (None, 4),

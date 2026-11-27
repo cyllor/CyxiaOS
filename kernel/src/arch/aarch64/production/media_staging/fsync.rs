@@ -38,6 +38,9 @@ use cyxia_kernel_core::security::{
 };
 use sha2::{Digest, Sha256};
 
+#[path = "fsync_retire.rs"]
+mod fsync_retire;
+
 const FILE_LEN: usize = SCRATCH_FILE_DATA.len();
 const SIZE_BYTES: usize = 8;
 const FROZEN_BYTES: usize = SIZE_BYTES + FSYNC_SCRATCH_MAX_BYTES;
@@ -439,6 +442,27 @@ fn recovered_version(inode_block: &[u8; BLOCK], commit_lsn: u64) -> Result<(usiz
     Ok((size, inode.durable_write_seq))
 }
 
+fn version_inode_page(inode: &mut [u8; BLOCK], size: usize, write_seq: u64) -> Result<(), Error> {
+    let file = &mut inode[INODE_AT..INODE_AT + INODE_BYTES];
+    file[16..24].copy_from_slice(&(size as u64).to_le_bytes());
+    file[24..32].copy_from_slice(&write_seq.to_le_bytes());
+    file[56..60].copy_from_slice(&(size.div_ceil(BLOCK) as u32).to_le_bytes());
+    let crc = crc32c_zeroed(file, 252)?;
+    file[252..].copy_from_slice(&crc.to_le_bytes());
+    Ok(())
+}
+
+fn allocate_second_data_home(bitmap: &mut [u8; BLOCK]) -> Result<(), Error> {
+    // Both fixture data blocks are in the first canonical bitmap page.
+    let bit = (SCRATCH_FILE_BLOCK + 1) as usize;
+    let mask = 1 << (bit % 8);
+    if bitmap[bit / 8] & mask != 0 {
+        return Err(Error::Conflict);
+    }
+    bitmap[bit / 8] |= mask;
+    Ok(())
+}
+
 fn final_receipt(
     snapshot: &mut [u8; FROZEN_BYTES],
     size: usize,
@@ -521,6 +545,12 @@ pub(super) fn recover(
         // SAFETY: this private preflight ends before any view is published.
         let receipts = unsafe { &mut *core::ptr::addr_of_mut!(RECEIPTS) };
         let expected = read_retained_receipt(disk, origin, receipts)?;
+        if checkpoint.generation == 2
+            && fsync_retire::initial_residue_present(disk, checkpoint, config)?
+        {
+            let mounted = fsync_retire::resume(disk, checkpoint, config, expected)?;
+            return Ok((checkpoint, mounted));
+        }
         return reopen::recover_boot_pair(disk, checkpoint, Some(config), mode, |disk, epoch| {
             volume::validate_fsync_homes(
                 disk,
@@ -607,22 +637,11 @@ pub(super) fn recover(
         let (size, write_seq) = recovered_version(block, final_lsn)?;
         let pages = size.div_ceil(BLOCK);
         let mut inode = prior_inode;
-        let file = &mut inode[INODE_AT..INODE_AT + INODE_BYTES];
-        file[16..24].copy_from_slice(&(size as u64).to_le_bytes());
-        file[24..32].copy_from_slice(&write_seq.to_le_bytes());
-        file[56..60].copy_from_slice(&(pages as u32).to_le_bytes());
-        let crc = crc32c_zeroed(file, 252)?;
-        file[252..].copy_from_slice(&crc.to_le_bytes());
+        version_inode_page(&mut inode, size, write_seq)?;
         writer.verify_replay_home(INODE_START, final_lsn, &prior_inode, &inode)?;
         if pages == 2 {
-            // Both fixture data blocks are in the first canonical bitmap page.
-            let bit = (SCRATCH_FILE_BLOCK + 1) as usize;
-            let mask = 1 << (bit % 8);
-            if prior_bitmap[bit / 8] & mask != 0 {
-                return Err(Error::Conflict);
-            }
             let mut bitmap = prior_bitmap;
-            bitmap[bit / 8] |= mask;
+            allocate_second_data_home(&mut bitmap)?;
             writer.verify_replay_home(BITMAP_START, final_lsn, &prior_bitmap, &bitmap)?;
         }
         let mut old_data = [0; BLOCK];

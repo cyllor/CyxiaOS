@@ -929,6 +929,27 @@ class W11Validation(unittest.TestCase):
                         v.check_w11_staging(tuple(words), recovered + [off_by_one], b"", True,
                                             3, modes, pending_fsync_blocks=pending)
 
+    def test_fsync_resume_initial_checkpoint_retirement_checks_remaining_writes(self):
+        modes = v.Modes(fsync_scratch=True, media_reopen=True)
+        words = w11_words(staging=True)
+        words[145:151] = [0, 1, 1, 2, 1, 1]
+        words[162:164] = [1, 1]
+        lines = [v.STAGING_MARKER, "V020_W12_MEDIA_EPOCH a=1 b=2 c=1",
+                 "V020_FSYNC_RECOVERED a=2 b=21 c=7",
+                 f"V020_W11_MEDIA_SNAPSHOT_0X40 a=3 b={v.EAGAIN_RESULT} c=0"]
+        lines += [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
+                  for index, detail in enumerate((2, 6, 151, 2, 1), start=1)]
+        for pending in (0, 1, 28):
+            with self.subTest(pending=pending):
+                reported = lines + [f"V020_FSYNC_CHECKPOINT_RETIRE a=1 b=21 c={pending}",
+                                    f"V020_W11_MEDIA_IO a=4288 b={6 + pending} "
+                                    f"c={3 + int(pending != 0)}"]
+                v.check_w11_staging(tuple(words), reported, b"", True, 3, modes,
+                                    pending_fsync_blocks=pending)
+                with self.assertRaisesRegex(ValueError, "retirement differs"):
+                    v.check_w11_staging(tuple(words), reported, b"", True, 3, modes,
+                                        pending_fsync_blocks=pending + 1)
+
     def test_fsync_third_boot_keeps_original_receipt(self):
         modes = v.Modes(fsync_scratch=True, media_reopen=True)
         words = w11_words(staging=True)

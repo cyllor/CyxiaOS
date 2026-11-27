@@ -361,6 +361,72 @@ pub struct RedoTransaction {
     pub log_blocks: u32,
 }
 
+/// Verify the residue of one exact transaction after its successor
+/// checkpoint is selected. The exclusive owner supplies the independently
+/// verified images and extent. Every surviving log block must match the
+/// original encoder byte-for-byte. A zero block may have been retired.
+/// This does not write or authorize retirement by itself.
+pub fn verify_checkpointed_transaction_residue(
+    io: &mut impl EpochBlockIo,
+    plan: RedoTransaction,
+    images: &[RedoImage<'_>],
+) -> Result<(), Error> {
+    let count = images.len();
+    if !(1..=MAX_REDO).contains(&count)
+        || plan.fs_uuid == [0; 16]
+        || plan.log_epoch == 0
+        || plan.txid == 0
+        || plan.begin_lsn == 0
+        || plan.begin_lsn.checked_add(count as u64 + 1) != Some(plan.commit_lsn)
+        || plan.log_blocks != 2 + 2 * count as u32
+        || plan.first_log_block < FIRST
+        || plan
+            .first_log_block
+            .checked_add(plan.log_blocks)
+            .is_none_or(|end| end > END)
+    {
+        return Err(Error::Invalid);
+    }
+    let encoding = RedoEncoding {
+        epoch: plan.log_epoch,
+        txid: plan.txid,
+        begin_lsn: plan.begin_lsn,
+        count: count as u32,
+    };
+    let mut observed = [0; BLOCK];
+    let mut compare = |block, expected: &[u8]| {
+        io.read(block, &mut observed)?;
+        if observed != *expected && observed.iter().any(|&byte| byte != 0) {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    };
+    let mut raw = [0; 2 * BLOCK];
+    let record: &mut [u8; BLOCK] = (&mut raw[..BLOCK]).try_into().unwrap();
+    encoding.begin(record)?;
+    compare(plan.first_log_block, record)?;
+    let mut digest = Sha256::new();
+    for (index, image) in images.iter().enumerate() {
+        if !(BITMAP_START..BLOCK_COUNT).contains(&image.home)
+            || images[..index]
+                .iter()
+                .any(|previous| previous.home == image.home)
+            || has_later_log_header(&image.contents[BLOCK - 64..], plan.log_epoch)
+        {
+            return Err(Error::Conflict);
+        }
+        digest.update(u64::from(image.home).to_le_bytes());
+        digest.update(image.contents);
+        let log = plan.first_log_block + 1 + 2 * index as u32;
+        encoding.after_image(&mut raw, index as u32, image.home, image.contents)?;
+        compare(log, &raw[..BLOCK])?;
+        compare(log + 1, &raw[BLOCK..])?;
+    }
+    let record: &mut [u8; BLOCK] = (&mut raw[..BLOCK]).try_into().unwrap();
+    encoding.commit(record, digest.finalize().into())?;
+    compare(plan.first_log_block + plan.log_blocks - 1, record)
+}
+
 /// Verified ordered FLUSH completions and matching device readback.
 pub struct CommittedRedo {
     transaction: RedoTransaction,
@@ -1297,6 +1363,30 @@ mod tests {
         assert_eq!(scan(&mut d, &mut fresh), Err(Error::Unknown));
         assert_eq!(SuperblockV1::decode(d.blocks[&1].as_ref()), Ok(checkpoint));
         assert!(d.blocks[&7000].as_ref() == &data);
+    }
+
+    #[test]
+    fn exact_checkpointed_transaction_identifies_ordinary_retirement_residue() {
+        let mut disk = blank_disk();
+        let mut work = RecoveryWorkspace::new();
+        let sb = SuperblockV1::decode(&superblock()).unwrap();
+        let images = [RedoImage {
+            home: 7000,
+            contents: &[0x41; BLOCK],
+        }];
+        let mut writer = RedoWriter::open(&mut disk, &mut work, sb).unwrap();
+        let plan = writer.prepare(1).unwrap();
+        writer.append(plan, &images, |_| Ok(())).unwrap();
+        let checkpoint = writer.checkpoint_verified(|_, _| Ok(())).unwrap().1;
+        disk.fail_write = Some(4);
+        assert_eq!(
+            retire_checkpointed_log(&mut disk, &mut work, checkpoint),
+            Err(Error::Unknown)
+        );
+        let events = disk.events.len();
+        verify_checkpointed_transaction_residue(&mut disk, plan, &images).unwrap();
+        assert_eq!(disk.events.len(), events);
+        assert_eq!(disk.blocks[&7000].as_ref(), images[0].contents);
     }
 
     #[test]
