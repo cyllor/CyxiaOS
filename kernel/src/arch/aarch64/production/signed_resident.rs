@@ -30,6 +30,9 @@ use cyxia_kernel_core::{
     },
 };
 
+#[path = "signed_budget_trace.rs"]
+mod budget_trace;
+
 const CLOCK: u16 = 1;
 const YIELD: u16 = 1 << 1;
 const SLEEP: u16 = 1 << 2;
@@ -92,6 +95,7 @@ impl From<Error> for Fault {
 pub(super) struct Sample {
     pub(super) wall: u64,
     cpu_tick: u64,
+    before: u64,
 }
 
 impl Sample {
@@ -108,7 +112,11 @@ impl Sample {
             let cpu_tick = timer::cpu_ticks();
             let wall = now_ns().checked_add(tick_ns).ok_or(Error::Clock)?;
             if before < wall && before / WINDOW_NS == wall / WINDOW_NS {
-                return Ok(Self { wall, cpu_tick });
+                return Ok(Self {
+                    wall,
+                    cpu_tick,
+                    before,
+                });
             }
         }
         Err(Error::Clock)
@@ -150,6 +158,7 @@ struct Continuous {
     initial_tick: u64,
     initial_spent: u64,
     idle_ns: u64,
+    trace: budget_trace::Trace,
 }
 
 struct Budget {
@@ -158,9 +167,10 @@ struct Budget {
 }
 
 impl Budget {
-    fn begin_continuous(&mut self) -> Result<(), Error> {
+    fn begin_continuous(&mut self, boot_epoch: u64) -> Result<(), Error> {
         let cursor = Sample::now()?;
         let initial_spent = self.ledger.lifetime_total()?;
+        let opening_window = self.ledger.aligned_window().ok_or(Error::Clock)?;
         self.ledger
             .start_continuous_after_bootstrap_recovery(cpu::slot(), cursor.wall, || Ok(()))?;
         self.continuous = Some(Continuous {
@@ -168,6 +178,7 @@ impl Budget {
             initial_tick: cursor.cpu_tick,
             initial_spent,
             idle_ns: 0,
+            trace: budget_trace::Trace::new(cursor, boot_epoch, opening_window, initial_spent),
         });
         Ok(())
     }
@@ -177,6 +188,7 @@ impl Budget {
             return Ok(Sample::now()?);
         };
         let receipt = continuous.cursor.account_gap(&mut self.ledger)?;
+        continuous.trace.record(continuous.cursor, None, 0);
         if receipt.overrun {
             return Err(Fault::Coordination {
                 used: receipt.actual_ns,
@@ -187,11 +199,12 @@ impl Budget {
         Ok(continuous.cursor)
     }
 
-    fn settle(&mut self, grant: Turn, start: Sample) -> Result<u64, Fault> {
+    fn settle(&mut self, grant: Turn, start: Sample, returned: u64) -> Result<u64, Fault> {
         let mut end = start;
         let receipt = end.settle(&mut self.ledger, grant)?;
         if let Some(continuous) = self.continuous.as_mut() {
             continuous.cursor = end;
+            continuous.trace.record(end, Some(grant), returned);
         }
         let actor = || grant.accounting_scope().1.map_or(0, |(_, actor)| actor.id);
         if receipt.actual_ns > grant.reserved_ns() {
@@ -225,8 +238,8 @@ impl Budget {
         Ok(())
     }
 
-    fn queue_evidence(&self, pending: &mut OutputQueue<128>) -> Result<(), Error> {
-        let continuous = self.continuous.as_ref().ok_or(Error::NotReady)?;
+    fn queue_evidence(&mut self, pending: &mut OutputQueue<128>) -> Result<(), Error> {
+        let continuous = self.continuous.as_mut().ok_or(Error::NotReady)?;
         let observed = continuous.cursor.cpu_since(continuous.initial_tick)?;
         let charged = self
             .ledger
@@ -236,6 +249,9 @@ impl Budget {
         if observed != charged {
             return Err(Error::Clock);
         }
+        continuous
+            .trace
+            .maybe_seal(continuous.cursor, &self.ledger, charged, continuous.idle_ns);
         let mut text = [0; 96];
         let payload = report_payload(
             &mut text,
@@ -321,7 +337,7 @@ fn startup_work<T>(budget: &mut Budget, step: u64, work: impl FnOnce() -> T) -> 
         }
     };
     let result = work();
-    let used = budget.settle(grant, start)?;
+    let used = budget.settle(grant, start, 0)?;
     if used == 0 {
         return Err(Error::Clock.into());
     }
@@ -359,12 +375,13 @@ fn turn(
     };
     // Recheck the persisted authority inside the prepaid turn. No role is
     // entered using a generation or address space from its own request.
+    let mut returned = 0;
     let result = if policy.service_generation(member.role) == Ok(member.actor.generation) {
-        run_quantum(member, index, task, grant, &start)
+        run_quantum(member, index, task, grant, &start, &mut returned)
     } else {
         Err(Error::Denied)
     };
-    budget.settle(grant, start)?;
+    budget.settle(grant, start, returned)?;
     result.map_err(Into::into)
 }
 
@@ -374,6 +391,7 @@ fn run_quantum(
     task: &mut Task,
     grant: Turn,
     start: &Sample,
+    returned: &mut u64,
 ) -> Result<(), Error> {
     // A separate physical timer forces return before the prepaid bound
     // expires. Reserve exit/settlement margin using the native fixture's
@@ -408,6 +426,7 @@ fn run_quantum(
             cpu::disable_timer();
         }
         ACTIVE_ROLE_TTBR0.store(0, Ordering::Release);
+        *returned += 1;
         match task.trap() {
             Ok(false) => {}
             Ok(true) => break,
@@ -476,7 +495,7 @@ fn run_tasks(
                             IRQS[0].load(Ordering::Acquire),
                         );
                     }
-                    budget.settle(grant, start)?;
+                    budget.settle(grant, start, 0)?;
                     result?;
                     if pending.pending() != 0 || budget_frame {
                         wake =
@@ -498,7 +517,7 @@ fn queue_activity(
     window: u64,
     proof_window: &mut u64,
     budget_frame: &mut bool,
-    budget: &Budget,
+    budget: &mut Budget,
     pending: &mut OutputQueue<128>,
 ) -> Result<(), Error> {
     if pending.pending() == 0 {
@@ -653,7 +672,7 @@ pub(super) fn run(info: &BootInfo) -> ! {
     if policy.boot_epoch() != staged.confirmed_epoch {
         resident::serve(info, Some(FENCED), budget.ledger);
     }
-    if let Err(error) = budget.begin_continuous() {
+    if let Err(error) = budget.begin_continuous(policy.boot_epoch()) {
         fence(info, budget, OutputQueue::new(), error.into());
     }
     let actors = match identities(&policy) {

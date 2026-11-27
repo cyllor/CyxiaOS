@@ -181,6 +181,9 @@ impl Cpu0BudgetLedger {
     pub fn spent(&self, class: Class) -> u64 {
         self.spent[class.index()]
     }
+    pub fn aligned_window(&self) -> Option<u64> {
+        self.window
+    }
     pub fn ordinary_closed(&self) -> bool {
         self.ordinary_closed
     }

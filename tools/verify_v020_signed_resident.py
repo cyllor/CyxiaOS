@@ -2,17 +2,22 @@
 """Verify signed scratch role lifecycle on the locked per-vCPU PMU QEMU."""
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
 import select
 import shutil
+import socket
 import struct
 import subprocess
 import tempfile
 import time
 
+from check_elf import symbol
+from run_qemu import Qmp
 from transport import FrameDecoder
+from v0199_budget_trace import SIGNED_TRACE_BYTES, verify_signed_trace
 from v020_production_media import (
     BLOCK_BYTES, REDO_HEADER_BYTES, SECURITY_REDO, STAGING_UUID, verify_signed_disk,
 )
@@ -27,6 +32,7 @@ COMPLETE_PROGRESS = (0xFFFF, 0x8778)  # Clock/Yield for all, four Sleep and four
 STARTUP = "V020_STARTUP state=SECURE_DEGRADED reason=signed_media_unavailable command=status"
 RECOVERY_NS = 8_000_000
 PMU_PATCH = Path(__file__).resolve().parent / "qemu/cyxia-per-vcpu-pmu.patch"
+TRACE_FILE = "cpu0-budget-trace.bin"
 
 
 def verify_resident_budget(lines: list, progress: list) -> list:
@@ -61,8 +67,32 @@ def verify_disk(path: Path, epoch: int, roles: list) -> str:
     return policy
 
 
-def boot(binary: str, elf: Path, output: Path, timeout: float,
-         disk: Path | None, epoch: int | None) -> dict:
+def capture_budget_trace(socket_path: Path, elf: Path, output: Path, deadline: float) -> dict:
+    location = symbol(elf.read_bytes(), "V020_SIGNED_CPU_BUDGET_TRACE")
+    require(location["size"] == SIGNED_TRACE_BYTES and location["pa"] % 4096 == 0,
+            "invalid linked signed CPU0 trace extent")
+    path = output / TRACE_FILE
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.settimeout(5)
+        sock.connect(str(socket_path))
+        qmp = Qmp(sock)
+        try:
+            require("QMP" in qmp.receive(deadline), "invalid signed budget QMP greeting")
+            qmp.execute("qmp_capabilities")
+            require(qmp.execute("query-status")["running"], "guest was not live before CPU0 capture")
+            qmp.execute("stop")
+            require(qmp.execute("query-status")["status"] == "paused", "guest did not pause for CPU0 capture")
+            qmp.execute("pmemsave", {"val": location["pa"], "size": location["size"],
+                                     "filename": str(path.resolve())})
+        finally:
+            (output / "budget-qmp.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in qmp.transcript), encoding="utf-8",
+            )
+    return {"budget_trace_sha256": sha(path), "budget_trace_physical": location["pa"]}
+
+
+def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None,
+         epoch: int | None, *, budget_trace: bool = False) -> dict:
     output.mkdir()
     elf_digest = sha(elf)
     result = {"elf_sha256": elf_digest, "status": "FAIL"}
@@ -78,7 +108,12 @@ def boot(binary: str, elf: Path, output: Path, timeout: float,
                  "-drive", f"file={disk},if=none,id=scratch,format=raw,cache=none",
                  "-device", "virtio-blk-device,drive=scratch"]
     deadline = time.monotonic() + timeout
-    with (output / "qemu-stderr.log").open("wb") as stderr:
+    capture = tempfile.TemporaryDirectory(prefix="cyx-signed-qmp-") if budget_trace else nullcontext()
+    with capture as socket_dir, (output / "qemu-stderr.log").open("wb") as stderr:
+        socket_path = None
+        if socket_dir is not None:
+            socket_path = Path(socket_dir) / "q"
+            argv += ["-qmp", f"unix:{socket_path},server=on,wait=off"]
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr)
         try:
             def wait_until(predicate) -> None:
@@ -147,9 +182,11 @@ def boot(binary: str, elf: Path, output: Path, timeout: float,
                     "legacy role authority or hardware failure")
             require(proc.poll() is None, "guest stopped after its last response")
             require(decoder.loss == decoder.corrupt == 0, "corrupt resident console trace")
+            if socket_path is not None:
+                result.update(capture_budget_trace(socket_path, elf, output, deadline))
             require(sha(elf) == elf_digest, "kernel ELF changed during the run")
             result["status"] = "PASS"
-        except (ValueError, OSError) as error:
+        except (ValueError, OSError, RuntimeError) as error:
             result["error"] = f"{type(error).__name__}: {error}"
         finally:
             if proc.poll() is None:
@@ -175,6 +212,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--qemu-sha256", required=True, help="pinned accounting QEMU executable")
     parser.add_argument("--patch-sha256", required=True, help="pinned per-vCPU PMU source patch")
+    parser.add_argument("--budget-trace", action="store_true", help="replay stopped CPU0 per-role and per-window debits")
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args()
     require(1 <= args.timeout <= 120, "invalid run timeout")
@@ -202,7 +240,8 @@ def main() -> int:
                 ("fresh", args.fresh_elf, disk, 1),
                 ("reopen", args.reopen_elf, disk, 2),
             ):
-                run = boot(binary, elf, args.output / name, args.timeout, medium, epoch)
+                run = boot(binary, elf, args.output / name, args.timeout, medium, epoch,
+                           budget_trace=args.budget_trace and epoch is not None)
                 summary[name] = run
                 require(run["status"] == "PASS", f"{name}: {run.get('error')}")
                 if name == "blank_reopen":
@@ -213,6 +252,12 @@ def main() -> int:
                     run["cpu0_pmu_ledger_idle_ns"] = verify_resident_budget(
                         serial.splitlines(), run["progress"]
                     )
+                    if args.budget_trace:
+                        trace = (args.output / name / TRACE_FILE).read_bytes()
+                        run.update(verify_signed_trace(
+                            trace, epoch, run["roles"], [row[1] for row in run["recovery"]],
+                            run["cpu0_pmu_ledger_idle_ns"],
+                        ))
         summary["status"] = "PASS"
     except (ValueError, OSError, struct.error) as error:
         summary["error"] = f"{type(error).__name__}: {error}"
