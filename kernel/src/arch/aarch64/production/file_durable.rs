@@ -7,7 +7,7 @@ use core::ptr::{addr_of_mut, copy_nonoverlapping};
 use cyxia_kernel_core::security::{
     Error as SecurityError,
     file_index_v0199::BLOCK_BYTES,
-    file_read_v4::{ENDPOINT, FileReadService, MAX_FRAME, MAX_REPLY, ReadError, StagedFile},
+    file_read_v4::{ENDPOINT, FileBlockService, MAX_FRAME, MAX_REPLY, ReadError, StagedFile},
     file_receipt_query_v4::{RECEIPT_KEY_BYTES, ReceiptKey},
     file_service_v4::{REPLY_HEADER, REQUEST_HEADER, Request},
 };
@@ -39,9 +39,8 @@ struct Job {
 struct Grant {
     holder: NativeRole,
     pie_cap: u64,
-    service: FileReadService,
+    service: FileBlockService,
     key: ReceiptKey,
-    write_seq: u64,
     jobs: [Option<Job>; 2],
 }
 
@@ -173,7 +172,7 @@ fn serve(index: usize, member: NativeRole, args: [u64; 6]) -> Result<(), i64> {
             return Err(EAGAIN);
         }
         let sequence = u64::from_le_bytes(request.payload.try_into().unwrap());
-        if grant.key.request_id() != Some(request.request_id) || sequence != grant.write_seq {
+        if grant.key.request_id() != Some(request.request_id) {
             return Err(E_AUTH);
         }
         grant
@@ -219,20 +218,22 @@ impl<'a> Client<'a> {
         })
     }
 
-    pub(super) fn start(&mut self, file: StagedFile, key: ReceiptKey, write_seq: u64) {
+    pub(super) fn start(&mut self, file: StagedFile, key: ReceiptKey) -> Result<(), SecurityError> {
+        let service =
+            FileBlockService::new_allocated_block(file).map_err(|_| SecurityError::Unauthorized)?;
         self.wait(FATAL + 1, |state| state.pending_open);
         // SAFETY: the CPU0 owner writes this slot while the role is stopped.
         unsafe {
             *addr_of_mut!(STATE.grant) = Some(Grant {
                 holder: self.holder,
                 pie_cap: self.pie_cap,
-                service: FileReadService::new(file),
+                service,
                 key,
-                write_seq,
                 jobs: [None, None],
             });
         }
         self.granted = true;
+        Ok(())
     }
 
     fn wait(&mut self, failure: u64, done: impl Fn(&State) -> bool) {
@@ -259,7 +260,7 @@ impl<'a> Client<'a> {
         frame: Frame,
         sequence: u64,
         out: &mut [u8; BLOCK_BYTES],
-    ) -> Result<(), SecurityError> {
+    ) -> Result<usize, SecurityError> {
         // SAFETY: a queued FSYNC prevents the stopped holder's mutations.
         let grant = unsafe { (*addr_of_mut!(STATE)).grant.as_ref().unwrap() };
         grant

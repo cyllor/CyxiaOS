@@ -7,10 +7,12 @@ use super::{
 
 const ROOT: u64 = 0x4649_4c45_0000_0001;
 const FILE: &[u8; 10] = b"readme.txt";
-const CONTENTS: &[u8; 29] = include_bytes!(concat!(env!("OUT_DIR"), "/fsync-client-content.bin"));
+const CONTENTS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fsync-client-content.bin"));
 const RESULT_DIGEST: &[u8; 32] =
     include_bytes!(concat!(env!("OUT_DIR"), "/fsync-client-digest.bin"));
 const REPLY_MAGIC: [u8; 8] = [0x52, 0x46, 0x59, 0x43, 3, 0, 128, 0];
+const WRITE_HEADER: usize = 44;
+const MAX_WRITE: usize = 128 - WRITE_HEADER;
 
 fn header<const BYTES: usize>(op: u16, id: u64) -> [u8; BYTES] {
     let mut wire = [0; BYTES];
@@ -58,6 +60,20 @@ fn accepted_volatile(reply: &[u8; 128], id: u64) -> bool {
         && field(reply, 112) == 0
 }
 
+fn acknowledge(reply: &[u8; 128]) {
+    let id = field(reply, 8);
+    let boot = field(reply, 16);
+    let mut ack = header::<88>(15, id);
+    put64(&mut ack, 32, boot);
+    put64(&mut ack, 40, boot);
+    put64(&mut ack, 48, id);
+    ack[56..].copy_from_slice(&reply[80..112]);
+    let released = service::<128>(&ack, 0);
+    if !accepted_volatile(&released, id) || released[80..112] != reply[80..112] {
+        reject_startup();
+    }
+}
+
 pub(super) fn run() {
     if clock() < 0 {
         reject_startup();
@@ -71,17 +87,25 @@ pub(super) fn run() {
     if !accepted_volatile(&opened, 1) || handle == 0 || field(&opened, 72) != 1 {
         reject_startup();
     }
+    acknowledge(&opened);
 
-    let mut write_seq = 0;
-    for seq in 1..=7 {
-        let mut write = header::<73>(4, seq + 1);
-        put32(&mut write, 40, CONTENTS.len() as u32);
-        write[44..].copy_from_slice(CONTENTS);
-        let reply = service::<128>(&write, handle);
-        write_seq = field(&reply, 120);
-        if !accepted_volatile(&reply, seq + 1) || write_seq != seq {
+    let chunks = CONTENTS.len().div_ceil(MAX_WRITE);
+    let write_count = chunks.max(7);
+    for index in 0..write_count {
+        let start = (index % chunks) * MAX_WRITE;
+        let data = &CONTENTS[start..(start + MAX_WRITE).min(CONTENTS.len())];
+        let sequence = index as u64 + 1;
+        let mut write = header::<128>(4, sequence + 1);
+        put32(&mut write, 12, (12 + data.len()) as u32);
+        put64(&mut write, 32, start as u64);
+        put32(&mut write, 40, data.len() as u32);
+        let write = &mut write[..WRITE_HEADER + data.len()];
+        write[WRITE_HEADER..].copy_from_slice(data);
+        let reply = service::<128>(write, handle);
+        if !accepted_volatile(&reply, sequence + 1) || field(&reply, 120) != sequence {
             reject_startup();
         }
+        acknowledge(&reply);
     }
 
     let mut alloc = header::<48>(10, 0);
@@ -98,11 +122,13 @@ pub(super) fn run() {
     }
 
     let mut fsync = header::<40>(5, field(&allocated, 8));
-    put64(&mut fsync, 32, write_seq);
+    put64(&mut fsync, 32, write_count as u64);
     let reply = service::<128>(&fsync, handle);
     if !receipt_is_committed(&reply)
         || reply[80..112] != *RESULT_DIGEST
         || field(&reply, 40) != 21
+        || field(&reply, 32) != CONTENTS.len() as u64
+        || field(&reply, 120) != write_count as u64
         || service::<128>(&fsync, handle) != reply
     {
         reject_startup();

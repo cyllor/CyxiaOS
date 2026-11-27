@@ -32,19 +32,25 @@ fn digest(path: &Path) -> [u8; 32] {
 /// sees the actual ABI WRITE bytes, independent of this test oracle.
 fn build_fsync_client_fixture(out: &Path) {
     const DEFAULT: &[u8; 29] = b"CyxiaOS V0.20 durable fsync!\n";
+    const BLOCK_BYTES: usize = 4096;
     const TEST_INPUT: &str = "CYXIA_FSYNC_TEST_CONTENT";
     println!("cargo:rerun-if-env-changed={TEST_INPUT}");
     let contents = if let Some(path) = env::var_os(TEST_INPUT) {
         let path = PathBuf::from(path);
         println!("cargo:rerun-if-changed={}", path.display());
         let meta = fs::metadata(&path).expect("FSYNC client fixture metadata");
-        assert!(meta.is_file() && meta.len() == DEFAULT.len() as u64);
+        assert!(
+            meta.is_file() && (DEFAULT.len() as u64..=BLOCK_BYTES as u64).contains(&meta.len())
+        );
         fs::read(path).expect("FSYNC client fixture input")
     } else {
         DEFAULT.to_vec()
     };
-    assert_eq!(contents.len(), DEFAULT.len(), "FSYNC client file length");
-    let mut page = [0; 4096];
+    assert!(
+        (DEFAULT.len()..=BLOCK_BYTES).contains(&contents.len()),
+        "FSYNC client file length"
+    );
+    let mut page = [0; BLOCK_BYTES];
     page[..contents.len()].copy_from_slice(&contents);
     let padded = out.join("fsync-client-page.bin");
     fs::write(&padded, page).unwrap();

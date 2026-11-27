@@ -1101,6 +1101,7 @@ mod tests {
             cap_selector: CAP,
             frame: &frame,
             key,
+            grown_size: None,
             pages: &pages,
         };
         let mut work = FsyncWorkspace::new();
@@ -1185,6 +1186,7 @@ mod tests {
             cap_selector: CAP,
             frame: &frame,
             key,
+            grown_size: None,
             pages: &pages,
         };
         assert_eq!(

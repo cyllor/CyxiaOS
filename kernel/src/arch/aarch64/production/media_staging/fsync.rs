@@ -39,7 +39,9 @@ use cyxia_kernel_core::security::{
 use sha2::{Digest, Sha256};
 
 const FILE_LEN: usize = SCRATCH_FILE_DATA.len();
-const WRITE_SEQ: u64 = 7;
+const SIZE_BYTES: usize = 8;
+const FROZEN_BYTES: usize = SIZE_BYTES + BLOCK;
+const INODE_AT: usize = SCRATCH_FILE_INODE as usize * INODE_BYTES;
 const TEST_CAP: u64 = 1;
 const SLOT: usize = 21;
 const RECEIPT_AT: usize = SLOT * RECEIPT_BYTES;
@@ -78,11 +80,20 @@ fn request_header(raw: &mut [u8], op: u16, id: u64) {
     raw[16..24].copy_from_slice(&id.to_le_bytes());
 }
 
-fn fsync_frame() -> [u8; REQUEST_HEADER + 8] {
+fn fsync_frame(write_seq: u64) -> [u8; REQUEST_HEADER + 8] {
     let mut raw = [0; REQUEST_HEADER + 8];
     request_header(&mut raw, 5, REQUEST_ID);
-    raw[REQUEST_HEADER..].copy_from_slice(&WRITE_SEQ.to_le_bytes());
+    raw[REQUEST_HEADER..].copy_from_slice(&write_seq.to_le_bytes());
     raw
+}
+
+fn frozen_material(snapshot: &mut [u8; FROZEN_BYTES], size: usize) -> &[u8] {
+    if size == FILE_LEN {
+        &snapshot[SIZE_BYTES..]
+    } else {
+        snapshot[..SIZE_BYTES].copy_from_slice(&(size as u64).to_le_bytes());
+        snapshot
+    }
 }
 
 fn freeze(
@@ -253,7 +264,7 @@ pub(super) fn execute(
         file.data,
         file.acl.owner_rights,
     )?;
-    client.start(file, KEY, WRITE_SEQ);
+    client.start(file, KEY)?;
     let allocation = client.request(ALLOC);
     // SAFETY: CPU0 is the sole synchronous staging owner. No other native
     // service or role can borrow these scratch workspaces.
@@ -270,10 +281,25 @@ pub(super) fn execute(
     client.publish(ALLOC, &reply);
 
     let request = client.request(FSYNC);
-    let mut data = [0; BLOCK];
-    client.freeze(request, WRITE_SEQ, &mut data)?;
+    let write_seq = u64::from_le_bytes(
+        Request::decode(request.bytes(), request.selector)?
+            .payload
+            .try_into()
+            .map_err(|_| Error::Invalid)?,
+    );
+    let mut snapshot = [0; FROZEN_BYTES];
+    let size = client.freeze(
+        request,
+        write_seq,
+        (&mut snapshot[SIZE_BYTES..]).try_into().unwrap(),
+    )?;
     let mut issuer = AuthContextIssuerV1::new(1)?;
-    let mut flow = freeze(&mut issuer, request.bytes(), request.selector, &data)?;
+    let mut flow = freeze(
+        &mut issuer,
+        request.bytes(),
+        request.selector,
+        frozen_material(&mut snapshot, size),
+    )?;
     let mut ledger = AdmissionLedgerV1::new(1)?;
     flow.admit(
         &mut ledger,
@@ -285,7 +311,8 @@ pub(super) fn execute(
         },
     )?;
     flow.execute(&mut ledger, flow.request().prepared_version, true)?;
-    let pages = [&data];
+    let data: &[u8; BLOCK] = snapshot[SIZE_BYTES..].try_into().unwrap();
+    let pages = [data];
     let job = FsyncJob {
         config,
         mounted,
@@ -295,6 +322,7 @@ pub(super) fn execute(
         cap_selector: request.selector,
         frame: request.bytes(),
         key: KEY,
+        grown_size: (size > FILE_LEN).then_some(size),
         pages: &pages,
     };
     let FsyncProgress::Committed { receipt: bound, .. } =
@@ -315,7 +343,7 @@ pub(super) fn execute(
         return Err(Error::Conflict);
     };
     if receipt.status != 3
-        || receipt.completed_prefix as usize != FILE_LEN
+        || receipt.completed_prefix as usize != size
         || receipt.commit_lsn != FINAL_LSN
         || !matches!(commit_segment(&mut writer, &job, work, |_| Err(Error::Conflict))?,
                      FsyncProgress::AlreadyDone(same) if same == receipt)
@@ -324,7 +352,7 @@ pub(super) fn execute(
     }
     let mut reread = [0; BLOCK];
     writer.read_committed(SCRATCH_FILE_BLOCK, &mut reread)?;
-    if reread != data {
+    if &reread != data {
         return Err(Error::Conflict);
     }
     let admission = flow.admission_id();
@@ -355,21 +383,43 @@ pub(super) fn execute(
     Ok(())
 }
 
-fn final_receipt(data: &[u8; BLOCK], commit_lsn: u64) -> Result<FileReceiptV4, Error> {
-    if data[FILE_LEN..].iter().any(|&byte| byte != 0) {
+fn recovered_version(inode_block: &[u8; BLOCK], commit_lsn: u64) -> Result<(usize, u64), Error> {
+    let inode = Inode::decode(&inode_block[INODE_AT..INODE_AT + INODE_BYTES])?;
+    let size = usize::try_from(inode.size).map_err(|_| Error::Conflict)?;
+    if !(FILE_LEN..=BLOCK).contains(&size)
+        || inode.durable_write_seq == 0
+        || commit_lsn == LEGACY_FINAL_LSN && (size, inode.durable_write_seq) != (FILE_LEN, 7)
+    {
         return Err(Error::Conflict);
     }
-    let frame = fsync_frame();
-    let frozen = freeze(&mut AuthContextIssuerV1::new(1)?, &frame, TEST_CAP, data)?;
+    Ok((size, inode.durable_write_seq))
+}
+
+fn final_receipt(
+    snapshot: &mut [u8; FROZEN_BYTES],
+    size: usize,
+    write_seq: u64,
+    commit_lsn: u64,
+) -> Result<FileReceiptV4, Error> {
+    if snapshot[SIZE_BYTES + size..].iter().any(|&byte| byte != 0) {
+        return Err(Error::Conflict);
+    }
+    let frame = fsync_frame(write_seq);
+    let frozen = freeze(
+        &mut AuthContextIssuerV1::new(1)?,
+        &frame,
+        TEST_CAP,
+        frozen_material(snapshot, size),
+    )?;
     Ok(FileReceiptV4 {
         log_epoch: 1,
         txid: 4,
         commit_lsn,
-        write_seq: WRITE_SEQ,
+        write_seq,
         status: 3,
-        completed_prefix: FILE_LEN as u32,
+        completed_prefix: size as u32,
         operation_digest: frozen.request().operation_digest,
-        output_digest: Sha256::digest(data).into(),
+        output_digest: Sha256::digest(&snapshot[SIZE_BYTES..]).into(),
         ..issued_receipt()
     })
 }
@@ -412,14 +462,10 @@ pub(super) fn recover(
     let mut index = [0; BLOCK];
     disk.read(INODE_START, &mut inode)?;
     disk.read(RECEIPTS_HOME + 6, &mut index)?;
-    let at = SCRATCH_FILE_INODE as usize * INODE_BYTES;
-    let file = &mut inode[at..at + INODE_BYTES];
+    let file = &mut inode[INODE_AT..INODE_AT + INODE_BYTES];
     if Inode::decode(file)?.durable_write_seq != 0 {
         return Err(Error::Conflict);
     }
-    file[24..32].copy_from_slice(&WRITE_SEQ.to_le_bytes());
-    let crc = crc32c_zeroed(file, 252)?;
-    file[252..].copy_from_slice(&crc.to_le_bytes());
     issued_index(&mut index)?;
     // SAFETY: the second CPU0 boot borrows the same exclusive static areas.
     let workspace = unsafe { reopen::workspace() };
@@ -437,9 +483,19 @@ pub(super) fn recover(
         LEGACY_FINAL_LSN if legacy_tail_blank => ISSUE_COMMIT_LSN,
         _ => return Err(Error::Conflict),
     };
-    let mut data = [0; BLOCK];
-    writer.read_committed_at(SCRATCH_FILE_BLOCK, final_lsn, &mut data)?;
-    let receipt = final_receipt(&data, final_lsn)?;
+    let mut snapshot = [0; FROZEN_BYTES];
+    let block: &mut [u8; BLOCK] = (&mut snapshot[SIZE_BYTES..]).try_into().unwrap();
+    writer.read_committed_at(INODE_START, final_lsn, block)?;
+    let (size, write_seq) = recovered_version(block, final_lsn)?;
+    file[16..24].copy_from_slice(&(size as u64).to_le_bytes());
+    file[24..32].copy_from_slice(&write_seq.to_le_bytes());
+    let crc = crc32c_zeroed(file, 252)?;
+    file[252..].copy_from_slice(&crc.to_le_bytes());
+    if *block != inode {
+        return Err(Error::Conflict);
+    }
+    writer.read_committed_at(SCRATCH_FILE_BLOCK, final_lsn, block)?;
+    let receipt = final_receipt(&mut snapshot, size, write_seq, final_lsn)?;
     image[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES].copy_from_slice(&receipt.encode()?);
     // The seven required homes must be in their respective commits even
     // when an after-image matches its checkpoint bytes. Together with the
@@ -460,7 +516,6 @@ pub(super) fn recover(
         }
         .encode()?,
     )?;
-    verify_block(&mut writer, INODE_START, final_lsn, &inode)?;
     verify_block(
         &mut writer,
         RECEIPTS_HOME,
@@ -480,7 +535,7 @@ pub(super) fn recover(
         if selected != checkpoint {
             return Err(Error::Conflict);
         }
-        mounted = Some(volume::validate_fsync_homes(disk, selected, config)?);
+        mounted = Some(volume::validate_fsync_homes(disk, selected, config, size)?);
         Ok(())
     })?;
     if chain.transactions != 4 || next.checkpoint_lsn != final_lsn {
@@ -502,8 +557,14 @@ pub(super) fn readback(
         return Err(Error::Stale);
     }
     let mut raw = [0; BLOCK];
-    disk.read(SCRATCH_FILE_BLOCK, &mut raw)?;
-    let expected = final_receipt(&raw, checkpoint.checkpoint_lsn)?;
+    disk.read(INODE_START, &mut raw)?;
+    let (size, write_seq) = recovered_version(&raw, checkpoint.checkpoint_lsn)?;
+    let mut snapshot = [0; FROZEN_BYTES];
+    disk.read(
+        SCRATCH_FILE_BLOCK,
+        (&mut snapshot[SIZE_BYTES..]).try_into().unwrap(),
+    )?;
+    let expected = final_receipt(&mut snapshot, size, write_seq, checkpoint.checkpoint_lsn)?;
     // Derive the static query qualification separately from the signed media
     // policy. Both are pinned to the identical persistent principal.
     // SAFETY: only the CPU0 staging owner borrows the role load scratch,

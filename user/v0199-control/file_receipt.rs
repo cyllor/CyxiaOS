@@ -54,15 +54,17 @@ pub(super) fn receipt_is_committed(reply: &[u8; 128]) -> bool {
         && field(8) == ID
         && field(16) == 1
         && field(24) == 3
-        && field(32) == 29
-        && matches!(field(40), 19 | 21)
+        && match field(40) {
+            19 => field(32) == 29 && field(120) == 7,
+            21 => (29..=4096).contains(&field(32)) && field(120) > 0,
+            _ => false,
+        }
         && field(48) == 1
         && field(56) == 4
         && field(64) == 0
         && field(72) == 0
         && reply[80..112] != [0; 32]
         && field(112) == ID
-        && field(120) == 7
 }
 
 #[cfg(file_receipt_query_probe)]

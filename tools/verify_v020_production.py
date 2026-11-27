@@ -582,11 +582,14 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
         event = "V020_FSYNC_RECOVERED" if reopen else "V020_FSYNC_COMMITTED"
         terminal = w11_rows(lines, event)
         legacy = [(2, 19, 7)] if reopen else [(19, 7, 29)]
-        current = [(2, 21, 7)] if reopen else [(21, 7, 29)]
-        require(terminal in (legacy, current), "media staging FSYNC terminal differs")
+        current = len(terminal) == 1 and (
+            terminal[0][:2] == (2, 21) and terminal[0][2] > 0 if reopen else
+            terminal[0][0] == 21 and terminal[0][1] > 0 and 29 <= terminal[0][2] <= 4096
+        )
+        require(terminal == legacy or current, "media staging FSYNC terminal differs")
         # Current binding and completion each add the two-block REDO for
         # the stream index. Reopen retires those four extra journal blocks.
-        closure_writes = 4 if terminal == current else 0
+        closure_writes = 4 if current else 0
         writes, flushes = (38, 5) if reopen else (4163, 12)
         expected_io = (writes + closure_writes, flushes)
     require(len(io) == 1 and io[0][0] > 0 and io[0][1:] == expected_io,

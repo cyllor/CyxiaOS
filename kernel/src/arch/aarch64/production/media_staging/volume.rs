@@ -320,6 +320,7 @@ fn staging_acl(
     system: Option<UnifiedSystemKind>,
     snapshots: SnapshotLayout,
     owner: Principal,
+    file_size: usize,
 ) -> Result<(), SecurityError> {
     let allocated_snapshots = if snapshots.allocated() {
         &SNAPSHOTS[..]
@@ -351,7 +352,7 @@ fn staging_acl(
     }
     if file
         && (inode.kind != 1
-            || inode.size != SCRATCH_FILE_DATA.len() as u64
+            || inode.size != file_size as u64
             || inode.extents != 1
             || inode.runs[0]
                 != (Extent {
@@ -512,7 +513,16 @@ pub(super) fn validate_homes(
     // SAFETY: one-shot CPU0 call (module header); the borrow ends on return.
     let w = unsafe { &mut *core::ptr::addr_of_mut!(MOUNT) };
     let principals = principals(config);
-    let policy = |acl, inode, kind| staging_acl(acl, inode, kind, snapshots, principals[0]);
+    let policy = |acl, inode, kind| {
+        staging_acl(
+            acl,
+            inode,
+            kind,
+            snapshots,
+            principals[0],
+            SCRATCH_FILE_DATA.len(),
+        )
+    };
     let e = if snapshots.allocated() {
         file_mount_v1::validate_unified(disk, sb, &SYSTEM, &SNAPSHOTS, &principals, w, policy)?
     } else {
@@ -564,6 +574,7 @@ pub(super) fn validate_fsync_homes(
     disk: &mut Disk,
     checkpoint: SuperblockV1,
     config: &VerifiedOfflineConfig<'_>,
+    file_size: usize,
 ) -> Result<MountEvidence, SecurityError> {
     // SAFETY: the one-shot CPU0 mount excludes all other MOUNT borrows.
     let w = unsafe { &mut *core::ptr::addr_of_mut!(MOUNT) };
@@ -575,6 +586,7 @@ pub(super) fn validate_fsync_homes(
                 kind.map(UnifiedSystemKind::from_baseline),
                 SnapshotLayout::BaselineFsyncFile,
                 config.principals()[0],
+                file_size,
             )
         })?;
     if e.security != expected_state(1, Some(config))?
