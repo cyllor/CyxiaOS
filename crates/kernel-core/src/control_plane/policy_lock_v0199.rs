@@ -206,6 +206,63 @@ pub fn runqueue_cpu_order_violation(held_cpus: &[usize], next_cpu: usize) -> Opt
     held_cpus.iter().copied().filter(|c| *c >= next_cpu).max()
 }
 
+/// Completed interval diagnostics, independent of admission and lock custody.
+/// This observes work that actually ran; it never authorizes new work and
+/// cannot clear a CriticalSectionMeter fault. One owner supplies sequential
+/// start/end timestamps. Invalid clock samples are counted, not clamped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompletedSectionObservations {
+    last_ns: u64,
+    in_budget: u64,
+    overruns: u64,
+    unmeasured: u64,
+    max_elapsed_ns: u64,
+}
+
+impl CompletedSectionObservations {
+    pub const fn new() -> Self {
+        Self {
+            last_ns: 0,
+            in_budget: 0,
+            overruns: 0,
+            unmeasured: 0,
+            max_elapsed_ns: 0,
+        }
+    }
+
+    pub fn record(&mut self, kind: SectionKind, start_ns: u64, end_ns: u64) {
+        let valid = start_ns >= self.last_ns && end_ns >= start_ns;
+        // Keep the observed high-water mark even when the interval is invalid.
+        self.last_ns = self.last_ns.max(start_ns).max(end_ns);
+        if !valid {
+            self.unmeasured = self.unmeasured.saturating_add(1);
+            return;
+        }
+        let elapsed_ns = end_ns - start_ns;
+        self.max_elapsed_ns = self.max_elapsed_ns.max(elapsed_ns);
+        if elapsed_ns > kind.budget_ns() {
+            self.overruns = self.overruns.saturating_add(1);
+        } else {
+            self.in_budget = self.in_budget.saturating_add(1);
+        }
+    }
+
+    /// In-budget, measured overruns, and unmeasured completed attempts.
+    pub const fn counts(&self) -> (u64, u64, u64) {
+        (self.in_budget, self.overruns, self.unmeasured)
+    }
+
+    pub const fn max_elapsed_ns(&self) -> u64 {
+        self.max_elapsed_ns
+    }
+}
+
+impl Default for CompletedSectionObservations {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Caller-supplied monotonic-ns critical-section meter (role_budget_v0199
 /// trust model). One active scope at a time; a bad clock retains ownership
 /// instead of inventing a duration; an overrun latches a sticky fault and
@@ -354,6 +411,44 @@ mod tests {
         let mut m = CriticalSectionMeter::new();
         m.begin(kind, start).unwrap();
         m.end(end).unwrap()
+    }
+
+    #[test]
+    fn completed_observations_continue_after_first_overrun() {
+        let mut m = CompletedSectionObservations::new();
+        m.record(SectionKind::EffectiveWork, 0, WORK_BUDGET_NS + 1);
+        m.record(SectionKind::EffectiveWork, 50_000, 140_000);
+        m.record(SectionKind::EffectiveWork, 150_000, 195_000);
+        assert_eq!(m.counts(), (1, 2, 0));
+        assert_eq!(m.max_elapsed_ns(), 90_000);
+    }
+
+    #[test]
+    fn completed_observations_reject_regressing_clock_without_inventing_time() {
+        let mut m = CompletedSectionObservations::new();
+        m.record(SectionKind::EffectiveWork, 100, 200);
+        m.record(SectionKind::EffectiveWork, 199, 300);
+        m.record(SectionKind::EffectiveWork, 400, 399);
+        m.record(SectionKind::EffectiveWork, 399, 401);
+        m.record(SectionKind::EffectiveWork, 401, 401);
+        assert_eq!(m.counts(), (2, 0, 3));
+        assert_eq!(m.max_elapsed_ns(), 100);
+    }
+
+    #[test]
+    fn diagnostic_observation_does_not_reopen_admission() {
+        let mut gate = CriticalSectionMeter::new();
+        gate.begin(SectionKind::EffectiveWork, 0).unwrap();
+        gate.end(WORK_BUDGET_NS + 1).unwrap();
+        let fault = gate.fault();
+        let mut observations = CompletedSectionObservations::new();
+        observations.record(SectionKind::EffectiveWork, 50_000, 140_000);
+        assert_eq!(observations.counts(), (0, 1, 0));
+        assert_eq!(
+            gate.begin(SectionKind::EffectiveWork, 150_000),
+            Err(Error::Denied)
+        );
+        assert_eq!(gate.fault(), fault);
     }
 
     #[test]

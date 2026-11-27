@@ -61,6 +61,7 @@ from v020_production_modes import (
     file_volatile_write_evidence, rows as w11_rows, signed_media_authority, snapshot_catalog_evidence,
     snapshot_envelope_evidence, snapshot_read_evidence, unified_mount_evidence, validate_extensions,
 )
+from v020_production_host_samples import HostMediaSamples
 from v020_production_qemu import (
     GA_RAM, PEER_SAMPLE, PEER_WAIT_SECONDS, SCRATCH_BYTES, STAGING_RAM, HostPeer,
     connect_qmp, create_scratch, free_port, qemu_args, scratch_summary, sha, shutdown,
@@ -154,6 +155,7 @@ PRODUCTION_SOURCES = [
     "tools/v020_production_media.py",
     "tools/v020_production_modes.py",
     "tools/v020_production_qemu.py",
+    "tools/v020_production_host_samples.py",
     "tools/v020_snapshot_envelopes.py",
     "tools/v020_tls_peer.py",
     "tests/fixtures/v020-signed-scratch/config.bin",
@@ -213,7 +215,7 @@ class Production:
             "policy_lock_timing_emulated": True,
             "policy_lock_budget_verified": False,
             "policy_lock_note": ("TCG diagnostic timing separates measured overruns from "
-                                 "attempts the meter could not measure."),
+                                 "attempts with invalid clock samples; all completed bridge calls are observed."),
             "admission_leases_inferred": False,
             "entropy_production": False,
             "host_peer_sample": "fixed 512-byte non-TLS pattern (not a ClientHello)",
@@ -424,8 +426,8 @@ def check_w11_baseline(words: tuple) -> None:
     require(words[152] == SECONDARY_CPU_MASK.bit_count(),
             "RecoveryProof writer takeover must cover the three stopped CPUs (word 152)")
     require(0 < words[153] < words[130], "FrameMeta Arena pages missing or inconsistent (word 153)")
-    require(words[154] <= min(1, words[137])
-            and (words[155] > POLICY_LOCK_WORK_BUDGET_NS) == (words[154] == 1),
+    require(words[154] <= words[137]
+            and (words[155] > POLICY_LOCK_WORK_BUDGET_NS) == (words[154] > 0),
             "policy_lock measured overrun disagrees with the maximum elapsed time")
     require(words[136] + words[154] > 0, "policy_lock requires a settled measurement")
     require(all(v == 0 for v in words[156:W11_END]), "nonzero wave-11 reserved words")
@@ -641,6 +643,7 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
         report["negative_control"] = "abrupt-peer: authenticated Echo with no normal credit retirement"
     decoder = FrameDecoder(); raw = bytearray(); decoded = bytearray()
     proc = None; sock = None; qmp = None; peer = None
+    host_samples = None
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="cyx-prod-") as td, (output / "qemu-stderr.log").open("wb") as err:
         scratch = (boot_disk or Path(td) / "scratch.raw") if staging else None
@@ -680,19 +683,28 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
             qmp.execute("qmp_capabilities")
             actual_cpus = qmp.execute("query-cpus-fast")
             report["qmp_cpus"] = actual_cpus
+            if scratch is not None:
+                host_samples = HostMediaSamples(proc.pid, actual_cpus)
+                host_samples.observe(len(decoded), phase="start")
             while time.monotonic() < end:
                 require(proc.poll() is None, "QEMU exited before acceptance")
+                poll_started = time.monotonic_ns() if host_samples is not None else None
                 value = qmp.execute("ringbuf-read", {"device": "cyxlog", "size": 1048576, "format": "base64"})
+                poll_elapsed = time.monotonic_ns() - poll_started if poll_started is not None else None
                 data = base64.b64decode(value, validate=True)
                 raw.extend(data)
                 require(len(raw) <= 2 * 1024 * 1024, "serial budget exceeded")
                 for frame in decoder.feed(data):
                     decoded.extend(frame)
+                if host_samples is not None:
+                    host_samples.observe(len(decoded), poll_elapsed)
                 if peer is not None and b"V020_W11_NET_LISTEN" in decoded:
                     peer.listening.set()
                 if b"FAIL" in decoded or b"SMP_ERROR" in decoded:
                     raise ValueError("guest failure")
                 if acceptance.completion in decoded:
+                    if host_samples is not None:
+                        host_samples.observe(len(decoded), phase="completion")
                     qmp.execute("stop")
                     qmp.execute("pmemsave", {"val": location["pa"], "size": 4096,
                                             "filename": str(output / "native-page.bin")})
@@ -757,9 +769,21 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             report["error"] = type(error).__name__ + ": " + str(error)
         finally:
+            if host_samples is not None:
+                host_samples.observe(len(decoded), phase="shutdown")
             if proc is not None:
                 shutdown(proc, qmp)
                 report["qemu_exit"] = proc.returncode
+            if host_samples is not None:
+                try:
+                    (output / "host-media-samples.json").write_text(
+                        json.dumps(host_samples.evidence(), indent=2) + "\n")
+                    report["host_media_samples"] = {
+                        "file": "host-media-samples.json", "count": len(host_samples.samples),
+                        "limit_reached": host_samples.limit_reached,
+                    }
+                except OSError as error:
+                    report["host_media_samples"] = {"unavailable": type(error).__name__}
             if peer is not None:
                 peer.stopping.set()
                 peer.join(timeout=PEER_WAIT_SECONDS + 1)

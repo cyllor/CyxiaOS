@@ -741,7 +741,21 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("acc.takeover_stopped_writer(", recovery)
         self.assertIn("acc.record(&ev)", recovery)
         meter = source(arm / "production/meter.rs")
-        self.assertIn("m.begin(SectionKind::EffectiveWork, now_ns())", meter)
+        # Keep both live call sites pinned above, and pin the complete interval
+        # observer instead of the retired diagnostic-only begin/end latch.
+        self.assertIn("static mut OBSERVATIONS: CompletedSectionObservations", meter)
+        scope = meter.split(
+            "pub(super) fn metered<T>(f: impl FnOnce() -> T) -> T {", 1
+        )[1].split("\n}", 1)[0]
+        start = scope.index("let start_ns = now_ns();")
+        call = scope.index("let out = f();")
+        end = scope.index("let end_ns = now_ns();")
+        record = scope.index("m.record(SectionKind::EffectiveWork, start_ns, end_ns)")
+        self.assertLess(start, call)
+        self.assertLess(call, end)
+        self.assertLess(end, record)
+        self.assertEqual(scope.count("f()"), 1)
+        self.assertTrue(scope.rstrip().endswith("\n    out"))
         net = source(arm / "production/net.rs")
         self.assertIn("pub(super) fn serve(info: &BootInfo) -> NetOutcome", net)
 
