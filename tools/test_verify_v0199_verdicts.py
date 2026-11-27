@@ -9,9 +9,9 @@ class VerdictTests(unittest.TestCase):
         locked["proofs"][0].update(evidence_count=count, evidence_digest=v.digest(evidence))
         return json.dumps(locked).encode()
 
-    def setup_run(self,root,status=1,reason=0):
+    def setup_run(self,root,status=1,reason=0,*,pair=None):
         g4,g5,ids,inv=v.inventory()
-        test,proof=min(g4)
+        test,proof=pair or min(g4)
         fields=dict(checker_id=(test>>16<<16)|1,checker_version=1,boot_epoch=1,controller_epoch=1,
                     security_epoch=0,object_or_stream_generation=1,seed=0,fault_point_id=0)
         fields.update({k:"11"*32 for k in v.FIELDS if k.endswith("_hash")})
@@ -196,5 +196,40 @@ class VerdictTests(unittest.TestCase):
             report = v.aggregate(raw, v.digest(raw), root)
             self.assertEqual(report["G4_QEMU"]["counts"]["PASS"], 0)
             self.assertEqual(report["G4_QEMU"]["status"], "BLOCKED_INVALID_EVIDENCE")
+
+    def test_physical_proof_requires_the_same_validated_board_lock_and_kernel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            g4, g5, _, _ = v.inventory()
+            pair = min(g5 - g4)
+            raw, verdict = self.setup_run(root, pair=pair)
+            evidence = root / "evidence" / f"{verdict.stem}.json"
+            platform = {"manifest_sha256": "22" * 32, "boot_image_sha256": "11" * 32,
+                        "raw_capture_sha256": "33" * 32}
+            wire = dict(json.loads(evidence.read_bytes()), platform_lock_sha256=platform["manifest_sha256"],
+                        raw_capture_sha256=platform["raw_capture_sha256"],
+                        run_id=1, test_id=pair[0], proof_class="ARCH_A53")
+            wire = json.dumps(wire).encode()
+            evidence.write_bytes(wire)
+            record = bytearray(verdict.read_bytes())
+            record[256:288] = hashlib.sha256(wire).digest()
+            record[288:] = hashlib.sha256(b"CYX/VERDICT/v4" + record[:288]).digest()
+            verdict.write_bytes(record)
+            manifest = json.loads(self.frozen_evidence(raw, 1, wire))
+            manifest["proofs"][0]["platform_lock_sha256"] = platform["manifest_sha256"]
+            raw = json.dumps(manifest).encode()
+
+            def verify(lock):
+                return v.aggregate(raw, v.digest(raw), root, a53_lock=lock)
+
+            self.assertEqual(verify(None)["ARCH_A53"]["counts"]["INVALID_EVIDENCE"], 1)
+            for key in platform:
+                different = {**platform, key: "44" * 32}
+                self.assertEqual(verify(different)["ARCH_A53"]["counts"]["INVALID_EVIDENCE"], 1)
+            report = verify(platform)
+            self.assertEqual(report["ARCH_A53"]["counts"]["PASS"], 1)
+            self.assertEqual(report["ARCH_A53"]["complete_ids"], 1)
+            self.assertEqual(report["G4_QEMU"]["counts"]["NOT_RUN"], 262)
+            self.assertEqual(report["G4_QEMU"]["by_class"]["STATIC_EL1"]["NOT_RUN"], 51)
 
 if __name__=="__main__":unittest.main()

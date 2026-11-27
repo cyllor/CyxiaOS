@@ -194,3 +194,30 @@ crates/kernel-core/src/security/recovery_proof_v2.rs（32 项测试，原生 EL1
 LATER）；「TLS 常量与规范分歧（握手 30s）」→ HANDSHAKE_TIMEOUT_MS 已改 3_000 并加
 编译期 pin（空闲双限等其余 reconciliation 以 T5 最终落地为准）。§4/§5 的其余描述
 仍按 HEAD 已提交状态有效。
+
+## 8. 正式证据归档
+
+安§7.4 对 127 个稳定 ID 要求 127 份 `RUNTIME_QEMU`、51 份 `STATIC_EL1` 和 84 份 `MODEL_CHECK`，
+G4 共 262 份。G5 在同一证据集上另核对 26 份 `ARCH_A53`。正式发布还须核实 G0/G1 完成及冻结清单的签发权限。
+[归档复验记录](v020-g4-archive-recheck.md) · [实体平台取证交接](v020-a53-platform-handoff.md)
+
+收到已认证的运行清单、清单摘要和原始归档后，按 G4 范围检查完整性。汇总按证明类型输出 PASS、FAIL、NOT_RUN
+以及非法归档计数。缺证据时保留 NOT_RUN，证据对象的身份、字节数和 SHA-256 均由汇总器复核。
+
+```sh
+python3 -B tools/verify_v0199_verdicts.py --scope g4 \
+  --manifest "$FROZEN_RUN_MANIFEST" --manifest-sha256 "$AUTHENTICATED_RUN_SHA256" \
+  --evidence-root "$VERDICT_ARCHIVE" --output "$REPORT_PATH"
+```
+
+两个可独立重放的子检查为 A06/SEC-M08 的 ELF 指令检查和 H05 的有界决策与发布检查。子检查报告记录实际输入与
+工具摘要，待有权判定器与其余必需证据共同出具正式 Verdict。
+
+```sh
+python3 -B tools/check_v0199_el1_fp.py --elf "$KERNEL_ELF" --elf-sha256 "$KERNEL_SHA256" \
+  --objdump-sha256 "$OBJDUMP_SHA256" --output "$STATIC_REPORT_DIR"
+cargo build --locked --offline -p cyxia-kernel-core --example v0199_h05_model_check
+target/debug/examples/v0199_h05_model_check > "$OBSERVED_TSV"
+python3 -B tools/check_v0199_h05_model.py --observed "$OBSERVED_TSV" \
+  --harness target/debug/examples/v0199_h05_model_check --output "$MODEL_REPORT_PATH"
+```
