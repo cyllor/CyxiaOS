@@ -30,13 +30,17 @@ use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind, TaskId};
 #[cfg(feature = "full-os")]
 use cyxia_kernel_core::frame_meta_v0199::{self as fm, PoolBridge};
 use cyxia_kernel_core::frames::{
-    FrameError, FrameHandle, FrameMeta, FramePool, FrameSnapshot, PageZeroer, RevokeComplete,
+    FrameError, FrameHandle, FrameMeta, FramePool, FrameSnapshot, FreeFrameIndex, PageZeroer,
+    RevokeComplete,
 };
 use cyxia_posix::Errno;
 
 pub const PAGES: usize = 65536;
 pub const BYTES: u64 = PAGES as u64 * 4096;
 static mut METADATA: [FrameMeta; PAGES] = [FrameMeta::EMPTY; PAGES];
+// Derived availability only; never replaces the authoritative pool or ledger.
+// Exclusive CPU0 access, with storage off the kernel stack.
+static mut FREE_INDEX: FreeFrameIndex = FreeFrameIndex::EMPTY;
 static mut POOL: Option<FramePool<'static>> = None;
 static mut PEAK: usize = 0;
 /// Authoritative mirror: one 40-byte row per pool page (2.5 MiB BSS,
@@ -82,6 +86,10 @@ pub fn init(base: u64, bytes: u64) -> Result<(), Errno> {
     };
     let metadata = unsafe { &mut *core::ptr::addr_of_mut!(METADATA) };
     let mut new_pool = FramePool::from_memory(&[region], &[], metadata).map_err(error)?;
+    // SAFETY: the unpublished pool is the sole borrower; the Busy gate above
+    // prevents reinitialization while any live pool holds this index.
+    let index = unsafe { &mut *core::ptr::addr_of_mut!(FREE_INDEX) };
+    new_pool.attach_free_index(index).map_err(error)?;
     // The attachment gate is the module's own full-os gate: whenever this
     // desktop pool is built, the authoritative mirror is attached.
     #[cfg(feature = "full-os")]

@@ -1,5 +1,7 @@
 """Real boot-format invariants for the high-half OS profile (synthetic ELF inputs)."""
+import os
 import struct
+from unittest.mock import patch
 import unittest
 import tempfile
 from pathlib import Path
@@ -52,6 +54,18 @@ class RuntimeElf(unittest.TestCase):
         with self.assertRaises(ValueError): x86_64.boot_image(raw, runtime=True)
 
 class UserBuildInputs(unittest.TestCase):
+    def test_standalone_qemu_requires_explicit_valid_firmware(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.dict(os.environ, {'CYXIA_PINNED_QEMU_FIRMWARE': str(root)}):
+                with self.assertRaises(ValueError):
+                    os_x86.launch_argv('/qemu', '/boot')
+                (root / 'bios-256k.bin').write_bytes(bytes(256 * 1024))
+                command = os_x86.launch_argv('/qemu', '/boot')
+                self.assertEqual(command[:3], ['/qemu', '-L', str(root)])
+            with patch.dict(os.environ, {'CYXIA_PINNED_QEMU_FIRMWARE': ''}):
+                self.assertNotIn('-L', os_x86.launch_argv('/qemu', '/boot'))
+
     def test_applet_kernel_file_bound_is_separate_from_legacy_and_ram(self):
         for name in ('cosmic-workspace-applets-v1', 'cosmic-notifications-applet-v1'):
             self.assertEqual(os_x86.kernel_file_limit([name]), 384 * 1024**2)
