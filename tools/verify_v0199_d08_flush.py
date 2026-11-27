@@ -175,6 +175,11 @@ def seal_seed_capture(seed: dict, seed_dir: Path, disk: Path) -> None:
     seed["capture_sha256"] = {
         name: sha(seed_dir / name) for name in ("serial.bin", "serial.txt", "qemu-stderr.log")
     }
+    # Successful budget capture has its own stopped bytes and QMP transcript.
+    # Failed-progress capture is separately recorded by the resident verifier.
+    for name in ("cpu0-budget-trace.bin", "budget-qmp.jsonl", "role-syscall-abi.bin"):
+        if (seed_dir / name).is_file():
+            seed["capture_sha256"][name] = sha(seed_dir / name)
     seed["preserved_disk_sha256"] = preserve_disk(disk, seed_dir / "scratch-after.raw", sha(disk))
     require(seed["status"] == "PASS",
             "could not seed a signed volume at BootEpoch 1: " + str(seed.get("error", "unknown")))
@@ -208,7 +213,8 @@ def main() -> int:
         create_scratch(disk)
         result["initial_disk_sha256"] = sha(disk)
         seed_dir = output / "seed"
-        result["seed"] = boot(str(binary), fresh, seed_dir, args.timeout, disk, 1)
+        result["seed"] = boot(str(binary), fresh, seed_dir, args.timeout, disk, 1,
+                              budget_trace=True)
         seed = result["seed"]
         seal_seed_capture(seed, seed_dir, disk)
         negative_dir = output / "without-flush"

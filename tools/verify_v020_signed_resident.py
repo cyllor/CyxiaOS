@@ -253,6 +253,29 @@ def capture_budget_trace(socket_path: Path, elf: Path, output: Path, deadline: f
     return {"budget_trace_sha256": sha(path), "budget_trace_physical": location["pa"], **mappings}
 
 
+def retain_failed_progress_trace(socket_path, elf, output, deadline) -> dict:
+    """Best-effort diagnostic only: never replace the original progress failure."""
+    target = output / "failed-progress"
+    result = {"status": "CAPTURE_ERROR", "capture_sha256": {}}
+    try:
+        target.mkdir()
+        result["capture"] = capture_budget_trace(socket_path, elf, target, deadline)
+        result["status"] = "CAPTURED"
+    except (ValueError, OSError, RuntimeError, KeyError) as error:
+        result["error"] = f"{type(error).__name__}: {error}"
+    # A later mapping/ABI readback failure can follow a successful pmemsave.
+    # Retain those bytes and the QMP transcript without treating them as proof.
+    for name in (TRACE_FILE, "budget-qmp.jsonl"):
+        path = target / name
+        try:
+            if path.is_file():
+                result["capture_sha256"][name] = sha(path)
+        except OSError as error:
+            result["status"] = "CAPTURE_ERROR"
+            result["hash_error"] = f"{type(error).__name__}: {error}"
+    return result
+
+
 def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None,
          epoch: int | None, *, expected_policy_sha256: str | None = None,
          expected_policy_envelope: bytes | None = None,
@@ -348,9 +371,16 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
                 wait_until(lambda: len(rows(lines, "V020_SIGNED_RESIDENT_PROGRESS"))
                            > progress_count)
                 progress = rows(lines, "V020_SIGNED_RESIDENT_PROGRESS")
-                require(len(progress) >= 5 and all(row[1:] == COMPLETE_PROGRESS for row in progress)
-                        and all(right[0] - left[0] >= 4 for left, right in zip(progress, progress[1:])),
-                        "all eight roles did not sustain authorized lifecycle progress")
+                progress_ok = (len(progress) >= 5
+                               and all(row[1:] == COMPLETE_PROGRESS for row in progress)
+                               and all(right[0] - left[0] >= 4
+                                       for left, right in zip(progress, progress[1:])))
+                if not progress_ok:
+                    result["progress"] = progress
+                    if socket_path is not None and proc.poll() is None:
+                        result["failed_progress_budget"] = retain_failed_progress_trace(
+                            socket_path, elf, output, deadline)
+                require(progress_ok, "all eight roles did not sustain authorized lifecycle progress")
                 if expect_business:
                     wait_until(lambda: len(rows(lines, "V020_SIGNED_BUSINESS_PROGRESS")) >= 5
                                or any(line.startswith("V020_STARTUP ") for line in lines))

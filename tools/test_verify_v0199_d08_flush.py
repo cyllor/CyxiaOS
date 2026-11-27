@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import verify_v0199_d08_flush as check
+import verify_v020_signed_resident as resident
 
 
 class FlushGateTests(unittest.TestCase):
@@ -103,6 +104,33 @@ class FlushGateTests(unittest.TestCase):
                 check.preserve_disk(disk, root / "short.raw", check.sha(disk))
 
 
+    def test_failed_progress_trace_retains_raw_capture(self):
+        for late_error in (False, True):
+            with self.subTest(late_error=late_error), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+
+                def capture(socket_path, elf, output, deadline):
+                    (output / resident.TRACE_FILE).write_bytes(b"raw trace fixture")
+                    (output / "budget-qmp.jsonl").write_bytes(b"raw QMP fixture")
+                    if late_error:
+                        raise ValueError("ABI mismatch after pmemsave")
+                    return {"budget_trace_sha256": check.sha(output / resident.TRACE_FILE)}
+
+                with patch.object(resident, "capture_budget_trace", side_effect=capture) as qmp:
+                    result = resident.retain_failed_progress_trace(
+                        root / "socket", root / "elf", root, 123)
+                    self.assertEqual(result["status"], "CAPTURE_ERROR" if late_error else "CAPTURED")
+                    self.assertEqual(result["capture_sha256"], {
+                        name: check.sha(root / "failed-progress" / name)
+                        for name in (resident.TRACE_FILE, "budget-qmp.jsonl")
+                    })
+                    if late_error:
+                        self.assertIn("ABI mismatch", result["error"])
+                    repeated = resident.retain_failed_progress_trace(
+                        root / "socket", root / "elf", root, 123)
+                    self.assertEqual(repeated["status"], "CAPTURE_ERROR")
+                    self.assertEqual(qmp.call_count, 1)
+
     def test_failed_seed_is_sealed_but_never_admitted(self):
         with tempfile.TemporaryDirectory() as d, patch.object(check, "SCRATCH_BYTES", 16):
             root = Path(d)
@@ -110,13 +138,16 @@ class FlushGateTests(unittest.TestCase):
                 (root / name).write_bytes(name.encode())
             disk = root / "disk.raw"
             disk.write_bytes(b"0123456789abcdef")
+            (root / "cpu0-budget-trace.bin").write_bytes(b"trace")
+            (root / "budget-qmp.jsonl").write_bytes(b"qmp")
             seed = {"status": "FAIL", "error": "incomplete role progress"}
             with self.assertRaisesRegex(ValueError, "incomplete role progress"):
                 check.seal_seed_capture(seed, root, disk)
             self.assertEqual(seed["status"], "FAIL")
             self.assertEqual(seed["capture_sha256"], {
                 name: check.sha(root / name)
-                for name in ("serial.bin", "serial.txt", "qemu-stderr.log")
+                for name in ("serial.bin", "serial.txt", "qemu-stderr.log",
+                             "cpu0-budget-trace.bin", "budget-qmp.jsonl")
             })
             self.assertEqual(seed["preserved_disk_sha256"], check.sha(disk))
             self.assertEqual(check.sha(root / "scratch-after.raw"), check.sha(disk))
