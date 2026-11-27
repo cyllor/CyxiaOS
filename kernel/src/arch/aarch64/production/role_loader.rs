@@ -3,9 +3,11 @@
 //! RX mappings have their writable aliases removed before first entry.
 use super::{Page, mmu, phys, ram_l3, timer, user};
 use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(cyxia_startup_catalog)]
+use cyxia_contracts::PagePermissions;
 use cyxia_contracts::PhysAddr;
 use cyxia_kernel_core::control_plane::{
-    Identity, cpu0_v0199 as profile,
+    Error, Identity, cpu0_v0199 as profile,
     pie_image_v0199::{
         ROLE_STACK_BYTES, RelativeRelocation, RolePackageInput, RolePackageSpec,
         VerifiedRolePackage,
@@ -163,6 +165,78 @@ fn remove_writable_alias(pa: u64) {
     }
 }
 
+/// Read the staged translation tables before making a signed context runnable.
+#[cfg(cyxia_startup_catalog)]
+fn verify_signed_translations(
+    tables: *const Tables,
+    backing_base: u64,
+    image_plan: &[u8; IMAGE / PAGE],
+    entry: u64,
+) -> Result<(), Error> {
+    // SAFETY: these are the three registered, pinned pages of the role
+    // being staged on CPU0. No hardware walker or other writer owns them.
+    let (root, mid, leaf) = unsafe {
+        (
+            core::ptr::addr_of!((*tables).root),
+            core::ptr::addr_of!((*tables).mid),
+            core::ptr::addr_of!((*tables).leaf),
+        )
+    };
+    let read = |page: *const Page, index: usize| {
+        // SAFETY: callers use an index in the fixed 512-entry table.
+        unsafe { page.cast::<u64>().add(index).read_volatile() }
+    };
+    for (parent, child) in [(root, mid), (mid, leaf)] {
+        mmu::checked_single_child_table(PhysAddr(phys(child as u64)), |index| read(parent, index))
+            .map_err(|_| Error::Denied)?;
+    }
+
+    let image_at = BASE as usize / PAGE;
+    let stack_at = STACK_BASE as usize / PAGE;
+    let stack_pages = ROLE_STACK_BYTES / PAGE;
+    let entry_flags = entry
+        .checked_sub(BASE)
+        .and_then(|offset| image_plan.get((offset / PAGE as u64) as usize));
+    let unmapped = [
+        0..image_at,
+        image_at + image_plan.len()..stack_at,
+        stack_at + stack_pages..PAGE / core::mem::size_of::<u64>(),
+    ];
+    if entry_flags != Some(&5)
+        || unmapped
+            .into_iter()
+            .flatten()
+            .any(|index| read(leaf, index) != 0)
+    {
+        return Err(Error::Denied);
+    }
+
+    let pages = image_plan
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(page, flags)| (image_at + page, flags))
+        .chain((stack_at..stack_at + stack_pages).map(|index| (index, 6)));
+    for (page, (index, flags)) in pages.enumerate() {
+        let pte = read(leaf, index);
+        if flags == 0 {
+            if pte != 0 {
+                return Err(Error::Denied);
+            }
+            continue;
+        }
+        let pa = phys(backing_base + (page * PAGE) as u64);
+        let permissions =
+            PagePermissions::new(flags & 2 != 0, flags & 1 != 0).map_err(|_| Error::Denied)?;
+        // SAFETY: the trusted direct map table is live and CPU0 staged all
+        // alias changes before the final broadcast TLBI.
+        let alias = unsafe { high_leaf(pa).read_volatile() };
+        mmu::checked_private_role_leaf(PhysAddr(pa), permissions, pte, alias)
+            .map_err(|_| Error::Denied)?;
+    }
+    Ok(())
+}
+
 pub(super) enum RoleLaunch {
     #[cfg(cyxia_signed_resident)]
     Lifecycle,
@@ -177,7 +251,7 @@ pub(super) fn load_role_with_identity(
     index: usize,
     generation: u64,
     launch: RoleLaunch,
-) -> NativeRole {
+) -> Result<NativeRole, Error> {
     let role = ROLES[index];
     let pkg = &CATALOG[index];
     assert_eq!(pkg.role_id, role.id());
@@ -297,8 +371,11 @@ pub(super) fn load_role_with_identity(
         #[cfg(cyxia_startup_catalog)]
         remove_writable_alias(pa);
     }
+    #[cfg(not(cyxia_startup_catalog))]
     assert_eq!(unsafe { (*t).leaf.0[STACK_BASE as usize / PAGE - 1] }, 0);
     tlbi();
+    #[cfg(cyxia_startup_catalog)]
+    verify_signed_translations(t, image_base, &map, entry)?;
     PIE_CAP[index].store(cap_selector, Ordering::Release);
     // Stash the entry/SP for the turn loop in the member's private region base
     // is not possible; keep a separate context array instead (see pie_context).
@@ -306,7 +383,7 @@ pub(super) fn load_role_with_identity(
     PIE_SP[index].store(startup.sp, Ordering::Release);
     PIE_X0[index].store(startup.x0, Ordering::Release);
     PIE_X1[index].store(startup.x1, Ordering::Release);
-    NativeRole {
+    Ok(NativeRole {
         role,
         actor,
         ttbr0_root: root_pa(index),
@@ -319,7 +396,7 @@ pub(super) fn load_role_with_identity(
         cpu_mask: profile::CONTROL_MASK,
         thread_count: 1,
         endpoint_id,
-    }
+    })
 }
 static PIE_ENTRY: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
 static PIE_SP: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];

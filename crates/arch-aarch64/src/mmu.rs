@@ -57,6 +57,43 @@ pub fn encode_user_leaf(
     Ok(d)
 }
 
+/// Check a private 4 KiB root or middle table with one registered child at
+/// index zero. The reader supplies actual descriptor words from that table.
+pub fn checked_single_child_table(
+    child: PhysAddr,
+    mut entry: impl FnMut(usize) -> u64,
+) -> Result<(), MappingError> {
+    if child.0 == 0 || !child.0.is_multiple_of(4096) || child.0 >= 1 << 48 {
+        return Err(MappingError::Address);
+    }
+    if entry(0) != (child.0 | 3) || (1..512).any(|slot| entry(slot) != 0) {
+        return Err(MappingError::Permissions);
+    }
+    Ok(())
+}
+
+/// Check a private role's owned user page and its kernel direct alias.
+/// A writable EL0 page has no direct alias, and immutable pages retain a
+/// read-only execute-never alias for EL1.
+pub fn checked_private_role_leaf(
+    frame: PhysAddr,
+    permissions: PagePermissions,
+    user_entry: u64,
+    direct_entry: u64,
+) -> Result<(), MappingError> {
+    let expected_user = encode_user_leaf(frame, permissions.writable(), permissions.executable())?;
+    let expected_direct = if permissions.writable() {
+        0
+    } else {
+        let readonly = PagePermissions::new(false, false).expect("read-only data");
+        encode_leaf(frame, readonly, MemoryAttr::Normal)?
+    };
+    if user_entry != expected_user || direct_entry != expected_direct {
+        return Err(MappingError::Permissions);
+    }
+    Ok(())
+}
+
 /// Validate one already-pinned EL0 page fragment against the trusted owned
 /// physical frame and this profile's exact leaf encoding. This does not
 /// acquire a pin, walk ancestor tables, or prove lifetime on its own.
@@ -88,6 +125,56 @@ pub fn checked_user_leaf_span(
 #[cfg(test)]
 mod copy_tests {
     use super::*;
+    #[test]
+    fn private_table_accepts_only_its_registered_low_child() {
+        let child = PhysAddr(0x4000_2000);
+        let mut table = [0; 512];
+        table[0] = child.0 | 3;
+        assert_eq!(checked_single_child_table(child, |i| table[i]), Ok(()));
+        assert_eq!(
+            checked_single_child_table(PhysAddr(0x4000_3000), |i| table[i]),
+            Err(MappingError::Permissions)
+        );
+        assert_eq!(
+            checked_single_child_table(PhysAddr(child.0 + 1), |i| table[i]),
+            Err(MappingError::Address)
+        );
+        table[511] = 0x4000_3000 | 3;
+        assert_eq!(
+            checked_single_child_table(child, |i| table[i]),
+            Err(MappingError::Permissions)
+        );
+    }
+
+    #[test]
+    fn private_leaf_requires_exact_permissions_and_kernel_alias() {
+        let frame = PhysAddr(0x4000_3000);
+        let rw = PagePermissions::new(true, false).unwrap();
+        let rx = PagePermissions::new(false, true).unwrap();
+        let ro_nx = PagePermissions::new(false, false).unwrap();
+        let user_rw = encode_user_leaf(frame, true, false).unwrap();
+        let user_rx = encode_user_leaf(frame, false, true).unwrap();
+        let alias_ro = encode_leaf(frame, ro_nx, MemoryAttr::Normal).unwrap();
+
+        assert_eq!(checked_private_role_leaf(frame, rw, user_rw, 0), Ok(()));
+        assert_eq!(
+            checked_private_role_leaf(frame, rx, user_rx, alias_ro),
+            Ok(())
+        );
+        assert_eq!(
+            checked_private_role_leaf(frame, rx, user_rw, 0),
+            Err(MappingError::Permissions)
+        );
+        assert_eq!(
+            checked_private_role_leaf(frame, rw, user_rw, alias_ro),
+            Err(MappingError::Permissions)
+        );
+        assert_eq!(
+            checked_private_role_leaf(frame, rx, user_rx, 0),
+            Err(MappingError::Permissions)
+        );
+    }
+
     #[test]
     fn copy_leaf_checks_exact_ownership_permission_and_fragment() {
         let pa = PhysAddr(0x4000);

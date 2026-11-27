@@ -501,7 +501,7 @@ fn load_signed_roles(
     for (index, slot) in members.iter_mut().enumerate() {
         *slot = Some(startup_work(budget, 3 + index as u64, || {
             load_role_with_identity(index, actors[index].generation, RoleLaunch::Lifecycle)
-        })?);
+        })??);
     }
     Ok(members.map(|entry| entry.expect("complete signed launch inventory")))
 }

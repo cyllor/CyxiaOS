@@ -625,6 +625,7 @@ fn load_role(index: usize) -> NativeRole {
             target_selector,
         },
     )
+    .expect("trusted diagnostic role translations")
 }
 
 // ---- in-vector production dispatch ----
