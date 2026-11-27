@@ -87,6 +87,9 @@ mod reopen;
 mod signed;
 #[cfg(feature = "v020-production-media-signed")]
 use cyxia_kernel_core::security::offline_config_v1::VerifiedOfflineConfig;
+#[cfg(cyxia_signed_scratch_catalog)]
+#[path = "startup_catalog.rs"]
+mod startup_catalog;
 #[path = "media_staging/volume.rs"]
 mod volume;
 
@@ -283,8 +286,13 @@ pub(super) fn verify_scratch_config() -> Result<VerifiedOfflineConfig<'static>, 
     // SAFETY: the serialized CPU0 foreground owns this scratch outside
     // package loading. The Ed25519 verifier wipes the borrowed span.
     let scratch = unsafe { &mut *core::ptr::addr_of_mut!(super::COPY_BUFFER.0) };
-    signed::verify(signed::WIRE, scratch)
-        .inspect_err(|e| report("V020_W13_CONFIG_ERROR", *e as u64, 0, 0))
+    #[cfg(cyxia_signed_scratch_catalog)]
+    let config = startup_catalog::verify_policy(scratch, |header, principals, lists| {
+        signed::verify_scratch_payload(header, principals, lists, signed::PAYLOAD)
+    });
+    #[cfg(not(cyxia_signed_scratch_catalog))]
+    let config = signed::verify(signed::WIRE, scratch);
+    config.inspect_err(|e| report("V020_W13_CONFIG_ERROR", *e as u64, 0, 0))
 }
 
 fn run_chain(

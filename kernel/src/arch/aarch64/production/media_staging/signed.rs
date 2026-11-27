@@ -1,11 +1,9 @@
-//! Immutable, public test catalog for the selected repository scratch policy.
-//! The FSYNC profile pins a separate volume and the exact diagnostic owner.
+//! Signed scratch policy. The resident may pin an external empty policy at
+//! build time. The FSYNC profile pins its separate test volume and owner.
 use super::volume::UUID;
-#[cfg(feature = "v020-production-fsync-scratch")]
-use cyxia_kernel_core::security::offline_config_v1::Principal;
 use cyxia_kernel_core::security::{
     Error,
-    offline_config_v1::{CatalogBindings, VerifiedOfflineConfig},
+    offline_config_v1::{CatalogBindings, ConfigHeader, Principal, VerifiedOfflineConfig},
 };
 
 #[cfg(not(feature = "v020-production-fsync-scratch"))]
@@ -15,7 +13,7 @@ pub(super) const WIRE: &[u8] =
 pub(super) const WIRE: &[u8] =
     include_bytes!("../../../../../../tests/fixtures/v020-signed-scratch/fsync-config.bin");
 #[cfg(not(feature = "v020-production-fsync-scratch"))]
-const PAYLOAD: &[u8] = &[0; 12];
+pub(super) const PAYLOAD: &[u8] = &[0; 12];
 #[cfg(feature = "v020-production-fsync-scratch")]
 const PAYLOAD: &[u8] = b"CYX-SCRATCH-FSYNC/v1:inode=1,principal=1";
 #[cfg(feature = "v020-production-fsync-scratch")]
@@ -85,13 +83,36 @@ const CATALOG: CatalogBindings = CatalogBindings {
     ],
 };
 
-/// Accept only the pinned, signed scratch configuration. Its expected wire
-/// digest, public key and catalog bindings are independent of the supplied bytes.
+/// Accept the pinned repository scratch fixture.
 pub(super) fn verify<'a>(
     wire: &'a [u8],
     scratch: &mut [u8],
 ) -> Result<VerifiedOfflineConfig<'a>, Error> {
     verify_vector(wire, scratch, PAYLOAD, WIRE_DIGEST)
+}
+
+pub(super) fn verify_scratch_payload(
+    header: &ConfigHeader,
+    principals: &[Principal; 16],
+    lists: &[u8],
+    expected: &[u8],
+) -> Result<(), Error> {
+    if header.fs_uuid != UUID
+        || header.generation != 1
+        || header.rule_generation != 1
+        || header.security_generation != 1
+        || header.key_generation != 1
+        || header.mode != 0
+        || header.clear_isolation_bitmap != 0
+        || lists != expected
+        || principals
+            .iter()
+            .enumerate()
+            .any(|(index, p)| p.id != index as u64 + 1 || p.generation != 1)
+    {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
 }
 
 fn verify_vector<'a>(
@@ -105,21 +126,7 @@ fn verify_vector<'a>(
         &PUBLIC_KEY,
         CATALOG,
         scratch,
-        |header, principals, lists| {
-            if header.fs_uuid != UUID
-                || header.generation != 1
-                || header.mode != 0
-                || header.clear_isolation_bitmap != 0
-                || lists != payload
-                || principals
-                    .iter()
-                    .enumerate()
-                    .any(|(index, p)| p.id != index as u64 + 1 || p.generation != 1)
-            {
-                return Err(Error::Unauthorized);
-            }
-            Ok(())
-        },
+        |header, principals, lists| verify_scratch_payload(header, principals, lists, payload),
     )?;
     if config.digest() != digest {
         return Err(Error::Conflict);

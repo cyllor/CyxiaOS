@@ -47,8 +47,8 @@ def verify_resident_budget(lines: list, progress: list) -> list:
     return samples
 
 
-def verify_disk(path: Path, epoch: int, roles: list) -> str:
-    policy = verify_signed_disk(path, epoch)
+def verify_disk(path: Path, epoch: int, roles: list, *, expected_policy_sha256: str | None = None) -> str:
+    policy = verify_signed_disk(path, epoch, expected_policy_sha256=expected_policy_sha256)
     with path.open("rb") as disk:
         for offset, expected in (
             (DATA_START * BLOCK_BYTES, epoch - 1),
@@ -92,7 +92,8 @@ def capture_budget_trace(socket_path: Path, elf: Path, output: Path, deadline: f
 
 
 def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None,
-         epoch: int | None, *, budget_trace: bool = False) -> dict:
+         epoch: int | None, *, expected_policy_sha256: str | None = None,
+         budget_trace: bool = False) -> dict:
     output.mkdir()
     elf_digest = sha(elf)
     result = {"elf_sha256": elf_digest, "status": "FAIL"}
@@ -201,7 +202,9 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
     (output / "serial.bin").write_bytes(data)
     (output / "serial.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     if result["status"] == "PASS" and epoch is not None:
-        result["policy_sha256"] = verify_disk(disk, epoch, result["roles"])
+        result["policy_sha256"] = verify_disk(
+            disk, epoch, result["roles"], expected_policy_sha256=expected_policy_sha256,
+        )
     return result
 
 
@@ -212,6 +215,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--qemu-sha256", required=True, help="pinned accounting QEMU executable")
     parser.add_argument("--patch-sha256", required=True, help="pinned per-vCPU PMU source patch")
+    parser.add_argument("--policy-sha256", help="SHA-256 of the independently signed scratch catalog")
     parser.add_argument("--budget-trace", action="store_true", help="replay stopped CPU0 per-role and per-window debits")
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args()
@@ -241,6 +245,7 @@ def main() -> int:
                 ("reopen", args.reopen_elf, disk, 2),
             ):
                 run = boot(binary, elf, args.output / name, args.timeout, medium, epoch,
+                           expected_policy_sha256=args.policy_sha256,
                            budget_trace=args.budget_trace and epoch is not None)
                 summary[name] = run
                 require(run["status"] == "PASS", f"{name}: {run.get('error')}")

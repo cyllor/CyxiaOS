@@ -1,13 +1,15 @@
 use std::{env, fs, io::Read, path::Path};
 
-// These are immutable build inputs. Only the freestanding resident image
-// embeds them. Signature and cross-asset checks still run inside the guest.
+// These immutable inputs are supported by the default resident image and the
+// explicit signed scratch resident profile. Verification runs in the guest.
 pub(super) fn build() {
     const DIR: &str = "CYXIA_STARTUP_CATALOG_DIR";
     println!("cargo:rustc-check-cfg=cfg(cyxia_startup_catalog)");
+    println!("cargo:rustc-check-cfg=cfg(cyxia_signed_scratch_catalog)");
     println!("cargo:rerun-if-env-changed={DIR}");
+    let signed_scratch = env::var_os("CARGO_FEATURE_V020_PRODUCTION_SIGNED_RESIDENT").is_some();
     if env::var_os("CARGO_FEATURE_V020_PRODUCTION").is_none()
-        || env::var_os("CARGO_FEATURE_V020_PRODUCTION_DIAGNOSTIC").is_some()
+        || (env::var_os("CARGO_FEATURE_V020_PRODUCTION_DIAGNOSTIC").is_some() && !signed_scratch)
     {
         return;
     }
@@ -38,7 +40,12 @@ pub(super) fn build() {
     assert_ne!(generation, 0, "startup key generation must be nonzero");
     fs::write(out.join("key-generation.rs"), generation.to_string())
         .expect("write startup catalog key generation");
-    println!("cargo:rustc-cfg=cyxia_startup_catalog");
+    let cfg = if signed_scratch {
+        "cyxia_signed_scratch_catalog"
+    } else {
+        "cyxia_startup_catalog"
+    };
+    println!("cargo:rustc-cfg={cfg}");
 }
 
 fn load(directory: &Path, name: &str, min: usize, max: usize) -> Vec<u8> {
