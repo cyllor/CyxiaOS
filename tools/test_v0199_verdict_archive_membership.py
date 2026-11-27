@@ -4,6 +4,7 @@ from pathlib import Path
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 import verify_v0199_verdicts as v
 
 
@@ -34,6 +35,26 @@ def archive(root, keys):
     return json.dumps(dict(schema='cyxia-frozen-verdict-run/v1',run_id=1,inventory_sha256=inv,proofs=proofs)).encode()
 
 class ArchiveMembership(unittest.TestCase):
+    def test_count_preserving_proof_reassignment_rejected(self):
+        # Preserve both aggregate counts and per-class counts, but move a
+        # mandatory proof off its normative case onto an unrelated case.
+        original = v.INVENTORY.read_bytes()
+        for proof, source, destination in (
+            ('STATIC_EL1', 'P09', 'P01'),
+            ('MODEL_CHECK', 'P02', 'P01'),
+            ('ARCH_A53', 'P10', 'P01'),
+        ):
+            with self.subTest(proof=proof), tempfile.TemporaryDirectory() as d:
+                data = json.loads(original)
+                cases = {case['id']: case for case in data['cases']}
+                key = 'g5_additional' if proof == 'ARCH_A53' else 'g4_required'
+                cases[source][key].remove(proof)
+                cases[destination][key].append(proof)
+                path = Path(d) / 'inventory.json'
+                path.write_text(json.dumps(data), encoding='utf-8')
+                with patch.object(v, 'INVENTORY', path):
+                    with self.assertRaisesRegex(ValueError, 'inventory proof assignment mismatch: ' + proof):
+                        v.inventory()
     def test_complete_canonical_archive_still_aggregates(self):
         g4,g5,_,_=v.inventory()
         # Synthetic namespace fixtures cannot supply a trusted board lock.

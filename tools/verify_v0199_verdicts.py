@@ -34,6 +34,31 @@ STABLE_CASES = {
     for number in numbers
 }
 
+# Independently transcribed from baseline 安§7.4, not derived from inventory JSON.
+_REQUIRED_CLASSES = {
+    "STATIC_EL1": frozenset(
+        "P09 P10 P11 P12 P13 F02 F09 M02 M04 M05 M08 M10 M11 M12 M13 M14 "
+        "M15 N01 N07 N12 N15 D02 D03 D09 D10 D12 D13 D14 S01 S02 S09 S11 "
+        "S12 S13 J01 J02 J07 J13 A01 A04 A06 A07 A10 A16 E03 E05 E08 E15 "
+        "H01 H05 H06"
+        .split()
+    ),
+    "MODEL_CHECK": frozenset(
+        "P02 P04 P05 P06 P13 F02 F03 F05 F06 F07 F09 F10 F11 F12 F13 M04 "
+        "M05 M06 M09 M11 M13 M14 N03 N04 N09 N10 N11 N13 N15 N16 D03 D04 "
+        "D05 D06 D09 D14 S02 S03 S04 S05 S06 S07 S08 S11 S12 S13 J01 J02 "
+        "J03 J04 J05 J06 J07 J08 J09 J10 J11 J12 J13 A04 A05 A06 A07 A10 "
+        "A11 A15 A16 E01 E02 E03 E04 E05 E06 E07 E08 E13 E14 E15 H01 H02 "
+        "H03 H04 H05 H06"
+        .split()
+    ),
+    "ARCH_A53": frozenset(
+        "P10 P11 P12 M02 M04 M08 M10 M11 M12 M13 M15 D04 D06 D09 D10 D14 "
+        "S09 S13 J01 J02 J07 A01 A04 A06 E03 E08"
+        .split()
+    ),
+}
+
 def require(ok,msg):
     if not ok: raise ValueError(msg)
 def digest(data):return hashlib.sha256(data).hexdigest()
@@ -99,6 +124,9 @@ def inventory():
         physical.update((test, CLASSES[proof]) for proof in additional)
     g5 = g4 | physical
     require(len(g4)==262 and len(g5-g4)==26,"inventory proof count mismatch")
+    for proof, names in _REQUIRED_CLASSES.items():
+        actual = {ids[test] for test, kind in g5 if kind == CLASSES[proof]}
+        require(actual == names, "inventory proof assignment mismatch: " + proof)
     return g4,g5,ids,digest(raw)
 def parse(raw):
     require(len(raw)==320,"wrong Verdict v4 size")
