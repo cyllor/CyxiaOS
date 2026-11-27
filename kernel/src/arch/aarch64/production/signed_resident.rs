@@ -628,17 +628,26 @@ fn run_tasks(
     let mut console_window = next_window;
     let mut command = 0;
     let mut budget_frame = false;
+    // Finish publishing the authenticated cohort before entering any EL0
+    // role. Each console grant prepares at most one frame and drains a
+    // bounded number of bytes, including when the UART is busy.
+    let mut ready_record = Some(0);
     loop {
         let now = now_ns();
         let window = now / WINDOW_NS;
-        if window >= next_window {
+        let ready_at_start = ready_record.is_none();
+        if ready_at_start && window >= next_window {
             next_window = window + 1;
             for (index, task) in tasks.iter_mut().enumerate() {
                 turn(policy, manifest, index, task, budget)?;
             }
         }
         let mut wake = next_boundary(now)?;
-        if window >= console_window || pending.pending() != 0 || budget_frame {
+        if window >= console_window
+            || ready_record.is_some()
+            || pending.pending() != 0
+            || budget_frame
+        {
             let start = budget.sample_gap()?;
             match budget.ledger.reserve_kernel_with_wall(
                 0,
@@ -649,25 +658,38 @@ fn run_tasks(
             ) {
                 Ok(grant) => {
                     console_window = window + 1;
-                    let result = queue_activity(
-                        &mut tasks,
-                        window,
-                        &mut proof_window,
-                        &mut budget_frame,
-                        budget,
-                        pending,
-                    );
-                    if result.is_ok() {
-                        resident::poll_console(
-                            &mut uart,
+                    let result = if let Some(index) = ready_record {
+                        queue_ready(policy.boot_epoch(), manifest, index, pending).map(|()| {
+                            resident::drain_console(&mut uart, pending);
+                            if pending.pending() == 0 {
+                                ready_record = (index < ROLE_COUNT).then_some(index + 1);
+                            }
+                        })
+                    } else {
+                        queue_activity(
+                            &mut tasks,
+                            window,
+                            &mut proof_window,
+                            &mut budget_frame,
+                            budget,
                             pending,
-                            &mut command,
-                            IRQS[0].load(Ordering::Acquire),
-                        );
-                    }
+                        )
+                        .map(|()| {
+                            resident::poll_console(
+                                &mut uart,
+                                pending,
+                                &mut command,
+                                IRQS[0].load(Ordering::Acquire),
+                            );
+                        })
+                    };
                     budget.settle(grant, start, 0)?;
                     result?;
-                    if pending.pending() != 0 || budget_frame {
+                    if !ready_at_start && ready_record.is_none() {
+                        proof_window = window + EVIDENCE_WINDOWS;
+                        continue;
+                    }
+                    if ready_record.is_some() || pending.pending() != 0 || budget_frame {
                         wake =
                             wake.min(now_ns().checked_add(CONSOLE_RETRY_NS).ok_or(Error::Clock)?);
                     }
@@ -680,6 +702,29 @@ fn run_tasks(
         // Recheck sooner only to finish a queued frame with remaining credit.
         budget.idle_until(wake)?;
     }
+}
+
+fn queue_ready(
+    epoch: u64,
+    manifest: &ValidatedLifecycleManifest<'_>,
+    index: usize,
+    pending: &mut OutputQueue<128>,
+) -> Result<(), Error> {
+    if pending.pending() != 0 {
+        return Ok(());
+    }
+    let (label, [a, b, c]) = if index == 0 {
+        ("V020_SIGNED_RESIDENT_BOOT", [epoch, ROLE_COUNT as u64, 0])
+    } else {
+        let actor = manifest.manifest().members[index - 1].actor;
+        (
+            "V020_SIGNED_RESIDENT_ROLE",
+            [(index - 1) as u64, actor.id, actor.generation],
+        )
+    };
+    let mut text = [0; 96];
+    let payload = report_payload(&mut text, label, a, b, c);
+    enqueue_resident_frame(pending, payload).map_err(|_| Error::Denied)
 }
 
 fn queue_activity(
@@ -934,20 +979,6 @@ pub(super) fn run(info: &BootInfo) -> ! {
         Ok(manifest) => manifest,
         Err(error) => fence(info, budget, OutputQueue::new(), error.into()),
     };
-    report(
-        "V020_SIGNED_RESIDENT_BOOT",
-        policy.boot_epoch(),
-        ROLE_COUNT as u64,
-        0,
-    );
-    for (index, actor) in actors.iter().enumerate() {
-        report(
-            "V020_SIGNED_RESIDENT_ROLE",
-            index as u64,
-            actor.id,
-            actor.generation,
-        );
-    }
     let mut pending = OutputQueue::new();
     let Err(fault) = run_tasks(info, &policy, &manifest, &mut budget, &mut pending);
     fence(info, budget, pending, fault)

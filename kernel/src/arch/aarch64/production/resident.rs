@@ -119,6 +119,12 @@ pub(crate) fn exception(frame: &mut ExceptionFrame, kind: u64) {
     super::exception(frame, kind);
 }
 
+pub(super) fn drain_console(uart: &mut Pl011, pending: &mut OutputQueue<128>) {
+    pending
+        .drain(uart, TX_BYTES_PER_TURN)
+        .expect("bounded PL011 transmit");
+}
+
 // CPU0 owns UART RX/TX after startup. The timer IRQ only rearms the timer
 // and increments its counter. Foreground consumes at most one command per turn.
 pub(super) fn poll_console(
@@ -127,9 +133,7 @@ pub(super) fn poll_console(
     command: &mut usize,
     interrupts: u64,
 ) {
-    pending
-        .drain(uart, TX_BYTES_PER_TURN)
-        .expect("bounded PL011 transmit");
+    drain_console(uart, pending);
     if pending.pending() != 0 {
         return;
     }
