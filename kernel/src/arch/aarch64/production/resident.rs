@@ -30,6 +30,9 @@ const RX_BYTES_PER_TURN: usize = 16;
 const TX_BYTES_PER_TURN: usize = 64;
 const CONSOLE_TURN_NS: u64 = 1_000_000;
 const DEGRADED_POLL_INTERVAL: u64 = 4;
+#[cfg(cyxia_startup_catalog)]
+const CATALOG_RECOVERY_NS: u64 =
+    cyxia_kernel_core::control_plane::role_budget_v0199::CLASS_LIMITS[Class::Recovery as usize];
 
 struct ResidentBudget {
     ledger: Cpu0BudgetLedger,
@@ -72,14 +75,12 @@ impl ResidentBudget {
     }
 
     #[cfg(cyxia_startup_catalog)]
-    fn verify_startup_envelope(&mut self) -> Result<bool, Error> {
-        use cyxia_kernel_core::control_plane::role_budget_v0199::CLASS_LIMITS;
-        let prepaid = CLASS_LIMITS[Class::Recovery as usize];
+    fn verify_startup_envelope(&mut self) -> Result<(bool, Settlement), Error> {
         let (started, grant) = loop {
             let now = self.now_ns()?;
             match self
                 .ledger
-                .reserve_kernel(cpu::slot(), Class::Recovery, prepaid, now)
+                .reserve_kernel(cpu::slot(), Class::Recovery, CATALOG_RECOVERY_NS, now)
             {
                 Ok(grant) => break (now, grant),
                 Err(Error::Exhausted) => timer::idle(),
@@ -87,11 +88,7 @@ impl ResidentBudget {
             }
         };
         let verified = startup_catalog::authenticate().is_ok();
-        let settlement = self.settle(started, grant)?;
-        if settlement.overrun || settlement.crossed_window {
-            return Err(Error::Exhausted);
-        }
-        Ok(verified)
+        Ok((verified, self.settle(started, grant)?))
     }
 }
 
@@ -183,20 +180,24 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         false,
     );
     #[cfg(cyxia_startup_catalog)]
-    let (startup_banner, budget_degraded): (&[u8], _) = match budget.verify_startup_envelope() {
-        Ok(true) => (
+    let catalog_check = budget.verify_startup_envelope();
+    #[cfg(cyxia_startup_catalog)]
+    let (startup_banner, budget_degraded): (&[u8], _) = match &catalog_check {
+        Ok((true, cost)) if !cost.overrun && !cost.crossed_window => (
             b"V020_STARTUP state=SECURE_DEGRADED reason=catalog_verified_pending command=status\n",
             false,
         ),
-        Ok(false) => (
+        Ok((false, cost)) if !cost.overrun && !cost.crossed_window => (
             b"V020_STARTUP state=SECURE_DEGRADED reason=catalog_rejected command=status\n",
             false,
         ),
-        Err(_) => (
+        _ => (
             b"V020_STARTUP state=SECURE_DEGRADED reason=catalog_budget command=status\n",
             true,
         ),
     };
+    #[cfg(cyxia_startup_catalog)]
+    let mut catalog_cost = catalog_check.ok().map(|(_, cost)| cost);
     enqueue_resident_frame(&mut pending, startup_banner).expect("resident startup frame");
     let mut command = 0;
     let mut last_interrupt = 0;
@@ -209,6 +210,22 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         if !accounting_fault && interrupts.wrapping_sub(last_interrupt) >= interval {
             last_interrupt = interrupts;
             let result = budget.turn(degraded, || {
+                #[cfg(cyxia_startup_catalog)]
+                if pending.pending() == 0
+                    && let Some(cost) = catalog_cost.take()
+                {
+                    let mut text = [0; 96];
+                    let flags = u64::from(cost.overrun) | (u64::from(cost.crossed_window) << 1);
+                    let payload = report_payload(
+                        &mut text,
+                        "V020_STARTUP_CATALOG_COST",
+                        cost.actual_ns,
+                        CATALOG_RECOVERY_NS,
+                        flags,
+                    );
+                    enqueue_resident_frame(&mut pending, payload)
+                        .expect("startup catalog budget frame");
+                }
                 if pending.pending() == 0
                     && let Some(bound) = notice.take()
                 {

@@ -18,13 +18,17 @@ from verify_smp import require
 
 STARTUP_REASONS = ("missing_startup_authority", "catalog_verified_pending",
                    "catalog_rejected", "catalog_budget")
+STARTUP_BANNERS = {
+    f"V020_STARTUP state=SECURE_DEGRADED reason={reason} command=status": reason
+    for reason in STARTUP_REASONS
+}
+RECOVERY_LIMIT_NS = 8_000_000
 
 
 def verify(elf: Path, output: Path, timeout: float,
            startup_reason: str = STARTUP_REASONS[0]) -> dict:
     require(1 <= timeout <= 120, "invalid run timeout")
     require(startup_reason in STARTUP_REASONS, "invalid expected startup state")
-    ready = f"V020_STARTUP state=SECURE_DEGRADED reason={startup_reason} command=status"
     output.mkdir(parents=True, exist_ok=False)
     binary = shutil.which("qemu-system-aarch64")
     require(binary is not None, "qemu-system-aarch64 is missing")
@@ -61,8 +65,11 @@ def verify(elf: Path, output: Path, timeout: float,
                 return rows(lines, "V020_RESIDENT_STATUS")
 
             read_until(deadline, lambda: any(line.startswith("V020_STARTUP ") for line in lines))
-            require([line for line in lines if line.startswith("V020_STARTUP ")] == [ready],
-                    "unexpected resident startup admission state")
+            banners = [line for line in lines if line.startswith("V020_STARTUP ")]
+            require(len(banners) == 1 and banners[0] in STARTUP_BANNERS,
+                    "missing or malformed resident startup admission state")
+            observed_reason = STARTUP_BANNERS[banners[0]]
+            report["observed_startup_reason"] = observed_reason
             require(rows(lines, "SMP_BOOT_OK") == [(4, 15, 0)], "incomplete SMP startup")
             for expected in range(1, 4):
                 # An idle interval separates every host-initiated request. An
@@ -82,8 +89,24 @@ def verify(elf: Path, output: Path, timeout: float,
             require(not any(line.startswith(("V020_PROD_", "V020_W11_NET_", "FAIL"))
                             for line in lines), "diagnostic fixture or hardware error in resident boot")
             require(proc.poll() is None, "QEMU exited after the last resident response")
-            report.update(status="PASS", startup_reason=startup_reason,
-                          replies=len(snapshots), timer_irqs=counts)
+            report.update(replies=len(snapshots), timer_irqs=counts)
+            costs = rows(lines, "V020_STARTUP_CATALOG_COST")
+            if observed_reason == STARTUP_REASONS[0]:
+                require(not costs, "absent startup catalog performed verification work")
+            else:
+                require(len(costs) == 1, "missing or repeated startup catalog budget settlement")
+                elapsed_ns, prepaid_ns, flags = costs[0]
+                require(elapsed_ns > 0 and prepaid_ns == RECOVERY_LIMIT_NS and flags in (0, 1, 3),
+                        "invalid startup catalog budget settlement")
+                report["catalog_budget"] = {"elapsed_ns": elapsed_ns, "prepaid_ns": prepaid_ns,
+                                            "overrun": bool(flags & 1), "crossed_window": bool(flags & 2)}
+                require((observed_reason == "catalog_budget") == bool(flags)
+                        and bool(flags) == (elapsed_ns > prepaid_ns),
+                        "startup catalog outcome disagrees with its budget settlement")
+            require([line for line in lines if line.startswith("V020_STARTUP ")] == banners,
+                    "repeated resident startup admission state")
+            require(observed_reason == startup_reason, "unexpected resident startup admission state")
+            report.update(status="PASS", startup_reason=startup_reason)
         except (OSError, ValueError) as error:
             report["error"] = f"{type(error).__name__}: {error}"
         finally:
