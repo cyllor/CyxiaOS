@@ -47,6 +47,74 @@ def device_snapshot(qmp, disk: Path) -> dict:
     return {"virtio": status, "drive": drive["inserted"], "operations": {k: stats[k] for k in COUNTERS}}
 
 
+def replay_reopen_qmp(transcript: list, raw: bytes, disk: Path) -> tuple:
+    """Reconstruct both device observations and the serial input from raw QMP.
+
+    This is a host replay of the live checker inputs, not a formal Verdict or
+    an authentication of the producer. A clean process exit is checked separately.
+    """
+    require(bool(transcript) and transcript[0]["direction"] == "receive"
+            and "QMP" in transcript[0]["message"], "missing replay QMP greeting")
+    calls = []
+    pending = None
+    for record in transcript[1:]:
+        msg = record["message"]
+        if record["direction"] == "send":
+            require(pending is None and type(msg.get("id")) is int
+                    and msg["id"] == len(calls) + 1, "invalid replay QMP request order")
+            pending = msg
+        else:
+            require(record["direction"] == "receive", "invalid replay QMP direction")
+            if "event" in msg and "id" not in msg:
+                require(msg["event"] in ("RESUME", "STOP", "SHUTDOWN"),
+                        "unexpected replay QMP event")
+                continue
+            require(pending is not None and msg.get("id") == pending["id"]
+                    and type(msg.get("id")) is int and "return" in msg and "error" not in msg,
+                    "unmatched or failed replay QMP response")
+            calls.append((pending, msg["return"]))
+            pending = None
+    # A clean quit can disconnect before its response reaches the host.
+    if pending is not None:
+        require(pending.get("execute") == "quit", "unfinished replay QMP request")
+        calls.append((pending, None))
+    cursor = 0
+
+    class Replay:
+        def execute(self, command, args=None):
+            nonlocal cursor
+            require(cursor < len(calls), "missing replay QMP command: " + command)
+            request, response = calls[cursor]
+            expected = {"execute": command, "id": cursor + 1}
+            if args is not None:
+                expected["arguments"] = args
+            require(request == expected, "unexpected replay QMP command: " + command)
+            cursor += 1
+            return response
+
+    qmp = Replay()
+    qmp.execute("qmp_capabilities")
+    cpus = qmp.execute("query-cpus-fast")
+    memory = qmp.execute("query-memory-size-summary")
+    require({(cpu["cpu-index"], cpu["qom-type"]) for cpu in cpus}
+            == {(index, "cortex-a53-arm-cpu") for index in range(4)} and len(cpus) == 4
+            and memory == {"base-memory": 1024**3, "plugged-memory": 0},
+            "unexpected replay QEMU topology")
+    initial = device_snapshot(qmp, disk)
+    qmp.execute("cont")
+    serial = bytearray()
+    while cursor < len(calls) and calls[cursor][0].get("execute") == "ringbuf-read":
+        chunk = qmp.execute("ringbuf-read", {"device": "cyxlog", "size": 65536, "format": "base64"})
+        serial.extend(base64.b64decode(chunk, validate=True))
+        require(len(serial) <= 1024 * 1024, "replay serial evidence exceeded its limit")
+    require(bytes(serial) == raw and bool(raw), "replay QMP serial differs from raw capture")
+    qmp.execute("stop")
+    final = device_snapshot(qmp, disk)
+    qmp.execute("quit")
+    require(cursor == len(calls), "unexpected trailing replay QMP commands")
+    return initial, final
+
+
 def check_device(snapshot: dict, flush: bool) -> dict:
     device = snapshot["virtio"]
     media = snapshot["drive"]
@@ -152,10 +220,14 @@ def reopen(binary: Path, elf: Path, disk: Path, output: Path, timeout: float, *,
             if qmp is not None:
                 (output / "qmp.jsonl").write_text("".join(json.dumps(row) + "\n" for row in qmp.transcript))
     require(proc.returncode == 0, "QEMU did not shut down cleanly")
+    transcript = [json.loads(line) for line in (output / "qmp.jsonl").read_text().splitlines()]
+    replayed = replay_reopen_qmp(transcript, (output / "serial.bin").read_bytes(), disk)
+    require(replayed == (initial, final), "replay differs from live device observations")
     lines = b"".join(frames).decode("ascii").splitlines()
     detail = check_reopen(lines, final, flush=flush, before=before, after=sha(disk))
     if flush:
         detail["policy_sha256"] = verify_disk(disk, 2, rows(lines, "V020_SIGNED_RESIDENT_ROLE"))
+    detail["qmp_replay_checked"] = True
     detail["capture_sha256"] = {name: sha(output / name) for name in ("argv.json", "serial.bin", "serial.txt", "qmp.jsonl", "qemu-stderr.log")}
     return detail
 
