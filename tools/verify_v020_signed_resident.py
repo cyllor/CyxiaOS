@@ -34,6 +34,7 @@ RECOVERY_NS = 8_000_000
 PMU_PATCH = Path(__file__).resolve().parent / "qemu/cyxia-per-vcpu-pmu.patch"
 TRACE_FILE = "cpu0-budget-trace.bin"
 FRAME_TABLE_FILE = "dense-frame-meta.bin"
+PAGE = 4096
 
 
 def verify_resident_budget(lines: list, progress: list) -> list:
@@ -110,13 +111,82 @@ def verify_frame_table(path: Path, table_bytes: int, permanent: int, ranges: lis
             "frame_meta_free_rows": len(raw) // row.size - observed}
 
 
+def verify_role_mappings(qmp, output: Path, elf: bytes, backing: dict) -> dict:
+    tables = symbol(elf, "V020_SIGNED_ROLE_TABLES")
+    direct = symbol(elf, "ram_l3")["pa"]
+    image_pages, stack_pages = 16, 8
+    role_pages = image_pages + stack_pages
+    table_pages = 3
+    require(backing["size"] == len(ROLES) * role_pages * PAGE
+            and tables["size"] == len(ROLES) * table_pages * PAGE
+            and tables["pa"] % PAGE == backing["pa"] % PAGE == 0,
+            "invalid linked signed role extents")
+
+    def capture(name, address, size):
+        path = output / name
+        qmp.execute("pmemsave", {"val": address, "size": size, "filename": str(path)})
+        raw = path.read_bytes()
+        require(len(raw) == size, "incomplete signed role translation readback")
+        return struct.unpack(f"<{size // 8}Q", raw)
+
+    aliases = capture("signed-role-aliases.bin",
+                      direct + ((backing["pa"] - 0x40000000) // PAGE) * 8,
+                      len(ROLES) * role_pages * 8)
+    entries = capture("signed-role-tables.bin", tables["pa"], tables["size"])
+    page_entries = PAGE // 8
+    user_leaf = (1 << 53) | 0xf43
+    read_only, no_execute = 1 << 7, 1 << 54
+    readonly = private = 0
+    for role in range(len(ROLES)):
+        start = role * table_pages * page_entries
+        root, middle, leaf = (entries[start + i * page_entries:start + (i + 1) * page_entries]
+                              for i in range(table_pages))
+        table = tables["pa"] + role * table_pages * PAGE
+        require(root[0] == ((table + PAGE) | 3) and middle[0] == ((table + 2 * PAGE) | 3)
+                and not any(root[1:]) and not any(middle[1:]),
+                "signed role table points outside its dedicated pages")
+        image_at, stack_at = 0x10000 // PAGE, 0x30000 // PAGE
+        image = leaf[image_at:image_at + image_pages]
+        stack = leaf[stack_at:stack_at + stack_pages]
+        require(any(entry and not entry & no_execute for entry in image)
+                and all(entry and not entry & read_only for entry in stack)
+                and not any(leaf[:image_at])
+                and not any(leaf[image_at + image_pages:stack_at])
+                and not any(leaf[stack_at + stack_pages:]),
+                "signed role stack, guard, or image mapping is invalid")
+        for index, entry in enumerate(image + stack):
+            if not entry:
+                continue
+            page_index = role * role_pages + index
+            pa = backing["pa"] + page_index * PAGE
+            expected = pa | user_leaf | (entry & (read_only | no_execute))
+            require(entry == expected, "signed role has an unexpected frame or flags")
+            if entry & read_only:
+                require(aliases[page_index] == (pa | 0x0060_0000_0000_0783),
+                        "immutable signed role page has a writable alias")
+                readonly += 1
+            else:
+                require(entry & no_execute and aliases[page_index] == 0,
+                        "signed role writable page has an EL1 direct alias")
+                private += 1
+    return {"role_readonly_pages": readonly, "role_private_writable_pages": private}
+
+
 def capture_budget_trace(socket_path: Path, elf: Path, output: Path, deadline: float, *,
                          frame_table: tuple | None = None) -> dict:
-    location = symbol(elf.read_bytes(), "V020_SIGNED_CPU_BUDGET_TRACE")
+    image = elf.read_bytes()
+    location = symbol(image, "V020_SIGNED_CPU_BUDGET_TRACE")
     require(location["size"] in (SIGNED_TRACE_BYTES, SIGNED_EARLY_TRACE_BYTES)
             and location["pa"] % 4096 == 0,
             "invalid linked signed CPU0 trace extent")
     path = output / TRACE_FILE
+    try:
+        backing = symbol(image, "V020_SIGNED_ROLE_BACKING")
+    except ValueError as error:
+        if str(error) != "missing symbol V020_SIGNED_ROLE_BACKING":
+            raise
+        backing = None
+    mappings = {}
     with socket.socket(socket.AF_UNIX) as sock:
         sock.settimeout(5)
         sock.connect(str(socket_path))
@@ -133,11 +203,13 @@ def capture_budget_trace(socket_path: Path, elf: Path, output: Path, deadline: f
                 table, table_bytes, _, _ = frame_table
                 qmp.execute("pmemsave", {"val": table, "size": table_bytes,
                                          "filename": str((output / FRAME_TABLE_FILE).resolve())})
+            if backing is not None:
+                mappings = verify_role_mappings(qmp, output, image, backing)
         finally:
             (output / "budget-qmp.jsonl").write_text(
                 "".join(json.dumps(row) + "\n" for row in qmp.transcript), encoding="utf-8",
             )
-    result = {"budget_trace_sha256": sha(path), "budget_trace_physical": location["pa"]}
+    result = {"budget_trace_sha256": sha(path), "budget_trace_physical": location["pa"], **mappings}
     if frame_table is not None:
         table, table_bytes, permanent, ranges = frame_table
         result["frame_meta_table_physical"] = table

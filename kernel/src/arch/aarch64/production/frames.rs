@@ -10,8 +10,8 @@
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
 //! * ROWS_BACKING (static mut): the only `&mut` to it is created once in
 //!   `register_production_statics`, guarded by the REGISTERED swap, on CPU0
-//!   before any secondary CPU or EL0 role runs. Copy-window builds retain the
-//!   ledger in NATIVE_LEDGER and publish it through REGISTERED_PAGES.
+//!   before any secondary CPU or EL0 role runs. Signed startup and copy-window
+//!   builds retain the ledger and publish it through REGISTERED_PAGES.
 //! * NATIVE_LEDGER is initialized once. Its RefCell and the underlying rows
 //!   are accessed only by CPU0. An IRQ does not acquire a ledger borrow.
 //! * REGISTERED and the inventory counters (atomics): CPU0 only. REGISTERED
@@ -45,7 +45,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch",
     all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
-    all(cyxia_startup_catalog, feature = "prototype-memory")
+    cyxia_startup_catalog
 ))]
 use core::{cell::RefCell, mem::MaybeUninit};
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind};
@@ -115,7 +115,7 @@ static mut ROWS_BACKING: [FrameMeta; ROWS] = [FrameMeta::ZERO; ROWS];
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch",
     all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
-    all(cyxia_startup_catalog, feature = "prototype-memory")
+    cyxia_startup_catalog
 ))]
 static mut NATIVE_LEDGER: MaybeUninit<RefCell<Ledger<'static>>> = MaybeUninit::uninit();
 static REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -165,7 +165,7 @@ fn role_storage() -> Result<[StaticRegion; 3], Error> {
     ])
 }
 
-#[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+#[cfg(cyxia_startup_catalog)]
 pub(super) fn role_storage_registered() -> bool {
     role_storage().is_ok_and(|regions| {
         regions.into_iter().all(|entry| {
@@ -264,7 +264,8 @@ fn register_production_statics() -> Result<(Inventory, u64), Error> {
         feature = "v020-production-snapshot-catalog",
         feature = "v020-production-file-read",
         feature = "v020-production-fsync-scratch",
-        all(feature = "v020-production-frame-pool", feature = "prototype-memory")
+        all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
+        cyxia_startup_catalog
     ))]
     install_ledger(ledger);
     Ok((inventory, service.region.len / PAGE))
@@ -276,7 +277,7 @@ fn register_production_statics() -> Result<(Inventory, u64), Error> {
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch",
     all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
-    all(cyxia_startup_catalog, feature = "prototype-memory")
+    cyxia_startup_catalog
 ))]
 fn install_ledger(ledger: Ledger<'static>) {
     // SAFETY: the exclusive boot claim has already been taken. The caller
@@ -290,7 +291,7 @@ fn install_ledger(ledger: Ledger<'static>) {
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch",
     all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
-    all(cyxia_startup_catalog, feature = "prototype-memory")
+    cyxia_startup_catalog
 ))]
 fn native_ledger() -> Option<&'static RefCell<Ledger<'static>>> {
     if cyxia_arch_aarch64::cpu::registered_slot() != Some(0)
@@ -318,7 +319,7 @@ pub(super) fn statically_pinned_control_span(span: core::ops::Range<u64>) -> boo
     feature = "v020-production-snapshot-catalog",
     feature = "v020-production-file-read",
     feature = "v020-production-fsync-scratch",
-    all(cyxia_startup_catalog, feature = "prototype-memory")
+    cyxia_startup_catalog
 ))]
 fn statically_pinned_span(span: core::ops::Range<u64>, class: StaticClass) -> bool {
     native_ledger()

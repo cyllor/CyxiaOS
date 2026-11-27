@@ -64,7 +64,9 @@ impl Tables {
 }
 #[repr(align(4096))]
 pub(super) struct CopyBuffer(pub(super) [u8; COPY]);
+#[cfg_attr(cyxia_startup_catalog, unsafe(export_name = "V020_SIGNED_ROLE_BACKING"))]
 pub(super) static mut BACKING: [Backing; ROLE_COUNT] = [const { Backing::ZERO }; ROLE_COUNT];
+#[cfg_attr(cyxia_startup_catalog, unsafe(export_name = "V020_SIGNED_ROLE_TABLES"))]
 pub(super) static mut TABLES: [Tables; ROLE_COUNT] = [const { Tables::ZERO }; ROLE_COUNT];
 pub(super) static mut COPY_BUFFER: CopyBuffer = CopyBuffer([0; COPY]);
 const _: () = assert!(core::mem::size_of::<Backing>() == IMAGE + ROLE_STACK_BYTES);
@@ -148,6 +150,19 @@ fn seal_page(pa: u64) {
     }
     tlbi();
 }
+
+#[cfg(cyxia_startup_catalog)]
+fn remove_writable_alias(pa: u64) {
+    let leaf = high_leaf(pa);
+    // SAFETY: CPU0 is preparing this never-entered role. No reader uses its
+    // writable backing after staging. The final broadcast TLBI completes
+    // every removal before its TTBR0 can be used.
+    unsafe {
+        assert_eq!(leaf.read_volatile(), pa | 0x0060_0000_0000_0703);
+        leaf.write_volatile(0);
+    }
+}
+
 pub(super) enum RoleLaunch {
     #[cfg(cyxia_signed_resident)]
     Lifecycle,
@@ -263,6 +278,10 @@ pub(super) fn load_role_with_identity(
         if !write {
             seal_page(pa);
         }
+        #[cfg(cyxia_startup_catalog)]
+        if write {
+            remove_writable_alias(pa);
+        }
         let desc = mmu::encode_user_leaf(PhysAddr(pa), write, execute).unwrap();
         unsafe {
             (*t).leaf.0[BASE as usize / PAGE + i] = desc;
@@ -275,6 +294,8 @@ pub(super) fn load_role_with_identity(
             (*t).leaf.0[STACK_BASE as usize / PAGE + i] =
                 mmu::encode_user_leaf(PhysAddr(pa), true, false).unwrap();
         }
+        #[cfg(cyxia_startup_catalog)]
+        remove_writable_alias(pa);
     }
     assert_eq!(unsafe { (*t).leaf.0[STACK_BASE as usize / PAGE - 1] }, 0);
     tlbi();

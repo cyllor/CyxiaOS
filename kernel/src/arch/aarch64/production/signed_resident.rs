@@ -488,7 +488,7 @@ fn load_signed_roles(
     actors: &[Identity; ROLE_COUNT],
 ) -> Result<[NativeRole; ROLE_COUNT], Fault> {
     startup_work(budget, 2, || {
-        #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
+        #[cfg(cyxia_startup_catalog)]
         if !frames::role_storage_registered() {
             return Err(Error::Denied);
         }
