@@ -117,6 +117,12 @@ impl StreamPort<'_, '_> {
 impl Port for StreamPort<'_, '_> {
     fn send(&mut self, bytes: &[u8]) -> Result<(), device::Error> {
         self.turn();
+        // Poll may finish after the broker's last deadline sample. Already
+        // admitted TCP work can progress, but new data must pass the live gate.
+        #[cfg(feature = "v020-production-authenticated-net")]
+        if !sec_n_broker::admits_next_transmit() {
+            return Err(device::Error::WouldBlock);
+        }
         match self.tcp.send_exact(bytes) {
             Ok(()) => Ok(()),
             Err(tcp::Error::WouldBlock) => Err(device::Error::WouldBlock),

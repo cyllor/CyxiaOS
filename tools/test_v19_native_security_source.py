@@ -720,7 +720,10 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertLess(run.index("STOPPED.load(Ordering::Acquire) == 14"),
                         run.index("recovery::takeover_stopped();"))
         # SEC-N serve runs in run() and its outcome is sealed.
-        self.assertIn("let net_outcome = net::serve(info);", run)
+        self.assertIn("let net_outcome = net::serve(info, super::sec_n_broker::BootIdentity::FIXTURE);", run)
+        self.assertLess(run.index("let staging_outcome = media_staging::stage("),
+                        run.index("match staging_outcome.network_boot()"))
+        self.assertIn("Some(identity) => net::serve(info, identity),", run)
         self.assertIn("net::publish(&net_outcome);", run)
         # 0x41: the recovery gate refuses BEFORE the metered bridge call.
         arm41 = prod.split("        0x41 => {", 1)[1].split("\n        _ => 0,", 1)[0]
@@ -768,7 +771,7 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertEqual(scope.count("f()"), 1)
         self.assertTrue(scope.rstrip().endswith("\n    out"))
         net = source(arm / "production/net.rs")
-        self.assertIn("pub(super) fn serve(info: &BootInfo) -> NetOutcome", net)
+        self.assertIn("pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity) -> NetOutcome", net)
 
     def test_v020_wave11_production_parks_halted_cpus_with_wfi(self):
         # Final fix wave I1: under TCG a WFE park spins a host core per halted

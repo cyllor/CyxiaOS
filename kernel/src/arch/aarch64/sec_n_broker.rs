@@ -954,6 +954,12 @@ fn broker_write<P: Port>(port: &mut P, len: u64) {
     }
 }
 
+#[cfg(feature = "v020-production-authenticated-net")]
+pub(crate) fn admits_next_transmit() -> bool {
+    // The same CPU0 foreground owns both the TCP turn and this snapshot.
+    unsafe { TLS_WINDOW }.is_some_and(|window| window.admits_io_at(now_ns()))
+}
+
 /// The port reported a closed/reset/failed stream: the connection is over.
 /// POLL now answers disconnected and this request answers EOF, so the guest's
 /// generation-bound socket sees Closed and parks instead of spinning on AGAIN.

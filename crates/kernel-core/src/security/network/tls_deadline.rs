@@ -68,10 +68,14 @@ impl TlsWindow {
         }
     }
 
+    pub fn admits_io_at(self, observed_ns: u64) -> bool {
+        self.last_read_ns <= observed_ns && observed_ns < self.deadline().0
+    }
+
     /// Called only after a positive read from the protected TCP port. Polls,
     /// sends and empty reads cannot renew the window.
     pub fn record_read(&mut self, observed_ns: u64) -> bool {
-        if observed_ns < self.last_read_ns || observed_ns >= self.deadline().0 {
+        if !self.admits_io_at(observed_ns) {
             return false;
         }
         self.last_read_ns = observed_ns;
@@ -82,6 +86,17 @@ impl TlsWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transmit_checks_the_clock_at_admission_and_does_not_extend_the_window() {
+        let start = 1_000;
+        let active = TlsWindow::new(Phase::Active, start).unwrap();
+        let expiry = start + ACTIVE_IDLE_NS;
+        assert!(active.admits_io_at(expiry - 1));
+        assert!(!active.admits_io_at(expiry));
+        assert!(!active.admits_io_at(start - 1));
+        assert_eq!(active.deadline(), (expiry, Limit::Idle));
+    }
 
     #[test]
     fn pending_input_stops_at_one_second_and_cannot_reopen() {
