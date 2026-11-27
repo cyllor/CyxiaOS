@@ -1,6 +1,7 @@
 //! Frozen SecurityProfile v3 structure from V0.19.9 §安0.8.
 //! Generation and the canonical RuleProfile digest are the only variables.
 use super::Error;
+use crate::security::network::pending_tls::{TLS_HANDSHAKE_MS, TLS_RECORD_IDLE_MS};
 
 pub(super) const BYTES: usize = 256;
 const FIXED: [u8; BYTES] = fixed_profile();
@@ -51,8 +52,8 @@ const fn fixed_profile() -> [u8; BYTES] {
     field(&mut wire, 117, [5]);
 
     // TLS time and buffer limits, SYN cookies and challenge ACK budgets.
-    field(&mut wire, 118, 3000u16.to_le_bytes());
-    field(&mut wire, 120, 1000u16.to_le_bytes());
+    field(&mut wire, 118, TLS_HANDSHAKE_MS.to_le_bytes());
+    field(&mut wire, 120, TLS_RECORD_IDLE_MS.to_le_bytes());
     field(&mut wire, 122, 16645u16.to_le_bytes());
     field(&mut wire, 124, 300u16.to_le_bytes());
     field(&mut wire, 126, 1000u16.to_le_bytes());

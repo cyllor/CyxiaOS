@@ -120,9 +120,9 @@ fn handshake(
     tls: &mut Session<'_>,
     scratch: &mut [u8],
 ) -> Result<(), ()> {
-    // Bounded number of cooperative native turns plus rustls' own monotonic
-    // handshake deadline. No blocking model, external POSIX or host socket.
-    for _ in 0..8192 {
+    // The broker bounds each entry and the total number of calls. End the
+    // handshake by elapsed monotonic time, independent of empty-poll speed.
+    loop {
         let now = broker::now().map_err(|_| ())?;
         socket.poll_native(now).map_err(|_| ())?;
         send_pending(socket, tls)?;
@@ -145,7 +145,6 @@ fn handshake(
         }
         broker::yield_cpu();
     }
-    Err(())
 }
 pub fn run() -> ! {
     let certificate =

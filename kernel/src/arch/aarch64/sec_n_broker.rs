@@ -25,7 +25,7 @@
 //! * Broker state (CONN_EPOCH, CONNECTED, STALL_AFTER_POLL, POLL_COUNT, OP_COUNTS,
 //!   CLOSE_SEEN, YIELD_RUN, ENTROPY_STATE, QUIESCENCE_REFUSED, HANDSHAKE_POLLS,
 //!   CONN_SOURCE, POLLED_EPOCH, ADMISSION_RECEIPT, RELAYED_BYTES,
-//!   STREAM_CLOSED, RETIREMENT)
+//!   STREAM_CLOSED, RETIREMENT, PENDING_TLS, TLS_AUTHENTICATED_EPOCH)
 //!   (static mut): CPU0-only, read/written only by the functions below and the
 //!   by-value accessors; no reference escapes.
 //! * load_guest()/map_page()/seal_page()/sync_code(): raw addr_of! arithmetic over
@@ -43,6 +43,8 @@ mod receipt;
 pub(super) mod signer;
 
 use super::*;
+#[cfg(feature = "v020-production-authenticated-net")]
+use cyxia_kernel_core::security::network::pending_tls::{PendingLimit, PendingTls};
 use cyxia_net_transport::device::{self, Port};
 
 // Trusted monotonic clocks from the EL1 architectural timer (the same source the
@@ -87,8 +89,6 @@ const OP_ADMISSION_RETIRED: u64 = 0x102;
 const OP_TLS_CERTIFICATE_VERIFY: u64 = 0x103;
 #[cfg(feature = "v020-production-authenticated-net")]
 const OP_TLS_AUTHENTICATED: u64 = 0x104;
-#[cfg(feature = "v020-production-authenticated-net")]
-const TLS_HANDSHAKE_NS: u64 = 3_000_000_000;
 
 const DIRECT_TLS_CIPHERTEXT: u64 = 1;
 // Shared-page field offsets (exact protected layout, see abi.rs const asserts).
@@ -230,7 +230,7 @@ enum Retirement {
 #[cfg(feature = "v020-production-authenticated-net")]
 static mut RETIREMENT: Retirement = Retirement::Open;
 #[cfg(feature = "v020-production-authenticated-net")]
-static mut TLS_PENDING_EXPIRES_NS: u64 = 0;
+static mut PENDING_TLS: Option<PendingTls> = None;
 #[cfg(feature = "v020-production-authenticated-net")]
 static mut TLS_AUTHENTICATED_EPOCH: u64 = 0;
 
@@ -499,10 +499,10 @@ pub(crate) fn stage_connection(
         {
             RETIREMENT = Retirement::Open;
             TLS_AUTHENTICATED_EPOCH = 0;
-            TLS_PENDING_EXPIRES_NS = if connected {
-                accepted_ns.checked_add(TLS_HANDSHAKE_NS).unwrap_or(0)
+            PENDING_TLS = if connected {
+                PendingTls::new(accepted_ns)
             } else {
-                0
+                None
             };
         }
     }
@@ -626,7 +626,12 @@ fn broker<P: Port>(
         OP_READ | OP_WRITE if unsafe { RETIREMENT } != Retirement::Open => reply(0, ST_FAILED),
         OP_ADMISSION_GRANTED => broker_admission_granted(),
         OP_READ | OP_WRITE if !unsafe { CONNECTED } => reply(0, ST_EOF),
-        OP_READ => broker_read(port, len),
+        OP_READ => broker_read(
+            port,
+            len,
+            #[cfg(feature = "v020-production-authenticated-net")]
+            signer.is_some(),
+        ),
         OP_WRITE => broker_write(port, len),
         OP_CLOSE => {
             unsafe { CONNECTED = false };
@@ -649,7 +654,7 @@ fn broker_certificate_verify(signer: Option<&mut signer::Signer>) {
             CONN_SOURCE,
             ADMISSION_RECEIPT,
             RETIREMENT,
-            TLS_PENDING_EXPIRES_NS,
+            PENDING_TLS.map_or(0, |pending| pending.deadline().0),
         )
     };
     if !connected
@@ -684,7 +689,7 @@ fn broker_tls_authenticated(signer: Option<&mut signer::Signer>) {
             ADMISSION_RECEIPT,
             RETIREMENT,
             TLS_AUTHENTICATED_EPOCH,
-            TLS_PENDING_EXPIRES_NS,
+            PENDING_TLS.map_or(0, |pending| pending.deadline().0),
         )
     };
     if state != Retirement::Open
@@ -820,7 +825,11 @@ fn broker_poll(normal_close: bool) {
 /// port never dequeues bytes the guest cannot take. A port that still returns
 /// more (a frame port) or fails ends the connection; bytes are never dropped
 /// silently.
-fn broker_read<P: Port>(port: &mut P, len: u64) {
+fn broker_read<P: Port>(
+    port: &mut P,
+    len: u64,
+    #[cfg(feature = "v020-production-authenticated-net")] authenticated_profile: bool,
+) {
     let limit = len as usize;
     if limit == 0 {
         return reply(0, ST_AGAIN); // nothing deliverable: dequeue nothing.
@@ -828,6 +837,18 @@ fn broker_read<P: Port>(port: &mut P, len: u64) {
     let mut frame = [0u8; device::MTU];
     match port.receive_up_to(&mut frame, limit) {
         Ok(Some(n)) if n != 0 && n <= limit && n <= frame.len() => {
+            #[cfg(feature = "v020-production-authenticated-net")]
+            if authenticated_profile && unsafe { TLS_AUTHENTICATED_EPOCH } == 0 {
+                let Some(mut pending) = (unsafe { PENDING_TLS }) else {
+                    return reply(0, ST_FAILED);
+                };
+                // The device poll may finish after the timer boundary. Never
+                // publish late input or renew an already expired window.
+                if !pending.record_read(now_ns()) {
+                    return reply(0, ST_FAILED);
+                }
+                unsafe { PENDING_TLS = Some(pending) };
+            }
             shared_put(OFF_PAYLOAD, &frame[..n]);
             unsafe { RELAYED_BYTES += n as u64 };
             reply(n as u64, ST_OK);
@@ -873,15 +894,32 @@ fn step(ctx: &mut user::Context, root: u64, asid: u8, latest_tick: u64) {
 
 #[cfg(feature = "v020-production-authenticated-net")]
 fn ticks_at_ns(ns: u64) -> u64 {
-    ((u128::from(ns) * u128::from(timer::frequency())) / 1_000_000_000).min(u128::from(u64::MAX))
-        as u64
+    (u128::from(ns) * u128::from(timer::frequency()))
+        .div_ceil(1_000_000_000)
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(feature = "v020-production-authenticated-net")]
+fn pending_timeout(pending: PendingTls, observed_ns: u64, dispatched: u64) -> GuestStop {
+    let (expires_ns, limit) = pending.deadline();
+    let code = match limit {
+        PendingLimit::Handshake => 903,
+        PendingLimit::RecordIdle => 904,
+    };
+    report(
+        "V020_SEC_N_PENDING_TIMEOUT",
+        code,
+        expires_ns - pending.accepted_ns(),
+        observed_ns - pending.accepted_ns(),
+    );
+    GuestStop { code, dispatched }
 }
 
 /// Why a bounded guest run ended without parking.
 #[derive(Clone, Copy)]
 pub(crate) struct GuestStop {
     /// 900 unexpected EL0 fault, 901 non-0x43 SVC, 902 SVC budget exhausted,
-    /// 903 kernel-owned TLS handshake deadline.
+    /// 903 kernel-owned TLS handshake deadline, 904 pending TLS input idle.
     pub(crate) code: u64,
     /// SVC dispatches performed before the stop (read by production only; the
     /// fixture halts on `code`).
@@ -937,15 +975,19 @@ pub(crate) fn run_guest<P: Port>(
     let stop = |code, dispatched| Err(GuestStop { code, dispatched });
     for _ in 0..budget {
         #[cfg(feature = "v020-production-authenticated-net")]
-        let latest_tick =
+        let (pending, latest_tick) =
             if signer.is_some() && unsafe { TLS_AUTHENTICATED_EPOCH == 0 && !CLOSE_SEEN } {
-                let expires = unsafe { TLS_PENDING_EXPIRES_NS };
-                if now_ns() >= expires {
+                let Some(pending) = (unsafe { PENDING_TLS }) else {
                     return stop(903, dispatched);
+                };
+                let now = now_ns();
+                let deadline_ns = pending.deadline().0;
+                if now >= deadline_ns {
+                    return Err(pending_timeout(pending, now, dispatched));
                 }
-                ticks_at_ns(expires)
+                (Some(pending), ticks_at_ns(deadline_ns))
             } else {
-                u64::MAX
+                (None, u64::MAX)
             };
         #[cfg(not(feature = "v020-production-authenticated-net"))]
         let latest_tick = u64::MAX;
@@ -960,8 +1002,11 @@ pub(crate) fn run_guest<P: Port>(
         if iss != 0x43 {
             return stop(901, dispatched); // only SVC 0x43 is admitted for this guest.
         }
-        if latest_tick != u64::MAX && timer::ticks() >= latest_tick {
-            return stop(903, dispatched);
+        #[cfg(feature = "v020-production-authenticated-net")]
+        if let Some(pending) = pending
+            && timer::ticks() >= latest_tick
+        {
+            return Err(pending_timeout(pending, now_ns(), dispatched));
         }
         broker(
             port,
