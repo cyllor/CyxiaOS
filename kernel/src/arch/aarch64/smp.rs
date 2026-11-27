@@ -138,7 +138,8 @@ mod v0199_effect_fixture;
 #[path = "v0199_epoch_disk.rs"]
 mod v0199_epoch_disk;
 #[cfg(feature = "v0199-format-selftest")]
-#[path = "v0199_format_fixture.rs"]
+#[cfg_attr(not(feature = "v020-history-readonly-selftest"), path = "v0199_format_fixture.rs")]
+#[cfg_attr(feature = "v020-history-readonly-selftest", path = "v020_history_readonly_fixture.rs")]
 mod v0199_format_fixture;
 // Dedicated scratch VirtIO-blk plumbing, shared by the format fixture and the
 // v020 opt-in media-staging lane (production/media_staging.rs).

@@ -105,6 +105,8 @@ v0199-d01-scheduler-selftest = ["v0199-epoch-disk-selftest"]
 # contract runs against real VirtIO block with guest FLUSH-ordering proof.
 # Never a production format path, signed catalog or mounted filesystem.
 v0199-format-selftest = ["v0199-cpu0-role-selftest", "prototype-memory", "dep:sha2"]
+# Never selected by the default mount. Only read an isolated historical fixture.
+v020-history-readonly-selftest = ["v0199-format-selftest", "cyxia-kernel-core/snapshot-history-candidate"]
 register-v15-selftest = ["smp-selftest", "prototype-memory"]
 ai-control-selftest = ["smp-selftest"]
 # Retired dynamic C/B/T/Q control-core migration mechanism, retained only as

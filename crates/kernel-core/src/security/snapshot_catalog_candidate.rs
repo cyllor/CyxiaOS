@@ -1,4 +1,4 @@
-//! Host-side D7 populated catalog candidate. Verifies capture bindings against
+//! D7 populated catalog candidate. Verifies capture bindings against
 //! a quiescent read view, with volume and counters supplied by the caller.
 
 use super::{
