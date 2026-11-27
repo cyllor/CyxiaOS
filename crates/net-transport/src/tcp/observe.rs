@@ -51,6 +51,18 @@ impl<P> ObservedPort<P> {
     pub(super) fn select_peer(&mut self, config: Config) {
         self.config = config;
     }
+    pub(super) fn reset_peer(&mut self, config: Config) {
+        self.config = config;
+        self.outstanding = [None; 64];
+        self.received_ack = None;
+        self.sent_fin_end = None;
+        self.final_ack_candidate = false;
+        self.rtt = None;
+        self.window_started = self.now;
+        self.sent = 0;
+        self.retransmitted = 0;
+        self.valid = true;
+    }
     pub(super) fn inner(&self) -> &P {
         &self.inner
     }

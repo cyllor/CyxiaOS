@@ -4,14 +4,14 @@
 //! The static ledger registers SMP and PIE page tables as Metadata, role
 //! memory and the copy buffer as Control, and SMP stacks and the pinned
 //! linker-placed network/staging region as Arena. Gaps between regions remain
-//! unowned permanent rows. Device and guest owners still manage mappings,
-//! DMA transactions and their lifecycle.
+//! unowned permanent rows. VirtIO queue admission assigns DMA pages in the
+//! arena to one queue for the boot. The driver manages descriptor custody.
 //!
 //! UNSAFE BOUNDARY REGISTRATION (baseline SEC-BUF: minimal trusted boundaries).
 //! * ROWS_BACKING (static mut): the only `&mut` to it is created once in
 //!   `register_production_statics`, guarded by the REGISTERED swap, on CPU0
-//!   before any secondary CPU or EL0 role runs. Signed startup and copy-window
-//!   builds retain the ledger and publish it through REGISTERED_PAGES.
+//!   before any secondary CPU or EL0 role runs. REGISTERED_PAGES publishes the
+//!   ledger to the boot CPU for checked copy-window and device operations.
 //! * NATIVE_LEDGER is initialized once. Its RefCell and the underlying rows
 //!   are accessed only by CPU0. An IRQ does not acquire a ledger borrow.
 //! * REGISTERED and the inventory counters (atomics): CPU0 only. REGISTERED
@@ -39,14 +39,6 @@ use super::{BACKING, Backing, COPY_BUFFER, CopyBuffer, ROLE_COUNT, TABLES, Table
 use super::{EXEC_TARGET, ExecTarget, PLAN_POOL, PLAN_POOL_BYTES, evidence};
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(any(
-    feature = "v020-production-live-control",
-    feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read",
-    feature = "v020-production-fsync-scratch",
-    all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
-    cyxia_startup_catalog
-))]
 use core::{cell::RefCell, mem::MaybeUninit};
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind};
 #[cfg(not(all(
@@ -55,7 +47,7 @@ use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind};
 )))]
 use cyxia_kernel_core::frame_meta_v0199::Inventory;
 use cyxia_kernel_core::frame_meta_v0199::{
-    COUNT, FrameMeta, Ledger, PAGE, StaticClass, StaticRegion,
+    COUNT, FrameMeta, Ledger, Owner, PAGE, StaticClass, StaticRegion,
 };
 use cyxia_kernel_core::security::Error as LedgerError;
 
@@ -109,14 +101,6 @@ const FATAL_FRAME_META: u64 = 0x5731_1290;
     any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
 )))]
 static mut ROWS_BACKING: [FrameMeta; ROWS] = [FrameMeta::ZERO; ROWS];
-#[cfg(any(
-    feature = "v020-production-live-control",
-    feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read",
-    feature = "v020-production-fsync-scratch",
-    all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
-    cyxia_startup_catalog
-))]
 static mut NATIVE_LEDGER: MaybeUninit<RefCell<Ledger<'static>>> = MaybeUninit::uninit();
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static REGISTERED_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -259,40 +243,16 @@ fn register_production_statics() -> Result<(Inventory, u64), Error> {
     let rows = unsafe { &mut (&mut *addr_of_mut!(ROWS_BACKING))[..pages] };
     let ledger = Ledger::initialize_static_sparse(rows, base, &regions).map_err(Error::Ledger)?;
     let inventory = ledger.inventory().map_err(Error::Ledger)?;
-    #[cfg(any(
-        feature = "v020-production-live-control",
-        feature = "v020-production-snapshot-catalog",
-        feature = "v020-production-file-read",
-        feature = "v020-production-fsync-scratch",
-        all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
-        cyxia_startup_catalog
-    ))]
     install_ledger(ledger);
     Ok((inventory, service.region.len / PAGE))
 }
 
-#[cfg(any(
-    feature = "v020-production-live-control",
-    feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read",
-    feature = "v020-production-fsync-scratch",
-    all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
-    cyxia_startup_catalog
-))]
 fn install_ledger(ledger: Ledger<'static>) {
     // SAFETY: the exclusive boot claim has already been taken. The caller
     // publishes REGISTERED_PAGES only after the slot is initialized.
     unsafe { addr_of_mut!(NATIVE_LEDGER).write(MaybeUninit::new(RefCell::new(ledger))) };
 }
 
-#[cfg(any(
-    feature = "v020-production-live-control",
-    feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read",
-    feature = "v020-production-fsync-scratch",
-    all(feature = "v020-production-frame-pool", feature = "prototype-memory"),
-    cyxia_startup_catalog
-))]
 fn native_ledger() -> Option<&'static RefCell<Ledger<'static>>> {
     if cyxia_arch_aarch64::cpu::registered_slot() != Some(0)
         || REGISTERED_PAGES.load(Ordering::Acquire) == 0
@@ -304,27 +264,26 @@ fn native_ledger() -> Option<&'static RefCell<Ledger<'static>>> {
     Some(unsafe { (*addr_of!(NATIVE_LEDGER)).assume_init_ref() })
 }
 
-#[cfg(any(
-    feature = "v020-production-live-control",
-    feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read",
-    feature = "v020-production-fsync-scratch"
-))]
+#[cfg(any(cyxia_startup_catalog, feature = "v020-production-diagnostic"))]
 pub(super) fn statically_pinned_control_span(span: core::ops::Range<u64>) -> bool {
     statically_pinned_span(span, StaticClass::Control)
 }
 
-#[cfg(any(
-    feature = "v020-production-live-control",
-    feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read",
-    feature = "v020-production-fsync-scratch",
-    cyxia_startup_catalog
-))]
 fn statically_pinned_span(span: core::ops::Range<u64>, class: StaticClass) -> bool {
     native_ledger()
         .and_then(|ledger| ledger.try_borrow().ok())
         .is_some_and(|ledger| ledger.statically_pinned(span, class))
+}
+
+pub(crate) fn claim_static_dma(
+    span: core::ops::Range<u64>,
+    owner: Owner,
+) -> Result<(), LedgerError> {
+    native_ledger()
+        .ok_or(LedgerError::Unauthorized)?
+        .try_borrow_mut()
+        .map_err(|_| LedgerError::Busy)?
+        .claim_static_dma(span, owner)
 }
 
 /// Registered static pages: the class tallies, never the unregistered gaps.

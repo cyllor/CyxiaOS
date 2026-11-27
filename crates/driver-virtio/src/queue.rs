@@ -50,8 +50,9 @@ enum State {
 struct Slot {
     state: State,
     generation: u64,
-    readable: u32,
-    writable: u32,
+    // Each request and response fits one 4 KiB page.
+    readable: u16,
+    writable: u16,
     descriptors: u16,
     version: u64,
     started: u64,
@@ -98,6 +99,7 @@ pub struct Completion {
 
 pub struct BatchQueue {
     memory: &'static mut BatchMemory,
+    dma_base: u64,
     notification: crate::transport::Notification,
     size: u16,
     available: u16,
@@ -142,6 +144,7 @@ impl BatchQueue {
         if !pa.is_multiple_of(4096) || pa.checked_add(bytes as u64).is_none() {
             return Err(Error::Address);
         }
+        p.admit_queue_dma(t.owner(), t.device_id(), index, pa, bytes)?;
         memory.desc.clear();
         memory.avail.clear();
         memory.used.clear();
@@ -163,6 +166,7 @@ impl BatchQueue {
         }
         Ok(Self {
             memory,
+            dma_base: pa,
             notification,
             size: size as u16,
             available: 0,
@@ -315,7 +319,7 @@ impl BatchQueue {
             let index = id as usize / 2;
             if seen & (1 << index) != 0
                 || self.slots[index].state != State::Published
-                || len > self.slots[index].writable
+                || len > u32::from(self.slots[index].writable)
             {
                 self.poison(t, p);
                 return Err(Error::Queue);
@@ -382,8 +386,11 @@ impl BatchQueue {
             .position(|s| s.state == State::Free && s.generation != u64::MAX)
             .ok_or(Error::Busy)?;
         let m = &self.memory;
-        let request_pa = p.physical(m.request[at].address(), 4096)?;
-        let response_pa = p.physical(m.response[at].address(), 4096)?;
+        let page_offset = at * core::mem::size_of::<Page>();
+        let request_pa =
+            self.dma_base + (core::mem::offset_of!(BatchMemory, request) + page_offset) as u64;
+        let response_pa =
+            self.dma_base + (core::mem::offset_of!(BatchMemory, response) + page_offset) as u64;
         m.request[at].copy_prefix_from(0, header);
         m.request[at].copy_prefix_from(header.len(), payload);
         // A Free slot is either zero-initialized or has passed through
@@ -433,8 +440,8 @@ impl BatchQueue {
         self.slots[at] = Slot {
             state: State::Private,
             generation: token.generation,
-            readable: readable as u32,
-            writable: writable as u32,
+            readable: readable as u16,
+            writable: writable as u16,
             descriptors,
             version: self.frozen_version,
             started: now,
@@ -594,7 +601,7 @@ impl BatchQueue {
         }
         let index = id as usize / 2;
         let s = self.slots[index];
-        if s.state != State::Published || len > s.writable {
+        if s.state != State::Published || len > u32::from(s.writable) {
             self.poison(t, p);
             return Err(Error::Queue);
         }

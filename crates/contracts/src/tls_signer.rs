@@ -4,6 +4,11 @@ pub const WIRE_BYTES: usize = 112;
 pub const TRANSCRIPT_BYTES: usize = 32;
 pub const SIGNATURE_BYTES: usize = 64;
 pub const SIGN_TIMEOUT_NS: u64 = 250_000_000;
+/// Read-only credential page mapped by the native owner only in the
+/// provisioned Signer's private EL0 address space.
+pub const KEY_PAGE_VA: usize = 0x0200_1000;
+pub const KEY_DER_MAX: usize = 256;
+pub const KEY_DER_OFFSET: usize = 8;
 const REQUEST_MAGIC: u32 = 0x4359_5347;
 const REPLY_MAGIC: u32 = 0x4359_5352;
 const SERVER_CERT_VERIFY: u16 = 1;

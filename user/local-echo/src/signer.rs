@@ -1,4 +1,4 @@
-//! Fixture identity holder in a separate EL0 address space.
+//! Ed25519 identity holder in a separate EL0 address space.
 #![no_std]
 #![no_main]
 
@@ -30,7 +30,15 @@ static ALLOCATOR: NoHeap = NoHeap;
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.entry")]
-extern "C" fn _start(pin0: u64, pin1: u64, pin2: u64, pin3: u64) -> ! {
+extern "C" fn _start(
+    pin0: u64,
+    pin1: u64,
+    pin2: u64,
+    pin3: u64,
+    _boot_epoch: u64,
+    _verifier_generation: u64,
+    _key_generation: u64,
+) -> ! {
     // SAFETY: this page is simultaneously mapped only to the EL1 owner and
     // this EL0 context. EL1 initializes it before each entry.
     let wire = unsafe { MAILBOX.read_volatile() };
@@ -42,11 +50,16 @@ extern "C" fn _start(pin0: u64, pin1: u64, pin2: u64, pin3: u64) -> ! {
         part.copy_from_slice(&word.to_le_bytes());
     }
     let reply = Request::decode(&wire).and_then(|request| {
-        let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(include_bytes!(concat!(
-            env!("OUT_DIR"),
-            "/key.der"
-        )))
-        .ok()?;
+        #[cfg(feature = "guest-resident")]
+        if (
+            request.boot_epoch,
+            request.verifier_generation,
+            request.key_generation,
+        ) != (_boot_epoch, _verifier_generation, _key_generation)
+        {
+            return None;
+        }
+        let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(key_der()?).ok()?;
         if digest(&SHA256, key.public_key().as_ref()).as_ref() != expected_pin {
             return None;
         }
@@ -59,6 +72,29 @@ extern "C" fn _start(pin0: u64, pin1: u64, pin2: u64, pin3: u64) -> ! {
         stop(1)
     }
     stop(0)
+}
+
+#[cfg(not(feature = "guest-resident"))]
+fn key_der() -> Option<&'static [u8]> {
+    Some(include_bytes!(concat!(env!("OUT_DIR"), "/key.der")))
+}
+
+#[cfg(feature = "guest-resident")]
+fn key_der() -> Option<&'static [u8]> {
+    use cyxia_contracts::tls_signer::{KEY_DER_MAX, KEY_DER_OFFSET, KEY_PAGE_VA};
+    // SAFETY: the admitted native root maps this dedicated credential page
+    // continuously for the Signer's lifetime. It is read-only and the
+    // broker bounds its provisioned DER length.
+    unsafe {
+        let len = (KEY_PAGE_VA as *const u64).read_volatile();
+        if !(1..=KEY_DER_MAX as u64).contains(&len) {
+            return None;
+        }
+        Some(core::slice::from_raw_parts(
+            (KEY_PAGE_VA + KEY_DER_OFFSET) as *const u8,
+            len as usize,
+        ))
+    }
 }
 
 fn stop(success: u64) -> ! {

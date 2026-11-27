@@ -18,6 +18,7 @@ pub mod broker_surface {
     pub const ADMISSION_RETIRED: u64 = 0x102;
     pub const TLS_CERTIFICATE_VERIFY: u64 = 0x103;
     pub const TLS_AUTHENTICATED: u64 = 0x104;
+    pub const ADMISSION_REJECTED: u64 = 0x105;
     pub const ADMISSION_RECEIPT_BYTES: usize = 12;
     pub const PAYLOAD: usize = 4096;
     /// Reserved ciphertext writes bypass the old cluster task/output queue
@@ -31,9 +32,8 @@ pub mod broker_surface {
         }
         match op {
             ENTROPY | READ => arg0 == 0,
-            ADMISSION_GRANTED | POLL_NORMAL_CLOSE | ADMISSION_RETIRED | TLS_AUTHENTICATED => {
-                len == ADMISSION_RECEIPT_BYTES && arg0 == 0
-            }
+            ADMISSION_GRANTED | POLL_NORMAL_CLOSE | ADMISSION_RETIRED | TLS_AUTHENTICATED
+            | ADMISSION_REJECTED => len == ADMISSION_RECEIPT_BYTES && arg0 == 0,
             TLS_CERTIFICATE_VERIFY => {
                 len == cyxia_contracts::tls_signer::SIGNATURE_BYTES && arg0 == 0
             }
@@ -58,6 +58,7 @@ mod tests {
         assert!(!allowed(WRITE, 0, DIRECT_TLS_CIPHERTEXT));
         assert!(!allowed(READ, 4097, 0));
         assert!(allowed(ADMISSION_GRANTED, ADMISSION_RECEIPT_BYTES, 0));
+        assert!(allowed(ADMISSION_REJECTED, ADMISSION_RECEIPT_BYTES, 0));
         assert!(!allowed(ADMISSION_GRANTED, 0, 0));
         assert!(!allowed(ADMISSION_GRANTED, ADMISSION_RECEIPT_BYTES + 1, 0));
         assert!(!allowed(ADMISSION_GRANTED, ADMISSION_RECEIPT_BYTES, 1));

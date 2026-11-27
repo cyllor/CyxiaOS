@@ -2,11 +2,17 @@
 //! a quiescent read view, with volume and counters supplied by the caller.
 
 use super::{
-    ENVELOPE_BYTES, Error, SNAPSHOT_CATALOG_BLOCK, SNAPSHOT_SLOT_START, SNAPSHOT_SLOTS,
-    SUPER_BYTES, UnifiedSystemKind, crc32c_zeroed, decode_envelope_header, encode_object_envelope,
-    le16, le32, le64, put16, put32, put64,
+    ENVELOPE_BYTES, Error, PERIODIC_SLOTS, SNAPSHOT_CATALOG_BLOCK, SNAPSHOT_SLOT_START,
+    SNAPSHOT_SLOTS, SUPER_BYTES, UnifiedSystemKind, crc32c_zeroed, decode_envelope_header,
+    encode_object_envelope, le16, le32, le64, put16, put32, put64,
     slot_candidate::{SlotIdentity, verify_slot},
 };
+
+// Candidate mutation tooling is host-only, including in a native history
+// profile which deliberately exposes only read APIs.
+#[cfg(not(target_os = "none"))]
+#[path = "snapshot_lifecycle_candidate.rs"]
+pub mod lifecycle;
 
 const MAGIC: u32 = 0x4359_4344;
 const VERSION: u16 = 1;
@@ -164,7 +170,7 @@ impl CatalogRecord {
 }
 
 fn slot_class(slot: usize) -> u8 {
-    if slot < 6 { 1 } else { 2 }
+    if slot < PERIODIC_SLOTS as usize { 1 } else { 2 }
 }
 
 fn encode_binding(

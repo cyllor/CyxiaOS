@@ -46,6 +46,7 @@ pub struct BatchedBlockIo<const BYTES: usize> {
     read_only: bool,
     pending: [Option<(Token, Operation, u64)>; MAX_CHAINS],
     state: DeviceState,
+    initial_mmio_reset_ns: Option<u64>,
     reset: Option<Result<u64, Error>>,
     last_completed: u64,
 }
@@ -114,9 +115,10 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         if BYTES == 0 || BYTES > 4096 - 16 || !BYTES.is_multiple_of(SECTOR_BYTES) {
             return Err(Error::Address);
         }
-        if let Some(checkpoint) = checkpoint.as_deref_mut() {
-            t.observe_mmio_reset(2, &[0], p, &mut *checkpoint)?;
+        let initial_mmio_reset_ns = if let Some(checkpoint) = checkpoint.as_deref_mut() {
+            let observed = t.observe_mmio_reset(2, &[0], p, &mut *checkpoint)?;
             checkpoint()?;
+            Some(observed)
         } else {
             if t.device_id() != 2 {
                 return Err(Error::Device);
@@ -129,7 +131,8 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
                     return Err(Error::Timeout);
                 }
             }
-        }
+            None
+        };
         t.set_status(3);
         t.select_device_features(1);
         p.barrier();
@@ -181,6 +184,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
             read_only,
             pending: [None; MAX_CHAINS],
             state: DeviceState::Live,
+            initial_mmio_reset_ns,
             reset: None,
             last_completed: 0,
         })
@@ -193,6 +197,12 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
     }
     pub fn capacity(&self) -> usize {
         self.queue.capacity()
+    }
+
+    /// Readback timestamp for the old MMIO queue's stopped state before
+    /// this attach admitted DMA. It conveys no result of any old request.
+    pub fn initial_mmio_reset_ns(&self) -> Option<u64> {
+        self.initial_mmio_reset_ns
     }
     pub fn is_quiescent(&self) -> bool {
         self.state == DeviceState::Live
@@ -619,6 +629,7 @@ mod tests {
                 read_only: false,
                 pending: [None; 8],
                 state: DeviceState::Live,
+                initial_mmio_reset_ns: None,
                 reset: None,
                 last_completed: 0,
             },
@@ -776,7 +787,8 @@ mod tests {
                 assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (0, 0));
                 assert_eq!(mmio.get32(0x80), 0);
             } else {
-                assert!(result.is_ok());
+                let attached = result.unwrap();
+                assert_eq!(attached.initial_mmio_reset_ns(), Some(ready_at));
                 assert_eq!(checkpoints, 5);
                 assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (15, 1));
             }
@@ -788,6 +800,7 @@ mod tests {
         let (mmio, platform, memory) = attach_fixture(FLUSH | READ_ONLY, false);
         let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
         let mut block = BatchedBlock::attach(transport, memory, &platform).unwrap();
+        assert_eq!(block.initial_mmio_reset_ns(), None);
         assert!(block.read_only());
         assert_eq!(
             block.begin(Operation::Write(0), &[0; 512], true, true, &platform),

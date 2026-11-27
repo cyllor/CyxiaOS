@@ -19,6 +19,12 @@ use cyxia_contracts::*;
 
 mod boot;
 mod console;
+#[cfg(any(
+    cyxia_startup_catalog,
+    feature = "v020-production-diagnostic",
+    feature = "unified-runtime"
+))]
+pub(crate) mod copy_window;
 mod exceptions;
 pub(crate) mod panic_stop;
 #[cfg(any(
@@ -37,12 +43,20 @@ pub(crate) use exceptions::ExceptionFrame;
 pub(crate) use exceptions::hex;
 
 pub(crate) const HIGH: u64 = cyxia_platform_virt::HIGH_BASE;
-pub(crate) const SUPERVISOR_COPY_WINDOW: u8 = cfg!(any(
-    feature = "v020-production-live-control",
-    feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read",
-    feature = "v020-production-fsync-scratch"
-)) as u8;
+pub(crate) const SOFTWARE_PAN: u8 =
+    cfg!(any(feature = "v020-production", feature = "unified-runtime")) as u8;
+// The legacy unified runtime may copy on any executing CPU. V0.20's
+// pointer-bearing endpoints currently dispatch on the control CPU only.
+pub(crate) const SECONDARY_COPY_WINDOWS: usize = if cfg!(feature = "unified-runtime") {
+    cyxia_contracts::BOOT_CPUS - 1
+} else {
+    0
+};
+const SECONDARY_COPY_ROOTS: usize = if SECONDARY_COPY_WINDOWS == 0 {
+    1
+} else {
+    SECONDARY_COPY_WINDOWS
+};
 // The default release resident path is covered by check_v020_el1_stack.py.
 // Catalog verification, diagnostics and debug builds have separate frames.
 const BOUNDED_DEFAULT_STACKS: bool = cfg!(all(
@@ -73,8 +87,9 @@ core::arch::global_asm!(
     ram_table_count = const cyxia_platform_virt::RAM_MIB / 2,
     ram_tables_bytes = const cyxia_platform_virt::RAM_MIB / 2 * 4096,
     exec_stack_bytes = const BOOT_EXEC_STACK_BYTES,
-    software_pan = const cfg!(feature = "v020-production") as u8,
-    supervisor_copy = const SUPERVISOR_COPY_WINDOW,
+    software_pan = const SOFTWARE_PAN,
+    secondary_copy_windows = const SECONDARY_COPY_WINDOWS,
+    secondary_copy_roots = const SECONDARY_COPY_ROOTS,
 );
 // Versioned loader contract, retained in the ELF's read-only load segment.
 #[used]
@@ -92,7 +107,7 @@ core::arch::global_asm!(
         feature = "legacy-desktop",
         not(feature = "smp-selftest")
     )) as u8,
-    software_pan = const cfg!(feature = "v020-production") as u8,
+    software_pan = const SOFTWARE_PAN,
 );
 unsafe extern "C" {
     #[cfg(not(feature = "smp-selftest"))]

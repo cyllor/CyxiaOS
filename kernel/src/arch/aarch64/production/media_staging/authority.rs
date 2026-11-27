@@ -26,6 +26,8 @@
 use super::Disk;
 use super::volume::{self, BOOT_HOME, FIRST_LOG_BLOCK, SECURITY_HOME};
 use cyxia_kernel_core::control_plane::role_manifest_v0199::ROLES;
+#[cfg(any(test, cyxia_startup_catalog))]
+use cyxia_kernel_core::security::boot_epoch_v1::{TlsBootPolicy, TlsBootTransition};
 use cyxia_kernel_core::security::{
     Error as SecurityError,
     boot_epoch_v1::{BootEpochAuthority, BootEpochTx, BootPairRedo},
@@ -66,23 +68,45 @@ pub(super) fn verify_previous_pair(
 
 /// Re-read the exact paired transaction from the actual device. Return its
 /// verified state image, not a synthetic next epoch or an unflushed home.
+#[cfg(any(test, feature = "v020-production-media-signed"))]
 pub(super) fn verified_pair_state(
     disk: &mut Disk,
     sb: SuperblockV1,
     config: volume::Config<'_>,
 ) -> Result<SecurityStateStoreV2, SecurityError> {
+    verified_pair_state_for(disk, sb, |state| {
+        if let Some(config) = config {
+            config.check_committed(state)?;
+        }
+        if *state != volume::expected_state(sb.generation, config)? {
+            return Err(SecurityError::Conflict);
+        }
+        Ok(())
+    })
+}
+
+#[cfg_attr(
+    not(any(feature = "v020-production-media-signed", cyxia_startup_catalog, test)),
+    allow(dead_code)
+)]
+pub(super) fn verified_pair_state_for(
+    disk: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    verify_state: impl FnOnce(&SecurityStateStoreV2) -> Result<(), SecurityError>,
+) -> Result<SecurityStateStoreV2, SecurityError> {
     // SAFETY: synchronous, non-overlapping use of this CPU0-owned workspace.
     let pair = unsafe { &mut *core::ptr::addr_of_mut!(PAIR) };
     pair.read(disk, FIRST_LOG_BLOCK)?;
-    verify_pair_state(pair, sb, config)
+    let state = verify_pair_state(pair, sb)?;
+    verify_state(&state)?;
+    Ok(state)
 }
 
 fn verify_pair_state(
     pair: &BootPairRedo,
     sb: SuperblockV1,
-    config: volume::Config<'_>,
 ) -> Result<SecurityStateStoreV2, SecurityError> {
-    let state = pair.verify(
+    pair.verify(
         sb,
         FIRST_LOG_BLOCK,
         SECURITY_HOME,
@@ -91,27 +115,59 @@ fn verify_pair_state(
         sb.checkpoint_lsn
             .checked_add(4)
             .ok_or(SecurityError::Exhausted)?,
-    )?;
-    if let Some(config) = config {
-        config.check_committed(&state)?;
-    }
-    if state != volume::expected_state(sb.generation, config)? {
-        return Err(SecurityError::Conflict);
-    }
-    Ok(state)
+    )
 }
 
 pub(super) enum BootLog {
     Empty,
-    Committed,
+    Committed(SecurityStateStoreV2),
     Checkpointed,
+    #[cfg(any(test, cyxia_startup_catalog))]
+    Prepared(u8),
+}
+
+/// Match the exact possible successor of the verified old homes. Each
+/// returned bit denotes one materialized preparation block from the log base.
+#[cfg(any(test, cyxia_startup_catalog))]
+pub(super) fn uncommitted_log_for(
+    disk: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    expected: SecurityStateStoreV2,
+) -> Result<BootLog, SecurityError> {
+    // SAFETY: the synchronous reopen owner holds the only PAIR workspace.
+    let pair = unsafe { &mut *core::ptr::addr_of_mut!(PAIR) };
+    pair.verify_uncommitted_prefix(
+        disk,
+        sb,
+        FIRST_LOG_BLOCK,
+        [SECURITY_HOME, BOOT_HOME],
+        expected,
+    )
+    .map(BootLog::Prepared)
 }
 
 /// Classify the bounded boot-only log before any home or log write.
+#[cfg(feature = "v020-production-fsync-scratch")]
 pub(super) fn recovery_log(
     disk: &mut impl EpochBlockIo,
     sb: SuperblockV1,
     config: volume::Config<'_>,
+) -> Result<BootLog, SecurityError> {
+    recovery_log_for(disk, sb, |epoch, state| {
+        if let Some(config) = config {
+            config.check_committed(state)?;
+        }
+        if *state != volume::expected_state(epoch, config)? {
+            return Err(SecurityError::Conflict);
+        }
+        Ok(())
+    })
+}
+
+pub(super) fn recovery_log_for(
+    disk: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    verify: impl Fn(u64, &SecurityStateStoreV2) -> Result<(), SecurityError>,
 ) -> Result<BootLog, SecurityError> {
     // SAFETY: the one-shot recovery still owns the sole PAIR workspace.
     let pair = unsafe { &mut *core::ptr::addr_of_mut!(PAIR) };
@@ -119,8 +175,11 @@ pub(super) fn recovery_log(
     if pair.blank() {
         return Ok(BootLog::Empty);
     }
-    let current_error = match verify_pair_state(pair, sb, config) {
-        Ok(_) => return Ok(BootLog::Committed),
+    let current_error = match verify_pair_state(pair, sb).and_then(|state| {
+        verify(sb.generation, &state)?;
+        Ok(state)
+    }) {
+        Ok(state) => return Ok(BootLog::Committed(state)),
         Err(error) => error,
     };
     if sb.generation == 1 {
@@ -136,12 +195,15 @@ pub(super) fn recovery_log(
     {
         return Err(current_error);
     }
+    disk.read(SECURITY_HOME, &mut raw)?;
+    let state = SecurityStateStoreV2::decode(&raw)?;
+    verify(prior.generation, &state)?;
     pair.verify_checkpointed_residue(
         disk,
         prior,
         FIRST_LOG_BLOCK,
         [SECURITY_HOME, BOOT_HOME],
-        volume::expected_state(prior.generation, config)?,
+        state,
     )?;
     Ok(BootLog::Checkpointed)
 }
@@ -164,12 +226,60 @@ pub(super) fn boot_epoch_owner(
     mounted: &SecurityStateStoreV2,
     config: volume::Config<'_>,
 ) -> Result<(u64, BootEpochAuthority), SecurityError> {
+    boot_epoch_owner_for(
+        disk,
+        checkpoint,
+        mounted,
+        config,
+        volume::Checkpoints::Staging,
+    )
+}
+
+pub(super) fn boot_epoch_owner_for(
+    disk: &mut Disk,
+    checkpoint: SuperblockV1,
+    mounted: &SecurityStateStoreV2,
+    config: volume::Config<'_>,
+    checkpoints: volume::Checkpoints,
+) -> Result<(u64, BootEpochAuthority), SecurityError> {
+    allocate_boot(
+        disk,
+        checkpoint,
+        mounted,
+        BootUpdate::Ordinary(config),
+        checkpoints,
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum BootUpdate<'a> {
+    Ordinary(volume::Config<'a>),
+    #[cfg(any(test, cyxia_startup_catalog))]
+    Tls(TlsBootPolicy<'a>),
+    #[cfg(any(test, cyxia_startup_catalog))]
+    Rotate(TlsBootTransition<'a>),
+}
+
+pub(super) fn allocate_boot(
+    disk: &mut Disk,
+    checkpoint: SuperblockV1,
+    mounted: &SecurityStateStoreV2,
+    update: BootUpdate<'_>,
+    checkpoints: volume::Checkpoints,
+) -> Result<(u64, BootEpochAuthority), SecurityError> {
+    let config = match update {
+        BootUpdate::Ordinary(config) => config,
+        #[cfg(any(test, cyxia_startup_catalog))]
+        BootUpdate::Tls(policy) => Some(policy.config()),
+        #[cfg(any(test, cyxia_startup_catalog))]
+        BootUpdate::Rotate(transition) => Some(transition.previous().config()),
+    };
     let mut state = [0; BLOCK_BYTES];
     let mut boot = [0; BLOCK_BYTES];
     let mut sb_raw = [0; BLOCK_BYTES];
     disk.read(SECURITY_HOME, &mut state)?;
     disk.read(BOOT_HOME, &mut boot)?;
-    if volume::read_checkpoint(disk, &mut sb_raw, config)? != checkpoint {
+    if volume::read_checkpoint_for(disk, &mut sb_raw, config, checkpoints)? != checkpoint {
         return Err(SecurityError::Conflict);
     }
     let next = mounted
@@ -212,16 +322,34 @@ pub(super) fn boot_epoch_owner(
     };
     // SAFETY: one-shot CPU0 call (module header); the borrow ends on return.
     let pair = unsafe { &mut *core::ptr::addr_of_mut!(PAIR) };
-    let confirmed = match config {
-        Some(verified) => {
-            let binding = authority.allocate_for_startup(disk, pair, tx, verified)?;
-            // allocate replaced the workspace images with device readback.
-            // Verify the signed startup identity before exposing its epoch.
-            binding.verify_state(&SecurityStateStoreV2::decode(pair.state_image())?)?;
-            binding.epoch()
+    let binding = match update {
+        BootUpdate::Ordinary(Some(config)) => {
+            authority.allocate_for_startup(disk, pair, tx, config)?
         }
-        None => authority.allocate(disk, pair, tx)?.epoch(),
+        #[cfg(any(test, cyxia_startup_catalog))]
+        BootUpdate::Tls(policy) => authority.allocate_with_tls_policy(disk, pair, tx, policy)?,
+        #[cfg(any(test, cyxia_startup_catalog))]
+        BootUpdate::Rotate(transition) => {
+            authority.allocate_tls_boot(disk, pair, tx, transition)?
+        }
+        BootUpdate::Ordinary(None) => {
+            let confirmed = authority.allocate(disk, pair, tx)?.epoch();
+            return verify_allocation(disk, pair, tx, confirmed, authority, next);
+        }
     };
+    // The redo workspace contains the independently reread committed images.
+    binding.verify_state(&SecurityStateStoreV2::decode(pair.state_image())?)?;
+    verify_allocation(disk, pair, tx, binding.epoch(), authority, next)
+}
+
+fn verify_allocation(
+    disk: &mut Disk,
+    pair: &mut BootPairRedo,
+    tx: BootEpochTx<'_>,
+    confirmed: u64,
+    mut authority: BootEpochAuthority,
+    next: u64,
+) -> Result<(u64, BootEpochAuthority), SecurityError> {
     if authority.confirmed_epoch() != Some(confirmed) || confirmed != next {
         return Err(SecurityError::Conflict);
     }

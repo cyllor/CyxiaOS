@@ -1,4 +1,44 @@
 use super::*;
+use crate::machine::copy_window;
+use core::ops::Range;
+use cyxia_contracts::PagePermissions;
+use cyxia_kernel_core::{
+    control_plane::Identity,
+    frame_meta_v0199::{FrameMeta, Owner as FrameOwner},
+    security::{Error as FrameError, syscall::user_copy_span},
+};
+
+static mut FRAME_ROWS: [FrameMeta; PAGES] = [FrameMeta::ZERO; PAGES];
+
+unsafe extern "C" {
+    static ram_l3: u8;
+}
+
+pub(super) fn initialize_frame_meta() -> Result<RuntimePool<'static>, Error> {
+    // SAFETY: CPU0 initializes the backing under the task owner gate, before
+    // publication of the runtime. All later access uses State::frame_meta.
+    let rows = unsafe { &mut *core::ptr::addr_of_mut!(FRAME_ROWS) };
+    RuntimePool::initialize(rows, frame_phys(0)?, TABLE_PAGES + CODE_PAGES).map_err(frame_error)
+}
+
+fn frame_error(error: FrameError) -> Error {
+    match error {
+        FrameError::Invalid => Error::Range,
+        FrameError::Unauthorized => Error::Auth,
+        FrameError::Stale => Error::Stale,
+        FrameError::Conflict => Error::Conflict,
+        FrameError::Capacity | FrameError::Exhausted => Error::Capacity,
+        FrameError::Busy => Error::Busy,
+        FrameError::Unknown => Error::Io,
+    }
+}
+
+fn frame_owner(owner: ObjectKey) -> Result<FrameOwner, Error> {
+    Ok(FrameOwner {
+        slot: u32::try_from(owner.id).map_err(|_| Error::Auth)?,
+        generation: owner.generation,
+    })
+}
 
 pub(super) fn frame_ptr(frame: usize) -> Result<*mut u8, Error> {
     if frame >= PAGES {
@@ -16,6 +56,23 @@ pub(super) fn frame_phys(frame: usize) -> Result<u64, Error> {
         .checked_sub(crate::HIGH)
         .ok_or(Error::Range)
 }
+
+fn ram_leaf(physical: u64) -> Result<*mut u64, Error> {
+    let offset = physical
+        .checked_sub(cyxia_platform_virt::RAM_BASE)
+        .filter(|_| physical < cyxia_platform_virt::USER_RAM_END && physical.is_multiple_of(4096))
+        .ok_or(Error::Range)?;
+    let table = (crate::HIGH + core::ptr::addr_of!(ram_l3) as u64) as *mut u64;
+    // SAFETY: boot installs a descriptor for each page of this RAM range.
+    Ok(unsafe { table.add((offset / 4096) as usize) })
+}
+
+fn direct_leaf(physical: u64, writable: bool) -> Result<u64, Error> {
+    let permissions = PagePermissions::new(writable, false).map_err(|_| Error::Auth)?;
+    mmu::encode_leaf(PhysAddr(physical), permissions, mmu::MemoryAttr::Normal)
+        .map_err(|_| Error::Range)
+}
+
 pub(super) fn synchronize() {
     unsafe {
         core::arch::asm!(
@@ -58,6 +115,12 @@ pub(super) fn load_code(elf: &[u8], frame: usize, pages: usize) -> Result<(), Er
     let input = elf
         .get(offset..offset.checked_add(len).ok_or(Error::Format)?)
         .ok_or(Error::Format)?;
+    for page in frame..frame + pages {
+        let physical = frame_phys(page)?;
+        if unsafe { ram_leaf(physical)?.read_volatile() } != direct_leaf(physical, true)? {
+            return Err(Error::Conflict);
+        }
+    }
     unsafe {
         let out = frame_ptr(frame)?;
         core::ptr::write_bytes(out, 0, pages * 4096);
@@ -67,29 +130,60 @@ pub(super) fn load_code(elf: &[u8], frame: usize, pages: usize) -> Result<(), Er
         }
         core::arch::asm!("dsb ish", "ic ialluis", "dsb ish", "isb", options(nostack));
     }
+    // Nobody has a user mapping yet. Seal the permanent code pages' direct
+    // aliases before any task can enter EL0 with one of these pages executable.
+    for page in frame..frame + pages {
+        unsafe { ram_leaf(frame_phys(page)?)?.write_volatile(0) };
+    }
+    synchronize();
+    for page in frame..frame + pages {
+        let physical = frame_phys(page)?;
+        unsafe { ram_leaf(physical)?.write_volatile(direct_leaf(physical, false)?) };
+    }
+    synchronize();
     Ok(())
 }
 pub(super) struct Pages<'a> {
     pub tasks: &'a [Task; TASKS],
     pub remote: Option<Remote>,
     pub load: Option<LoadCache>,
+    pub frame_meta: &'a mut Option<RuntimePool<'static>>,
 }
 impl Pages<'_> {
+    fn frames(&mut self) -> Result<&mut RuntimePool<'static>, Error> {
+        self.frame_meta.as_mut().ok_or(Error::NotReady)
+    }
+
     fn entry(&self, owner: ObjectKey, address: u64) -> Result<*mut u64, Error> {
         if address >= USER_LIMIT || !address.is_multiple_of(4096) {
             return Err(Error::Range);
         }
-        let leaf = if let Some(remote) = self.remote.filter(|r| r.key == owner) {
-            remote.leaf as *mut u64
+        let root = if let Some(remote) = self.remote.filter(|r| r.key == owner) {
+            remote.root
         } else {
             let index = task_index(self.tasks, owner)?;
-            frame_ptr(index * 3 + 2)?.cast::<u64>()
+            frame_ptr(index * 3)? as u64
         };
-        Ok(unsafe { leaf.add(address as usize / 4096) })
+        let middle = root + 4096;
+        let leaf = middle + 4096;
+        // SAFETY: these are the three contiguous, permanently reserved tables
+        // for the live task. USER_LIMIT restricts the walk to child index zero.
+        unsafe {
+            if (root as *const u64).read_volatile() != ((middle - crate::HIGH) | 3)
+                || (middle as *const u64).read_volatile() != ((leaf - crate::HIGH) | 3)
+            {
+                return Err(Error::Auth);
+            }
+            Ok((leaf as *mut u64).add(address as usize / 4096))
+        }
     }
 }
 impl MemoryBackend for Pages<'_> {
     fn zero(&mut self, frame: usize) -> Result<(), Error> {
+        let physical = frame_phys(frame)?;
+        if unsafe { ram_leaf(physical)?.read_volatile() } != direct_leaf(physical, true)? {
+            return Err(Error::Conflict);
+        }
         unsafe {
             core::ptr::write_bytes(frame_ptr(frame)?, 0, 4096);
         }
@@ -112,16 +206,25 @@ impl MemoryBackend for Pages<'_> {
         )
         .map_err(|_| Error::Auth)?;
         let entry = self.entry(owner, address)?;
-        let value = mmu::encode_user_leaf(PhysAddr(frame_phys(frame)?), writable, false)
-            .map_err(|_| Error::Range)?;
-        unsafe {
-            if entry.read_volatile() != 0 {
-                return Err(Error::Conflict);
-            }
-            entry.write_volatile(value);
+        let physical = frame_phys(frame)?;
+        let value =
+            mmu::encode_user_leaf(PhysAddr(physical), writable, false).map_err(|_| Error::Range)?;
+        let alias = ram_leaf(physical)?;
+        if unsafe {
+            entry.read_volatile() != 0 || alias.read_volatile() != direct_leaf(physical, true)?
+        } {
+            return Err(Error::Conflict);
         }
-        synchronize();
-        Ok(())
+        self.frames()?
+            .map_zeroed(physical, frame_owner(owner)?, || {
+                // The task gate excludes other table writers. Remove the
+                // privileged direct alias before publishing the user leaf.
+                unsafe { alias.write_volatile(0) };
+                synchronize();
+                unsafe { entry.write_volatile(value) };
+                synchronize();
+            })
+            .map_err(frame_error)
     }
     fn revoke(&mut self, owner: ObjectKey, address: u64, frame: usize) -> Result<(), Error> {
         // SEC-M04: a corrupted protected-frame index must fail closed;
@@ -134,15 +237,36 @@ impl MemoryBackend for Pages<'_> {
         .map_err(|_| Error::Auth)?;
         let entry = self.entry(owner, address)?;
         let physical = frame_phys(frame)?;
-        unsafe {
-            let current = entry.read_volatile();
-            if current != 0 && current & 0x0000_ffff_ffff_f000 != physical {
-                return Err(Error::Conflict);
-            }
-            entry.write_volatile(0);
-        }
-        synchronize();
-        Ok(())
+        let alias = ram_leaf(physical)?;
+        let direct = direct_leaf(physical, true)?;
+        let readonly =
+            mmu::encode_user_leaf(PhysAddr(physical), false, false).map_err(|_| Error::Range)?;
+        let writable =
+            mmu::encode_user_leaf(PhysAddr(physical), true, false).map_err(|_| Error::Range)?;
+        self.frames()?
+            .revoke(physical, frame_owner(owner)?, |owned| {
+                let (current, alias_value) =
+                    unsafe { (entry.read_volatile(), alias.read_volatile()) };
+                if !owned {
+                    // A failed map may have left the slot empty throughout.
+                    return if current == 0 && alias_value == direct {
+                        Ok(())
+                    } else {
+                        Err(FrameError::Conflict)
+                    };
+                }
+                if (current != 0 && current != readonly && current != writable) || alias_value != 0
+                {
+                    return Err(FrameError::Conflict);
+                }
+                unsafe { entry.write_volatile(0) };
+                synchronize();
+                // Only now can the ordinary allocator clear or reuse it.
+                unsafe { alias.write_volatile(direct) };
+                synchronize();
+                Ok(())
+            })
+            .map_err(frame_error)
     }
     fn load_cache(&mut self, object: ObjectKey, page: u64, frame: usize) -> Result<(), Error> {
         let load = self.load.ok_or(Error::NotReady)?;
@@ -169,7 +293,9 @@ pub(super) fn fault_page(
 }
 fn code_frame(tasks: &[Task; TASKS], owner: ObjectKey, address: u64) -> Option<usize> {
     let task = &tasks[task_index(tasks, owner).ok()?];
-    let (first, pages) = if task.package == CLIENT_PACKAGE {
+    let (first, pages) = if task.package == MEMORY_PACKAGE && crate::memory_fault_capture::PROFILE {
+        (MEMORY_CODE_FRAME, 4)
+    } else if task.package == CLIENT_PACKAGE {
         (CLIENT_CODE_FRAME, 4)
     } else if task.package == PACKAGE {
         (CODE_FRAME, 1)
@@ -179,142 +305,217 @@ fn code_frame(tasks: &[Task; TASKS], owner: ObjectKey, address: u64) -> Option<u
     let offset = address.checked_sub(0x10000)? as usize;
     (offset < pages * 4096).then_some(first + offset / 4096)
 }
-pub(super) fn prepare(
-    memory: &mut Memory<PAGES, 512>,
-    tasks: &[Task; TASKS],
-    remote: Option<Remote>,
-    owner: ObjectKey,
-    address: u64,
-    len: usize,
-    write: bool,
-) -> Result<(), Error> {
+
+fn copy_end(address: u64, len: usize) -> Result<u64, Error> {
     // SEC-S01/S02: check pointer arithmetic before touching any page or
     // user-owned memory. The syscall adapter still enforces task ownership,
-    // mappings, PTE permissions and reclaim/TLB synchronization below.
+    // mappings, PTE permissions and reclaim/TLB synchronization.
     if len == 0 {
-        return Ok(());
+        return Ok(address);
     }
-    let (_, end) = cyxia_kernel_core::security::syscall::user_copy_span(
-        address,
-        len,
-        0,
-        USER_LIMIT,
-        usize::MAX,
-    )
-    .map_err(|_| Error::Range)?;
-    let mut backend = Pages {
-        tasks,
-        remote,
-        load: None,
-    };
-    let mut page = address / 4096 * 4096;
-    while page < end {
-        if code_frame(tasks, owner, page).is_some() {
-            if write {
-                return Err(Error::Auth);
-            }
-        } else {
-            fault_page(memory, owner, page, write, &mut backend)?;
-        }
-        page += 4096;
-    }
-    Ok(())
+    user_copy_span(address, len, 0, USER_LIMIT, usize::MAX)
+        .map(|(_, end)| end)
+        .map_err(|_| Error::Range)
 }
-pub(super) fn copy_from(
-    memory: &Memory<PAGES, 512>,
-    tasks: &[Task; TASKS],
-    owner: ObjectKey,
-    address: u64,
-    out: &mut [u8],
-) -> Result<(), Error> {
-    let mut done = 0;
-    while done < out.len() {
-        let at = address.checked_add(done as u64).ok_or(Error::Range)?;
-        let frame = match code_frame(tasks, owner, at) {
-            Some(frame) => frame,
-            None => memory.resident(owner, at)?,
-        };
-        let offset = at as usize % 4096;
-        let n = (4096 - offset).min(out.len() - done);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                frame_ptr(frame)?.add(offset),
-                out.as_mut_ptr().add(done),
-                n,
-            );
-        }
-        done += n;
-    }
-    Ok(())
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Write,
+    LaunchInput,
 }
-pub(super) fn copy_to(
-    memory: &Memory<PAGES, 512>,
-    owner: ObjectKey,
-    address: u64,
-    input: &[u8],
-) -> Result<(), Error> {
-    let mut done = 0;
-    while done < input.len() {
-        let at = address.checked_add(done as u64).ok_or(Error::Range)?;
-        let frame = memory.resident(owner, at)?;
-        let offset = at as usize % 4096;
-        let n = (4096 - offset).min(input.len() - done);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                input.as_ptr().add(done),
-                frame_ptr(frame)?.add(offset),
-                n,
-            );
-        }
-        done += n;
-    }
-    Ok(())
-}
+
 /// A bounded memory-only borrow. It cannot escape the task gate or be held
 /// across device/file work, progress callbacks, or user execution.
 pub(crate) struct UserMemoryAccess<'a> {
     memory: &'a mut Memory<PAGES, 512>,
-    tasks: &'a [Task; TASKS],
-    remote: Option<Remote>,
+    pages: Pages<'a>,
     owner: ObjectKey,
 }
 impl UserMemoryAccess<'_> {
-    pub(crate) fn probe(&mut self, address: u64, len: usize, writable: bool) -> Result<(), Error> {
-        prepare(
-            self.memory,
-            self.tasks,
-            self.remote,
-            self.owner,
-            address,
-            len,
-            writable,
-        )
+    pub(super) fn new<'a>(
+        memory: &'a mut Memory<PAGES, 512>,
+        pages: Pages<'a>,
+        owner: ObjectKey,
+    ) -> UserMemoryAccess<'a> {
+        UserMemoryAccess {
+            memory,
+            pages,
+            owner,
+        }
     }
+
+    pub(crate) fn probe(&mut self, address: u64, len: usize, writable: bool) -> Result<(), Error> {
+        let end = copy_end(address, len)?;
+        let access = if writable {
+            Access::Write
+        } else {
+            Access::Read
+        };
+        let mut at = address;
+        while at < end {
+            let code = code_frame(self.pages.tasks, self.owner, at);
+            let frame = match code {
+                Some(frame) => frame,
+                None => fault_page(self.memory, self.owner, at, writable, &mut self.pages)?,
+            };
+            self.fragment(at, 1, frame, code.is_some(), access)?;
+            at = (at & !4095) + 4096;
+        }
+        Ok(())
+    }
+
     pub(crate) fn copyin(&mut self, address: u64, out: &mut [u8]) -> Result<(), Error> {
-        prepare(
-            self.memory,
-            self.tasks,
-            self.remote,
-            self.owner,
+        self.probe(address, out.len(), false)?;
+        self.copyin_resident(address, out)
+    }
+
+    pub(crate) fn copyout(&mut self, address: u64, input: &[u8]) -> Result<(), Error> {
+        self.probe(address, input.len(), true)?;
+        self.copyout_resident(address, input)
+    }
+
+    pub(super) fn copyin_resident(&mut self, address: u64, out: &mut [u8]) -> Result<(), Error> {
+        self.transfer(
             address,
             out.len(),
-            false,
-        )?;
-        copy_from(self.memory, self.tasks, self.owner, address, out)
+            Access::Read,
+            |physical, owner, asid, range| {
+                // SAFETY: transfer verifies the user leaf and holds the frame
+                // until the window returns. The destination is an EL1 borrow.
+                unsafe { copy_window::copy_in(physical, owner, asid, &mut out[range]) }
+            },
+        )
     }
-    pub(crate) fn copyout(&mut self, address: u64, input: &[u8]) -> Result<(), Error> {
-        prepare(
-            self.memory,
-            self.tasks,
-            self.remote,
-            self.owner,
+
+    pub(super) fn copyout_resident(&mut self, address: u64, input: &[u8]) -> Result<(), Error> {
+        self.write_resident(address, input, Access::Write)
+    }
+
+    /// Populate the two EL0-read-only data pages used for kernel launch and
+    /// recovery input, with the task stopped under the owner gate.
+    pub(super) fn write_launch_input(&mut self, address: u64, input: &[u8]) -> Result<(), Error> {
+        if !matches!(address, 0x20000 | 0x21000) || input.len() > 4096 {
+            return Err(Error::Range);
+        }
+        self.write_resident(address, input, Access::LaunchInput)
+    }
+
+    fn write_resident(&mut self, address: u64, input: &[u8], access: Access) -> Result<(), Error> {
+        self.transfer(
             address,
             input.len(),
-            true,
-        )?;
-        copy_to(self.memory, self.owner, address, input)
+            access,
+            |physical, owner, asid, range| {
+                // SAFETY: transfer holds the exact page with write access
+                // authorized for this operation. The source is an EL1 borrow.
+                unsafe { copy_window::copy_out(physical, owner, asid, &input[range]) }
+            },
+        )
+    }
+
+    fn fragment(
+        &self,
+        at: u64,
+        bytes: usize,
+        frame: usize,
+        code: bool,
+        access: Access,
+    ) -> Result<u64, Error> {
+        let physical = frame_phys(frame)?;
+        let offset = at & 4095;
+        let entry = self.pages.entry(self.owner, at - offset)?;
+        let pte = unsafe { entry.read_volatile() };
+        let rx =
+            mmu::encode_user_leaf(PhysAddr(physical), false, true).map_err(|_| Error::Range)?;
+        let alias = if code {
+            if access != Access::Read || pte != rx {
+                return Err(Error::Auth);
+            }
+            direct_leaf(physical, false)?
+        } else {
+            let ro = mmu::encode_user_leaf(PhysAddr(physical), false, false)
+                .map_err(|_| Error::Range)?;
+            if pte == rx || (access == Access::LaunchInput && pte != ro) {
+                return Err(Error::Auth);
+            }
+            0
+        };
+        if unsafe { ram_leaf(physical)?.read_volatile() } != alias {
+            return Err(Error::Conflict);
+        }
+        mmu::checked_user_leaf_span(
+            pte,
+            PhysAddr(physical),
+            offset,
+            bytes,
+            access == Access::Write,
+        )
+        .map(|physical| physical.0)
+        .map_err(|_| Error::Auth)
+    }
+
+    fn transfer(
+        &mut self,
+        address: u64,
+        length: usize,
+        access: Access,
+        mut copy: impl FnMut(u64, Identity, u8, Range<usize>) -> Result<(), FrameError>,
+    ) -> Result<(), Error> {
+        copy_end(address, length)?;
+        let owner = Identity {
+            id: self.owner.id,
+            generation: self.owner.generation,
+        };
+        let frame_owner = frame_owner(self.owner)?;
+        let asid = user::dynamic_asid();
+        let mut done = 0;
+        while done < length {
+            let at = address + done as u64;
+            let code = code_frame(self.pages.tasks, self.owner, at);
+            let frame = match code {
+                Some(frame) => frame,
+                None => self.memory.resident(self.owner, at)?,
+            };
+            let count = (4096 - (at & 4095) as usize).min(length - done);
+            let physical = self.fragment(at, count, frame, code.is_some(), access)?;
+            let range = done..done + count;
+            if code.is_some() {
+                // The sealed code page has a permanent reservation.
+                copy(physical, owner, asid, range).map_err(frame_error)?;
+            } else {
+                let frames = self.pages.frames()?;
+                let pin = frames
+                    .pin(physical & !4095, frame_owner)
+                    .map_err(frame_error)?;
+                let transferred = copy(physical, owner, asid, range);
+                frames.unpin(pin).map_err(frame_error)?;
+                transferred.map_err(frame_error)?;
+            }
+            done += count;
+        }
+        Ok(())
     }
 }
+
+impl State {
+    pub(super) fn user_memory(&mut self, owner: ObjectKey) -> Result<UserMemoryAccess<'_>, Error> {
+        if !self.remote.is_some_and(|remote| remote.key == owner) {
+            task_index(&self.tasks, owner)?;
+        }
+        Ok(UserMemoryAccess::new(
+            &mut self.memory,
+            Pages {
+                tasks: &self.tasks,
+                remote: self.remote,
+                load: None,
+                frame_meta: &mut self.frame_meta,
+            },
+            owner,
+        ))
+    }
+}
+
 pub(crate) fn with_user_memory<R>(
     owner: ObjectKey,
     body: impl FnOnce(&mut UserMemoryAccess<'_>) -> Result<R, Error>,
@@ -324,12 +525,7 @@ pub(crate) fn with_user_memory<R>(
         if s.tasks[i].life == Life::Exiting {
             return Err(Error::Stale);
         }
-        body(&mut UserMemoryAccess {
-            memory: &mut s.memory,
-            tasks: &s.tasks,
-            remote: s.remote,
-            owner,
-        })
+        body(&mut s.user_memory(owner)?)
     })
 }
 pub fn copyin(owner: ObjectKey, address: u64, out: &mut [u8]) -> Result<(), Error> {

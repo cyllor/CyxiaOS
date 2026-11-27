@@ -5,6 +5,7 @@ use super::{Error, durable_role_epoch_v0199::ConfirmedBootPolicy};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
+pub mod deployment;
 pub mod entropy;
 pub mod tls_deadline;
 mod tls_packages;
@@ -20,7 +21,7 @@ pub const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 
 /// Generations and key catalogue pinned by the owner of the installed TLS
 /// Verifier and Signer. The state must come from the confirmed boot pair.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TlsInstallation {
     pub verifier_generation: u64,
     pub signer_generation: u64,

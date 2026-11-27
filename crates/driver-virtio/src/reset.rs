@@ -2,6 +2,7 @@
 
 pub const RESET_PROOF_BYTES: usize = 64;
 pub(crate) const RESET_DEADLINE_NS: u64 = 100_000_000;
+pub(crate) const RESET_POLL_LIMIT: usize = 1 << 20;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum DeviceState {

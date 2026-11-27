@@ -103,5 +103,24 @@ class FlushGateTests(unittest.TestCase):
                 check.preserve_disk(disk, root / "short.raw", check.sha(disk))
 
 
+    def test_failed_seed_is_sealed_but_never_admitted(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(check, "SCRATCH_BYTES", 16):
+            root = Path(d)
+            for name in ("serial.bin", "serial.txt", "qemu-stderr.log"):
+                (root / name).write_bytes(name.encode())
+            disk = root / "disk.raw"
+            disk.write_bytes(b"0123456789abcdef")
+            seed = {"status": "FAIL", "error": "incomplete role progress"}
+            with self.assertRaisesRegex(ValueError, "incomplete role progress"):
+                check.seal_seed_capture(seed, root, disk)
+            self.assertEqual(seed["status"], "FAIL")
+            self.assertEqual(seed["capture_sha256"], {
+                name: check.sha(root / name)
+                for name in ("serial.bin", "serial.txt", "qemu-stderr.log")
+            })
+            self.assertEqual(seed["preserved_disk_sha256"], check.sha(disk))
+            self.assertEqual(check.sha(root / "scratch-after.raw"), check.sha(disk))
+
+
 if __name__ == "__main__":
     unittest.main()

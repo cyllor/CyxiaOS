@@ -1,4 +1,4 @@
-//! Fixed four-core terminal stop coordination. Enter only after the vector
+//! Terminal CPU and device stop coordination. Enter only after the vector
 //! closes admission and installs the trusted local emergency stack.
 use core::arch::asm;
 
@@ -8,6 +8,8 @@ use core::arch::asm;
 ))]
 compile_error!("panic-stop self-tests use the isolated resident SMP profile");
 
+#[cfg(feature = "v020-production")]
+use crate::virtio_platform::{DMA_STOP_DEVICES, registered_dma, reset_registered_dma};
 #[cfg(feature = "v020-production")]
 use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "v020-production")]
@@ -31,6 +33,9 @@ const WAIT_POLLS: u32 = 1 << 20;
 const NO_IRQ_TOKEN: u64 = 1023; // GICv2 spurious/no active interrupt.
 #[cfg(feature = "v020-production")]
 const OBSERVED_CLOSURE: u64 = 0x80; // vectors.S terminal entry marker.
+
+#[cfg(feature = "v020-panic-stop-dma-selftest")]
+mod dma_fixture;
 
 #[cfg(feature = "v020-production")]
 static TARGETS: CpuTargets = CpuTargets::new();
@@ -113,6 +118,73 @@ const _: () = {
     assert!(core::mem::offset_of!(StopRecord, uart_began) == 280);
     assert!(core::mem::offset_of!(StopRecord, uart_status) == 312);
     assert!(core::mem::size_of::<StopCpu>() == 48);
+};
+
+#[cfg(feature = "v020-production")]
+#[repr(C)]
+struct StopDevice {
+    mmio_pa: AtomicU64,
+    device_id: AtomicU64,
+    queues: AtomicU64,
+    reset: AtomicU64,
+    began: AtomicU64,
+    ended: AtomicU64,
+    observed_ns: AtomicU64,
+    error: AtomicU64,
+}
+
+#[cfg(feature = "v020-production")]
+impl StopDevice {
+    const fn empty() -> Self {
+        Self {
+            mmio_pa: AtomicU64::new(0),
+            device_id: AtomicU64::new(0),
+            queues: AtomicU64::new(0),
+            reset: AtomicU64::new(0),
+            began: AtomicU64::new(0),
+            ended: AtomicU64::new(0),
+            observed_ns: AtomicU64::new(0),
+            error: AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "v020-production")]
+#[repr(C, align(4096))]
+struct DmaStopRecord {
+    magic: AtomicU64,
+    owner_token: AtomicU64,
+    registered: AtomicU64,
+    confirmed: AtomicU64,
+    unknown: AtomicU64,
+    result: AtomicU64,
+    began: AtomicU64,
+    ended: AtomicU64,
+    devices: [StopDevice; DMA_STOP_DEVICES],
+}
+
+// Keep the CPU ACK and UART ABI independent. A sealed DMA stop reports
+// physical cessation only. Drivers continue to own their pages and I/O.
+#[cfg(feature = "v020-production")]
+#[used]
+#[unsafe(no_mangle)]
+static CYXIA_DMA_STOP_EVIDENCE: DmaStopRecord = DmaStopRecord {
+    magic: AtomicU64::new(0),
+    owner_token: AtomicU64::new(0),
+    registered: AtomicU64::new(0),
+    confirmed: AtomicU64::new(0),
+    unknown: AtomicU64::new(0),
+    result: AtomicU64::new(0),
+    began: AtomicU64::new(0),
+    ended: AtomicU64::new(0),
+    devices: [const { StopDevice::empty() }; DMA_STOP_DEVICES],
+};
+
+#[cfg(feature = "v020-production")]
+const _: () = {
+    assert!(core::mem::size_of::<DmaStopRecord>() == 4096);
+    assert!(core::mem::offset_of!(DmaStopRecord, devices) == 64);
+    assert!(core::mem::size_of::<StopDevice>() == 64);
 };
 
 /// A CPU registers its own hardware target and MPIDR after attaching its
@@ -256,7 +328,62 @@ fn coordinate(slot: usize, gic: &Gic, stop: &StopRecord, token: u64, began: u64)
         if confirmed == ALL_CORES { 1 } else { 2 },
         Ordering::Release,
     );
+    stop_dma(token, confirmed == ALL_CORES);
     report_stop(slot, stop, token, confirmed, frequency);
+}
+
+#[cfg(feature = "v020-production")]
+fn stop_dma(token: u64, all_cpus_stopped: bool) {
+    let stop = &CYXIA_DMA_STOP_EVIDENCE;
+    stop.magic.store(0x4359_5844_4d41_5301, Ordering::Relaxed);
+    stop.owner_token.store(token, Ordering::Relaxed);
+    stop.began.store(timer::ticks(), Ordering::Relaxed);
+    let mut registered = 0;
+    let mut confirmed = 0;
+    for (slot, device) in registered_dma().into_iter().enumerate() {
+        let Some(device) = device else { continue };
+        let bit = 1 << slot;
+        registered |= bit;
+        let row = &stop.devices[slot];
+        row.mmio_pa.store(device.mmio_pa, Ordering::Relaxed);
+        row.device_id
+            .store(u64::from(device.device_id), Ordering::Relaxed);
+        row.queues
+            .store(u64::from(device.queues), Ordering::Relaxed);
+        if !all_cpus_stopped {
+            continue;
+        }
+        row.began.store(timer::ticks(), Ordering::Relaxed);
+        // SAFETY: the elected owner reached this point with DAIF masked and
+        // observed the release ACK of every CPU. Each ACK followed an ordered
+        // terminal departure from all normal submission and queue selection.
+        let reset = unsafe { reset_registered_dma(device) };
+        row.ended.store(timer::ticks(), Ordering::Relaxed);
+        match reset {
+            Ok(observed_ns) => {
+                row.observed_ns.store(observed_ns, Ordering::Relaxed);
+                row.reset.store(1, Ordering::Relaxed);
+                confirmed |= bit;
+            }
+            Err(error) => {
+                row.error.store(error as u64 + 1, Ordering::Relaxed);
+                row.reset.store(2, Ordering::Relaxed);
+            }
+        }
+    }
+    stop.ended.store(timer::ticks(), Ordering::Relaxed);
+    stop.registered.store(registered, Ordering::Relaxed);
+    stop.confirmed.store(confirmed, Ordering::Relaxed);
+    stop.unknown
+        .store(registered & !confirmed, Ordering::Relaxed);
+    let result = if !all_cpus_stopped {
+        3 // CPU acknowledgement unconfirmed. No device is safe to reset.
+    } else if confirmed != registered {
+        2 // At least one reset lacks ordered readback.
+    } else {
+        1 // All registered devices have stopped DMA.
+    };
+    stop.result.store(result, Ordering::Release);
 }
 
 #[cfg(feature = "v020-production")]
@@ -394,7 +521,11 @@ pub(crate) fn stop(reason: u64) -> ! {
 #[cfg(feature = "v020-panic-stop-selftest")]
 #[inline(never)]
 #[unsafe(export_name = "cyxia_request_quiescent_stop")]
-pub(crate) fn exercise() -> ! {
+pub(crate) fn exercise(info: &cyxia_contracts::BootInfo) -> ! {
+    #[cfg(feature = "v020-panic-stop-dma-selftest")]
+    dma_fixture::stage(info).expect("DMA stop fixture startup");
+    #[cfg(not(feature = "v020-panic-stop-dma-selftest"))]
+    let _ = info;
     // Both deliberate software stops run after a normal four-core bring-up.
     #[cfg(feature = "v020-panic-stop-late-selftest")]
     panic!("requested terminal stop");

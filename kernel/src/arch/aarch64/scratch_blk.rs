@@ -53,7 +53,11 @@ const SECTORS_PER_BLOCK: u64 = (BLOCK_BYTES / SECTOR_BYTES) as u64;
 const EMPTY_INPUT: [u8; TRANSFER_BYTES] = [0; TRANSFER_BYTES];
 pub(crate) type ScratchBlock = BatchedBlockIo<TRANSFER_BYTES>;
 
-#[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
+#[cfg_attr(
+    feature = "v020-production",
+    unsafe(link_section = ".bss.sec_n.dma"),
+    unsafe(export_name = "V020_DMA_BLOCK_QUEUE")
+)]
 static mut QUEUE: BatchMemory = BatchMemory::zeroed();
 #[cfg_attr(feature = "v020-production", unsafe(link_section = ".bss.sec_n"))]
 static mut DEVICE: MaybeUninit<ScratchBlock> = MaybeUninit::uninit();

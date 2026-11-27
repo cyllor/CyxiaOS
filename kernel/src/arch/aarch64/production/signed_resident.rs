@@ -1,23 +1,39 @@
-//! Native lifecycle diagnostic under the signed scratch policy.
+//! Native CPU0 role lifecycle after signed boot admission.
 //!
-//! The public fixture signs an empty service allowlist. The eight built-in
-//! packages may exercise their private contexts and lifecycle syscalls once
-//! the disk's boot/security pair is confirmed. No service capability is
-//! installed and protected calls never reach the legacy diagnostic bridge.
+//! The eight lifecycle roles start after the disk's boot/security pair is
+//! confirmed. Independently authorized network packages are handed to a
+//! business CPU after confirmation of the same policy.
 //! The locked per-vCPU QEMU PMU provides CPU debits, while the physical
 //! timer enforces separate wall deadlines. The default catalog path keeps
 //! one continuous CPU0 cursor from early boot through the durable media
 //! handoff and the resident roles.
 
-use super::role_loader::{RoleLaunch, pie_syscall_abi, retire_stopped_role};
+#[cfg(cyxia_resident_net)]
+use super::super::sec_n_broker::{BootIdentity, signer::Signer};
+use super::super::signed_exec_trap::{Execution, Return};
+use super::role_loader::{RoleLaunch, registered_role_abi, retire_stopped_role};
+#[cfg(cyxia_business_package)]
+use super::signed_business;
+#[cfg(cyxia_startup_catalog)]
+use super::startup_catalog::{self, NetworkDeployment};
 use super::{
     BootInfo, E_AUTH, Error, ExceptionFrame, IRQS, Identity, NativeRole, NativeRoleManifest,
     Ordering, ROLE_COUNT, ROLES, Role, TIMER_IRQ, bring_up_production, cpu, frames, gic,
     load_role_with_identity, media_staging, now_ns, ns_from_ticks, pie_context, profile, recovery,
     report, report_payload, resident, role_asid, timer, trapped_ttbr0, user,
 };
+#[cfg(cyxia_resident_net)]
+use super::{net_entropy::Entropy, net_resident::Resident, network_worker};
+#[cfg(cyxia_startup_catalog)]
+use super::{signed_control, signed_syscalls};
 use crate::machine::enqueue_resident_frame;
 use core::sync::atomic::AtomicU64;
+#[cfg(not(cyxia_startup_catalog))]
+use cyxia_kernel_core::security::syscall_v3::decode_aarch64_lifecycle_svc_v3;
+#[cfg(cyxia_startup_catalog)]
+use cyxia_kernel_core::security::syscall_v3::{
+    ABI_VERSION, ValidatedCall, decode_aarch64_authorized_svc_v3,
+};
 use cyxia_kernel_core::{
     console::OutputQueue,
     control_plane::{
@@ -25,10 +41,10 @@ use cyxia_kernel_core::{
         role_manifest_v0199::ValidatedLifecycleManifest,
     },
     security::{
-        Error as SvcError,
-        durable_role_epoch_v0199::ConfirmedBootPolicy,
-        syscall::Syscall,
-        syscall_v3::{decode_aarch64_lifecycle_svc_v3, preflight_errno},
+        Error as SvcError, durable_role_epoch_v0199::ConfirmedBootPolicy,
+        offline_config_v1::VerifiedOfflineConfig,
+        startup_catalog_v0199::role_services::RoleServices, syscall::Syscall,
+        syscall_v3::preflight_errno,
     },
 };
 
@@ -41,6 +57,10 @@ const SLEEP: u16 = 1 << 2;
 const DENIED: u16 = 1 << 3;
 const EVIDENCE_WINDOWS: u64 = 4;
 const RECOVERY_NS: u64 = CLASS_LIMITS[Class::Recovery as usize];
+const LOAD_EVIDENCE: bool = cfg!(all(
+    cyxia_startup_catalog,
+    feature = "v020-production-sec-s-load"
+));
 const CONSOLE_TURN_NS: u64 = 1_000_000;
 const CONSOLE_RETRY_NS: u64 = 1_000_000;
 const MAX_WALL_NS: u64 = 50_000_000;
@@ -51,11 +71,22 @@ const NO_MEDIA: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=signed_media_unavailable command=status\n";
 const FENCED: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=signed_roles_fenced command=status\n";
-#[cfg(cyxia_lifecycle_package_signature)]
+#[cfg(cyxia_startup_catalog)]
 const UNQUALIFIED_PACKAGES: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=lifecycle_packages_unqualified command=status\n";
-// CPU0 publishes the expected root/ASID for each EL0 entry. The
-// vector consumes it once, before the common native capture returns.
+#[cfg(cyxia_startup_catalog)]
+const NETWORK_POLICY_REJECTED: &[u8] =
+    b"V020_STARTUP state=SECURE_DEGRADED reason=network_policy_rejected command=status\n";
+#[cfg(cyxia_startup_catalog)]
+const ROLE_SERVICES_REJECTED: &[u8] =
+    b"V020_STARTUP state=SECURE_DEGRADED reason=role_services_unqualified command=status\n";
+#[cfg(cyxia_business_package)]
+const UNQUALIFIED_BUSINESS: &[u8] =
+    b"V020_STARTUP state=SECURE_DEGRADED reason=business_package_unqualified command=status\n";
+// CPU0 publishes the expected root/ASID for each EL0 entry. The vector
+// checks the captured translation and marks it for one foreground dispatch.
+// All registered roots are page aligned and use no TTBR0 flags.
+const CAPTURED: u64 = 1;
 static ACTIVE_ROLE_TTBR0: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn verify_captured_role(frame: &ExceptionFrame, kind: u64) {
@@ -64,7 +95,12 @@ pub(super) fn verify_captured_role(frame: &ExceptionFrame, kind: u64) {
         if captured == 0
             || frame.spsr & 0x1f != 0
             || ACTIVE_ROLE_TTBR0
-                .compare_exchange(captured, 0, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(
+                    captured,
+                    captured | CAPTURED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_err()
         {
             super::fatal(FATAL_ROLE_CONTEXT);
@@ -78,10 +114,180 @@ struct Task {
     activity: u16,
 }
 
+/// The scheduler consumed this stopped role's vector capture exactly once.
+/// A checked user span borrows it only for the synchronous syscall.
+#[cfg(cyxia_startup_catalog)]
+pub(super) struct SignedCaller {
+    pub(super) index: usize,
+    pub(super) member: NativeRole,
+    root_asid: u64,
+}
+
+#[cfg(cyxia_startup_catalog)]
+impl SignedCaller {
+    pub(super) fn root_asid(&self) -> u64 {
+        self.root_asid
+    }
+
+    pub(super) fn registered(&self) -> bool {
+        registered_role_abi(self.index, self.member, self.root_asid) == Some(ABI_VERSION)
+    }
+}
+
+struct Services {
+    grants: RoleServices,
+    selector_base: u64,
+    #[cfg(cyxia_startup_catalog)]
+    objects: Option<signed_syscalls::Objects>,
+}
+
+#[cfg(cyxia_startup_catalog)]
+enum CallOwner {
+    Lifecycle,
+    TaskGroup,
+    VirtualMemory,
+    RosterObjects,
+    Control,
+}
+
+#[cfg(cyxia_startup_catalog)]
+const fn call_owner(operation: Syscall) -> CallOwner {
+    match operation {
+        Syscall::Exit | Syscall::Yield | Syscall::Sleep | Syscall::Clock => CallOwner::Lifecycle,
+        Syscall::Spawn | Syscall::Join => CallOwner::TaskGroup,
+        Syscall::ReserveVm | Syscall::MapOwned | Syscall::Unmap => CallOwner::VirtualMemory,
+        Syscall::QueryTask
+        | Syscall::RevokeCap
+        | Syscall::IpcSend
+        | Syscall::IpcRecv
+        | Syscall::SubmitReadVector => CallOwner::RosterObjects,
+        Syscall::ReadSnapshot
+        | Syscall::SubmitPlan
+        | Syscall::QueryPlan
+        | Syscall::ReportResult
+        | Syscall::ServiceCall => CallOwner::Control,
+    }
+}
+
+impl Services {
+    fn new(grants: RoleServices, boot_epoch: u64) -> Result<Self, Error> {
+        // Low 16 bits select an endpoint; a stale startup payload cannot
+        // name a fresh endpoint after a confirmed volume reopen.
+        let selector_base = match boot_epoch.checked_mul(1 << 16) {
+            Some(base) if base != 0 => base,
+            _ if (0..ROLE_COUNT).all(|index| grants.control_caps(index) == 0) => 0,
+            _ => return Err(Error::Exhausted),
+        };
+        Ok(Self {
+            grants,
+            selector_base,
+            #[cfg(cyxia_startup_catalog)]
+            objects: None,
+        })
+    }
+
+    fn selector(&self, index: usize) -> u64 {
+        if self.grants.control_caps(index) == 0 {
+            0
+        } else {
+            self.selector_base | (0xc000 + index as u64)
+        }
+    }
+
+    #[cfg(cyxia_startup_catalog)]
+    fn install(
+        &mut self,
+        members: &[NativeRole; ROLE_COUNT],
+        boot_epoch: u64,
+    ) -> Result<(), Error> {
+        if self.grants != RoleServices::NONE {
+            self.objects = Some(
+                signed_syscalls::Objects::new(
+                    Some(signed_syscalls::ObjectGrant {
+                        task_query_mask: self.grants.task_query_mask,
+                        ipc_peers: self.grants.ipc_peers,
+                    }),
+                    members,
+                    boot_epoch,
+                )
+                .ok_or(Error::Denied)?,
+            );
+            for (index, member) in members.iter().copied().enumerate() {
+                signed_control::bind_audit(
+                    member,
+                    self.grants.control_caps(index),
+                    self.selector(index),
+                    boot_epoch,
+                )
+                .map_err(|_| Error::Denied)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(cyxia_startup_catalog)]
+    fn permits(&self, caller: &SignedCaller, operation: Syscall, selector: u64) -> bool {
+        let index = caller.index;
+        match call_owner(operation) {
+            CallOwner::Lifecycle => true,
+            // The fixed lifecycle roster has no spawn-group grant, child task
+            // ownership, or VM reservation and owned-page allocator.
+            CallOwner::TaskGroup | CallOwner::VirtualMemory => false,
+            CallOwner::RosterObjects => self
+                .objects
+                .as_ref()
+                .is_some_and(|objects| objects.permits(index, operation, selector)),
+            CallOwner::Control => signed_control::authorized(
+                caller.member,
+                self.grants.control_caps(index),
+                self.selector(index),
+                operation,
+                selector,
+            ),
+        }
+    }
+
+    #[cfg(cyxia_startup_catalog)]
+    fn dispatch(&mut self, caller: &SignedCaller, call: ValidatedCall) -> i64 {
+        let index = caller.index;
+        match call_owner(call.operation) {
+            CallOwner::RosterObjects => self
+                .objects
+                .as_mut()
+                .map_or(E_AUTH, |objects| objects.dispatch(caller, call, now_ns())),
+            CallOwner::Control => signed_control::dispatch(
+                caller,
+                self.grants.control_caps(index),
+                self.selector(index),
+                call,
+            ),
+            CallOwner::Lifecycle | CallOwner::TaskGroup | CallOwner::VirtualMemory => E_AUTH,
+        }
+    }
+}
+
+struct StartupInputs {
+    config: VerifiedOfflineConfig<'static>,
+    #[cfg(cyxia_business_package)]
+    business: signed_business::ApprovedPackage,
+}
+
+enum EvidenceFrame {
+    Roles,
+    Budget,
+    #[cfg(cyxia_business_package)]
+    Business,
+}
+
 enum TaskAction {
     Resume,
     EndTurn,
     Exit(i32),
+}
+
+enum RoleStop {
+    Exited(i32),
+    Fault { esr: u64, far: u64 },
 }
 
 enum Fault {
@@ -101,9 +307,9 @@ enum Fault {
         ended: u64,
         crossed: bool,
     },
-    RoleExit {
+    RoleStopped {
         actor: Identity,
-        status: i32,
+        stop: RoleStop,
     },
 }
 
@@ -305,8 +511,8 @@ impl Budget {
         Ok(())
     }
 
-    fn queue_evidence(&mut self, pending: &mut OutputQueue<128>) -> Result<(), Error> {
-        let continuous = self.continuous.as_mut().ok_or(Error::NotReady)?;
+    fn evidence_debit(&self) -> Result<u64, Error> {
+        let continuous = self.continuous.as_ref().ok_or(Error::NotReady)?;
         let observed = continuous.cursor.cpu_since(continuous.initial_tick)?;
         let charged = self
             .ledger
@@ -316,18 +522,52 @@ impl Budget {
         if observed != charged {
             return Err(Error::Clock);
         }
-        continuous
-            .trace
-            .maybe_seal(continuous.cursor, &self.ledger, charged, continuous.idle_ns);
+        Ok(charged)
+    }
+
+    fn queue_evidence(&mut self, pending: &mut OutputQueue<128>) -> Result<(), Error> {
+        let charged = self.evidence_debit()?;
+        let continuous = self.continuous.as_mut().ok_or(Error::NotReady)?;
+        if !LOAD_EVIDENCE {
+            continuous.trace.maybe_seal(
+                continuous.cursor,
+                &self.ledger,
+                charged,
+                continuous.idle_ns,
+            );
+        }
         let mut text = [0; 96];
         let payload = report_payload(
             &mut text,
             "V020_SIGNED_RESIDENT_CPU",
-            observed,
+            charged,
             charged,
             continuous.idle_ns,
         );
         enqueue_resident_frame(pending, payload).map_err(|_| Error::Denied)
+    }
+
+    fn seal_retirement(&mut self) -> Result<(), Fault> {
+        self.sample_gap()?;
+        let charged = self.evidence_debit()?;
+        let continuous = self.continuous.as_mut().ok_or(Error::NotReady)?;
+        let count = continuous
+            .trace
+            .seal(continuous.cursor, &self.ledger, charged, continuous.idle_ns)
+            .ok_or(Error::Exhausted)?;
+        report(
+            "V020_SIGNED_RESIDENT_CPU",
+            charged,
+            charged,
+            continuous.idle_ns,
+        );
+        report(
+            "V020_SEC_S_TRACE_FINAL",
+            continuous.cursor.wall / WINDOW_NS,
+            count as u64,
+            charged,
+        );
+        Ok(())
     }
 }
 
@@ -426,21 +666,43 @@ fn register_frames(info: &mut BootInfo, budget: &mut Budget) -> Result<(), Fault
 }
 
 impl Task {
-    fn trap(&mut self, syscall_abi: u16) -> Result<TaskAction, Error> {
-        let ctx = &mut self.context;
-        if ctx.kind == 9 {
-            return Ok(TaskAction::EndTurn);
-        }
-        if ctx.kind != 8 || ctx.esr >> 26 != 0x15 {
+    fn syscall(
+        &mut self,
+        syscall_abi: u16,
+        index: usize,
+        member: NativeRole,
+        services: &mut Services,
+        captured_ttbr0: u64,
+    ) -> Result<TaskAction, Error> {
+        if registered_role_abi(index, member, captured_ttbr0) != Some(syscall_abi) {
             return Err(Error::Denied);
         }
-        let call = match decode_aarch64_lifecycle_svc_v3(syscall_abi, ctx.esr, &ctx.regs) {
+        #[cfg(not(cyxia_startup_catalog))]
+        let _ = services;
+        #[cfg(cyxia_startup_catalog)]
+        let caller = SignedCaller {
+            index,
+            member,
+            root_asid: captured_ttbr0,
+        };
+        let ctx = &mut self.context;
+        #[cfg(cyxia_startup_catalog)]
+        let decoded = decode_aarch64_authorized_svc_v3(
+            syscall_abi,
+            ctx.esr,
+            &ctx.regs,
+            |operation, first| services.permits(&caller, operation, first),
+        );
+        #[cfg(not(cyxia_startup_catalog))]
+        let decoded = decode_aarch64_lifecycle_svc_v3(syscall_abi, ctx.esr, &ctx.regs);
+        let call = match decoded {
             Ok(call) => call,
             Err(error) => {
-                if error == SvcError::Unauthorized {
+                let result = preflight_errno(error);
+                if result == E_AUTH {
                     self.activity |= DENIED;
                 }
-                ctx.regs[0] = preflight_errno(error) as u64;
+                ctx.regs[0] = result as u64;
                 return Ok(TaskAction::Resume);
             }
         };
@@ -463,15 +725,24 @@ impl Task {
                 }
             }
             Syscall::Exit => return Ok(TaskAction::Exit(call.args[0] as i32)),
-            _ => ctx.regs[0] = E_AUTH as u64,
+            _ => {
+                #[cfg(cyxia_startup_catalog)]
+                let result = services.dispatch(&caller, call);
+                #[cfg(not(cyxia_startup_catalog))]
+                let result = E_AUTH;
+                if result == E_AUTH {
+                    self.activity |= DENIED;
+                }
+                ctx.regs[0] = result as u64;
+            }
         }
         Ok(TaskAction::Resume)
     }
 }
 
-fn reservation(role: Role) -> (Class, u16, u64) {
+fn reservation(role: Role, round: u16) -> (Class, u16, u64) {
     match role {
-        Role::Operations => (Class::Operations, 1, 2_000_000),
+        Role::Operations => (Class::Operations, round, 2_000_000),
         Role::Security => (Class::Security, 12, 2_000_000),
         Role::DeterministicController | Role::Publisher => (Class::Decision, 1, 250_000),
         Role::ModelManager | Role::Supervisor => (Class::Coordination, 0, 500_000),
@@ -490,43 +761,239 @@ fn startup_work<T>(budget: &mut Budget, step: u64, work: impl FnOnce() -> T) -> 
     Ok(result)
 }
 
+#[cfg(cyxia_startup_catalog)]
+fn persist_recovery(budget: &mut Budget, retirement_cpu: u64) -> Result<(), Fault> {
+    let mut batches = u64::from(retirement_cpu != 0);
+    let mut used = retirement_cpu;
+    while recovery::has_pending_persistence() {
+        let mut work = RecoveryBatches::new(budget);
+        let result = recovery::persist_pending(&mut || work.checkpoint());
+        let (persist_batches, persist_cpu) = work.finish()?;
+        let committed = result.map_err(|_| Error::Denied)?;
+        batches += persist_batches;
+        used = used.checked_add(persist_cpu).ok_or(Error::Exhausted)?;
+        if !committed {
+            break;
+        }
+    }
+    if batches != 0 {
+        report("V020_SEC_S_RECOVERY_BUDGET", batches, used, RECOVERY_NS);
+    }
+    Ok(())
+}
+
+#[cfg(cyxia_business_package)]
+fn business_layouts(
+    info: &BootInfo,
+    budget: &mut Budget,
+    policy: &ConfirmedBootPolicy<'_>,
+    #[cfg(cyxia_resident_net)] network_entropy: Option<&mut Entropy>,
+) -> Result<[signed_business::Layout; 3], Fault> {
+    let mut entropy = RecoveryBatches::new(budget);
+    let layouts = signed_business::addresses(
+        info,
+        policy,
+        #[cfg(cyxia_resident_net)]
+        network_entropy,
+        &mut || entropy.checkpoint(),
+    );
+    let (batches, used) = entropy.finish()?;
+    let layouts = layouts?;
+    if used == 0 {
+        return Err(Error::Clock.into());
+    }
+    report("V020_SIGNED_BUSINESS_ENTROPY", batches, used, RECOVERY_NS);
+    Ok(layouts)
+}
+
+#[cfg(cyxia_business_package)]
+fn activate_business(
+    budget: &mut Budget,
+    policy: &ConfirmedBootPolicy<'_>,
+    package: &signed_business::ApprovedPackage,
+    layouts: [signed_business::Layout; 3],
+) -> Result<(), Fault> {
+    for (index, layout) in layouts.into_iter().enumerate() {
+        startup_work(budget, (3 + ROLE_COUNT + index) as u64, || {
+            signed_business::prepare(policy, package, index + 1, layout)
+        })??;
+    }
+    let mask = signed_business::open(policy)?;
+    report("V020_SIGNED_BUSINESS_READY", policy.boot_epoch(), mask, 0);
+    Ok(())
+}
+
+#[cfg(cyxia_startup_catalog)]
+fn qualify_network(
+    recovery: &mut RecoveryBatches<'_>,
+    config: &VerifiedOfflineConfig<'_>,
+) -> Result<(Option<NetworkDeployment>, media_staging::NetworkPolicy), SvcError> {
+    recovery.checkpoint()?;
+    let deployment = startup_catalog::network(config, &mut || recovery.checkpoint())?;
+    recovery.checkpoint()?;
+    let predecessor = media_staging::verify_network_predecessor()?;
+    let current = deployment.map(NetworkDeployment::manifest);
+    Ok((
+        deployment,
+        media_staging::NetworkPolicy {
+            current,
+            predecessor,
+        },
+    ))
+}
+
+#[cfg(cyxia_startup_catalog)]
+fn qualify_role_services(
+    recovery: &mut RecoveryBatches<'_>,
+    config: &VerifiedOfflineConfig<'_>,
+) -> Result<RoleServices, SvcError> {
+    #[cfg(cyxia_role_services)]
+    {
+        recovery.checkpoint()?;
+        RoleServices::verify(
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/startup-catalog/role-services.bin"
+            )),
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/startup-catalog/role-services.sig"
+            )),
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/startup-catalog/offline-ed25519-pubkey.bin"
+            )),
+            config.digest(),
+            super::role_loader::lifecycle_package_digests(),
+        )
+    }
+    #[cfg(not(cyxia_role_services))]
+    {
+        let _ = (recovery, config);
+        Ok(RoleServices::NONE)
+    }
+}
+
+#[cfg(cyxia_resident_net)]
+fn network_entropy(
+    info: &BootInfo,
+    budget: &mut Budget,
+    identity: BootIdentity<'static>,
+) -> Result<Option<Entropy>, Fault> {
+    let mut work = RecoveryBatches::new(budget);
+    let result = Entropy::attach_checkpointed(info, identity.boot_epoch(), &mut || {
+        work.checkpoint()
+            .map_err(|_| cyxia_driver_virtio::Error::Busy)
+    });
+    work.finish()?;
+    match result {
+        Ok(entropy) => Ok(Some(entropy)),
+        Err(error) => {
+            report(
+                "V020_SIGNED_NET_OFFLINE",
+                identity.boot_epoch(),
+                error as u64,
+                1,
+            );
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(cyxia_resident_net)]
+fn stage_resident_network(
+    info: &BootInfo,
+    budget: &mut Budget,
+    identity: BootIdentity<'static>,
+    entropy: Entropy,
+) -> Result<(), Fault> {
+    let mut work = RecoveryBatches::new(budget);
+    let engine = Resident::start(info, identity, entropy, &mut || {
+        work.checkpoint()
+            .map_err(|_| cyxia_driver_virtio::Error::Busy)
+    });
+    if let Err(fault) = work.finish() {
+        if let Ok(mut engine) = engine {
+            engine.stop();
+        }
+        return Err(fault);
+    }
+    match engine {
+        Ok(engine) => network_worker::stage(identity.boot_epoch(), engine)?,
+        Err(error) => {
+            report(
+                "V020_SIGNED_NET_OFFLINE",
+                identity.boot_epoch(),
+                error as u64,
+                2,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn load_signed_roles(
     budget: &mut Budget,
     policy: &ConfirmedBootPolicy<'_>,
     actors: &[Identity; ROLE_COUNT],
-) -> Result<[NativeRole; ROLE_COUNT], Fault> {
-    startup_work(budget, 2, || {
+    services: &mut Services,
+) -> Result<([NativeRole; ROLE_COUNT], Execution), Fault> {
+    let execution = startup_work(budget, 2, || {
         #[cfg(cyxia_startup_catalog)]
         if !frames::role_storage_registered() {
             return Err(Error::Denied);
         }
-        recovery::init_signed(policy).map_err(|_| Error::Denied)
+        recovery::init_signed(policy).map_err(|_| Error::Denied)?;
+        Execution::configure().ok_or(Error::Denied)
     })??;
 
     // Each package owns a separate prepaid Recovery turn. The cohort stays
     // unpublished until every package is loaded and its full inventory passes.
     let mut members = [None; ROLE_COUNT];
-    for (index, slot) in members.iter_mut().enumerate() {
-        *slot = Some(startup_work(budget, 3 + index as u64, || {
-            load_role_with_identity(index, actors[index].generation, RoleLaunch::Lifecycle)
-        })??);
+    for (index, actor) in actors.iter().enumerate() {
+        startup_work(budget, 3 + index as u64, || {
+            members[index] = Some(load_role_with_identity(
+                index,
+                actor.generation,
+                RoleLaunch::Lifecycle {
+                    cap_selector: services.selector(index),
+                    object_epoch: services
+                        .grants
+                        .uses_objects(index)
+                        .then(|| policy.boot_epoch()),
+                },
+            )?);
+            #[cfg(cyxia_startup_catalog)]
+            if index + 1 == ROLE_COUNT {
+                services.install(
+                    &members.map(|entry| entry.expect("complete roster")),
+                    policy.boot_epoch(),
+                )?;
+            }
+            Ok::<(), Error>(())
+        })??;
     }
-    Ok(members.map(|entry| entry.expect("complete signed launch inventory")))
+    Ok((
+        members.map(|entry| entry.expect("complete signed launch inventory")),
+        execution,
+    ))
 }
 
 fn turn(
     policy: &ConfirmedBootPolicy<'_>,
     manifest: &ValidatedLifecycleManifest<'_>,
-    index: usize,
+    (index, round): (usize, u16),
     task: &mut Task,
     budget: &mut Budget,
+    execution: &Execution,
+    services: &mut Services,
 ) -> Result<(), Fault> {
     let start = budget.sample_gap()?;
     if start.wall < task.wake_ns {
         return Ok(());
     }
     let member = manifest.manifest().members[index];
-    let (class, domain, quota) = reservation(member.role);
+    let (class, domain, quota) = reservation(member.role, round);
     let grant = match budget.ledger.reserve_indexed_role_with_wall(
         manifest,
         index,
@@ -546,22 +1013,65 @@ fn turn(
     // entered using a generation or address space from its own request.
     let mut returned = 0;
     let result = if policy.service_generation(member.role) == Ok(member.actor.generation) {
-        run_quantum(member, index, task, grant, &start, &mut returned)
+        run_quantum(
+            member,
+            index,
+            task,
+            grant,
+            &start,
+            &mut returned,
+            execution,
+            services,
+        )
     } else {
         Err(Error::Denied)
     };
     budget.settle(grant, start, returned)?;
-    if let Some(status) = result? {
+    if let Some(stop) = result? {
         // The full cohort owns startup readiness. Close its admission before
         // waiting for the recovery grant that retires this stopped role.
         budget.ledger.close_ordinary();
+        #[cfg(cyxia_resident_net)]
+        network_worker::close();
+        #[cfg(cyxia_business_package)]
+        signed_business::close();
         let (recovery_start, recovery_grant) = budget.reserve_recovery()?;
-        let retirement = retire_stopped_role(index, member.ttbr0_root);
-        budget.settle(recovery_grant, recovery_start, 0)?;
+        let retirement = (|| {
+            if let RoleStop::Fault { esr, far } = &stop {
+                recovery::record_role_failure(member.actor, *esr, *far)
+                    .map_err(|_| Error::Denied)?;
+            }
+            retire_stopped_role(index, member)?;
+            #[cfg(cyxia_startup_catalog)]
+            if let Some(objects) = services.objects.as_mut() {
+                objects.retire(index);
+            }
+            task.context = user::Context::empty();
+            Ok::<(), Error>(())
+        })();
+        let retirement_cpu = budget.settle(recovery_grant, recovery_start, 0)?;
         retirement?;
-        return Err(Fault::RoleExit {
+        #[cfg(cyxia_business_package)]
+        {
+            let stopped_deadline = now_ns().checked_add(WINDOW_NS).ok_or(Error::Clock)?;
+            while !recovery::business_writers_stopped() {
+                let now = now_ns();
+                if now >= stopped_deadline {
+                    break;
+                }
+                budget.idle_until(stopped_deadline.min(now + CONSOLE_RETRY_NS))?;
+            }
+        }
+        #[cfg(cyxia_startup_catalog)]
+        persist_recovery(budget, if LOAD_EVIDENCE { retirement_cpu } else { 0 })?;
+        #[cfg(not(cyxia_startup_catalog))]
+        let _ = retirement_cpu;
+        if LOAD_EVIDENCE {
+            budget.seal_retirement()?;
+        }
+        return Err(Fault::RoleStopped {
             actor: member.actor,
-            status,
+            stop,
         });
     }
     Ok(())
@@ -574,16 +1084,24 @@ fn run_quantum(
     grant: Turn,
     start: &Sample,
     returned: &mut u64,
-) -> Result<Option<i32>, Error> {
+    execution: &Execution,
+    services: &mut Services,
+) -> Result<Option<RoleStop>, Error> {
     // A separate physical timer forces return before the prepaid bound
     // expires. Reserve exit/settlement margin using the native fixture's
     // role limits. Clock, rejection and waiting cannot refill a grant.
-    let decision = grant.accounting_scope().0 == Class::Decision;
-    let exit_margin_ns = if decision { 150_000 } else { 100_000 };
-    let trap_limit = if decision { 1 } else { 8 };
+    let (exit_margin_ns, trap_limit) = match grant.accounting_scope().0 {
+        Class::Decision => (150_000, 1),
+        // This role may copy and authenticate a complete audit RPC on return.
+        Class::Coordination if member.role == Role::Supervisor => (250_000, 4),
+        // The load packages make frequent Clock calls during each turn.
+        // Leave space for the next block and sample charged CPU at each return.
+        Class::Operations | Class::Security if LOAD_EVIDENCE => (500_000, 32),
+        _ => (100_000, 8),
+    };
     let asid = role_asid(index);
     let ttbr0 = member.ttbr0_root | (u64::from(asid) << 48);
-    let syscall_abi = pie_syscall_abi(index, member.ttbr0_root).ok_or(Error::Denied)?;
+    let syscall_abi = registered_role_abi(index, member, ttbr0).ok_or(Error::Denied)?;
     for _ in 0..trap_limit {
         let wall_ticks = timer::ticks();
         let wall_left = grant
@@ -613,18 +1131,32 @@ fn run_quantum(
         }
         // Every dispatch needs a newly captured lower-EL trap from the
         // root registered for this entry. No stale trap reaches recovery.
-        if ACTIVE_ROLE_TTBR0.swap(0, Ordering::AcqRel) != 0 || task.context.kind == 0 {
+        let capture = ACTIVE_ROLE_TTBR0.swap(0, Ordering::AcqRel);
+        if capture != (ttbr0 | CAPTURED) || task.context.kind == 0 {
             return Err(Error::Denied);
         }
+        let captured_ttbr0 = capture & !CAPTURED;
         *returned += 1;
-        match task.trap(syscall_abi) {
-            Ok(TaskAction::Resume) => {}
-            Ok(TaskAction::EndTurn) => break,
-            Ok(TaskAction::Exit(status)) => return Ok(Some(status)),
-            Err(error) => {
-                recovery::record_role_failure(member.actor, task.context.esr, task.context.far)
-                    .map_err(|_| Error::Denied)?;
-                return Err(error);
+        match execution.handle_return(&mut task.context) {
+            Return::Timer | Return::Yield => break,
+            Return::Emulated => {}
+            Return::Syscall => match task.syscall(syscall_abi, index, member, services, captured_ttbr0)? {
+                TaskAction::Resume => {}
+                TaskAction::EndTurn => break,
+                TaskAction::Exit(status) => return Ok(Some(RoleStop::Exited(status))),
+            },
+            Return::TerminateTask => {
+                // The lower-EL vector has just authenticated this task's
+                // live root, ASID and EL0t context. Only a positively
+                // classified synchronous exception can end this task.
+                return Ok(Some(RoleStop::Fault {
+                    esr: task.context.esr,
+                    far: task.context.far,
+                }));
+            }
+            Return::FailStop => {
+                recovery::record_unattributed_sync(task.context.esr, task.context.far);
+                super::fatal(FATAL_ROLE_CONTEXT);
             }
         }
     }
@@ -637,6 +1169,8 @@ fn run_tasks(
     manifest: &ValidatedLifecycleManifest<'_>,
     budget: &mut Budget,
     pending: &mut OutputQueue<128>,
+    execution: &Execution,
+    services: &mut Services,
 ) -> Result<core::convert::Infallible, Fault> {
     let mut uart = resident::attach_console(info);
     let mut tasks: [Task; ROLE_COUNT] = core::array::from_fn(|index| Task {
@@ -648,7 +1182,7 @@ fn run_tasks(
     let mut proof_window = next_window + EVIDENCE_WINDOWS;
     let mut console_window = next_window;
     let mut command = 0;
-    let mut budget_frame = false;
+    let mut next_evidence = EvidenceFrame::Roles;
     // Finish publishing the authenticated cohort before entering any EL0
     // role. Each console grant prepares at most one frame and drains a
     // bounded number of bytes, including when the UART is busy.
@@ -660,14 +1194,51 @@ fn run_tasks(
         if ready_at_start && window >= next_window {
             next_window = window + 1;
             for (index, task) in tasks.iter_mut().enumerate() {
-                turn(policy, manifest, index, task, budget)?;
+                turn(
+                    policy,
+                    manifest,
+                    (index, 1),
+                    task,
+                    budget,
+                    execution,
+                    services,
+                )?;
             }
+            if LOAD_EVIDENCE {
+                // Give each role its first turn before dispatching the rest
+                // of the prepared evaluation and security review quanta.
+                for (index, task) in tasks.iter_mut().enumerate() {
+                    let rounds = match manifest.manifest().members[index].role {
+                        Role::Operations => 15,
+                        Role::Security => 4,
+                        _ => 1,
+                    };
+                    for round in 2..=rounds {
+                        if now_ns() / WINDOW_NS != window {
+                            break;
+                        }
+                        turn(
+                            policy,
+                            manifest,
+                            (index, round),
+                            task,
+                            budget,
+                            execution,
+                            services,
+                        )?;
+                    }
+                }
+            }
+            // Stopped business writers and durable ACKs do not depend on
+            // an EL0 role being runnable in this window.
+            #[cfg(cyxia_startup_catalog)]
+            persist_recovery(budget, 0)?;
         }
         let mut wake = next_boundary(now)?;
         if window >= console_window
             || ready_record.is_some()
             || pending.pending() != 0
-            || budget_frame
+            || !matches!(next_evidence, EvidenceFrame::Roles)
         {
             let start = budget.sample_gap()?;
             match budget.ledger.reserve_kernel_with_wall(
@@ -691,7 +1262,7 @@ fn run_tasks(
                             &mut tasks,
                             window,
                             &mut proof_window,
-                            &mut budget_frame,
+                            &mut next_evidence,
                             budget,
                             pending,
                         )
@@ -710,7 +1281,10 @@ fn run_tasks(
                         proof_window = window + EVIDENCE_WINDOWS;
                         continue;
                     }
-                    if ready_record.is_some() || pending.pending() != 0 || budget_frame {
+                    if ready_record.is_some()
+                        || pending.pending() != 0
+                        || !matches!(next_evidence, EvidenceFrame::Roles)
+                    {
                         wake =
                             wake.min(now_ns().checked_add(CONSOLE_RETRY_NS).ok_or(Error::Clock)?);
                     }
@@ -752,19 +1326,40 @@ fn queue_activity(
     tasks: &mut [Task; ROLE_COUNT],
     window: u64,
     proof_window: &mut u64,
-    budget_frame: &mut bool,
+    next: &mut EvidenceFrame,
     budget: &mut Budget,
     pending: &mut OutputQueue<128>,
 ) -> Result<(), Error> {
-    if pending.pending() == 0 {
-        if *budget_frame {
-            budget.queue_evidence(pending)?;
-            *budget_frame = false;
-        } else if window >= *proof_window {
+    if pending.pending() != 0 {
+        return Ok(());
+    }
+    match *next {
+        EvidenceFrame::Roles if window >= *proof_window => {
             queue_progress(tasks, window, pending)?;
             *proof_window = window + EVIDENCE_WINDOWS;
-            *budget_frame = true;
+            *next = EvidenceFrame::Budget;
         }
+        EvidenceFrame::Budget => {
+            budget.queue_evidence(pending)?;
+            #[cfg(cyxia_business_package)]
+            {
+                *next = EvidenceFrame::Business;
+            }
+            #[cfg(not(cyxia_business_package))]
+            {
+                *next = EvidenceFrame::Roles;
+            }
+        }
+        #[cfg(cyxia_business_package)]
+        EvidenceFrame::Business => {
+            let [one, two, three] = signed_business::progress();
+            let mut text = [0; 112];
+            let payload =
+                report_payload(&mut text, "V020_SIGNED_BUSINESS_PROGRESS", one, two, three);
+            enqueue_resident_frame(pending, payload).map_err(|_| Error::Denied)?;
+            *next = EvidenceFrame::Roles;
+        }
+        EvidenceFrame::Roles => {}
     }
     Ok(())
 }
@@ -844,6 +1439,13 @@ fn identities(policy: &ConfirmedBootPolicy<'_>) -> Result<[Identity; ROLE_COUNT]
 }
 
 fn fence(info: &BootInfo, budget: Budget, pending: OutputQueue<128>, fault: Fault) -> ! {
+    #[cfg(cyxia_resident_net)]
+    {
+        network_worker::close();
+        Signer::discard_deployment_input();
+    }
+    #[cfg(cyxia_business_package)]
+    signed_business::close();
     let witness = match fault {
         Fault::Operation(error) => ("V020_SIGNED_RESIDENT_FAULT", [error as u64, 0, 0]),
         Fault::Budget {
@@ -864,9 +1466,19 @@ fn fence(info: &BootInfo, budget: Budget, pending: OutputQueue<128>, fault: Faul
             "V020_SIGNED_RESIDENT_COORD_OVERRUN",
             [used, ended, u64::from(crossed)],
         ),
-        Fault::RoleExit { actor, status } => (
+        Fault::RoleStopped {
+            actor,
+            stop: RoleStop::Exited(status),
+        } => (
             "V020_SIGNED_RESIDENT_EXIT",
             [actor.id, actor.generation, i64::from(status) as u64],
+        ),
+        Fault::RoleStopped {
+            actor,
+            stop: RoleStop::Fault { esr, .. },
+        } => (
+            "V020_SIGNED_RESIDENT_ROLE_FAULT",
+            [actor.id, actor.generation, esr],
         ),
     };
     // Finish any retained serial suffix before the read-only status banner.
@@ -881,6 +1493,13 @@ fn fence(info: &BootInfo, budget: Budget, pending: OutputQueue<128>, fault: Faul
 }
 
 fn degraded(info: &BootInfo, budget: Budget, reason: Option<&'static [u8]>) -> ! {
+    #[cfg(cyxia_resident_net)]
+    {
+        network_worker::close();
+        Signer::discard_deployment_input();
+    }
+    #[cfg(cyxia_business_package)]
+    signed_business::close();
     resident::serve_with_queue(
         info,
         reason,
@@ -900,6 +1519,13 @@ pub(super) fn run(info: &BootInfo) -> ! {
         ledger: Cpu0BudgetLedger::new(),
         continuous: None,
     };
+    #[cfg(cyxia_startup_catalog)]
+    if !cfg!(cyxia_lifecycle_package_signature) {
+        // A signing-input build has no authorized service arena. Bring up
+        // the console without touching media or staging any user mappings.
+        bring_up_production(info);
+        degraded(info, budget, Some(UNQUALIFIED_PACKAGES));
+    }
     #[cfg(cyxia_startup_catalog)]
     let (early_start, early_grant) = budget.begin_boot().expect("early Recovery budget");
     #[cfg(not(all(cyxia_startup_catalog, feature = "prototype-memory")))]
@@ -923,7 +1549,7 @@ pub(super) fn run(info: &BootInfo) -> ! {
     };
     #[cfg(all(cyxia_startup_catalog, feature = "prototype-memory"))]
     let info = &reserved;
-    let config = match startup_work(&mut budget, 1, || {
+    let startup = match startup_work(&mut budget, 1, || {
         // An authenticated catalog with unsupported lists can still be
         // inspected by the default read-only diagnostics.
         let fallback = if cfg!(cyxia_startup_catalog) {
@@ -932,17 +1558,22 @@ pub(super) fn run(info: &BootInfo) -> ! {
             Some(FENCED)
         };
         let config = media_staging::verify_scratch_config().map_err(|_| fallback)?;
-        #[cfg(cyxia_lifecycle_package_signature)]
+        #[cfg(cyxia_startup_catalog)]
         super::startup_catalog::verify_lifecycle_packages(&config)
             .map_err(|_| Some(UNQUALIFIED_PACKAGES))?;
-        Ok(config)
+        Ok(StartupInputs {
+            #[cfg(cyxia_business_package)]
+            business: signed_business::authorize(&config)
+                .map_err(|_| Some(UNQUALIFIED_BUSINESS))?,
+            config,
+        })
     }) {
         Ok(Ok(config)) => config,
         Ok(Err(reason)) => degraded(info, budget, reason),
         Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     };
     #[cfg(cyxia_startup_catalog)]
-    let mut staged = {
+    let (deployment, grants, mut staged) = {
         budget
             .continuous
             .as_mut()
@@ -950,29 +1581,51 @@ pub(super) fn run(info: &BootInfo) -> ! {
             .trace
             .begin_media();
         let mut media = RecoveryBatches::new(&mut budget);
-        let staged =
-            media_staging::stage_with_policy(info, Some(config), &mut || media.checkpoint());
-        let confirmed_epoch = staged
-            .resident_boot
-            .as_ref()
-            .map_or(0, |_| staged.confirmed_epoch);
+        // Qualification determines the signed policy permitted to inspect
+        // or change the volume. Debit it in the same startup Recovery span.
+        let staged = (|| {
+            let (deployment, policy) =
+                qualify_network(&mut media, &startup.config).map_err(|error| {
+                    (
+                        NETWORK_POLICY_REJECTED,
+                        "V020_SEC_N_CATALOG_REJECTED",
+                        error,
+                    )
+                })?;
+            let grants = qualify_role_services(&mut media, &startup.config)
+                .map_err(|error| (ROLE_SERVICES_REJECTED, "V020_SEC_S_CATALOG_REJECTED", error))?;
+            let staged =
+                media_staging::stage_with_policy(info, Some(startup.config), policy, &mut || {
+                    media.checkpoint()
+                });
+            Ok((deployment, grants, staged))
+        })();
         let (batches, used) = match media.finish() {
             Ok(debit) => debit,
             Err(fault) => fence(info, budget, OutputQueue::new(), fault),
         };
-        if confirmed_epoch != 0 {
+        let (deployment, grants, staged) = match staged {
+            Ok(staged) => staged,
+            Err((reason, label, error)) => {
+                report(label, error as u64, 0, 0);
+                degraded(info, budget, Some(reason));
+            }
+        };
+        if staged.resident_boot.is_some() {
             budget
                 .continuous
                 .as_ref()
                 .expect("active boot meter")
                 .trace
-                .finish_media(confirmed_epoch);
+                .finish_media(staged.confirmed_epoch);
             report("V020_SIGNED_MEDIA_BUDGET", batches, used, RECOVERY_NS);
         }
-        staged
+        (deployment, grants, staged)
     };
     #[cfg(not(cyxia_startup_catalog))]
-    let mut staged = media_staging::stage_with_policy(info, Some(config));
+    let grants = RoleServices::NONE;
+    #[cfg(not(cyxia_startup_catalog))]
+    let mut staged = media_staging::stage_with_policy(info, Some(startup.config));
     let Some(boot) = staged.resident_boot.take() else {
         degraded(info, budget, Some(NO_MEDIA));
     };
@@ -990,12 +1643,21 @@ pub(super) fn run(info: &BootInfo) -> ! {
         Ok(actors) => actors,
         Err(error) => fence(info, budget, OutputQueue::new(), error.into()),
     };
-    let members = match load_signed_roles(&mut budget, &policy, &actors) {
-        Ok(members) => members,
+    let mut services = match Services::new(grants, policy.boot_epoch()) {
+        Ok(services) => services,
+        Err(error) => fence(info, budget, OutputQueue::new(), error.into()),
+    };
+    let (members, execution) = match load_signed_roles(&mut budget, &policy, &actors, &mut services)
+    {
+        Ok(loaded) => loaded,
         Err(fault) => fence(info, budget, OutputQueue::new(), fault),
     };
     let other_protected_pool_bytes =
         core::mem::size_of::<[super::Tables; ROLE_COUNT]>() + super::COPY + 1024 * 1024;
+    #[cfg(cyxia_startup_catalog)]
+    let other_protected_pool_bytes = other_protected_pool_bytes
+        + core::mem::size_of::<Services>()
+        + signed_control::PROTECTED_BYTES;
     #[cfg(feature = "v020-production-diagnostic")]
     let other_protected_pool_bytes = other_protected_pool_bytes + super::PLAN_POOL_BYTES;
     let manifest = NativeRoleManifest {
@@ -1008,7 +1670,83 @@ pub(super) fn run(info: &BootInfo) -> ! {
         Ok(manifest) => manifest,
         Err(error) => fence(info, budget, OutputQueue::new(), error.into()),
     };
+    #[cfg(cyxia_startup_catalog)]
+    if let Some(NetworkDeployment::Revoked(manifest)) = deployment {
+        report(
+            "V020_SIGNED_NET_REVOKED",
+            policy.boot_epoch(),
+            manifest.installation().key_generation,
+            0,
+        );
+    }
+    #[cfg(cyxia_resident_net)]
+    let identity = match deployment {
+        Some(NetworkDeployment::Active(package)) => match package.authorize(policy) {
+            Ok(confirmed) => Some(BootIdentity::from_deployment(confirmed)),
+            Err(error) => {
+                report("V020_SEC_N_CATALOG_REJECTED", error as u64, 0, 0);
+                degraded(info, budget, Some(NETWORK_POLICY_REJECTED));
+            }
+        },
+        _ => None,
+    };
+    #[cfg(cyxia_resident_net)]
+    #[cfg_attr(not(cyxia_business_package), allow(unused_mut))]
+    let mut entropy = match identity {
+        Some(identity) => match network_entropy(info, &mut budget, identity) {
+            Ok(entropy) => entropy,
+            Err(fault) => fence(info, budget, OutputQueue::new(), fault),
+        },
+        None => None,
+    };
+    #[cfg(cyxia_business_package)]
+    let layouts = match business_layouts(
+        info,
+        &mut budget,
+        &policy,
+        #[cfg(cyxia_resident_net)]
+        entropy.as_mut(),
+    ) {
+        Ok(layouts) => layouts,
+        Err(fault) => fence(info, budget, OutputQueue::new(), fault),
+    };
+    #[cfg(cyxia_resident_net)]
+    if let (Some(identity), Some(entropy)) = (identity, entropy)
+        && let Err(fault) = stage_resident_network(info, &mut budget, identity, entropy)
+    {
+        fence(info, budget, OutputQueue::new(), fault);
+    }
+    #[cfg(cyxia_resident_net)]
+    Signer::discard_deployment_input();
+    #[cfg(cyxia_business_package)]
+    if let Err(fault) = activate_business(&mut budget, &policy, &startup.business, layouts) {
+        fence(info, budget, OutputQueue::new(), fault);
+    }
+    #[cfg(all(cyxia_resident_net, not(cyxia_business_package)))]
+    if let Err(error) = network_worker::open(policy.boot_epoch()) {
+        fence(info, budget, OutputQueue::new(), error.into());
+    }
+    #[cfg(cyxia_resident_net)]
+    if let Some(identity) = identity.filter(|_| network_worker::staged(policy.boot_epoch())) {
+        report(
+            "V020_SIGNED_NET_READY",
+            identity.boot_epoch(),
+            identity
+                .confirmed_installation()
+                .expect("authorized TLS")
+                .key_generation,
+            u64::from(identity.listener().listen_port),
+        );
+    }
     let mut pending = OutputQueue::new();
-    let Err(fault) = run_tasks(info, &policy, &manifest, &mut budget, &mut pending);
+    let Err(fault) = run_tasks(
+        info,
+        &policy,
+        &manifest,
+        &mut budget,
+        &mut pending,
+        &execution,
+        &mut services,
+    );
     fence(info, budget, pending, fault)
 }

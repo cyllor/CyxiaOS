@@ -18,6 +18,7 @@ from check_elf import symbol
 from run_qemu import Qmp
 from transport import FrameDecoder
 from v0199_budget_trace import SIGNED_EARLY_TRACE_BYTES, SIGNED_TRACE_BYTES, verify_signed_trace
+from v020_frame_meta import FRAME_ROW, PERMANENT_ROW, queue_dma_rows
 from v020_production_media import (
     BLOCK_BYTES, REDO_HEADER_BYTES, SECURITY_REDO, STAGING_UUID, verify_signed_disk,
 )
@@ -30,6 +31,8 @@ from verify_smp import boot_ram_mib, require
 ROLES = (6, 7, 2, 8, 9, 3, 10, 11)
 COMPLETE_PROGRESS = (0xFFFF, 0x8778)  # Clock/Yield for all, four Sleep and four refusals.
 STARTUP = "V020_STARTUP state=SECURE_DEGRADED reason=signed_media_unavailable command=status"
+UNQUALIFIED_ROSTER = ("V020_STARTUP state=SECURE_DEGRADED "
+                      "reason=lifecycle_packages_unqualified command=status")
 RECOVERY_NS = 8_000_000
 PMU_PATCH = Path(__file__).resolve().parent / "qemu/cyxia-per-vcpu-pmu.patch"
 TRACE_FILE = "cpu0-budget-trace.bin"
@@ -92,26 +95,31 @@ def frame_geometry(lines: list) -> tuple:
     return table, table_bytes, permanent, [(0x40000000, 0x44000000), *ranges]
 
 
-def verify_frame_table(path: Path, table_bytes: int, permanent: int, ranges: list) -> dict:
+def verify_frame_table(qmp, image: bytes, path: Path, table_bytes: int, permanent: int,
+                       ranges: list, dma_queues: set[str]) -> dict:
     raw = path.read_bytes()
-    row = struct.Struct("<IIQQIIII")
+    row = FRAME_ROW
     require(len(raw) == table_bytes, "incomplete signed FrameMeta readback")
-    pinned = (0xFFFFFFFF, 4, 0, 0, 0, 0, 0, 0)
+    dma_rows, queues = queue_dma_rows(qmp, image, raw, dma_queues)
     free = (0xFFFFFFFF, 8, 0, 0, 0, 0, 0, 0)
     observed = 0
-    for record in row.iter_unpack(raw):
+    for index, record in enumerate(row.iter_unpack(raw)):
+        pinned = dma_rows.get(index, PERMANENT_ROW)
         require(record in (pinned, free), "signed FrameMeta contains unexpected owners or references")
         observed += record == pinned
     require(observed == permanent, "signed FrameMeta inventory differs from stopped RAM")
     for base, end in ranges:
-        first, last = ((pa - 0x40000000) // 4096 * row.size for pa in (base, end))
-        require(all(record == pinned for record in row.iter_unpack(raw[first:last])),
+        first, last = ((pa - 0x40000000) // PAGE for pa in (base, end))
+        require(all(record == dma_rows.get(index, PERMANENT_ROW)
+                    for index, record in enumerate(row.iter_unpack(
+                        raw[first * row.size:last * row.size]), start=first)),
                 "signed FrameMeta fixed reservation was not permanent")
     return {"frame_meta_table_sha256": sha(path), "frame_meta_permanent_rows": observed,
-            "frame_meta_free_rows": len(raw) // row.size - observed}
+            "frame_meta_free_rows": len(raw) // row.size - observed, "dma_queues": queues}
 
 
-def verify_role_mappings(qmp, output: Path, elf: bytes, backing: dict) -> dict:
+def verify_role_mappings(qmp, output: Path, elf: bytes, backing: dict,
+                         retired_index: int | None = None) -> dict:
     tables = symbol(elf, "V020_SIGNED_ROLE_TABLES")
     direct = symbol(elf, "ram_l3")["pa"]
     image_pages, stack_pages = 16, 8
@@ -142,7 +150,8 @@ def verify_role_mappings(qmp, output: Path, elf: bytes, backing: dict) -> dict:
         root, middle, leaf = (entries[start + i * page_entries:start + (i + 1) * page_entries]
                               for i in range(table_pages))
         table = tables["pa"] + role * table_pages * PAGE
-        require(root[0] == ((table + PAGE) | 3) and middle[0] == ((table + 2 * PAGE) | 3)
+        expected_root = 0 if role == retired_index else (table + PAGE) | 3
+        require(root[0] == expected_root and middle[0] == ((table + 2 * PAGE) | 3)
                 and not any(root[1:]) and not any(middle[1:]),
                 "signed role table points outside its dedicated pages")
         image_at, stack_at = 0x10000 // PAGE, 0x30000 // PAGE
@@ -172,7 +181,8 @@ def verify_role_mappings(qmp, output: Path, elf: bytes, backing: dict) -> dict:
     return {"role_readonly_pages": readonly, "role_private_writable_pages": private}
 
 
-def capture_role_syscall_abi(qmp, output: Path, image: bytes) -> dict:
+def capture_role_syscall_abi(qmp, output: Path, image: bytes,
+                             retired_index: int | None = None) -> dict:
     try:
         location = symbol(image, "V020_SIGNED_ROLE_SYSCALL_ABI")
     except ValueError as error:
@@ -188,13 +198,15 @@ def capture_role_syscall_abi(qmp, output: Path, image: bytes) -> dict:
     raw = path.read_bytes()
     require(len(raw) == width, "incomplete role syscall ABI readback")
     tags = struct.unpack(f"<{len(ROLES)}H", raw)
-    require(tags == (3,) * len(ROLES), "a signed lifecycle role lacks a verified ABI3 tag")
+    expected = tuple(0 if index == retired_index else 3 for index in range(len(ROLES)))
+    require(tags == expected, "signed ABI3 table disagrees with the live and retired roles")
     return {"role_syscall_abi": dict(zip(ROLES, tags)),
             "role_syscall_abi_sha256": sha(path)}
 
 
 def capture_budget_trace(socket_path: Path, elf: Path, output: Path, deadline: float, *,
-                         frame_table: tuple | None = None) -> dict:
+                         frame_table: tuple | None = None, expect_business: bool = False,
+                         retired_index: int | None = None, inspect_roles=None) -> dict:
     image = elf.read_bytes()
     location = symbol(image, "V020_SIGNED_CPU_BUDGET_TRACE")
     require(location["size"] in (SIGNED_TRACE_BYTES, SIGNED_EARLY_TRACE_BYTES)
@@ -221,28 +233,31 @@ def capture_budget_trace(socket_path: Path, elf: Path, output: Path, deadline: f
             qmp.execute("pmemsave", {"val": location["pa"], "size": location["size"],
                                      "filename": str(path.resolve())})
             if frame_table is not None:
-                table, table_bytes, _, _ = frame_table
+                table, table_bytes, permanent, ranges = frame_table
+                frames = output / FRAME_TABLE_FILE
                 qmp.execute("pmemsave", {"val": table, "size": table_bytes,
-                                         "filename": str((output / FRAME_TABLE_FILE).resolve())})
-            mappings.update(capture_role_syscall_abi(qmp, output, image))
+                                         "filename": str(frames.resolve())})
+                dma_queues = {"block", "rng"} if expect_business else {"block"}
+                mappings["frame_meta_table_physical"] = table
+                mappings.update(verify_frame_table(qmp, image, frames, table_bytes, permanent,
+                                                   ranges, dma_queues))
+            mappings.update(capture_role_syscall_abi(qmp, output, image, retired_index))
             if backing is not None:
-                mappings.update(verify_role_mappings(qmp, output, image, backing))
+                mappings.update(verify_role_mappings(qmp, output, image, backing, retired_index))
+                if inspect_roles is not None:
+                    mappings.update(inspect_roles(qmp, output, backing))
         finally:
             (output / "budget-qmp.jsonl").write_text(
                 "".join(json.dumps(row) + "\n" for row in qmp.transcript), encoding="utf-8",
             )
-    result = {"budget_trace_sha256": sha(path), "budget_trace_physical": location["pa"], **mappings}
-    if frame_table is not None:
-        table, table_bytes, permanent, ranges = frame_table
-        result["frame_meta_table_physical"] = table
-        result.update(verify_frame_table(output / FRAME_TABLE_FILE, table_bytes, permanent, ranges))
-    return result
+    return {"budget_trace_sha256": sha(path), "budget_trace_physical": location["pa"], **mappings}
 
 
 def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None,
          epoch: int | None, *, expected_policy_sha256: str | None = None,
          expected_policy_envelope: bytes | None = None,
-         budget_trace: bool = False) -> dict:
+         budget_trace: bool = False, unqualified_roster: bool = False,
+         expect_business: bool = False) -> dict:
     output.mkdir()
     elf_digest = sha(elf)
     result = {"elf_sha256": elf_digest, "status": "FAIL"}
@@ -251,7 +266,8 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
     decoder = FrameDecoder()
     image = elf.read_bytes()
     ram = boot_ram_mib(image)
-    trace_size = symbol(image, "V020_SIGNED_CPU_BUDGET_TRACE")["size"]
+    trace_size = (None if unqualified_roster
+                  else symbol(image, "V020_SIGNED_CPU_BUDGET_TRACE")["size"])
     early_boot = trace_size == SIGNED_EARLY_TRACE_BYTES
     dense = early_boot and ram == 1024
     geometry = None
@@ -263,6 +279,9 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
         argv += ["-global", "virtio-mmio.force-legacy=false",
                  "-drive", f"file={disk},if=none,id=scratch,format=raw,cache=none",
                  "-device", "virtio-blk-device,drive=scratch"]
+    if expect_business:
+        argv += ["-object", "rng-random,id=boot-rng,filename=/dev/urandom",
+                 "-device", "virtio-rng-device,rng=boot-rng"]
     deadline = time.monotonic() + timeout
     capture = (tempfile.TemporaryDirectory(prefix="cyx-signed-qmp-")
                if budget_trace or (dense and epoch is not None) else nullcontext())
@@ -286,18 +305,24 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
 
             if epoch is None:
                 wait_until(lambda: any(line.startswith("V020_STARTUP ") for line in lines))
-                require(STARTUP in lines, "missing medium did not fence startup")
+                expected = UNQUALIFIED_ROSTER if unqualified_roster else STARTUP
+                require(expected in lines, "startup did not report the expected refusal")
                 proc.stdin.write(b"status\n")
                 proc.stdin.flush()
                 wait_until(lambda: bool(rows(lines, "V020_RESIDENT_STATUS")))
                 require(rows(lines, "V020_RESIDENT_STATUS")[0][:2] == (15, 0),
-                        "missing medium did not retain the read-only resident service")
+                        "refused startup did not retain the read-only resident service")
                 require(not any(line.startswith(("V020_SIGNED_RESIDENT_BOOT ",
                                                  "V020_SIGNED_RESIDENT_ROLE ",
                                                  "V020_SIGNED_RESIDENT_PROGRESS ",
-                                                 "V020_SIGNED_RESIDENT_CPU "))
-                                for line in lines), "EL0 roles started without confirmed media")
-                if disk is not None:
+                                                 "V020_SIGNED_RESIDENT_CPU ",
+                                                 "V020_SIGNED_BUSINESS_READY ",
+                                                 "V020_SIGNED_BUSINESS_PROGRESS "))
+                                for line in lines), "EL0 progressed after refused startup")
+                if unqualified_roster:
+                    require(not any(line.startswith("V020_W11_MEDIA_") for line in lines),
+                            "startup touched the media with an unqualified role roster")
+                elif disk is not None:
                     io = rows(lines, "V020_W11_MEDIA_IO")
                     require(len(io) == 1 and io[0][0] > 0 and io[0][1:] == (0, 0),
                             "the reopen path wrote or flushed rejected media")
@@ -326,13 +351,36 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
                 require(len(progress) >= 5 and all(row[1:] == COMPLETE_PROGRESS for row in progress)
                         and all(right[0] - left[0] >= 4 for left, right in zip(progress, progress[1:])),
                         "all eight roles did not sustain authorized lifecycle progress")
+                if expect_business:
+                    wait_until(lambda: len(rows(lines, "V020_SIGNED_BUSINESS_PROGRESS")) >= 5
+                               or any(line.startswith("V020_STARTUP ") for line in lines))
+                    business = rows(lines, "V020_SIGNED_BUSINESS_PROGRESS")
+                    business_start = f"V020_SIGNED_BUSINESS_READY a={epoch} b=14 c=0"
+                    require(rows(lines, "V020_SIGNED_BUSINESS_READY") == [(epoch, 14, 0)]
+                            and lines.index(f"V020_W11_MEDIA_STEP a=4 b=1 c={epoch}")
+                            < lines.index(business_start),
+                            "business cores did not open together after durable BootEpoch")
+                    require(len(business) >= 5 and all(count > 0 for count in business[0])
+                            and all(all(a < b for a, b in zip(left, right))
+                                    for left, right in zip(business, business[1:])),
+                            "business cores did not sustain native dispatches")
+                    entropy = rows(lines, "V020_SIGNED_BUSINESS_ENTROPY")
+                    require(len(entropy) == 1, "missing business ASLR budget")
+                    batches, used, quota = entropy[0]
+                    require(0 < used <= batches * quota and quota == RECOVERY_NS,
+                            "invalid business ASLR budget")
+                    result.update(business_progress=business, business_entropy_budget=entropy[0])
+                else:
+                    require(not rows(lines, "V020_SIGNED_BUSINESS_READY"),
+                            "unexpected business workload on a lifecycle-only image")
                 recovery = rows(lines, "V020_SIGNED_RESIDENT_RECOVERY")
                 media_budget = rows(lines, "V020_SIGNED_MEDIA_BUDGET")
                 first_step = 0 if early_boot else 1
                 steps = [step for step, _, _ in recovery]
+                complete_steps = list(range(first_step, 3 + len(ROLES) + (3 if expect_business else 0)))
                 require(trace_size in (SIGNED_TRACE_BYTES, SIGNED_EARLY_TRACE_BYTES)
-                        and steps in (list(range(first_step, 3)),
-                                      list(range(first_step, 3 + len(ROLES))))
+                        and (steps == complete_steps
+                             or (not expect_business and steps == list(range(first_step, 3))))
                         and all(0 < used <= quota == RECOVERY_NS for _, used, quota in recovery),
                         "signed startup lacks a Recovery settlement")
                 ready = lines.index(f"V020_SIGNED_RESIDENT_BOOT a={epoch} b={len(ROLES)} c=0")
@@ -370,13 +418,15 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
             require(decoder.loss == decoder.corrupt == 0, "corrupt resident console trace")
             if socket_path is not None:
                 result.update(capture_budget_trace(socket_path, elf, output, deadline,
-                                                   frame_table=geometry))
+                                                   frame_table=geometry,
+                                                   expect_business=expect_business))
             if geometry is not None:
                 samples = verify_resident_budget(lines, progress)
                 result.update(verify_signed_trace(
                     (output / TRACE_FILE).read_bytes(), epoch, result["roles"],
                     [used for _, used, _ in recovery], samples,
                     media_budget=result["media_budget"], frame_budget=result["frame_budget"],
+                    business_entropy_budget=result.get("business_entropy_budget"),
                 ))
             require(sha(elf) == elf_digest, "kernel ELF changed during the run")
             result["status"] = "PASS"
@@ -414,6 +464,10 @@ def main() -> int:
     policy.add_argument("--policy-envelope", type=Path,
                         help="independent signed lifecycle envelope for a specific volume")
     parser.add_argument("--budget-trace", action="store_true", help="replay stopped CPU0 per-role and per-window debits")
+    parser.add_argument("--unqualified-roster-elf", type=Path, action="append", default=[],
+                        help="default image whose missing or incorrect package signature must fence before media")
+    parser.add_argument("--expect-business-reopen", action="store_true",
+                        help="reopen image carries an independently signed business package")
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args()
     expected_envelope = None if args.policy_envelope is None else args.policy_envelope.read_bytes()
@@ -427,7 +481,9 @@ def main() -> int:
     version = subprocess.check_output([binary, "--version"], timeout=10, text=True).splitlines()[0]
     require(version.startswith("QEMU emulator version 10.2.2"), "unverified QEMU version")
     args.output.mkdir(parents=True, exist_ok=False)
-    summary = {"scope": "native-signed-scratch-role-lifecycle", "status": "FAIL",
+    scope = ("native-signed-resident-business" if args.expect_business_reopen
+             else "native-signed-scratch-role-lifecycle")
+    summary = {"scope": scope, "status": "FAIL",
                "qemu_version": version, "qemu_sha256": binary_digest,
                "patch_sha256": patch_digest, "cpu_accounting": "pinned-per-vcpu-pmu",
                "complete_production_accounting": False}
@@ -445,7 +501,8 @@ def main() -> int:
                 run = boot(binary, elf, args.output / name, args.timeout, medium, epoch,
                            expected_policy_sha256=args.policy_sha256,
                            expected_policy_envelope=expected_envelope,
-                           budget_trace=args.budget_trace and epoch is not None)
+                           budget_trace=args.budget_trace and epoch is not None,
+                           expect_business=name == "reopen" and args.expect_business_reopen)
                 summary[name] = run
                 require(run["status"] == "PASS", f"{name}: {run.get('error')}")
                 if name == "blank_reopen":
@@ -462,7 +519,18 @@ def main() -> int:
                             trace, epoch, run["roles"], [row[1] for row in run["recovery"]],
                             run["cpu0_pmu_ledger_idle_ns"],
                             media_budget=run.get("media_budget"),
+                            business_entropy_budget=run.get("business_entropy_budget"),
                         ))
+                if name == "fresh":
+                    for index, unqualified in enumerate(args.unqualified_roster_elf):
+                        case = f"unqualified_roster_{index + 1}"
+                        before = sha(disk)
+                        refused = boot(binary, unqualified, args.output / case, args.timeout,
+                                       disk, None, unqualified_roster=True)
+                        summary[case] = refused
+                        require(refused["status"] == "PASS", f"{case}: {refused.get('error')}")
+                        require(sha(disk) == before, "unqualified role roster changed the volume")
+                        refused["unchanged_media_sha256"] = before
         summary["status"] = "PASS"
     except (ValueError, OSError, struct.error) as error:
         summary["error"] = f"{type(error).__name__}: {error}"

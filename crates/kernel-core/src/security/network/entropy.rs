@@ -5,6 +5,7 @@ use zeroize::{Zeroize, Zeroizing};
 const PERSONALIZATION: &[u8] = b"CYX/DRBG/v1";
 const TLS_LABEL: &[u8] = b"CYX/TLS/v1";
 const TCP_ISN_LABEL: &[u8] = b"CYX/TCP-ISN/v1";
+const ASLR_LABEL: &[u8] = b"CYX/ASLR/v1";
 pub const INIT_SEED_BYTES: usize = 48;
 pub const RESEED_BYTES: usize = 32;
 pub const MAX_REQUEST_BYTES: usize = 4096;
@@ -138,6 +139,7 @@ impl Drop for HmacDrbg {
 pub enum Domain {
     Tls,
     TcpIsn,
+    Aslr,
 }
 
 /// The root instance generates a fresh 32-byte master at each key epoch.
@@ -147,6 +149,7 @@ pub struct NetworkRandom {
     root: HmacDrbg,
     tls: HmacDrbg,
     tcp_isn: HmacDrbg,
+    aslr: HmacDrbg,
     boot_epoch: u64,
     key_epoch: u64,
     seeded_at_ms: u64,
@@ -163,11 +166,12 @@ impl NetworkRandom {
             return Err(Error::Invalid);
         }
         let mut root = HmacDrbg::instantiate(seed);
-        let (tls, tcp_isn) = Self::derive_domains(&mut root, boot_epoch, 1);
+        let (tls, tcp_isn, aslr) = Self::derive_domains(&mut root, boot_epoch, 1);
         Ok(Self {
             root,
             tls,
             tcp_isn,
+            aslr,
             boot_epoch,
             key_epoch: 1,
             seeded_at_ms: now_ms,
@@ -181,7 +185,7 @@ impl NetworkRandom {
         root: &mut HmacDrbg,
         boot_epoch: u64,
         key_epoch: u64,
-    ) -> (HmacDrbg, HmacDrbg) {
+    ) -> (HmacDrbg, HmacDrbg, HmacDrbg) {
         let mut master = Zeroizing::new([0u8; 32]);
         root.generate(&mut master[..]);
         let prk = Zeroizing::new(hmac_sha256(&[0; 32], &master[..]));
@@ -199,7 +203,11 @@ impl NetworkRandom {
             seed[40..].copy_from_slice(&key);
             HmacDrbg::instantiate(&seed)
         };
-        (instantiate(TLS_LABEL), instantiate(TCP_ISN_LABEL))
+        (
+            instantiate(TLS_LABEL),
+            instantiate(TCP_ISN_LABEL),
+            instantiate(ASLR_LABEL),
+        )
     }
 
     fn observe_clock(&mut self, now_ms: u64) -> Result<(), Error> {
@@ -219,7 +227,7 @@ impl NetworkRandom {
         Ok(self.calls >= RESEED_CALLS || now_ms - self.seeded_at_ms >= RESEED_MS)
     }
 
-    /// Replace both old domain streams only after accepting fresh entropy.
+    /// Replace the old domain streams only after accepting fresh entropy.
     pub fn reseed(&mut self, entropy: &[u8; RESEED_BYTES], now_ms: u64) -> Result<(), Error> {
         self.observe_clock(now_ms)?;
         let Some(next_epoch) = self.key_epoch.checked_add(1) else {
@@ -227,7 +235,7 @@ impl NetworkRandom {
             return Err(Error::Exhausted);
         };
         self.root.update(entropy);
-        (self.tls, self.tcp_isn) =
+        (self.tls, self.tcp_isn, self.aslr) =
             Self::derive_domains(&mut self.root, self.boot_epoch, next_epoch);
         self.key_epoch = next_epoch;
         self.seeded_at_ms = now_ms;
@@ -258,6 +266,7 @@ impl NetworkRandom {
             let stream = match domain {
                 Domain::Tls => &mut self.tls,
                 Domain::TcpIsn => &mut self.tcp_isn,
+                Domain::Aslr => &mut self.aslr,
             };
             stream.generate(output);
             self.calls += 1;
@@ -271,6 +280,7 @@ impl NetworkRandom {
         self.root.zeroize();
         self.tls.zeroize();
         self.tcp_isn.zeroize();
+        self.aslr.zeroize();
         self.closed = true;
     }
 }
@@ -349,6 +359,15 @@ mod tests {
         assert_ne!(tls, other);
         a.fill(Domain::Tls, &mut same, 10).unwrap();
         assert_ne!(tls, same);
+
+        let mut aslr = [0; 32];
+        a.fill(Domain::Aslr, &mut aslr, 10).unwrap();
+        b.fill(Domain::Aslr, &mut same, 10).unwrap();
+        newer.fill(Domain::Aslr, &mut other, 10).unwrap();
+        assert_eq!(aslr, same);
+        assert_ne!(aslr, tls);
+        assert_ne!(aslr, tcp);
+        assert_ne!(aslr, other);
     }
 
     #[test]

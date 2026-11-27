@@ -17,6 +17,7 @@ pub const CONTROL_CPU: usize = 0;
 pub const CONTROL_MASK: u64 = 0b0001;
 pub const BUSINESS_MASK: u64 = 0b1110;
 pub const ALL_BUSINESS_COUNT: u32 = 3;
+pub const BUSINESS_THREAD_ID_BASE: u64 = 0x100;
 pub const CONTROL_BUDGET_NS: u64 = 70_000_000;
 pub const CONTROL_WINDOW_NS: u64 = 100_000_000;
 

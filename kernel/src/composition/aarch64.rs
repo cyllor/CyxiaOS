@@ -2,13 +2,19 @@
 #[cfg(all(
     feature = "v0199-cpu0-role-selftest",
     any(
-        feature = "ai-control-selftest", feature = "prototype-runtime",
-        feature = "unified-runtime", feature = "net-selftest",
-        feature = "model-v13-selftest", feature = "storage-v13-selftest",
-        feature = "tcp-v13-selftest", feature = "register-v15-selftest"
+        feature = "ai-control-selftest",
+        feature = "prototype-runtime",
+        feature = "unified-runtime",
+        feature = "net-selftest",
+        feature = "model-v13-selftest",
+        feature = "storage-v13-selftest",
+        feature = "tcp-v13-selftest",
+        feature = "register-v15-selftest"
     )
 ))]
-compile_error!("V0.19.9 CPU0 role fixture cannot mix historical control/cluster acceptance profiles");
+compile_error!(
+    "V0.19.9 CPU0 role fixture cannot mix historical control/cluster acceptance profiles"
+);
 #[cfg(all(
     feature = "register-v15-selftest",
     any(
@@ -76,9 +82,17 @@ mod a02_capture;
 #[cfg(feature = "unified-runtime")]
 #[path = "../diagnostics/a03_demand.rs"]
 mod a03_demand;
+#[cfg(not(feature = "selftest"))]
+#[path = "../desktop/address_space.rs"]
+mod address_space;
+#[cfg(not(feature = "selftest"))]
+#[path = "../desktop/ai.rs"]
+mod ai;
 #[cfg(feature = "unified-runtime")]
 #[path = "../runtime/recovery/boot_recovery.rs"]
 mod boot_recovery;
+#[path = "../platform/virt/clock.rs"]
+mod clock;
 #[cfg(feature = "tcp-v13-selftest")]
 #[path = "../runtime/network/cluster_transport.rs"]
 mod cluster_transport;
@@ -109,6 +123,22 @@ mod domain_storage;
 #[cfg(feature = "unified-runtime")]
 #[path = "../runtime/tasks/domain_tasks.rs"]
 mod domain_tasks;
+#[cfg(any(
+    feature = "tcp-v13-selftest",
+    feature = "unified-runtime",
+    all(feature = "ported", not(feature = "selftest"))
+))]
+#[path = "../desktop/entropy.rs"]
+mod entropy;
+#[cfg(all(feature = "ported", not(feature = "selftest")))]
+#[path = "../desktop/memory/exec_memory.rs"]
+mod exec_memory;
+#[cfg(feature = "graphics")]
+#[path = "../desktop/graphics.rs"]
+mod graphics;
+#[cfg_attr(feature = "smp-selftest", allow(dead_code))]
+#[path = "../platform/virt/interrupts.rs"]
+mod interrupts;
 #[cfg(feature = "unified-runtime")]
 #[path = "../runtime/learning/learning_canary.rs"]
 mod learning_canary;
@@ -151,9 +181,18 @@ mod ownership_evidence;
 #[cfg(feature = "unified-runtime")]
 #[path = "../runtime/cluster/peer_replay.rs"]
 mod peer_replay;
+#[cfg(not(feature = "selftest"))]
+#[path = "../desktop/process_arch.rs"]
+mod process_arch;
 #[cfg(feature = "unified-runtime")]
 #[path = "../runtime/services/service_windows.rs"]
 mod service_windows;
+#[cfg(all(feature = "ported", not(feature = "selftest")))]
+#[path = "../desktop/memory/shared_memory.rs"]
+mod shared_memory;
+#[cfg(not(feature = "selftest"))]
+#[path = "../desktop/shell.rs"]
+mod shell;
 #[cfg(feature = "smp-selftest")]
 #[cfg_attr(
     any(
@@ -167,6 +206,9 @@ mod service_windows;
 )]
 #[path = "../arch/aarch64/smp.rs"]
 mod smp;
+#[cfg(not(feature = "selftest"))]
+#[path = "../desktop/storage.rs"]
+mod storage;
 #[cfg(feature = "unified-runtime")]
 #[path = "../diagnostics/storage_fault_capture.rs"]
 mod storage_fault_capture;
@@ -180,44 +222,8 @@ mod unified_store;
 #[path = "../runtime/cluster/unified_task.rs"]
 mod unified_task;
 #[cfg(not(feature = "selftest"))]
-#[path = "../desktop/ai.rs"]
-mod ai;
-#[path = "../platform/virt/clock.rs"]
-mod clock;
-#[cfg(any(
-    feature = "tcp-v13-selftest",
-    feature = "unified-runtime",
-    all(feature = "ported", not(feature = "selftest"))
-))]
-#[path = "../desktop/entropy.rs"]
-mod entropy;
-#[cfg(all(feature = "ported", not(feature = "selftest")))]
-#[path = "../desktop/memory/exec_memory.rs"]
-mod exec_memory;
-#[cfg(feature = "graphics")]
-#[path = "../desktop/graphics.rs"]
-mod graphics;
-#[cfg_attr(feature = "smp-selftest", allow(dead_code))]
-#[path = "../platform/virt/interrupts.rs"]
-mod interrupts;
-#[cfg(all(feature = "ported", not(feature = "selftest")))]
-#[path = "../desktop/memory/shared_memory.rs"]
-mod shared_memory;
-#[cfg(not(feature = "selftest"))]
-#[path = "../desktop/shell.rs"]
-mod shell;
-#[cfg(not(feature = "selftest"))]
-#[path = "../desktop/storage.rs"]
-mod storage;
-#[cfg(not(feature = "selftest"))]
 #[path = "../desktop/user.rs"]
 mod user;
-#[cfg(not(feature = "selftest"))]
-#[path = "../desktop/process_arch.rs"]
-mod process_arch;
-#[cfg(not(feature = "selftest"))]
-#[path = "../desktop/address_space.rs"]
-mod address_space;
 #[cfg(not(feature = "selftest"))]
 #[path = "../desktop/memory/user_heap.rs"]
 mod user_heap;
@@ -229,6 +235,7 @@ mod user_heap;
     feature = "tcp-v13-selftest",
     feature = "prototype-runtime",
     feature = "net-selftest",
+    feature = "v020-production",
     feature = "v020-production-diagnostic",
     cyxia_startup_catalog,
     feature = "v0199-sec-n-selftest",
@@ -238,6 +245,6 @@ mod user_heap;
 mod virtio_platform;
 // SEC-N production VirtIO-net device init. Gated behind the existing
 // SEC-N virtio networking for the explicit V0.20 native diagnostic profile.
-#[cfg(feature = "v020-production-diagnostic")]
+#[cfg(any(feature = "v020-production-diagnostic", cyxia_resident_net))]
 #[path = "../platform/virt/net_device.rs"]
 mod net_device;

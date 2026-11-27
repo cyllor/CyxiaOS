@@ -1,6 +1,6 @@
-//! Default AArch64 startup with a build-pinned external catalog. The signed
-//! SIM admission reopens an existing compatible volume and runs only its
-//! authorized lifecycle roles. This owner has no diagnostic service bridge.
+//! Default AArch64 startup with a build-pinned external catalog. Admission
+//! reopens an existing compatible volume and launches the verified roster.
+//! An independently signed workload may run on the fixed business CPUs.
 
 use super::*;
 use crate::ExceptionFrame;
@@ -9,18 +9,29 @@ use cyxia_kernel_core::control_plane::{
     role_manifest_v0199::{NativeRole, NativeRoleManifest, ROLE_COUNT, ROLES, Role},
 };
 
+mod copy_window;
 #[path = "frames.rs"]
-mod frames;
+pub(crate) mod frames;
 #[path = "media_staging.rs"]
 mod media_staging;
+#[cfg(any(cyxia_business_package, cyxia_resident_net))]
+mod net_entropy;
+#[cfg(cyxia_resident_net)]
+pub(super) mod net_resident;
+#[cfg(cyxia_resident_net)]
+pub(super) mod network_worker;
 #[path = "recovery.rs"]
 mod recovery;
 #[path = "resident.rs"]
 mod resident;
 #[path = "role_loader.rs"]
 mod role_loader;
+#[cfg(cyxia_business_package)]
+pub(super) mod signed_business;
+mod signed_control;
 #[path = "signed_resident.rs"]
 mod signed_resident;
+mod signed_syscalls;
 #[path = "startup_catalog.rs"]
 mod startup_catalog;
 
@@ -30,6 +41,7 @@ use role_loader::{
 };
 
 const E_AUTH: i64 = -1;
+const EFAULT: i64 = -12;
 
 pub(crate) fn run(info: &BootInfo) -> ! {
     signed_resident::run(info)

@@ -114,6 +114,30 @@ impl Workspace {
         }
     }
 
+    /// Validate the transaction cursor of every receipt retained in the
+    /// checkpointed homes of the exclusive mount. A bound terminal result
+    /// needs a retained transaction identity within the selected checkpoint.
+    pub fn verify_checkpointed_receipts(&self, checkpoint: SuperblockV1) -> Result<(), Error> {
+        use super::file_media_v0199::{FileReceiptV4, RECEIPT_BYTES};
+
+        for raw in self.receipts.chunks_exact(RECEIPT_BYTES) {
+            if raw.iter().all(|&byte| byte == 0) {
+                continue;
+            }
+            let receipt = FileReceiptV4::decode(raw)?;
+            let terminal_effect = matches!(receipt.status, 3 | 4)
+                || receipt.status == 6 && receipt.operation_digest != [0; 32];
+            if receipt.fs_uuid != checkpoint.fs_uuid
+                || receipt.log_epoch >= checkpoint.log_epoch
+                || receipt.commit_lsn > checkpoint.checkpoint_lsn
+                || terminal_effect && receipt.commit_lsn == 0
+            {
+                return Err(Error::Conflict);
+            }
+        }
+        Ok(())
+    }
+
     /// Check the receipt/query view captured by a successful exclusive mount
     /// after the owner independently verifies the single paired BootEpoch redo.
     /// That transaction changes only the boot and security homes, so the
@@ -124,6 +148,45 @@ impl Workspace {
         prior: &MountEvidence,
         committed: &SecurityStateStoreV2,
         config: &VerifiedOfflineConfig<'_>,
+    ) -> Result<[u8; 32], Error> {
+        let old_security = prior.security;
+        let expected = SecurityStateStoreV2 {
+            state_generation: old_security
+                .state_generation
+                .checked_add(1)
+                .ok_or(Error::Exhausted)?,
+            last_boot_epoch: old_security
+                .last_boot_epoch
+                .checked_add(1)
+                .ok_or(Error::Exhausted)?,
+            ..old_security
+        };
+        self.confirmed_receipt_query_digest_for(prior, committed, config, &expected)
+    }
+
+    /// Rebind the read-only receipt view after a signed TLS transition
+    /// changed only the two protected boot homes.
+    pub fn confirmed_receipt_query_digest_after_tls(
+        &self,
+        prior: &MountEvidence,
+        committed: &SecurityStateStoreV2,
+        transition: super::boot_epoch_v1::TlsBootTransition<'_>,
+    ) -> Result<[u8; 32], Error> {
+        let expected = transition.successor_state(&prior.security)?;
+        self.confirmed_receipt_query_digest_for(
+            prior,
+            committed,
+            transition.current().config(),
+            &expected,
+        )
+    }
+
+    fn confirmed_receipt_query_digest_for(
+        &self,
+        prior: &MountEvidence,
+        committed: &SecurityStateStoreV2,
+        config: &VerifiedOfflineConfig<'_>,
+        expected: &SecurityStateStoreV2,
     ) -> Result<[u8; 32], Error> {
         let old_boot = BootEpochStoreV1::decode(&self.boot)?;
         let old_security = SecurityStateStoreV2::decode(&self.security)?;
@@ -139,18 +202,7 @@ impl Workspace {
         {
             return Err(Error::Conflict);
         }
-        let expected = SecurityStateStoreV2 {
-            state_generation: old_security
-                .state_generation
-                .checked_add(1)
-                .ok_or(Error::Exhausted)?,
-            last_boot_epoch: old_security
-                .last_boot_epoch
-                .checked_add(1)
-                .ok_or(Error::Exhausted)?,
-            ..old_security
-        };
-        if committed != &expected {
+        if committed != expected {
             return Err(Error::Conflict);
         }
         let _view = super::file_receipt_query_v4::MountedReceiptQuery::new(
@@ -459,6 +511,61 @@ mod tests {
     const RECEIPTS: u32 = 7003;
     const ACL: u32 = 7010;
     const ROOT: u32 = 7014;
+
+    #[test]
+    fn checkpoint_bounds_require_transaction_evidence_for_bound_terminal_results() {
+        use crate::security::file_media_v0199::{FileReceiptV4, RECEIPT_BYTES, local_request_id};
+
+        let checkpoint = SuperblockV1 {
+            fs_uuid: [1; 16],
+            generation: 3,
+            log_epoch: 3,
+            checkpoint_lsn: 13,
+        };
+        let record = FileReceiptV4 {
+            fs_uuid: checkpoint.fs_uuid,
+            issued_boot_epoch: 2,
+            group_id: 0,
+            group_generation: 1,
+            stream_slot: 0,
+            stream_generation: 1,
+            request_seq: 1,
+            log_epoch: 0,
+            txid: 0,
+            commit_lsn: 0,
+            write_seq: 0,
+            status: 1,
+            result: 0,
+            completed_prefix: 0,
+            operation_digest: [0; 32],
+            output_digest: [0; 32],
+            request_id: local_request_id(0, 0, 1).unwrap(),
+            owner_principal_id: 1,
+        };
+        let done = FileReceiptV4 {
+            status: 3,
+            operation_digest: [2; 32],
+            ..record
+        };
+        let committed = FileReceiptV4 {
+            log_epoch: 2,
+            txid: 2,
+            commit_lsn: 13,
+            ..done
+        };
+        let mut workspace = Workspace::new();
+        for (receipt, expected) in [
+            (record, Ok(())),
+            (done, Err(Error::Conflict)),
+            (committed, Ok(())),
+            (FileReceiptV4 { commit_lsn: 14, ..committed }, Err(Error::Conflict)),
+            (FileReceiptV4 { log_epoch: 3, ..committed }, Err(Error::Conflict)),
+        ] {
+            workspace.receipts[..RECEIPT_BYTES].copy_from_slice(&receipt.encode().unwrap());
+            assert_eq!(workspace.verify_checkpointed_receipts(checkpoint), expected);
+        }
+    }
+
     fn p16(b: &mut [u8], i: usize, v: u16) {
         b[i..i + 2].copy_from_slice(&v.to_le_bytes());
     }
@@ -907,6 +1014,18 @@ mod tests {
         check_signed_fsync_roundtrip_at(1, Some(3), CANONICAL_BUSINESS_START);
     }
 
+    #[test]
+    fn signed_fsync_extends_across_bitmap_boundary_and_cold_recovers() {
+        let boundary = BLOCK as u32 * 8;
+        check_signed_fsync_roundtrip_with_layout(
+            1,
+            Some(2),
+            boundary - 1,
+            boundary - 2,
+            Some(boundary + 1),
+        );
+    }
+
     fn check_signed_fsync_roundtrip(initial_pages: usize, added_pages: Option<usize>) {
         check_signed_fsync_roundtrip_at(initial_pages, added_pages, DATA_START);
     }
@@ -915,6 +1034,22 @@ mod tests {
         initial_pages: usize,
         added_pages: Option<usize>,
         allocation_floor: u32,
+    ) {
+        check_signed_fsync_roundtrip_with_layout(
+            initial_pages,
+            added_pages,
+            allocation_floor,
+            9000,
+            None,
+        );
+    }
+
+    fn check_signed_fsync_roundtrip_with_layout(
+        initial_pages: usize,
+        added_pages: Option<usize>,
+        allocation_floor: u32,
+        data_start: u32,
+        neighbor_home: Option<u32>,
     ) {
         use crate::security::{
             file_admission_flow_v1::FileAdmissionFlowV1,
@@ -982,11 +1117,10 @@ mod tests {
             seal(&mut raw, 76);
             raw
         }
-        const DATA: u32 = 9000;
+        const BITS_PER_BITMAP: u32 = BLOCK as u32 * 8;
         const FSYNC: u64 = 1 << 13;
         const CAP: u64 = 9;
         const BOOT: u64 = 2;
-        const RECEIPT_SLOT: usize = 21;
         let growing = added_pages.is_some();
         let target_pages = initial_pages + added_pages.unwrap_or(0);
         let segmented = target_pages > 120;
@@ -998,17 +1132,23 @@ mod tests {
         } else {
             target_size
         };
-        let neighbor_block = DATA + initial_pages as u32;
+        let adjacent = data_start + initial_pages as u32;
+        let neighbor_block = neighbor_home.unwrap_or(adjacent);
+        let merge_adjacent =
+            initial_pages != 0 && allocation_floor == adjacent && neighbor_block != adjacent;
+        // Slot 106 straddles the last two pages of the store. They must
+        // survive reuse of the receipt scan buffer for the growth bitmaps.
+        let receipt_slot = if merge_adjacent { 106 } else { 21 };
         let mut source = fixture();
         source.set_allocated(STATE_HOME + 1, false);
-        for block in DATA..DATA + initial_pages as u32 {
+        for block in data_start..adjacent {
             source.set_allocated(block, true);
         }
         inode(
             source.inode_slot(1),
             1,
             initial_size as u64,
-            DATA,
+            data_start,
             initial_pages as u32,
         );
         if growing {
@@ -1086,12 +1226,13 @@ mod tests {
         .unwrap();
         let mut first = [0; BLOCK];
         let mut second = [0; BLOCK];
-        let receipt_at = RECEIPT_SLOT * RECEIPT_BYTES % BLOCK;
+        let receipt_home = RECEIPTS + (receipt_slot * RECEIPT_BYTES / BLOCK) as u32;
+        let receipt_at = receipt_slot * RECEIPT_BYTES % BLOCK;
         first[receipt_at..].copy_from_slice(&issued[..BLOCK - receipt_at]);
         second[..RECEIPT_BYTES - (BLOCK - receipt_at)]
             .copy_from_slice(&issued[BLOCK - receipt_at..]);
-        source.0.insert(RECEIPTS, Box::new(first));
-        source.0.insert(RECEIPTS + 1, Box::new(second));
+        source.0.insert(receipt_home, Box::new(first));
+        source.0.insert(receipt_home + 1, Box::new(second));
         source.0.insert(
             0,
             Box::new(superblock(SuperblockV1 {
@@ -1241,10 +1382,17 @@ mod tests {
             (receipt, redo.ordered_digest())
         };
         let mut raw = [0; BLOCK];
-        let mut bitmap_before = [0; BLOCK];
-        writer
-            .read_committed(BITMAP_START, &mut bitmap_before)
-            .unwrap();
+        let mut bitmaps_before = [[0; BLOCK]; 2];
+        let first_bitmap = allocation_floor / BITS_PER_BITMAP;
+        let last_bitmap = added_pages.map_or(first_bitmap, |added| {
+            (allocation_floor + added as u32 - 1) / BITS_PER_BITMAP
+        });
+        let bitmap_count = (last_bitmap - first_bitmap + 1) as usize;
+        for (page, bits) in bitmaps_before[..bitmap_count].iter_mut().enumerate() {
+            writer
+                .read_committed(BITMAP_START + first_bitmap + page as u32, bits)
+                .unwrap();
+        }
         let (bound, _) = committed(&mut writer, &job, 8);
         assert_eq!((bound.status, bound.completed_prefix), (2, 0));
         writer.read_committed(INODE_START, &mut raw).unwrap();
@@ -1255,12 +1403,16 @@ mod tests {
         let first_candidate = if initial_pages == 0 {
             allocation_floor
         } else {
-            DATA
+            data_start
         };
         writer.read_committed(first_candidate, &mut raw).unwrap();
         assert!(raw.iter().all(|&byte| byte == 0));
-        writer.read_committed(BITMAP_START, &mut raw).unwrap();
-        assert_eq!(raw, bitmap_before);
+        for (page, bits) in bitmaps_before[..bitmap_count].iter().enumerate() {
+            writer
+                .read_committed(BITMAP_START + first_bitmap + page as u32, &mut raw)
+                .unwrap();
+            assert_eq!(&raw, bits);
+        }
         let (mut writer, final_epoch) = if !segmented {
             (writer, CHECKPOINT.log_epoch)
         } else {
@@ -1295,7 +1447,7 @@ mod tests {
                     .unwrap();
                 for block in allocation_floor..allocation_floor + prefix_growth as u32 {
                     let bit = block as usize;
-                    bitmap_before[bit / 8] |= 1 << (bit % 8);
+                    bitmaps_before[0][bit / 8] |= 1 << (bit % 8);
                     writer
                         .read_committed_at(block, prefix.commit_lsn, &mut raw)
                         .unwrap();
@@ -1306,9 +1458,9 @@ mod tests {
                 }
             }
             writer.read_committed(BITMAP_START, &mut raw).unwrap();
-            assert_eq!(raw, bitmap_before);
+            assert_eq!(raw, bitmaps_before[0]);
             let untouched = if prefix_growth == 0 {
-                DATA + prefix_pages as u32
+                data_start + prefix_pages as u32
             } else {
                 allocation_floor + prefix_growth as u32
             };
@@ -1337,22 +1489,27 @@ mod tests {
             )
         };
         let final_pages = target_pages - usize::from(segmented) * 120;
-        // Data + both receipt blocks, index, inode and optional bitmap.
-        let final_log_blocks = 2 + 2 * (final_pages as u32 + 4 + u32::from(growing));
+        // Data + both receipt blocks, index, inode and allocated bitmap pages.
+        let bitmap_homes = if growing { bitmap_count as u32 } else { 0 };
+        let final_log_blocks = 2 + 2 * (final_pages as u32 + 4 + bitmap_homes);
         let (done, committed_digest) = committed(&mut writer, &job, final_log_blocks);
         assert_eq!(done.log_epoch, final_epoch);
         if growing {
-            writer
-                .read_committed_at(BITMAP_START, done.commit_lsn, &mut raw)
-                .unwrap();
             for block in allocation_floor..allocation_floor + added_pages.unwrap() as u32 {
-                let byte = block as usize / 8;
-                bitmap_before[byte] |= 1 << (block % 8);
+                let page = (block / BITS_PER_BITMAP - first_bitmap) as usize;
+                let bit = (block % BITS_PER_BITMAP) as usize;
+                bitmaps_before[page][bit / 8] |= 1 << (bit % 8);
             }
-            assert!(
-                raw == bitmap_before,
-                "growth allocated outside the expected bitmap range"
-            );
+            for (page, bits) in bitmaps_before[..bitmap_count].iter().enumerate() {
+                writer
+                    .read_committed_at(
+                        BITMAP_START + first_bitmap + page as u32,
+                        done.commit_lsn,
+                        &mut raw,
+                    )
+                    .unwrap();
+                assert_eq!(&raw, bits, "unexpected allocated blocks");
+            }
             writer.read_committed(neighbor_block, &mut raw).unwrap();
             assert_eq!(raw, [0xa5; BLOCK]);
         }
@@ -1442,25 +1599,34 @@ mod tests {
                 }
             );
             assert_eq!(neighbor.durable_write_seq, 0);
-            assert_eq!(usize::from(current.extents), initial_extents + 1);
+            assert_eq!(
+                usize::from(current.extents),
+                initial_extents + usize::from(!merge_adjacent)
+            );
             if initial_extents != 0 {
                 assert_eq!(
                     current.runs[0],
                     Extent {
                         logical: 0,
-                        physical: DATA,
-                        count: initial_pages as u32
+                        physical: data_start,
+                        count: if merge_adjacent {
+                            target_pages as u32
+                        } else {
+                            initial_pages as u32
+                        },
                     }
                 );
             }
-            assert_eq!(
-                current.runs[initial_extents],
-                Extent {
-                    logical: initial_pages as u32,
-                    physical: allocation_floor,
-                    count: added_pages.unwrap() as u32
-                }
-            );
+            if !merge_adjacent {
+                assert_eq!(
+                    current.runs[initial_extents],
+                    Extent {
+                        logical: initial_pages as u32,
+                        physical: allocation_floor,
+                        count: added_pages.unwrap() as u32,
+                    }
+                );
+            }
             disk.read(neighbor_block, &mut raw).unwrap();
             assert_eq!(raw, [0xa5; BLOCK]);
         }
@@ -1484,9 +1650,9 @@ mod tests {
             }
         }
         let mut receipt = [0; RECEIPT_BYTES];
-        disk.read(RECEIPTS, &mut raw).unwrap();
+        disk.read(receipt_home, &mut raw).unwrap();
         receipt[..BLOCK - receipt_at].copy_from_slice(&raw[receipt_at..]);
-        disk.read(RECEIPTS + 1, &mut raw).unwrap();
+        disk.read(receipt_home + 1, &mut raw).unwrap();
         receipt[BLOCK - receipt_at..].copy_from_slice(&raw[..RECEIPT_BYTES - (BLOCK - receipt_at)]);
         assert_eq!(FileReceiptV4::decode(&receipt).unwrap(), done);
     }

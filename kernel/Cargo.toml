@@ -69,15 +69,20 @@ v0199-advice-e2e-selftest = ["smp-selftest", "dep:sha2"]
 v0199-cpu0-svc-selftest = ["v0199-advice-e2e-selftest"]
 # The production entry shares fixed SMP bring-up. Native diagnostic builds
 # opt in to bounded ABI3/trap, network and scratch-media evidence.
-v020-production = ["smp-selftest", "dep:sha2", "cyxia-arch-aarch64/software-pan"]
+v020-production = ["smp-selftest", "dep:sha2", "dep:zeroize", "cyxia-arch-aarch64/software-pan"]
 v020-panic-stop-selftest = ["v020-production"]
 v020-panic-stop-late-selftest = ["v020-panic-stop-selftest"]
+v020-panic-stop-dma-selftest = ["v020-panic-stop-selftest", "prototype-memory"]
 v020-production-diagnostic = ["v020-production", "dep:sha2", "sec-n-native"]
 v020-production-media-staging = ["v020-production-diagnostic", "prototype-memory"]
 v020-production-authenticated-net = ["v020-production-diagnostic", "dep:zeroize"]
+# Authorized deployment uses the signed catalog and the 1-GiB FrameMeta ledger.
+v020-production-resident-net = ["v020-production", "sec-n-native", "prototype-memory"]
 v020-production-media-reopen = ["v020-production-media-staging"]
 v020-production-media-signed = ["v020-production-media-staging"]
 v020-production-signed-resident = ["v020-production-media-signed"]
+# Drive the signed CPU0 roles to their evaluation/review limits and retain the terminal PMU trace.
+v020-production-sec-s-load = ["v020-production", "prototype-memory"]
 # Separate signed baseline-v1 file owner on one dedicated test disk.
 v020-production-fsync-scratch = ["v020-production-media-signed"]
 v020-production-media-envelopes = ["v020-production-media-staging"]
@@ -143,7 +148,7 @@ tcp-v13-selftest = ["smp-selftest", "prototype-memory", "dep:cyxia-cluster-trans
 prototype-runtime = ["smp-selftest", "prototype-memory"]
 # Continuous AI core scheduling and protected authenticated cluster service together.
 # The legacy diagnostic path keeps the historical prototype wire codec available.
-unified-runtime = ["prototype-runtime", "dep:cyxia-cluster-transport", "dep:sha2", "dep:cyxia-peer-billing", "cyxia-prototype/legacy-cluster"]
+unified-runtime = ["prototype-runtime", "dep:cyxia-cluster-transport", "dep:sha2", "dep:cyxia-peer-billing", "cyxia-prototype/legacy-cluster", "cyxia-arch-aarch64/software-pan"]
 prototype-memory = ["cyxia-platform-virt/prototype-memory"]
 graphics = []
 # The historical desktop/ported reference profiles keep the retired CPU0

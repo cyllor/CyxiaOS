@@ -170,6 +170,16 @@ def preserve_disk(disk: Path, output: Path, expected: str) -> str:
     return expected
 
 
+def seal_seed_capture(seed: dict, seed_dir: Path, disk: Path) -> None:
+    """Seal a returned boot's raw evidence even when its semantic check failed."""
+    seed["capture_sha256"] = {
+        name: sha(seed_dir / name) for name in ("serial.bin", "serial.txt", "qemu-stderr.log")
+    }
+    seed["preserved_disk_sha256"] = preserve_disk(disk, seed_dir / "scratch-after.raw", sha(disk))
+    require(seed["status"] == "PASS",
+            "could not seed a signed volume at BootEpoch 1: " + str(seed.get("error", "unknown")))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("fresh-elf", "reopen-elf", "qemu", "qemu-source", "output"):
@@ -199,12 +209,8 @@ def main() -> int:
         result["initial_disk_sha256"] = sha(disk)
         seed_dir = output / "seed"
         result["seed"] = boot(str(binary), fresh, seed_dir, args.timeout, disk, 1)
-        require(result["seed"]["status"] == "PASS", "could not seed a signed volume at BootEpoch 1")
         seed = result["seed"]
-        seed["capture_sha256"] = {
-            name: sha(seed_dir / name) for name in ("serial.bin", "serial.txt", "qemu-stderr.log")
-        }
-        seed["preserved_disk_sha256"] = preserve_disk(disk, seed_dir / "scratch-after.raw", sha(disk))
+        seal_seed_capture(seed, seed_dir, disk)
         negative_dir = output / "without-flush"
         result["without_flush"] = reopen(binary, reopen_elf, disk, negative_dir, args.timeout,
                                          flush=False)

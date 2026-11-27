@@ -26,9 +26,17 @@
 //! conjunction was never satisfiable in any build; default, host and
 //! non-full-os builds stay unattached). Native boot verification of the
 //! desktop attachment remains open.
+//!
+//! The native task pool uses the same row layout and exact-address allocation
+//! transitions through `RuntimePool`. Its FrameMeta mapping and pin references
+//! fence each anonymous page through confirmed revocation and reuse.
 use crate::frames::{FrameError, FrameRecorder, FrameSnapshot};
 use crate::security::Error;
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind, TaskId};
+
+mod runtime_pool;
+pub use runtime_pool::{Pin, RuntimePool};
+
 pub const PAGE: u64 = 4096;
 pub const COUNT: usize = 262144;
 pub const RAM_BYTES: u64 = COUNT as u64 * PAGE;
@@ -45,6 +53,9 @@ const QUARANTINED: u32 = 3;
 const PERMANENT: u32 = 4;
 const DIRTY: u32 = 8;
 const SECRET: u32 = 16;
+
+mod dma;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameMeta {
@@ -85,7 +96,13 @@ impl FrameMeta {
         }
     }
     fn empty_refs(self) -> bool {
-        self.refcnt == 0 && self.pin_count == 0 && self.dma_inflight == 0 && self.share_count == 0
+        self.only_mapping_refs(0)
+    }
+    fn only_mapping_refs(self, mappings: u32) -> bool {
+        self.refcnt == mappings
+            && self.pin_count == 0
+            && self.dma_inflight == 0
+            && self.share_count == 0
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,9 +137,7 @@ pub enum Reference {
     Share,
 }
 /// Owner class of a statically registered permanent region. The class is
-/// recorded on the region record, never on the row: PERMANENT rows stay
-/// unowned with empty reference counters, exactly like the fixed regions
-/// of the full-RAM ledger.
+/// recorded on the region. Arena rows may also record dedicated DMA owners.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StaticClass {
     Arena,
@@ -486,8 +501,10 @@ impl<'a> Ledger<'a> {
         let first = ((span.start - self.base) / PAGE) as usize;
         let last = ((span.end - 1 - self.base) / PAGE) as usize;
         self.rows.get(first..=last).is_some_and(|rows| {
-            rows.iter()
-                .all(|row| *row == FrameMeta::unowned(PERMANENT, 0))
+            rows.iter().all(|row| {
+                *row == FrameMeta::unowned(PERMANENT, 0)
+                    || (class == StaticClass::Arena && row.is_static_dma())
+            })
         })
     }
 
@@ -590,9 +607,9 @@ impl<'a> Ledger<'a> {
         checkpoint: &mut impl FnMut() -> Result<(), Error>,
     ) -> Result<Inventory, Error> {
         let mut counts = [0u32; 5];
-        for batch in self.rows.chunks(ROW_BATCH) {
+        for (batch_index, batch) in self.rows.chunks(ROW_BATCH).enumerate() {
             checkpoint()?;
-            for r in batch {
+            for (index, r) in batch.iter().enumerate() {
                 let state = r.flags & STATE;
                 if r.flags & !(STATE | DIRTY | SECRET) != 0 || state > PERMANENT {
                     return Err(Error::Conflict);
@@ -600,7 +617,12 @@ impl<'a> Ledger<'a> {
                 // Pool-mode quarantine mirrors the pool's unowned dirty pages
                 // (failed zeroing or completed revocation): fenced from reuse
                 // until a zero proof, with no owner and possibly generation 0.
-                if state == FREE
+                if state == PERMANENT && r.owner_slot != NONE {
+                    let pa = self.base + (batch_index * ROW_BATCH + index) as u64 * PAGE;
+                    if !r.is_static_dma() || !self.statically_pinned(pa..pa + PAGE, StaticClass::Arena) {
+                        return Err(Error::Conflict);
+                    }
+                } else if state == FREE
                     || state == PERMANENT
                     || (self.pool_mode && state == QUARANTINED && r.owner_slot == NONE)
                 {
@@ -842,15 +864,20 @@ impl<'a> Ledger<'a> {
     /// (FREE|DIRTY / unowned QUARANTINED|DIRTY) row becomes ALLOCATED under
     /// the pool's next generation. Generations must stay in lockstep with
     /// the pool; a divergent or already-owned row rejects fail-closed.
-    fn record_alloc(&mut self, address: u64, owner: Owner, generation: u64) -> Result<(), Error> {
+    fn record_alloc(
+        &mut self,
+        address: u64,
+        owner: Owner,
+        generation: u64,
+    ) -> Result<&mut FrameMeta, Error> {
         let r = self.pool_row(address)?;
         if !owner.valid() {
             return Err(Error::Unauthorized);
         }
         let reusable = r.flags == FREE
             || r.flags == (FREE | DIRTY)
-            || (r.flags == (QUARANTINED | DIRTY) && r.owner_slot == NONE);
-        if !reusable || !r.empty_refs() {
+            || r.flags == (QUARANTINED | DIRTY);
+        if !reusable || r.owner_slot != NONE || r.owner_generation != 0 || !r.empty_refs() {
             return Err(Error::Busy);
         }
         let next = r.frame_generation.checked_add(1).ok_or(Error::Capacity)?;
@@ -864,7 +891,7 @@ impl<'a> Ledger<'a> {
             flags: ALLOCATED,
             ..FrameMeta::ZERO
         };
-        Ok(())
+        Ok(r)
     }
     /// Record a failed zeroing of a dirty pool candidate: the row stays
     /// unowned at the same generation but is quarantined, never free.
@@ -1033,6 +1060,7 @@ impl FrameRecorder for PoolBridge<'_> {
         self.ledger
             .borrow_mut()
             .record_alloc(address.0, pool_owner(owner)?, generation)
+            .map(|_| ())
             .map_err(|_| FrameError::Ledger)
     }
     fn zero_failed(&self, address: PhysAddr) -> Result<(), FrameError> {
@@ -2072,17 +2100,18 @@ mod tests {
             bridge.ledger.borrow_mut().record_retired(0x40000000),
             Err(Error::Busy)
         );
-        assert_eq!(
-            bridge.ledger.borrow_mut().record_alloc(
+        assert!(bridge
+            .ledger
+            .borrow_mut()
+            .record_alloc(
                 0x40001000,
                 Owner {
                     slot: 7,
                     generation: 1
                 },
                 1
-            ),
-            Ok(())
-        );
+            )
+            .is_ok());
         assert_eq!(
             bridge.ledger.borrow_mut().record_retired(0x40001000),
             Err(Error::Busy)

@@ -50,6 +50,7 @@ struct ControlView {
     notify: u8,
 }
 static CONTROL_VIEW: read_snapshot::ReadSnapshot<ControlView> = read_snapshot::ReadSnapshot::new();
+#[cfg_attr(feature = "unified-runtime", unsafe(link_section = ".bss.sec_n.dma"))]
 static mut QUEUE: BatchMemory = BatchMemory::zeroed();
 static mut DISK: Option<NativeDisk> = None;
 static mut SCHEDULER: Scheduler = Scheduler::new(16, 16);

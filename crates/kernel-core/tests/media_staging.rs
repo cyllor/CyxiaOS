@@ -30,6 +30,7 @@ struct Disk {
     flushes: u64,
     first_flush_writes: Option<u64>,
     fail_before_write: Option<u64>,
+    fail_before_flush: Option<u64>,
 }
 
 impl EpochBlockIo for Disk {
@@ -52,6 +53,9 @@ impl EpochBlockIo for Disk {
     }
 
     fn flush(&mut self) -> Result<(), Error> {
+        if self.fail_before_flush == Some(self.flushes) {
+            return Err(Error::Unknown);
+        }
         self.first_flush_writes.get_or_insert(self.writes);
         self.flushes += 1;
         Ok(())
@@ -60,6 +64,182 @@ impl EpochBlockIo for Disk {
 
 // These native static workspaces belong to one CPU0 at a time.
 static STAGING_OWNER: Mutex<()> = Mutex::new(());
+
+#[test]
+fn resident_startup_reclaims_genesis_preparations_in_durable_tail_first_order() {
+    use cyxia_kernel_core::security::boot_epoch_v1::{BootEpochStoreV1, TlsBootPolicy};
+    use reopen::BootLogRecovery;
+
+    let _owner = STAGING_OWNER.lock().unwrap();
+    let verified = signed::verify(signed::WIRE, &mut [0; 1024]).unwrap();
+    let policy = TlsBootPolicy::new(&verified, None).unwrap();
+    let mut clean = Disk::default();
+    let checkpoint = volume::format(&mut clean, Some(&verified), LegacyZero).unwrap();
+    let previous = policy.resident_state(0).unwrap();
+    let append = |disk: &mut Disk, previous: &_| {
+        authority::allocate_boot(
+            disk,
+            checkpoint,
+            previous,
+            authority::BootUpdate::Tls(policy),
+            volume::Checkpoints::Resident,
+        )
+    };
+    let interrupted = |writes| {
+        let mut disk = Disk {
+            blocks: clean.blocks.clone(),
+            fail_before_write: Some(writes),
+            ..Disk::default()
+        };
+        assert_eq!(append(&mut disk, &previous).err(), Some(Error::Unknown));
+        // Reopen a new owner against the media left by the failed append.
+        Disk {
+            blocks: disk.blocks,
+            ..Disk::default()
+        }
+    };
+    for (writes, cleared) in [0, 1, 2, 2, 3, 3].into_iter().enumerate() {
+        let mut disk = interrupted(writes as u64);
+        let (selected, mounted, disposition) =
+            reopen::recover_resident_with_reconciliation(&mut disk, checkpoint, policy, None)
+                .unwrap();
+        let expected = if cleared == 0 {
+            BootLogRecovery::Empty
+        } else {
+            BootLogRecovery::DiscardedPreparation {
+                cleared_blocks: cleared,
+            }
+        };
+        assert_eq!(disposition, expected);
+        assert_eq!(selected, checkpoint);
+        assert_eq!(mounted.boot.boot_epoch, 0);
+        assert_eq!(mounted.security, previous);
+        assert_eq!(
+            (disk.writes, disk.flushes),
+            (cleared.into(), cleared.into())
+        );
+        assert!(disk.blocks == clean.blocks);
+    }
+
+    let full_preparation = interrupted(5);
+    let materialized = [
+        volume::FIRST_LOG_BLOCK + 3,
+        volume::FIRST_LOG_BLOCK + 1,
+        volume::FIRST_LOG_BLOCK,
+    ];
+    for cut in 0..materialized.len() {
+        for during_flush in [false, true] {
+            let mut disk = Disk {
+                blocks: full_preparation.blocks.clone(),
+                fail_before_write: (!during_flush).then_some(cut as u64),
+                fail_before_flush: during_flush.then_some(cut as u64),
+                ..Disk::default()
+            };
+            assert_eq!(
+                reopen::recover_resident_with_reconciliation(&mut disk, checkpoint, policy, None)
+                    .err(),
+                Some(Error::Unknown)
+            );
+            let zeroed = cut + usize::from(during_flush);
+            assert_eq!((disk.writes, disk.flushes), (zeroed as u64, cut as u64));
+            for (index, block) in materialized.iter().enumerate() {
+                let expected = if index < zeroed {
+                    [0; BLOCK_BYTES]
+                } else {
+                    full_preparation.blocks[block]
+                };
+                assert_eq!(disk.blocks[block], expected);
+            }
+            // A failed FLUSH can leave the last zeroed block either durable
+            // or absent. This instance observes the write, which is a valid
+            // shorter prefix when the new owner reads it after reset.
+            disk.fail_before_write = None;
+            disk.fail_before_flush = None;
+            let (_, mounted, _) =
+                reopen::recover_resident_with_reconciliation(&mut disk, checkpoint, policy, None)
+                    .unwrap();
+            assert_eq!(mounted.security, previous);
+            assert!(disk.blocks == clean.blocks);
+            let (next, _) = append(&mut disk, &mounted.security).unwrap();
+            assert_eq!(next, 1);
+        }
+    }
+
+    for (block, offset) in [
+        (volume::FIRST_LOG_BLOCK, 56),
+        (volume::FIRST_LOG_BLOCK + 2, 0),
+        (volume::FIRST_LOG_BLOCK + 5, 32),
+        (BITMAP_START - 1, 0),
+    ] {
+        let mut disk = Disk {
+            blocks: full_preparation.blocks.clone(),
+            ..Disk::default()
+        };
+        disk.blocks.get_mut(&block).unwrap()[offset] ^= 1;
+        assert!(
+            reopen::recover_resident_with_reconciliation(&mut disk, checkpoint, policy, None)
+                .is_err()
+        );
+        assert_eq!((disk.writes, disk.flushes), (0, 0));
+    }
+    let mut missing = Disk {
+        blocks: full_preparation.blocks.clone(),
+        ..Disk::default()
+    };
+    missing
+        .blocks
+        .insert(volume::FIRST_LOG_BLOCK + 1, [0; BLOCK_BYTES]);
+    assert!(
+        reopen::recover_resident_with_reconciliation(&mut missing, checkpoint, policy, None)
+            .is_err()
+    );
+    assert_eq!((missing.writes, missing.flushes), (0, 0));
+
+    let mut advanced_home = full_preparation;
+    advanced_home.blocks.insert(
+        volume::BOOT_HOME,
+        BootEpochStoreV1 {
+            fs_uuid: previous.fs_uuid,
+            boot_epoch: 1,
+        }
+        .encode()
+        .unwrap(),
+    );
+    assert!(
+        reopen::recover_resident_with_reconciliation(&mut advanced_home, checkpoint, policy, None)
+            .is_err()
+    );
+    assert_eq!((advanced_home.writes, advanced_home.flushes), (0, 0));
+
+    // The restarted owner can observe a whole COMMIT even though the old
+    // owner's second FLUSH returned UNKNOWN. Protect it before any home write.
+    let mut uncertain_commit = Disk {
+        blocks: clean.blocks,
+        fail_before_flush: Some(1),
+        ..Disk::default()
+    };
+    assert_eq!(
+        append(&mut uncertain_commit, &previous).err(),
+        Some(Error::Unknown)
+    );
+    let mut disk = Disk {
+        blocks: uncertain_commit.blocks,
+        fail_before_flush: Some(0),
+        ..Disk::default()
+    };
+    assert_eq!(
+        reopen::recover_resident_with_reconciliation(&mut disk, checkpoint, policy, None).err(),
+        Some(Error::Unknown)
+    );
+    assert_eq!(disk.writes, 0);
+    disk.fail_before_flush = None;
+    let (selected, mounted, disposition) =
+        reopen::recover_resident_with_reconciliation(&mut disk, checkpoint, policy, None).unwrap();
+    assert_eq!(disk.first_flush_writes, Some(0));
+    assert_eq!((selected.generation, selected.checkpoint_lsn), (2, 4));
+    assert_eq!(mounted.boot.boot_epoch, 1);
+    assert_eq!(disposition, BootLogRecovery::Replayed);
+}
 
 #[test]
 fn signed_boot_recovery_resumes_at_durable_boundaries() {
@@ -206,11 +386,320 @@ fn lifecycle_reopen_uses_the_signed_volume_and_generations() {
     let (_, owner) =
         authority::boot_epoch_owner(&mut disk, checkpoint, &mount.security, config).unwrap();
     assert_eq!(
-        owner
-            .confirmed_boot_policy(&verified)
-            .unwrap()
-            .boot_epoch(),
+        owner.confirmed_boot_policy(&verified).unwrap().boot_epoch(),
         2
+    );
+}
+
+#[test]
+fn signed_resident_reopens_a_baseline_volume_with_ordinary_file_homes() {
+    use cyxia_kernel_core::security::{
+        file_format_v1::{self, FormatWorkspace, SCRATCH_FILE_BLOCK, SCRATCH_FILE_DATA},
+        file_media_v0199::BLOCK_COUNT,
+        recovery_v1::{RecoveryWorkspace, RedoImage, RedoWriter, retire_checkpointed_log},
+    };
+
+    let _owner = STAGING_OWNER.lock().unwrap();
+    let verified = signed::verify(signed::WIRE, &mut [0; 1024]).unwrap();
+    let config = Some(&verified);
+    let mut disk = Disk::default();
+    let first = file_format_v1::format_baseline_with_fsync_scratch_file(
+        &mut disk,
+        BLOCK_COUNT,
+        &volume::format_manifest(config),
+        &mut FormatWorkspace::new(),
+    )
+    .unwrap()
+    .superblock;
+    let mut file = [0; BLOCK_BYTES];
+    disk.read(SCRATCH_FILE_BLOCK, &mut file).unwrap();
+    assert_eq!(&file[..SCRATCH_FILE_DATA.len()], SCRATCH_FILE_DATA);
+
+    let (checkpoint, mounted) = reopen::recover_resident(&mut disk, first, &verified).unwrap();
+    assert_eq!(mounted.structure.directory_entries, 1);
+    assert_eq!(mounted.boot.boot_epoch, 0);
+    assert_eq!(
+        authority::boot_epoch(&mut disk, checkpoint, &mounted.security, config),
+        Ok(1)
+    );
+    let (checkpoint, mounted) = reopen::recover_resident(&mut disk, first, &verified).unwrap();
+    assert_eq!(mounted.structure.directory_entries, 1);
+    assert_eq!(mounted.boot.boot_epoch, 1);
+    assert_eq!(
+        authority::boot_epoch(&mut disk, checkpoint, &mounted.security, config),
+        Ok(2)
+    );
+
+    // A normal directory metadata transaction advances the checkpoint beyond
+    // the boot-only LSN. Provision it through the frozen v1 redo writer.
+    let mut directory = [0; BLOCK_BYTES];
+    disk.read(CANONICAL_BUSINESS_START, &mut directory).unwrap();
+    directory[16..26].copy_from_slice(b"status.txt");
+    let crc = crc32c_zeroed(&directory[..128], 124).unwrap();
+    directory[124..128].copy_from_slice(&crc.to_le_bytes());
+    let images = [RedoImage {
+        home: CANONICAL_BUSINESS_START,
+        contents: &directory,
+    }];
+    let mut journal = RecoveryWorkspace::new();
+    let mut writer = RedoWriter::open(&mut disk, &mut journal, checkpoint).unwrap();
+    let plan = writer.prepare(images.len()).unwrap();
+    writer.append(plan, &images, |_| Ok(())).unwrap();
+    let (_, checkpoint) = writer
+        .checkpoint_verified(|disk, sb| {
+            volume::validate_resident_homes(disk, sb, 2, &verified).map(|_| ())
+        })
+        .unwrap();
+    assert_eq!((checkpoint.generation, checkpoint.checkpoint_lsn), (3, 11));
+    retire_checkpointed_log(&mut disk, &mut journal, checkpoint).unwrap();
+
+    let (selected, mounted) = reopen::recover_resident(&mut disk, checkpoint, &verified).unwrap();
+    assert_eq!(selected, checkpoint);
+    assert_eq!(mounted.structure.directory_entries, 1);
+    assert_eq!(mounted.boot.boot_epoch, 2);
+    let (epoch, _) = authority::boot_epoch_owner_for(
+        &mut disk,
+        checkpoint,
+        &mounted.security,
+        config,
+        volume::Checkpoints::Resident,
+    )
+    .unwrap();
+    assert_eq!(epoch, 3);
+    let (selected, mounted) = reopen::recover_resident(&mut disk, checkpoint, &verified).unwrap();
+    assert_eq!((selected.generation, selected.checkpoint_lsn), (4, 15));
+    assert_eq!(mounted.boot.boot_epoch, 3);
+    assert_eq!(disk.blocks[&CANONICAL_BUSINESS_START], directory);
+    let mut reopened = [0; BLOCK_BYTES];
+    disk.read(SCRATCH_FILE_BLOCK, &mut reopened).unwrap();
+    assert_eq!(reopened, file);
+}
+
+#[test]
+fn signed_tls_boot_pair_rotates_replays_and_revokes_without_changing_file_homes() {
+    use cyxia_kernel_core::security::{
+        boot_epoch_v1::{TlsBootPolicy, TlsBootTransition},
+        network::deployment::{BYTES as MANIFEST_BYTES, KeyManifest},
+        offline_config_v1::{CatalogBindings, SIGNATURE_LABEL, VerifiedOfflineConfig},
+    };
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+
+    let _owner = STAGING_OWNER.lock().unwrap();
+    let key = SigningKey::from_bytes(&[0x39; 32]);
+    let public = key.verifying_key().to_bytes();
+    let sign_config = |generation: u64, key_generation: u64, manifest: &[u8]| {
+        let mut wire = signed::WIRE[..signed::WIRE.len() - 64].to_vec();
+        wire[32..40].copy_from_slice(&generation.to_le_bytes());
+        wire[56..64].copy_from_slice(&key_generation.to_le_bytes());
+        wire[128..160].copy_from_slice(&Sha256::digest(manifest));
+        let signature = key.sign(&[SIGNATURE_LABEL, &wire].concat()).to_bytes();
+        wire.extend_from_slice(&signature);
+        wire
+    };
+    fn verify<'a>(wire: &'a [u8], public: &[u8; 32]) -> VerifiedOfflineConfig<'a> {
+        let bindings = CatalogBindings {
+            rule_generation: u64::from_le_bytes(wire[40..48].try_into().unwrap()),
+            security_generation: u64::from_le_bytes(wire[48..56].try_into().unwrap()),
+            key_generation: u64::from_le_bytes(wire[56..64].try_into().unwrap()),
+            rule_hash: wire[64..96].try_into().unwrap(),
+            security_hash: wire[96..128].try_into().unwrap(),
+            key_manifest_hash: wire[128..160].try_into().unwrap(),
+        };
+        VerifiedOfflineConfig::verify(
+            wire,
+            public,
+            bindings,
+            &mut [0; 1024],
+            |header, _, lists| signed::verify_lifecycle_payload(header, lists),
+        )
+        .unwrap()
+    }
+    let network_manifest = |generation: u64, predecessor: [u8; 32], enabled: bool| {
+        let mut wire = [0u8; MANIFEST_BYTES];
+        wire[..8].copy_from_slice(b"CYXNET01");
+        for at in [8, 16, 24] {
+            wire[at..at + 8].copy_from_slice(&generation.to_le_bytes());
+        }
+        wire[32..64].copy_from_slice(&predecessor);
+        if enabled {
+            wire[64..72].copy_from_slice(&[10, 0, 2, 15, 10, 0, 2, 2]);
+            wire[72] = 24;
+            wire[73] = 1;
+            wire[74..76].copy_from_slice(&7u16.to_le_bytes());
+            wire[76..82].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
+            wire[88..120].fill(4 + generation as u8);
+            wire[120..152].fill(1 + generation as u8);
+            wire[152..184].fill(7);
+        } else {
+            wire[73] = 2;
+        }
+        wire
+    };
+    let old_manifest = network_manifest(1, [0; 32], true);
+    let old_wire = sign_config(1, 1, &old_manifest);
+    let old_config = verify(&old_wire, &public);
+    let old_manifest = KeyManifest::parse(&old_manifest).unwrap().unwrap();
+    let old = TlsBootPolicy::new(&old_config, Some(old_manifest)).unwrap();
+    let active_manifest = network_manifest(2, old_config.digest(), true);
+    let active_wire = sign_config(2, 2, &active_manifest);
+    let active_config = verify(&active_wire, &public);
+    let active_manifest = KeyManifest::parse(&active_manifest).unwrap().unwrap();
+    let active = TlsBootPolicy::new(&active_config, Some(active_manifest)).unwrap();
+    let rotate = TlsBootTransition::new(old, active).unwrap();
+    let mut unrotated_manifest = network_manifest(3, active_config.digest(), true);
+    let listener = active_manifest.listener().unwrap();
+    unrotated_manifest[88..120].copy_from_slice(&listener.local_pin);
+    unrotated_manifest[120..152].copy_from_slice(&listener.peer_pin);
+    let unrotated_wire = sign_config(3, 3, &unrotated_manifest);
+    let unrotated_config = verify(&unrotated_wire, &public);
+    let unrotated = TlsBootPolicy::new(
+        &unrotated_config,
+        KeyManifest::parse(&unrotated_manifest).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        TlsBootTransition::new(active, unrotated).err(),
+        Some(Error::Conflict),
+    );
+    let revoked_manifest = network_manifest(3, active_config.digest(), false);
+    let revoked_wire = sign_config(3, 3, &revoked_manifest);
+    let revoked_config = verify(&revoked_wire, &public);
+    let revoked_manifest = KeyManifest::parse(&revoked_manifest).unwrap().unwrap();
+    let revoked = TlsBootPolicy::new(&revoked_config, Some(revoked_manifest)).unwrap();
+    let revoke = TlsBootTransition::new(active, revoked).unwrap();
+    assert!(TlsBootTransition::new(old, revoked).is_err());
+    assert!(TlsBootTransition::new(revoked, active).is_err());
+
+    let mut disk = Disk::default();
+    let first = volume::format(&mut disk, Some(&old_config), LegacyZero).unwrap();
+    let mounted = volume::mount(&mut disk, first, Some(&old_config), LegacyZero).unwrap();
+    assert_eq!(
+        authority::boot_epoch(&mut disk, first, &mounted.security, Some(&old_config)),
+        Ok(1)
+    );
+    let immutable = disk.blocks[&CANONICAL_BUSINESS_START];
+    let (checkpoint, mounted) =
+        reopen::recover_resident_with_tls(&mut disk, first, active, Some(rotate)).unwrap();
+    assert_eq!(mounted.security, old.resident_state(1).unwrap());
+    assert!(reopen::recover_resident_with_tls(&mut disk, checkpoint, active, None).is_err());
+
+    let boot = |d: &mut Disk, checkpoint, before: &_, update| {
+        authority::allocate_boot(d, checkpoint, before, update, volume::Checkpoints::Resident)
+    };
+    for update in [
+        authority::BootUpdate::Tls(old),
+        authority::BootUpdate::Rotate(rotate),
+    ] {
+        let mut incomplete = Disk {
+            blocks: disk.blocks.clone(),
+            fail_before_write: Some(5),
+            ..Disk::default()
+        };
+        assert_eq!(
+            boot(&mut incomplete, checkpoint, &mounted.security, update).err(),
+            Some(Error::Unknown)
+        );
+        incomplete.fail_before_write = None;
+        if matches!(update, authority::BootUpdate::Rotate(_)) {
+            let effects = (incomplete.writes, incomplete.flushes);
+            assert!(
+                reopen::recover_resident_with_tls(&mut incomplete, checkpoint, old, None).is_err()
+            );
+            assert_eq!((incomplete.writes, incomplete.flushes), effects);
+        }
+        let (unchanged_checkpoint, recovered) =
+            reopen::recover_resident_with_tls(&mut incomplete, checkpoint, active, Some(rotate))
+                .unwrap();
+        assert_eq!(unchanged_checkpoint, checkpoint);
+        assert_eq!(recovered.security, mounted.security);
+        assert_eq!(recovered.boot, mounted.boot);
+        assert!(incomplete.blocks == disk.blocks);
+    }
+
+    let (epoch, authority) = boot(
+        &mut disk,
+        checkpoint,
+        &mounted.security,
+        authority::BootUpdate::Rotate(rotate),
+    )
+    .unwrap();
+    assert_eq!(epoch, 2);
+    let policy = authority.confirmed_boot_policy(&active_config).unwrap();
+    assert!(active_manifest.installation().authorize(policy).is_ok());
+    assert!(old_manifest.installation().authorize(policy).is_err());
+    let after = authority::verified_pair_state_for(&mut disk, checkpoint, |state| {
+        assert_eq!(*state, active.resident_state(2)?);
+        Ok(())
+    })
+    .unwrap();
+    volume::confirm_tls_receipts(&mounted, &after, rotate).unwrap();
+    let io = (disk.writes, disk.flushes);
+    assert!(reopen::recover_resident_with_tls(&mut disk, checkpoint, old, None).is_err());
+    assert_eq!((disk.writes, disk.flushes), io);
+    for before_write in 0..9 {
+        let mut reboot = Disk {
+            blocks: disk.blocks.clone(),
+            fail_before_write: Some(before_write),
+            ..Disk::default()
+        };
+        assert_eq!(
+            reopen::recover_resident_with_tls(&mut reboot, checkpoint, active, Some(rotate)).err(),
+            Some(Error::Unknown)
+        );
+        reboot.fail_before_write = None;
+        let selected = volume::read_checkpoint_for(
+            &mut reboot,
+            &mut [0; BLOCK_BYTES],
+            Some(&active_config),
+            volume::Checkpoints::Resident,
+        )
+        .unwrap();
+        let (_, mounted) =
+            reopen::recover_resident_with_tls(&mut reboot, selected, active, Some(rotate)).unwrap();
+        assert_eq!(mounted.security, after);
+    }
+
+    // The native owner retires the key-changing redo before service
+    // publication; the next deployment needs only its public predecessor.
+    let (checkpoint, _) =
+        reopen::recover_resident_with_tls(&mut disk, checkpoint, active, Some(rotate)).unwrap();
+    let (checkpoint, mounted) =
+        reopen::recover_resident_with_tls(&mut disk, checkpoint, revoked, Some(revoke)).unwrap();
+    let (epoch, authority) = boot(
+        &mut disk,
+        checkpoint,
+        &mounted.security,
+        authority::BootUpdate::Rotate(revoke),
+    )
+    .unwrap();
+    assert_eq!(epoch, 3);
+    let policy = authority.confirmed_boot_policy(&revoked_config).unwrap();
+    assert_eq!(
+        revoked_manifest.installation().authorize(policy).err(),
+        Some(Error::Unauthorized)
+    );
+    assert_eq!(
+        policy.service_generation(cyxia_kernel_core::control_plane::role_manifest_v0199::ROLES[0]),
+        Ok(1)
+    );
+    assert!(reopen::recover_resident_with_tls(&mut disk, checkpoint, active, None).is_err());
+    let (checkpoint, mounted) =
+        reopen::recover_resident_with_tls(&mut disk, checkpoint, revoked, Some(revoke)).unwrap();
+    assert_eq!(mounted.security, revoked.resident_state(3).unwrap());
+    assert_eq!(disk.blocks[&CANONICAL_BUSINESS_START], immutable);
+    let (epoch, authority) = boot(
+        &mut disk,
+        checkpoint,
+        &mounted.security,
+        authority::BootUpdate::Tls(revoked),
+    )
+    .unwrap();
+    assert_eq!(epoch, 4);
+    let policy = authority.confirmed_boot_policy(&revoked_config).unwrap();
+    assert_eq!(
+        revoked_manifest.installation().authorize(policy).err(),
+        Some(Error::Unauthorized)
     );
 }
 

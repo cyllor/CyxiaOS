@@ -33,17 +33,35 @@ _start:
  str x0, [x1, #8]
  ldr x1, =high_l1
  str x0, [x1, #2056]
-.if {supervisor_copy}
- ldr x2, =__copy_secondary_l1
- str x0, [x2, #2056]
-.endif
  ldr x0, =dev_l2
  orr x0, x0, #3
  str x0, [x1, #2048]
-.if {supervisor_copy}
+.if {software_pan}
+ // Each CPU that copies has its own table path at the same private VA.
+ // The control-only profile gives the secondaries a root with no window.
+ ldr x2, =__copy_secondary_l1
+ ldr x3, =ram_l2
+ orr x3, x3, #3
+.if {secondary_copy_windows}
+ ldr x4, =__copy_secondary_l2
+ ldr x5, =__copy_secondary_l3
+.endif
+ mov x6, #{secondary_copy_roots}
+.Linit_secondary_copy:
  str x0, [x2, #2048]
+ str x3, [x2, #2056]
+.if {secondary_copy_windows}
+ orr x7, x4, #3
+ str x7, [x2, #2064]
+ orr x7, x5, #3
+ str x7, [x4]
+ add x4, x4, #4096
+ add x5, x5, #4096
+.endif
+ add x2, x2, #4096
+ subs x6, x6, #1
+ b.ne .Linit_secondary_copy
  // HIGH + 2 GiB is L1 slot 258, beyond the 1 GiB RAM alias.
- // All secondaries use the parallel root with this slot still invalid.
  ldr x0, =__copy_window_l2
  orr x3, x0, #3
  str x3, [x1, #2064]
@@ -84,10 +102,8 @@ _start:
  ldr x11, =__exception_stacks_end_phys
 .if {software_pan}
  ldr x13, =empty_l1
-.endif
-.if {supervisor_copy}
- ldr x14, =__copy_secondary_l1
- ldr x15, =__copy_window_l2
+ ldr x14, =__copy_window_l2
+ ldr x15, =.Lcopy_ancestors_end
 .endif
 6: ldr x8, =0x0060000000000703
  cmp x1, x7
@@ -107,12 +123,11 @@ _start:
  // The zeroed translation root keeps a read-only, execute-never alias.
  cmp x1, x13
  b.eq .Lreadonly_boot_page
-.endif
-.if {supervisor_copy}
  cmp x1, x14
- b.eq .Lreadonly_boot_page
+ b.lo .Lkernel_boot_page
  cmp x1, x15
- b.eq .Lreadonly_boot_page
+ b.lo .Lreadonly_boot_page
+.Lkernel_boot_page:
 .endif
  ldr x9, ={entry}
  cmp x1, x9
@@ -179,14 +194,20 @@ high_l1: .skip 4096
 .if {software_pan}
 .global empty_l1
 empty_l1: .skip 4096
-.endif
-.if {supervisor_copy}
-.global __copy_secondary_l1
-__copy_secondary_l1: .skip 4096
 .global __copy_window_l2
 __copy_window_l2: .skip 4096
+.global __copy_secondary_l1
+__copy_secondary_l1: .skip {secondary_copy_roots} * 4096
+.if {secondary_copy_windows}
+__copy_secondary_l2: .skip {secondary_copy_windows} * 4096
+.endif
+.Lcopy_ancestors_end:
 .global __copy_window_l3
 __copy_window_l3: .skip 4096
+.if {secondary_copy_windows}
+.global __copy_secondary_l3
+__copy_secondary_l3: .skip {secondary_copy_windows} * 4096
+.endif
 .endif
 dev_l2: .skip 4096
 ram_l2: .skip 4096

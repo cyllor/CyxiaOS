@@ -65,9 +65,9 @@
 //! * EXEC_TARGET: bounded D01 executor root. CPU0 prepares exact registered
 //!   work, installs the version and weight inside the measured target lock,
 //!   and re-reads the atomic root for terminal/observation verification.
-//! * copy_address()/read_bytes()/write_bytes(): bounded raw addr_of! arithmetic
-//!   over the advice spaces, re-checked against this profile's own tables and
-//!   mmu::checked_user_leaf_span before any high-half alias is dereferenced.
+//! * EL1 fixture setup and result observation access stopped advice pages.
+//!   SVC payloads walk the registered caller's advice data mapping and use
+//!   the CPU-local copy window to reach the checked physical span.
 //! * PIE backing/tables (static mut): CPU0 is the sole loader; seal_page does
 //!   real break-before-make on the high-half direct map before publishing the
 //!   low user mapping. No writable alias of executable code remains.
@@ -108,12 +108,6 @@ use cyxia_kernel_core::security::{
 };
 use sha2::{Digest, Sha256};
 
-#[cfg(any(
-    feature = "v020-production-live-control",
-    feature = "v020-production-snapshot-catalog",
-    feature = "v020-production-file-read",
-    feature = "v020-production-fsync-scratch"
-))]
 #[path = "production/copy_window.rs"]
 mod copy_window;
 #[path = "production/evidence.rs"]
@@ -132,7 +126,7 @@ mod file_read;
 #[path = "production/file_receipt.rs"]
 mod file_receipt;
 #[path = "production/frames.rs"]
-mod frames;
+pub(crate) mod frames;
 #[cfg(feature = "v020-production-media-staging")]
 #[path = "production/media_staging.rs"]
 mod media_staging;
@@ -334,23 +328,17 @@ fn lo(d: &[u8; 32]) -> u64 {
     u64::from_le_bytes(d[..8].try_into().unwrap())
 }
 
-// ---- advice-space checked copyin/out (identical contract to advice-e2e) ----
-fn copy_address(space: usize, va: u64, bytes: usize, write: bool) -> Option<(u64, u64)> {
-    if space >= PRIVATE_SPACES {
+// ---- advice-space data backing and checked syscall copy-in ----
+fn advice_data_span(space: usize, va: u64, bytes: usize, write: bool) -> Option<PhysAddr> {
+    if !(FIRST_ADVICE_SPACE..PRIVATE_SPACES).contains(&space) {
         return None;
     }
-    let page = va & !4095;
-    let offset = va & 4095;
+    let offset = va.checked_sub(DATA)?;
     let (root, mid, leaf, base) = unsafe {
         let root = core::ptr::addr_of!(ROOTS).cast::<Page>().add(space);
         let mid = core::ptr::addr_of!(MIDDLES).cast::<Page>().add(space);
         let leaf = core::ptr::addr_of!(LEAVES).cast::<Page>().add(space);
-        let base = match page {
-            CODE => core::ptr::addr_of!(v0199_advice_user_start) as u64,
-            DATA => core::ptr::addr_of!(DATA_PAGES).cast::<Page>().add(space) as u64,
-            STACK => core::ptr::addr_of!(USER_STACKS).cast::<Page>().add(space) as u64,
-            _ => return None,
-        };
+        let base = core::ptr::addr_of!(DATA_PAGES).cast::<Page>().add(space) as u64;
         (root, mid, leaf, base)
     };
     let root_desc = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*root).0[0])) };
@@ -359,24 +347,51 @@ fn copy_address(space: usize, va: u64, bytes: usize, write: bool) -> Option<(u64
         return None;
     }
     let desc =
-        unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*leaf).0[(page / 4096) as usize])) };
-    let pa = mmu::checked_user_leaf_span(desc, PhysAddr(phys(base)), offset, bytes, write).ok()?;
-    Some((base.checked_add(offset)?, pa.0))
+        unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*leaf).0[(DATA / 4096) as usize])) };
+    mmu::checked_user_leaf_span(desc, PhysAddr(phys(base)), offset, bytes, write).ok()
 }
-fn read_word(space: usize, off: u64) -> u64 {
-    let (src, _) = copy_address(space, DATA + off, 8, false).expect("production read span");
-    unsafe { core::ptr::read_volatile(src as *const u64) }
-}
-fn read_bytes(space: usize, off: u64, out: &mut [u8]) {
-    let (src, _) =
-        copy_address(space, DATA + off, out.len(), false).expect("production copyin span");
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = unsafe { core::ptr::read_volatile((src + i as u64) as *const u8) };
+
+fn advice_input(
+    space: usize,
+    member: NativeRole,
+    root_asid: u64,
+    address: u64,
+    length: usize,
+) -> Result<copy_window::StackSpan, i64> {
+    let physical = advice_data_span(space, address, length, false)
+        .ok_or(EFAULT)?
+        .0;
+    let owner_end = member
+        .private_rw
+        .base
+        .checked_add(member.private_rw.bytes)
+        .ok_or(EFAULT)?;
+    if physical < member.private_rw.base
+        || physical
+            .checked_add(length as u64)
+            .is_none_or(|end| end > owner_end)
+    {
+        return Err(EFAULT);
+    }
+    // SAFETY: advice_dispatch matched the active EL0 root and role before
+    // the page walk. This CPU exclusively owns the stopped advice space.
+    unsafe {
+        copy_window::StackSpan::from_syscall_static(physical, length, member.actor, root_asid, false)
     }
 }
+
+fn read_word(space: usize, off: u64) -> u64 {
+    let src = crate::HIGH
+        + advice_data_span(space, DATA + off, 8, false)
+            .expect("fixture read span")
+            .0;
+    unsafe { core::ptr::read_volatile(src as *const u64) }
+}
 fn write_bytes(space: usize, off: u64, bytes: &[u8]) {
-    let (dst, _) =
-        copy_address(space, DATA + off, bytes.len(), true).expect("production copyout span");
+    let dst = crate::HIGH
+        + advice_data_span(space, DATA + off, bytes.len(), true)
+            .expect("fixture write span")
+            .0;
     for (i, b) in bytes.iter().enumerate() {
         unsafe { core::ptr::write_volatile((dst + i as u64) as *mut u8, *b) };
     }
@@ -890,6 +905,9 @@ fn pie_dispatch(index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u
 /// Advice-chain bridge dispatch — the SAME kernel-core APIs the advice-e2e
 /// fixture calls, now serviced in the exception vector.
 fn advice_dispatch(role_index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFrame) -> u64 {
+    if role_index >= ADVICE_SPACES {
+        return E_AUTH as u64;
+    }
     let space = FIRST_ADVICE_SPACE + role_index;
     let member = unsafe {
         core::ptr::read_volatile(
@@ -900,24 +918,29 @@ fn advice_dispatch(role_index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFra
     };
     let cpu = cpu::slot();
     let expected = member.ttbr0_root | (u64::from(user::dynamic_asid()) << 48);
-    if cpu != 0 || member.ttbr0_root == 0 || trapped_ttbr0() != expected {
+    let root = core::ptr::addr_of!(ROOTS)
+        .cast::<Page>()
+        .wrapping_add(space);
+    if cpu != 0
+        || member.role != ROLES[role_index]
+        || member.ttbr0_root != phys(root as u64)
+        || trapped_ttbr0() != expected
+    {
         return E_AUTH as u64;
     }
     match x8 {
         0x50 if args[2] == ADVICE_BYTES as u64 => {
             // Advice intake glue (no SvcV3Bridge submit entry exists).
-            if cpu != 0
-                || member.caps & SEND_ADVICE != SEND_ADVICE
-                || args[0] != ADVICE_CAP
-                || args[3] != 0
-            {
+            if member.caps & SEND_ADVICE != SEND_ADVICE || args[0] != ADVICE_CAP || args[3] != 0 {
                 return 0;
             }
             let mut copy = [0u8; ADVICE_BYTES];
-            if copy_address(space, args[1], ADVICE_BYTES, false).is_none() {
+            if advice_input(space, member, expected, args[1], copy.len())
+                .and_then(|input| input.copy_in(&mut copy))
+                .is_err()
+            {
                 return 0;
             }
-            read_bytes(space, args[1] & 4095, &mut copy);
             let trusted = trusted_scope();
             let ledger = unsafe { &mut *ledger_ptr() };
             let pair = unsafe { &mut *pair_ptr() };
@@ -935,17 +958,20 @@ fn advice_dispatch(role_index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFra
         }
         0x50 if args[2] == (DECISION_BYTES + DISPOSITION_BYTES) as u64 => {
             // REGISTER via the real SvcV3Bridge 0x50 endpoint.
-            if cpu != 0
-                || member.caps & DECISION_REGISTER != DECISION_REGISTER
+            if member.caps & DECISION_REGISTER != DECISION_REGISTER
                 || args[0] != DECISION_CAP
+                || args[3] != 0
+                || args[5] < 8
             {
                 return 0;
             }
             let mut copy = [0u8; DECISION_BYTES + DISPOSITION_BYTES];
-            if copy_address(space, args[1], copy.len(), false).is_none() {
+            if advice_input(space, member, expected, args[1], copy.len())
+                .and_then(|input| input.copy_in(&mut copy))
+                .is_err()
+            {
                 return 0;
             }
-            read_bytes(space, args[1] & 4095, &mut copy);
             let caller = VerifiedNativeCaller {
                 identity: member.actor,
                 package_abi: 3,
@@ -970,7 +996,7 @@ fn advice_dispatch(role_index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFra
         }
         0x41 => {
             // PUBLISH via the real SvcV3Bridge 0x41 endpoint.
-            if cpu != 0 || member.caps & PUBLISH_PLAN != PUBLISH_PLAN {
+            if member.caps & PUBLISH_PLAN != PUBLISH_PLAN {
                 return 0;
             }
             if !recovery::publish_allowed() {
@@ -979,14 +1005,21 @@ fn advice_dispatch(role_index: usize, x8: u64, args: [u64; 6], _f: &ExceptionFra
             let plan_len = args[1] as usize;
             let mut plan_copy = [0u8; 212];
             let mut side_copy = [0u8; DECISION_BYTES];
-            if plan_len != plan_copy.len()
-                || copy_address(space, args[0], plan_len, false).is_none()
-                || copy_address(space, args[2], DECISION_BYTES, false).is_none()
+            if plan_len != plan_copy.len() || args[3] != 1 {
+                return 0;
+            }
+            let Ok(plan_span) = advice_input(space, member, expected, args[0], plan_len) else {
+                return 0;
+            };
+            let Ok(side_span) = advice_input(space, member, expected, args[2], side_copy.len())
+            else {
+                return 0;
+            };
+            if plan_span.copy_in(&mut plan_copy).is_err()
+                || side_span.copy_in(&mut side_copy).is_err()
             {
                 return 0;
             }
-            read_bytes(space, args[0] & 4095, &mut plan_copy);
-            read_bytes(space, args[2] & 4095, &mut side_copy);
             let caller = VerifiedNativeCaller {
                 identity: member.actor,
                 package_abi: 3,
@@ -1543,12 +1576,23 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     // NEGATIVE: operations role may not publish.
     write_bytes(ops_space, ENVELOPE_OFF, &plan);
     write_bytes(ops_space, PUB_SIDECAR_OFF, &rec);
+    let before_denied_publish = copy_window::syscall_closed_counts();
     advice_carrier(ops_space, 0x41, pub_args);
     let bad_pub = SVC_OUT[ROLE_COUNT].load(Ordering::Relaxed);
     assert_eq!(bad_pub, 0, "non-publisher must be denied");
+    assert_eq!(
+        copy_window::syscall_closed_counts(),
+        before_denied_publish,
+        "denied publish must leave the copy window untouched"
+    );
     assert_eq!(unsafe { (&*gate_ptr()).published_count() }, 1);
     assert_eq!(ACCEPT_COUNT.load(Ordering::Relaxed), 1);
     report("V020_PROD_BAD_PUBLISH", OPS.id, bad_pub, 0);
+    let mut crossing_sidecar = pub_args;
+    crossing_sidecar[2] = DATA + 4096 - 8;
+    advice_carrier(pub_space, 0x41, crossing_sidecar);
+    assert_eq!(SVC_OUT[ROLE_COUNT + 3].load(Ordering::Relaxed), 0);
+    assert_eq!(copy_window::syscall_closed_counts(), before_denied_publish);
     advice_carrier(pub_space, 0x41, pub_args);
     let pub_replay = SVC_OUT[ROLE_COUNT + 3].load(Ordering::Relaxed);
     assert_eq!(pub_replay, 2, "replay publish no effect");
@@ -1903,6 +1947,16 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     media_staging::publish(&staging_outcome);
     #[cfg(feature = "v020-production-live-control")]
     observations::drive(&mut pie_ctx, &pie_manifest);
+    let (reads, writes, closed) = copy_window::syscall_closed_counts();
+    assert!(reads >= 7 && closed, "advice syscall copy window evidence");
+    #[cfg(feature = "v020-production-live-control")]
+    assert!(writes >= 2, "snapshot syscall copy window evidence");
+    report(
+        "V020_SEC_M_SYSCALL_COPY_WINDOW",
+        reads,
+        writes,
+        u64::from(closed),
+    );
     #[cfg(feature = "v020-production-file-read")]
     if staging_outcome.services_ready()
         && let Some(view) = staging_outcome.file_read

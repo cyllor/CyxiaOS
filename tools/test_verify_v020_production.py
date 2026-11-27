@@ -137,6 +137,17 @@ class CopyWindowEvidence(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing one Supervisor file copy-window witness"):
                 v.supervisor_copy_windows(b"", None, None, [], file_copy=True)
 
+    def test_syscall_path_requires_a_closed_copy_window(self):
+        with patch.object(v, "symbol", return_value={"pa": 4096}):
+            with self.assertRaisesRegex(ValueError, "missing one syscall copy-window witness"):
+                v.supervisor_copy_windows(b"", None, None, [], syscall_copy=True)
+            for fields in ("a=6 b=0 c=1", "a=7 b=0 c=0", "a=7 b=1 c=1"):
+                with self.assertRaisesRegex(ValueError, "invalid syscall copy-window close counts"):
+                    v.supervisor_copy_windows(
+                        b"", None, None, [f"V020_SEC_M_SYSCALL_COPY_WINDOW {fields}"],
+                        syscall_copy=True,
+                    )
+
 
 class W11Validation(unittest.TestCase):
     def check(self, words=None, lines=None, staging=False, modes=v.Modes()):

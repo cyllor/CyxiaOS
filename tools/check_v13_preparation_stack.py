@@ -19,6 +19,8 @@ EXCEPTION_RESERVE = 4_096
 CHECKER_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 NAMES = {
     "secondary_entry": "secondary_entry",
+    # LLVM may keep the secondary worker as a distinct stack frame.
+    "secondary_work": "cyxia_kernel::smp::secondary_work::",
     "run_turn": "cyxia_kernel::smp::prototype_runtime::native::run_turn::",
     "next_input": "cyxia_kernel::smp::prototype_runtime::native::next_input::",
     "next_paid": "cyxia_kernel::domain_control::next_paid::",

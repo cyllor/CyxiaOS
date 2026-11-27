@@ -1,6 +1,9 @@
 //! Typed VirtIO register operations shared by modern MMIO and PCI transports.
 //! PCI register widths and read-to-clear ISR semantics are preserved here.
-use crate::{Error, Platform, reset::RESET_DEADLINE_NS};
+use crate::{
+    Error, Platform,
+    reset::{RESET_DEADLINE_NS, RESET_POLL_LIMIT},
+};
 use core::ptr::{read_volatile, write_volatile};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,7 +138,7 @@ impl Transport {
             backend: Backend::Pci(PciTransport { regions }),
         })
     }
-    fn owner(&self) -> usize {
+    pub(crate) fn owner(&self) -> usize {
         match &self.backend {
             Backend::Mmio(r) => r.base,
             Backend::Pci(p) => p.regions.common.base,
@@ -328,6 +331,10 @@ impl Transport {
                 return Err(Error::Timeout);
             }
         }
+        self.negotiate_version_one(platform)
+    }
+    /// Negotiate VERSION_1 after a serialized reset proved the old queues off.
+    pub(crate) fn negotiate_version_one(&mut self, platform: &impl Platform) -> Result<(), Error> {
         self.set_status(3);
         self.select_device_features(1);
         if self.device_features() & 1 == 0 {
@@ -359,6 +366,29 @@ impl Transport {
         self.set_status(self.status() | 128);
     }
 
+    /// Confirm hardware DMA cessation without inspecting a paused driver's
+    /// software state. Success says nothing about an old request's result.
+    ///
+    /// # Safety
+    /// `region` is the pinned, registered modern MMIO mapping. The caller
+    /// permanently stopped every CPU and IRQ path that can access the device
+    /// and is its sole terminal MMIO owner. `queues` names every queue that
+    /// could own DMA in this boot. Abandoned queues and pages stay pinned.
+    pub unsafe fn terminal_mmio_reset(
+        region: MappedRegion,
+        device_id: u32,
+        queues: &[u16],
+        platform: &impl Platform,
+    ) -> Result<u64, Error> {
+        if queues.is_empty() {
+            return Err(Error::Queue);
+        }
+        let started = platform.now_ns();
+        // SAFETY: the terminal owner has exclusive access to these registers.
+        let mut transport = unsafe { Self::attach(region.base, region.len)? };
+        transport.observe_mmio_reset_since(device_id, queues, platform, started, || Ok(()))
+    }
+
     /// Confirm a reset with all named queues disabled. The serialized owner
     /// must hold every old queue fenced or have published none in this boot.
     /// One deadline covers status, readiness, and grant renewal.
@@ -367,12 +397,22 @@ impl Transport {
         device_id: u32,
         queues: &[u16],
         platform: &impl Platform,
+        checkpoint: impl FnMut() -> Result<(), Error>,
+    ) -> Result<u64, Error> {
+        self.observe_mmio_reset_since(device_id, queues, platform, platform.now_ns(), checkpoint)
+    }
+
+    fn observe_mmio_reset_since(
+        &mut self,
+        device_id: u32,
+        queues: &[u16],
+        platform: &impl Platform,
+        started: u64,
         mut checkpoint: impl FnMut() -> Result<(), Error>,
     ) -> Result<u64, Error> {
         if !matches!(self.backend, Backend::Mmio(_)) {
             return Err(Error::Unsupported);
         }
-        let started = platform.now_ns();
         let now_within_deadline = || {
             let now = platform.now_ns();
             now.checked_sub(started)
@@ -387,7 +427,7 @@ impl Transport {
         }
         self.set_status(0);
         platform.barrier();
-        loop {
+        for _ in 0..RESET_POLL_LIMIT {
             checkpoint()?;
             now_within_deadline()?;
             if self.device_id() != device_id {
@@ -407,6 +447,7 @@ impl Transport {
             }
             core::hint::spin_loop();
         }
+        Err(Error::Timeout)
     }
 
     pub(crate) fn check(&self) -> Result<(), Error> {

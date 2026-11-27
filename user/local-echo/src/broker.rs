@@ -98,7 +98,7 @@ pub fn boot_identity() -> Option<([u8; 32], [u8; 32])> {
         ))
     }
 }
-pub fn poll() -> Result<(bool, u64, u32, bool), Error> {
+pub fn poll() -> Result<(bool, u64, u32, bool, bool), Error> {
     let (_, connected) = request(allowed::POLL, &[], &mut [], 0)?;
     unsafe {
         let p = page();
@@ -106,7 +106,13 @@ pub fn poll() -> Result<(bool, u64, u32, bool), Error> {
         let ip = core::ptr::addr_of!((*p).domains.peer_ipv4).read_volatile();
         let ip = u32::try_from(ip).map_err(|_| Error::Invalid)?;
         match connected {
-            0 | 1 | 3 => Ok((connected != 0, generation, ip, connected == 3)),
+            0 | 1 | 3 | 4 | 5 | 7 => Ok((
+                connected & 1 != 0,
+                generation,
+                ip,
+                connected & 2 != 0,
+                connected & 4 != 0,
+            )),
             _ => Err(Error::Invalid),
         }
     }
@@ -126,6 +132,10 @@ pub fn poll_normal_close(generation: u64, source: u32) -> Result<(), Error> {
 
 pub fn admission_retired(generation: u64, source: u32) -> Result<(), Error> {
     connection_receipt(allowed::ADMISSION_RETIRED, generation, source)
+}
+
+pub fn admission_rejected(generation: u64, source: u32) -> Result<(), Error> {
+    connection_receipt(allowed::ADMISSION_REJECTED, generation, source)
 }
 
 pub fn tls_authenticated(

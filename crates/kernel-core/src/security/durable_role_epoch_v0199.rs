@@ -6,6 +6,10 @@
 //! it never silently mounts legacy snapshot media or writes a raw disk block.
 use super::{
     Error,
+    boot_epoch_v1::{
+        TlsBootPolicy, TlsBootTransition,
+        tls_policy::{TLS_SIGNER_SLOT, TLS_SLOTS, TLS_VERIFIER_SLOT},
+    },
     file_index_v0199::{BLOCK_BYTES, SecurityStateStoreV2},
 };
 use crate::control_plane::role_manifest_v0199::{ROLE_COUNT, ROLES, Role};
@@ -31,6 +35,11 @@ pub struct StopEvidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Change {
     AllocateBoot,
+    /// Only an authenticated cold TLS transition may prepare this boot pair.
+    AllocateTlsBoot {
+        generation: u64,
+        digest: [u8; 32],
+    },
     Restart(StopEvidence),
     Isolate(StopEvidence),
     /// Only prepare_offline_install may admit this signed transition.
@@ -38,6 +47,11 @@ pub enum Change {
         generation: u64,
         digest: [u8; 32],
     },
+}
+impl Change {
+    pub(super) fn allocates_boot(self) -> bool {
+        matches!(self, Self::AllocateBoot | Self::AllocateTlsBoot { .. })
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreparedEpoch {
@@ -103,6 +117,7 @@ pub struct DurableEpochGate {
     paired_store: bool,
     startup_verified: bool,
     paired_confirmed: bool,
+    tls_enabled: bool,
 }
 
 /// Current signed policy and durable boot identity. The borrow excludes a
@@ -124,6 +139,12 @@ impl ConfirmedBootPolicy<'_> {
         self.config_digest
     }
 
+    /// Compare an independently qualified boot package's policy binding
+    /// with the same configuration after durable BootEpoch confirmation.
+    pub fn matches_config_digest(&self, digest: [u8; 32]) -> bool {
+        self.config_digest == digest
+    }
+
     pub fn service_generation(&self, role: Role) -> Result<u64, Error> {
         self.epochs.service_generation(role)
     }
@@ -132,11 +153,10 @@ impl ConfirmedBootPolicy<'_> {
         &self,
         installation: &super::network::TlsInstallation,
     ) -> Result<(), Error> {
-        // The signed scratch TLS profile reserves these on-disk slots.
-        // Reject an overlapping protected control-role assignment.
-        const VERIFIER: usize = 12;
-        const SIGNER: usize = 13;
-        const TLS_SLOTS: u64 = (1 << VERIFIER) | (1 << SIGNER);
+        // Reject a revoked installation and any overlapping control slot.
+        if !self.epochs.tls_enabled {
+            return Err(Error::Unauthorized);
+        }
         if self
             .epochs
             .slots
@@ -159,8 +179,8 @@ impl ConfirmedBootPolicy<'_> {
         if generations.contains(&0)
             || generations
                 != [
-                    state.service_generations[VERIFIER],
-                    state.service_generations[SIGNER],
+                    state.service_generations[TLS_VERIFIER_SLOT],
+                    state.service_generations[TLS_SIGNER_SLOT],
                     state.key_generation,
                 ]
         {
@@ -196,6 +216,7 @@ impl DurableEpochGate {
             paired_store: false,
             startup_verified: false,
             paired_confirmed: false,
+            tls_enabled: true,
         })
     }
     /// Reconcile both actual protected startup stores. This alone is
@@ -234,6 +255,15 @@ impl DurableEpochGate {
     }
     pub fn boot_epoch(&self) -> Option<u64> {
         (self.boot_confirmed && self.pending.is_none()).then_some(self.committed.last_boot_epoch)
+    }
+    pub(super) fn bind_tls_startup(&mut self, policy: TlsBootPolicy<'_>) -> Result<(), Error> {
+        if self.boot_confirmed || self.paired_confirmed || self.pending.is_some() {
+            return Err(Error::Busy);
+        }
+        self.verify_startup_config(policy.config())?;
+        policy.verify_committed(&self.committed)?;
+        self.tls_enabled = policy.listener_enabled();
+        Ok(())
     }
     pub(super) fn verify_startup_config(
         &self,
@@ -299,7 +329,10 @@ impl DurableEpochGate {
     ) -> Result<PreparedEpoch, Error> {
         // No generic runtime call may install offline configuration,
         // and the old mount must be revalidated after such a commit.
-        if matches!(change, Change::InstallConfig { .. }) {
+        if matches!(
+            change,
+            Change::InstallConfig { .. } | Change::AllocateTlsBoot { .. }
+        ) {
             return Err(Error::Unauthorized);
         }
         if self
@@ -334,7 +367,9 @@ impl DurableEpochGate {
                     epoch: after.last_boot_epoch,
                 }
             }
-            Change::InstallConfig { .. } => return Err(Error::Unauthorized),
+            Change::InstallConfig { .. } | Change::AllocateTlsBoot { .. } => {
+                return Err(Error::Unauthorized);
+            }
             Change::Restart(stop) | Change::Isolate(stop) => {
                 if !self.boot_confirmed || stop.generation == 0 || stop.digest == [0; 32] {
                     return Err(Error::Unauthorized);
@@ -383,6 +418,47 @@ impl DurableEpochGate {
             ticket,
             after,
             outcome,
+            placement: None,
+        });
+        Ok(ticket)
+    }
+
+    /// Cold boot owns the quiescent state before either TLS role has started.
+    /// Advance the configuration and boot epoch with no observable midpoint.
+    pub(super) fn prepare_tls_boot(
+        &mut self,
+        transition: TlsBootTransition<'_>,
+    ) -> Result<PreparedEpoch, Error> {
+        if !self.paired_store
+            || !self.startup_verified
+            || self.boot_confirmed
+            || self.paired_confirmed
+        {
+            return Err(Error::Unauthorized);
+        }
+        if self.pending.is_some() || self.last.is_some() {
+            return Err(Error::Busy);
+        }
+        let before = self.committed;
+        let after = transition.successor_state(&before)?;
+        let ticket = PreparedEpoch {
+            change: Change::AllocateTlsBoot {
+                generation: after.offline_config_generation,
+                digest: after.offline_config_hash,
+            },
+            fs_uuid: after.fs_uuid,
+            old_state_generation: before.state_generation,
+            new_state_generation: after.state_generation,
+            target_boot_epoch: after.last_boot_epoch,
+            after_digest: hash(&after.encode()?),
+        };
+        self.tls_enabled = transition.current().listener_enabled();
+        self.pending = Some(Pending {
+            ticket,
+            after,
+            outcome: Outcome::Boot {
+                epoch: after.last_boot_epoch,
+            },
             placement: None,
         });
         Ok(ticket)
@@ -512,7 +588,7 @@ impl DurableEpochGate {
                 Error::Conflict
             });
         }
-        let paired = self.paired_store && ticket.change == Change::AllocateBoot;
+        let paired = self.paired_store && ticket.change.allocates_boot();
         if placement.fs_uuid != ticket.fs_uuid
             || placement.log_epoch == 0
             || placement.txid == 0
@@ -640,7 +716,7 @@ impl DurableEpochGate {
         commit: &[u8],
         verify_native: impl FnOnce(&PreparedEpoch, &CommitEvidence, &[u8]) -> Result<(), Error>,
     ) -> Result<Outcome, Error> {
-        if !self.paired_store || ticket.change != Change::AllocateBoot {
+        if !self.paired_store || !ticket.change.allocates_boot() {
             return Err(Error::Unauthorized);
         }
         let sb = super::file_media_v0199::SuperblockV1::decode(superblock_raw)?;
@@ -706,7 +782,7 @@ impl DurableEpochGate {
         redo_verified: bool,
         verify_commit: impl FnOnce(&PreparedEpoch, &CommitEvidence) -> Result<(), Error>,
     ) -> Result<Outcome, Error> {
-        if self.paired_store && ticket.change == Change::AllocateBoot && !paired {
+        if self.paired_store && ticket.change.allocates_boot() && !paired {
             return Err(Error::Unauthorized);
         }
         if !redo_verified

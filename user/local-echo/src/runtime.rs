@@ -76,7 +76,9 @@ impl NativeSocket for BrokerSocket {
     }
     fn poll_native(&mut self, _now_ms: u64) -> Result<(), SocketError> {
         match broker::poll() {
-            Ok((true, generation, ip, _)) if generation == self.generation && ip == self.source => {
+            Ok((true, generation, ip, _, _))
+                if generation == self.generation && ip == self.source =>
+            {
                 Ok(())
             }
             Ok(_) => Err(SocketError::Closed),
@@ -164,7 +166,7 @@ pub fn run() -> ! {
     let mut scratch = [0u8; cyxia_local_echo::broker_surface::PAYLOAD];
     loop {
         let now = broker::now().unwrap_or_else(|_| broker::park());
-        let (connected, generation, source, normal_close) =
+        let (connected, generation, source, normal_close, resident) =
             broker::poll().unwrap_or_else(|_| broker::park());
         if !connected {
             broker::yield_cpu();
@@ -199,7 +201,13 @@ pub fn run() -> ! {
             terminal: false,
         };
         if handshake(&mut socket, &mut session, &mut scratch).is_err() {
-            let _ = gate.reject(ticket);
+            gate.reject(ticket).unwrap_or_else(|_| broker::park());
+            if resident {
+                session.abort();
+                scratch.fill(0);
+                broker::admission_rejected(generation, source).unwrap_or_else(|_| broker::park());
+                continue;
+            }
             gate.begin_restart();
             broker::park();
         }
@@ -253,6 +261,10 @@ pub fn run() -> ! {
                 native_tcp::finish_session(&socket, &mut gate, active, &session)
                     .unwrap_or_else(|_| broker::park());
                 broker::admission_retired(generation, source).unwrap_or_else(|_| broker::park());
+                if resident {
+                    scratch.fill(0);
+                    break;
+                }
                 broker::park();
             }
             broker::yield_cpu();

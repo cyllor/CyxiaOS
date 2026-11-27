@@ -39,6 +39,20 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertGreaterEqual(preflight, 0)
         self.assertGreater(submit, preflight)
 
+    def test_native_user_copies_share_the_window_and_release_pins_after_copy(self):
+        task_memory = source(ARM / "memory.rs")
+        self.assertIn("    fn transfer(", task_memory)
+        transfer = task_memory.split("    fn transfer(", 1)[1].split("\n    }", 1)[0]
+        copied = transfer.index("let transferred = copy(physical")
+        self.assertLess(transfer.index(".pin("), copied)
+        self.assertLess(copied, transfer.index(".unpin("))
+        self.assertNotIn("frame_ptr(", transfer)
+        self.assertIn("copy_window::copy_in(", task_memory)
+        self.assertIn("copy_window::copy_out(", task_memory)
+        task_abi = source(ARM / "abi.rs")
+        self.assertIn("s.user_memory(owner)?.copyin(address, out)", task_abi)
+        self.assertIn("s.user_memory(owner)?.copyout(address, input)", task_abi)
+
     def test_legacy_remote_syscalls_are_closed(self):
         src = source(ARM / "abi.rs")
         self.assertIn("19 | 20 =>", src)
@@ -801,10 +815,62 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("let syscall_abi = verified.syscall_abi();", loader)
         self.assertIn("PIE_SYSCALL_ABI[index].store(syscall_abi, Ordering::Release);", loader)
         self.assertIn("decode_aarch64_lifecycle_svc_v3(syscall_abi, ctx.esr, &ctx.regs)", signed)
-        self.assertIn("compare_exchange(captured, 0, Ordering::AcqRel, Ordering::Acquire)", signed)
+        adapter = signed.split("impl Task {", 1)[1].split("fn reservation(", 1)[0]
+        self.assertLess(adapter.index("registered_role_abi(index, member, captured_ttbr0)"),
+                        adapter.index("decode_aarch64_authorized_svc_v3("))
+        self.assertLess(adapter.index("services.permits(&caller, operation, first)"),
+                        adapter.index("services.dispatch(&caller, call)"))
+        self.assertIn("captured | CAPTURED", signed)
+        self.assertNotIn("trapped_ttbr0()", adapter)
         quantum = signed.split("fn run_quantum(", 1)[1].split("fn run_tasks(", 1)[0]
+        self.assertLess(quantum.index("registered_role_abi(index, member, ttbr0)"),
+                        quantum.index("user::enter_pinned_until_retired("))
         self.assertLess(quantum.index("ACTIVE_ROLE_TTBR0.swap(0, Ordering::AcqRel)"),
-                        quantum.index("task.trap(syscall_abi)"))
+                        quantum.index("let captured_ttbr0 = capture & !CAPTURED"))
+        self.assertLess(quantum.index("let captured_ttbr0 = capture & !CAPTURED"),
+                        quantum.index("execution.handle_return(&mut task.context)"))
+        self.assertLess(quantum.index("execution.handle_return(&mut task.context)"),
+                        quantum.index("task.syscall(syscall_abi,"))
+
+        window = source(arm / "copy_window.rs")
+        self.assertIn("Signed(&'call SignedCaller)", window)
+        self.assertIn("Self::Vector(_) => trapped_ttbr0() == root_asid", window)
+        self.assertIn("Self::Signed(caller) => caller.root_asid() == root_asid && caller.registered()",
+                      window)
+
+    def test_signed_lifecycle_uses_the_sec_p_execution_trap_contract(self):
+        arm = ROOT / "kernel/src/arch/aarch64/production"
+        traps = source(arm / "signed_exec_trap.rs")
+        self.assertIn("const TRAPPING_BITS: u64 = (1 << 15) | (1 << 16) | (1 << 18);", traps)
+        self.assertIn("observed & TRAPPING_BITS == 0", traps)
+        self.assertIn("TrapSource::LowerElAarch64", traps)
+        self.assertIn("decide_trap(", traps)
+        self.assertIn("resume_frame(", traps)
+
+    def test_authorized_network_is_published_after_confirmed_boot_on_business_cpu(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        signed = source(arm / "production/signed_resident.rs")
+        startup = signed.split("pub(super) fn run(info:", 1)[1]
+        self.assertLess(startup.index("boot.policy()"), startup.index("stage_resident_network("))
+        worker = source(arm / "production/network_worker.rs")
+        self.assertIn("pub(crate) const CPU: usize = 1;", worker)
+        self.assertIn("Plane::Business", worker)
+        self.assertIn("authorize_business_core(", worker)
+        self.assertIn("network_worker::worker(slot)", source(arm / "smp.rs"))
+
+    def test_resident_ingress_retains_one_frame_across_preemption(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        parser = source(arm / "sec_n_broker/ingress.rs")
+        poll = parser.split("pub(crate) fn poll_frame(", 1)[1].split("pub(crate) fn discard_frame(", 1)[0]
+        self.assertIn("&mut pending.context", poll)
+        self.assertIn("timer::cpu_elapsed_ns(started)", poll)
+        self.assertLess(poll.index("return Ok(None);\n        }\n        let pending"),
+                        poll.index("self.pending.take()"))
+        self.assertLess(poll.index("if matches!(verdict, Ok(true))"),
+                        poll.index(".copy_to_nonoverlapping("))
+        port = source(arm / "production/net_resident.rs")
+        self.assertLess(port.index("if !self.parser.has_pending()"),
+                        port.index("self.nic.receive(frame)?"))
 
     def test_signed_lifecycle_exit_retires_the_root_with_prepaid_recovery(self):
         arm = ROOT / "kernel/src/arch/aarch64/production"
@@ -812,13 +878,14 @@ class NativeSecurityWiring(unittest.TestCase):
         turn = signed.split("fn turn(", 1)[1].split("fn run_quantum(", 1)[0]
         ordered = [
             "budget.settle(grant, start, returned)?",
-            "if let Some(status) = result?",
+            "if let Some(stop) = result?",
             "budget.ledger.close_ordinary()",
             "budget.reserve_recovery()?",
-            "retire_stopped_role(index, member.ttbr0_root)",
+            "retire_stopped_role(index, member)?",
+            "task.context = user::Context::empty()",
             "budget.settle(recovery_grant, recovery_start, 0)?",
             "retirement?;",
-            "return Err(Fault::RoleExit",
+            "return Err(Fault::RoleStopped",
         ]
         for step in ordered:
             self.assertIn(step, turn)
@@ -826,6 +893,8 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         loader = source(arm / "role_loader.rs")
         retire = loader.split("pub(super) fn retire_stopped_role(", 1)[1].split("\n}\n", 1)[0]
+        self.assertLess(retire.index("registration(index).write(Registration::Retired)"),
+                        retire.index("root.write_volatile(0)"))
         self.assertLess(retire.index("root.write_volatile(0)"), retire.index("tlbi();"))
         self.assertLess(retire.index("tlbi();"), retire.index("PIE_SYSCALL_ABI[index].store(0"))
 
@@ -845,6 +914,25 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertIn("table.admit_live(", audit)
         self.assertIn("trapped_pie_cap(index, m)", audit)
         self.assertNotIn("table.admit(", audit)
+
+    def test_v020_syscall_payloads_use_checked_copy_windows(self):
+        arm = ROOT / "kernel/src/arch/aarch64"
+        prod = source(arm / "production.rs")
+        advice = prod.split("fn advice_dispatch(", 1)[1].split("fn with_bundle(", 1)[0]
+        self.assertIn("trapped_ttbr0() != expected", advice)
+        self.assertIn("copy_in(&mut plan_copy)", advice)
+        self.assertIn("copy_in(&mut side_copy)", advice)
+        self.assertNotIn("read_bytes(", advice)
+        self.assertIn("StackSpan::from_syscall_static(", prod)
+
+        observations = source(arm / "production/observations.rs")
+        snapshot = observations.split("pub(super) fn snapshot(", 1)[1].split(
+            "pub(super) fn audit(", 1
+        )[0]
+        self.assertIn("StackSpan::verify_syscall(", snapshot)
+        self.assertLess(snapshot.index("trapped_pie_cap("), snapshot.index("verify_syscall("))
+        self.assertLess(snapshot.index("copy_out_and_check("), snapshot.index("SNAP_SEQ.store("))
+        self.assertNotIn("copy_reply(", observations)
 
     def test_v020_combined_mount_gates_both_native_services(self):
         arm = ROOT / "kernel/src/arch/aarch64"

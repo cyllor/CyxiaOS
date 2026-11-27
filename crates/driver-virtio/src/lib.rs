@@ -64,13 +64,27 @@ pub enum Error {
 
 /// Platform implementation must provide DMA visibility and ordered MMIO access.
 /// # Safety
-/// DMA addresses must identify the supplied pinned memory for its complete lifetime;
-/// cache maintenance and barriers must cover CPU/device ownership transitions.
+/// A successful physical translation identifies the complete contiguous pinned
+/// memory region for its lifetime. Cache maintenance and barriers must cover
+/// CPU/device ownership transitions.
 pub unsafe trait Platform {
     /// Copy a scalar diagnostic only; implementations must not schedule,
     /// borrow a device/owner, read clocks or alter DMA custody here.
     fn diagnostic_stage(&self, _stage: u64) {}
     fn physical(&self, address: usize, len: usize) -> Result<u64, Error>;
+    /// Authorize the exact split-ring and bounce-page range for this queue
+    /// before publishing any DMA address. The assignment survives a failed
+    /// configuration, an abandoned queue, and all resets for this backing.
+    fn admit_queue_dma(
+        &self,
+        _transport: usize,
+        _device: u32,
+        _index: u32,
+        _pa: u64,
+        _len: usize,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
     /// Synchronize an exclusively owned DMA region before CPU access or after writes.
     /// # Safety
     /// Address/length must denote mapped, pinned storage owned by the caller.
@@ -206,6 +220,7 @@ pub use transport::{MappedRegion, PciRegions, Transport};
 /// This deliberately quarantines failed devices instead of reusing in-flight pages.
 pub struct Queue {
     memory: &'static mut QueueMemory,
+    dma_base: u64,
     notification: transport::Notification,
     size: u16,
     available: u16,
@@ -241,6 +256,7 @@ impl Queue {
         if !pa.is_multiple_of(4096) || pa.checked_add(size as u64).is_none() {
             return Err(Error::Address);
         }
+        platform.admit_queue_dma(transport.owner(), transport.device_id(), index, pa, size)?;
         memory.desc.clear();
         memory.avail.clear();
         memory.used.clear();
@@ -256,6 +272,7 @@ impl Queue {
         transport.enable_queue();
         Ok(Self {
             memory,
+            dma_base: pa,
             notification,
             size: queue_size as u16,
             available: 0,
@@ -303,8 +320,8 @@ impl Queue {
         transport.check()?;
         self.validate_idle_used(transport, platform)?;
         let m = &self.memory;
-        let response_pa = platform.physical(m.response.address(), 4096)?;
-        let request_pa = platform.physical(m.request.address(), 4096)?;
+        let response_pa = self.dma_base + core::mem::offset_of!(QueueMemory, response) as u64;
+        let request_pa = self.dma_base + core::mem::offset_of!(QueueMemory, request) as u64;
         m.request.copy_prefix_from(0, request);
         let response_descriptor = if request.is_empty() { 0 } else { 16 };
         if !request.is_empty() {
@@ -443,7 +460,7 @@ impl EventQueue {
         if queue.size < 8 || queue.size > 64 || !queue.size.is_power_of_two() {
             return Err(Error::Queue);
         }
-        let pa = platform.physical(queue.memory.response.address(), 4096)?;
+        let pa = queue.dma_base + core::mem::offset_of!(QueueMemory, response) as u64;
         for slot in 0..usize::from(queue.size) {
             queue.memory.desc.put64(slot * 16, pa + slot as u64 * 8);
             queue.memory.desc.put32(slot * 16 + 8, 8);
@@ -566,6 +583,102 @@ mod tests {
             0
         }
     }
+
+    #[test]
+    fn queue_dma_denial_leaves_device_addresses_unpublished() {
+        use core::cell::Cell;
+
+        struct RejectDma(Cell<Option<(usize, u32, u32, u64, usize)>>);
+        // SAFETY: the test uses pinned boxed memory and no DMA hardware.
+        unsafe impl Platform for RejectDma {
+            fn physical(&self, address: usize, _: usize) -> Result<u64, Error> {
+                Ok(address as u64)
+            }
+            fn admit_queue_dma(
+                &self,
+                transport: usize,
+                device: u32,
+                index: u32,
+                pa: u64,
+                len: usize,
+            ) -> Result<(), Error> {
+                self.0.set(Some((transport, device, index, pa, len)));
+                Err(Error::Address)
+            }
+            unsafe fn sync(&self, _: usize, _: usize) {}
+            fn barrier(&self) {}
+            fn now_ms(&self) -> u64 {
+                0
+            }
+        }
+
+        for batched in [true, false] {
+            let platform = RejectDma(Cell::new(None));
+            let mmio = Box::leak(Box::new(Page::zeroed()));
+            mmio.put32(0, 0x74726976);
+            mmio.put32(4, 2);
+            mmio.put32(8, 2);
+            mmio.put32(0x34, 16);
+            let mut transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+            let (result, pa, len) = if batched {
+                let memory = Box::leak(Box::new(queue::BatchMemory::zeroed()));
+                let pa = memory as *mut _ as u64;
+                let result = queue::BatchQueue::configure(&mut transport, memory, 0, &platform);
+                (result.err(), pa, size_of::<queue::BatchMemory>())
+            } else {
+                let memory = Box::leak(Box::new(QueueMemory::zeroed()));
+                let pa = memory as *mut _ as u64;
+                let result = Queue::configure(&mut transport, memory, 0, &platform);
+                (result.err(), pa, size_of::<QueueMemory>())
+            };
+            assert_eq!(result, Some(Error::Address), "batched={batched}");
+            assert_eq!(platform.0.get(), Some((mmio.address(), 2, 0, pa, len)));
+            for offset in [0x38, 0x44, 0x80, 0x84, 0x90, 0x94, 0xa0, 0xa4] {
+                assert_eq!(mmio.get32(offset), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_mmio_reset_refuses_changed_device_before_writing() {
+        let mmio = Box::new(Page::zeroed());
+        mmio.put32(0, 0x74726976);
+        mmio.put32(4, 2);
+        mmio.put32(8, 4);
+        mmio.put32(0x70, 15);
+        let region = MappedRegion {
+            base: mmio.address(),
+            len: 4096,
+        };
+        // SAFETY: the mock has no other owner and is never resumed.
+        assert_eq!(
+            unsafe { Transport::terminal_mmio_reset(region, 2, &[0], &Host) },
+            Err(Error::Device)
+        );
+        assert_eq!(mmio.get32(0x70), 15);
+    }
+
+    #[test]
+    fn terminal_mmio_reset_cannot_certify_a_ready_queue_with_a_frozen_clock() {
+        let mmio = Box::new(Page::zeroed());
+        mmio.put32(0, 0x74726976);
+        mmio.put32(4, 2);
+        mmio.put32(8, 2);
+        mmio.put32(0x44, 1);
+        mmio.put32(0x70, 15);
+        let region = MappedRegion {
+            base: mmio.address(),
+            len: 4096,
+        };
+        // SAFETY: the mock has no other owner and is never resumed.
+        assert_eq!(
+            unsafe { Transport::terminal_mmio_reset(region, 2, &[0], &Host) },
+            Err(Error::Timeout)
+        );
+        assert_eq!(mmio.get32(0x70), 0);
+        assert_eq!(mmio.get32(0x44), 1);
+    }
+
     /// Wide request stores must stay byte-exact, including the unaligned head
     /// and tail runs used by the 12-byte virtio-net header offset.
     #[test]

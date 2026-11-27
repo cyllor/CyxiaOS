@@ -36,7 +36,7 @@ impl BatchedNet {
         tx: &'static mut BatchMemory,
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        Self::initialize_inner(t, rx, tx, None, p)
+        Self::initialize_inner(t, rx, tx, None, p, &mut || Ok(()))
     }
 
     /// Admit the V0.20 native net profile with only MAC and VERSION_1,
@@ -48,7 +48,20 @@ impl BatchedNet {
         expected_mac: [u8; 6],
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        Self::initialize_inner(t, rx, tx, Some(expected_mac), p)
+        Self::initialize_native_with_checkpoint(t, rx, tx, expected_mac, p, &mut || Ok(()))
+    }
+
+    /// Native startup renews its recovery grant before reset observations and
+    /// before enabling each queue. A refused grant cannot authorize new DMA.
+    pub fn initialize_native_with_checkpoint(
+        t: Transport,
+        rx: &'static mut BatchMemory,
+        tx: &'static mut BatchMemory,
+        expected_mac: [u8; 6],
+        p: &impl Platform,
+        checkpoint: &mut dyn FnMut() -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        Self::initialize_inner(t, rx, tx, Some(expected_mac), p, checkpoint)
     }
 
     fn initialize_inner(
@@ -57,19 +70,22 @@ impl BatchedNet {
         tx: &'static mut BatchMemory,
         expected_mac: Option<[u8; 6]>,
         p: &impl Platform,
+        checkpoint: &mut dyn FnMut() -> Result<(), Error>,
     ) -> Result<Self, Error> {
         if t.device_id() != 1 {
             return Err(Error::Device);
         }
         let strict_features = expected_mac.is_some();
-        Net::negotiate(&mut t, p, !strict_features)?;
+        Net::negotiate(&mut t, p, !strict_features, checkpoint)?;
         let configured =
             (|t: &mut Transport, rx: &'static mut BatchMemory, tx: &'static mut BatchMemory| {
                 let mac = Net::read_mac(t, p)?;
                 if expected_mac.is_some_and(|expected| expected != mac) {
                     return Err(Error::Device);
                 }
+                checkpoint()?;
                 let rx = BatchQueue::configure(t, rx, 0, p)?;
+                checkpoint()?;
                 let tx = BatchQueue::configure(t, tx, 1, p)?;
                 t.start(p)?;
                 Ok((mac, rx, tx))
@@ -161,6 +177,13 @@ impl BatchedNet {
             .map(|observed| {
                 [0, 1].map(|id| ResetProof::for_first_generation(boot_epoch, 1, id, observed))
             })
+    }
+    /// Disable new publication without waiting for this device's MMIO reset.
+    /// All queue descriptors and their pinned backing remain in custody.
+    pub fn fence_native(&mut self, platform: &impl Platform) {
+        if self.state == DeviceState::Live {
+            self.fail(platform);
+        }
     }
     /// Return RX and TX custody in queue-ID order after the terminal reset
     /// attempt. A published chain has no verified completion at this point.
