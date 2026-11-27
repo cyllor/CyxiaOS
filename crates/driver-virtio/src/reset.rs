@@ -7,6 +7,7 @@ pub(crate) const RESET_DEADLINE_NS: u64 = 100_000_000;
 pub(crate) enum DeviceState {
     Live,
     Failed,
+    RecoveryFenced,
     ResetAttempted,
 }
 

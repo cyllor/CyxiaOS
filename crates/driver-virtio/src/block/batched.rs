@@ -194,7 +194,11 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
     /// Read old requests after the owner has permanently fenced submission.
     /// Only a verified and retained block completion sets `completed`.
     pub fn terminal_custody(&self) -> Option<BlockTerminalCustody> {
-        (self.state != DeviceState::Live).then(|| BlockTerminalCustody {
+        matches!(
+            self.state,
+            DeviceState::RecoveryFenced | DeviceState::ResetAttempted
+        )
+        .then(|| BlockTerminalCustody {
             reset: self.reset,
             requests: self.pending.map(|request| {
                 request.map(|(token, operation, time)| RetainedBlock {
@@ -237,8 +241,8 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
     /// Stop software submissions when the foreground owner has lost its
     /// execution budget. Preserve every exact token for a recovery owner.
     pub fn fence_for_recovery(&mut self) {
-        if self.state == DeviceState::Live {
-            self.state = DeviceState::Failed;
+        if matches!(self.state, DeviceState::Live | DeviceState::Failed) {
+            self.state = DeviceState::RecoveryFenced;
             self.queue.fence();
         }
     }
@@ -247,7 +251,10 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
     /// Completion/FLUSH obligations remain in custody, including after the
     /// device and its old queue read back disabled.
     pub fn stop_failed_mmio(&mut self, p: &impl Platform) -> Option<Result<u64, Error>> {
-        if self.state != DeviceState::Failed {
+        if !matches!(
+            self.state,
+            DeviceState::Failed | DeviceState::RecoveryFenced
+        ) {
             return None;
         }
         self.state = DeviceState::ResetAttempted;
@@ -422,7 +429,12 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         {
             return Err(Error::Response);
         }
-        if self.state != DeviceState::Live {
+        // A checked completion remains ACKable after an ordinary failure.
+        // Recovery handoff or a reset attempt freezes the entire ledger.
+        if matches!(
+            self.state,
+            DeviceState::RecoveryFenced | DeviceState::ResetAttempted
+        ) {
             return Err(Error::Device);
         }
         self.queue.release(token)?;
@@ -765,6 +777,7 @@ mod tests {
             token
         );
         block.fence_for_recovery();
+        assert_eq!(block.acknowledge(token), Err(Error::Device));
         platform.clock_step_ns = 25_000_000;
         assert_eq!(block.stop_failed_mmio(&platform), Some(Err(Error::Timeout)));
         let custody = block.terminal_custody().unwrap();
