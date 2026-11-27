@@ -34,6 +34,7 @@ pub mod network;
 pub mod process;
 pub mod syscall;
 pub mod syscall_v3;
+pub mod verdict_v4;
 
 #[cfg(test)]
 mod integration_tests;

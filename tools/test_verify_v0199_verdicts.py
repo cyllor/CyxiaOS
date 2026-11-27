@@ -1,6 +1,8 @@
 """Synthetic structural regressions only; no formal case verdicts are issued."""
 import hashlib,json,struct,tempfile,unittest
 from pathlib import Path
+import subprocess
+import sys
 from unittest.mock import patch
 import verify_v0199_verdicts as v
 class VerdictTests(unittest.TestCase):
@@ -18,7 +20,8 @@ class VerdictTests(unittest.TestCase):
         item=dict(test_id=test,proof_class=v.NAMES[proof],**fields)
         manifest=json.dumps(dict(schema="cyxia-frozen-verdict-run/v1",run_id=1,inventory_sha256=inv,proofs=[item])).encode()
         stem=f"{test:08x}-{proof}"
-        (root/"verdicts").mkdir();(root/"evidence").mkdir()
+        (root/"verdicts").mkdir(exist_ok=True)
+        (root/"evidence").mkdir(exist_ok=True)
         e=b"synthetic test fixture, not runtime proof"
         (root/"evidence"/"object.bin").write_bytes(e)
         m=json.dumps({"files":[{"path":"evidence/object.bin","bytes":len(e),"sha256":v.digest(e)}]}).encode()
@@ -174,6 +177,51 @@ class VerdictTests(unittest.TestCase):
             rec=bytearray(p.read_bytes());struct.pack_into("<H",rec,20,2);struct.pack_into("<I",rec,32,4)
             rec[288:]=hashlib.sha256(b"CYX/VERDICT/v4"+rec[:288]).digest();p.write_bytes(rec)
             self.assertEqual(v.aggregate(m,v.digest(m),r)["G4_QEMU"]["status"],"FAIL")
+
+    def test_cli_defaults_to_complete_qemu_evidence(self):
+        g4, _, _, inventory_digest = v.inventory()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            items = []
+            for pair in sorted(g4):
+                fixture, verdict_path = self.setup_run(root, pair=pair)
+                items.extend(json.loads(fixture)["proofs"])
+            manifest = json.dumps({
+                "schema": "cyxia-frozen-verdict-run/v1", "run_id": 1,
+                "inventory_sha256": inventory_digest, "proofs": items,
+            }).encode()
+            run_path = root / "run.json"
+            run_path.write_bytes(manifest)
+
+            def check(name, *args):
+                report_path = root / f"{name}.json"
+                process = subprocess.run([
+                    sys.executable, "-B", str(Path(v.__file__).resolve()),
+                    "--manifest", str(run_path), "--manifest-sha256", v.digest(manifest),
+                    "--evidence-root", str(root), "--output", str(report_path), *args,
+                ], capture_output=True, text=True, timeout=10)
+                self.assertEqual(process.stderr, "")
+                report = json.loads(report_path.read_bytes())
+                self.assertEqual(json.loads(process.stdout).get("required_gate"), report.get("required_gate"))
+                return process.returncode, report
+
+            code, report = check("default")
+            self.assertEqual(code, 0)
+            self.assertEqual(report["required_gate"], "G4_QEMU")
+            self.assertEqual(report["G4_QEMU"]["counts"]["PASS"], 262)
+            self.assertEqual(report["G4_QEMU"]["complete_ids"], 127)
+            self.assertEqual(report["ARCH_A53"]["counts"]["NOT_RUN"], 26)
+
+            code, report = check("physical", "--scope", "g5")
+            self.assertEqual(code, 1)
+            self.assertEqual(report["required_gate"], "G5_ARCH")
+            self.assertEqual(report["G5_ARCH"]["status"], "NOT_RUN")
+
+            verdict_path.unlink()
+            code, report = check("incomplete")
+            self.assertEqual(code, 1)
+            self.assertEqual(report["G4_QEMU"]["counts"]["NOT_RUN"], 1)
+
     def test_invalid_record_evidence_or_manifest_cannot_count_as_pass(self):
         with tempfile.TemporaryDirectory() as d:
             r=Path(d);m,p=self.setup_run(r)

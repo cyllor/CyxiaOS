@@ -20,6 +20,7 @@ NAMES={v:k for k,v in CLASSES.items()}
 STATUS={0:"NOT_RUN",1:"PASS",2:"FAIL"}
 REASONS={0:{1,2,7,8,9},1:{0},2:{3,4,5,6}}
 INVENTORY=Path(__file__).resolve().parent/"v0199-required-proof-inventory.json"
+VERDICT_GATES = {"g4": "G4_QEMU", "g5": "G5_ARCH"}
 
 # Verdict v4 identity allocation and the ranges in baseline 安§7.4.
 _CASE_RANGES = (
@@ -238,7 +239,8 @@ def main():
     p.add_argument("--manifest-sha256",required=True)
     p.add_argument("--evidence-root",type=Path,required=True)
     p.add_argument("--output",type=Path,required=True)
-    p.add_argument("--scope", choices=("g4", "g5"), default="g5", help="required archive proof set for the exit status")
+    p.add_argument("--scope", choices=VERDICT_GATES, default="g4",
+                   help="choose g4 (default) for V0.20 QEMU acceptance or g5 for physical-board acceptance")
     p.add_argument("--a53-manifest", type=Path, help="operator-locked physical platform manifest")
     p.add_argument("--a53-manifest-sha256")
     p.add_argument("--a53-evidence-root", type=Path)
@@ -255,9 +257,10 @@ def main():
         a53_lock = load_handoff(a.a53_manifest, a.a53_manifest_sha256, a.a53_evidence_root)
     result=aggregate(a.manifest.read_bytes(),a.manifest_sha256,a.evidence_root.resolve(strict=True),
                      a53_lock=a53_lock)
+    required_gate = VERDICT_GATES[a.scope]
+    result["required_gate"] = required_gate
     with a.output.open("x",encoding="utf-8") as f:json.dump(result,f,ensure_ascii=False,indent=2);f.write("\n")
-    print(json.dumps({k:result[k] for k in ("run_id","G4_QEMU","G5_ARCH","ARCH_A53")},indent=2))
-    scope = "G4_QEMU" if a.scope == "g4" else "G5_ARCH"
-    return int(result[scope]["status"] != "PASS")
+    print(json.dumps({k:result[k] for k in ("run_id","required_gate","G4_QEMU","G5_ARCH","ARCH_A53")},indent=2))
+    return int(result[required_gate]["status"] != "PASS")
 if __name__=="__main__":
     raise SystemExit(main())
