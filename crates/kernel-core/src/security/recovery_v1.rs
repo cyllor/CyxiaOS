@@ -385,6 +385,22 @@ pub struct RedoWriter<'a, I> {
     workspace: &'a mut RecoveryWorkspace,
 }
 
+struct CommittedView<'w, 'a, I>(&'w mut RedoWriter<'a, I>);
+
+impl<I: EpochBlockIo> EpochBlockIo for CommittedView<'_, '_, I> {
+    fn read(&mut self, block: u32, out: &mut [u8; BLOCK]) -> Result<(), Error> {
+        self.0.read_committed(block, out)
+    }
+
+    fn write(&mut self, _: u32, _: &[u8; BLOCK]) -> Result<(), Error> {
+        Err(Error::Unauthorized)
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        Err(Error::Unauthorized)
+    }
+}
+
 impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
     pub fn open(
         io: &'a mut I,
@@ -564,6 +580,34 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
         out: &mut [u8; BLOCK],
     ) -> Result<(), Error> {
         self.read_view(home, Some(commit_lsn), out)
+    }
+
+    /// Read-only committed home view for preflight before any replay writes.
+    /// Journal and superblock reads are not supported by this home view.
+    pub fn committed_view(&mut self) -> impl EpochBlockIo + '_ {
+        CommittedView(self)
+    }
+
+    /// Prove that one exact after-image is in the required verified commit
+    /// and that its physical home is either canonical predecessor or has
+    /// already been written by an interrupted replay of that same commit.
+    pub fn verify_replay_home(
+        &mut self,
+        home: u32,
+        commit_lsn: u64,
+        predecessor: &[u8; BLOCK],
+        after: &[u8; BLOCK],
+    ) -> Result<(), Error> {
+        let mut raw = [0; BLOCK];
+        self.read_committed_at(home, commit_lsn, &mut raw)?;
+        if raw != *after {
+            return Err(Error::Conflict);
+        }
+        self.io.read(home, &mut raw)?;
+        if raw != *predecessor && raw != *after {
+            return Err(Error::Conflict);
+        }
+        Ok(())
     }
 
     fn read_view(
@@ -1051,12 +1095,30 @@ mod tests {
             [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, u32::MAX, 13, u32::MAX]
         );
         assert!(!d.blocks.contains_key(&DATA_HOME));
+        // One home write survives a stop during the ordinary replay.
+        d.write(DATA_HOME, &data).unwrap();
+        d.flush().unwrap();
         let mut reopened = Disk {
             blocks: d.blocks,
             ..Disk::default()
         };
         let mut independent = RecoveryWorkspace::new();
-        let writer = RedoWriter::open(&mut reopened, &mut independent, sb).unwrap();
+        let mut writer = RedoWriter::open(&mut reopened, &mut independent, sb).unwrap();
+        writer
+            .verify_replay_home(DATA_HOME, plan.commit_lsn, &[0; BLOCK], &data)
+            .unwrap();
+        writer
+            .verify_replay_home(INODE_START, plan.commit_lsn, &[0; BLOCK], &inode_page)
+            .unwrap();
+        {
+            let mut view = writer.committed_view();
+            let mut raw = [0; BLOCK];
+            view.read(INODE_START, &mut raw).unwrap();
+            assert_eq!(raw, inode_page);
+            assert_eq!(view.write(DATA_HOME, &data), Err(Error::Unauthorized));
+            assert_eq!(view.flush(), Err(Error::Unauthorized));
+        }
+        assert!(writer.io.events.is_empty());
         let (replayed, next) = writer
             .checkpoint_verified(|io, _| {
                 let mut block = [0; BLOCK];
