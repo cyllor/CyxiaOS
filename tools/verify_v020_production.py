@@ -735,11 +735,18 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
                                    pending_fsync_blocks=pending_fsync_blocks,
                                    expected_fsync_epoch=expected_fsync_epoch)
     net_boot_epoch = words[148] if modes.signed_media else 1
+    confirmed = w11_rows(lines, "V020_SEC_N_CONFIRMED_BOOT")
     if modes.signed_media:
+        require(confirmed == [(net_boot_epoch, 1, 1)],
+                "missing confirmed TLS boot binding for signed scratch media")
         listen = "V020_W11_NET_LISTEN a=7 b=0 c=0"
         confirmation = f"V020_W11_MEDIA_STEP a=4 b=1 c={net_boot_epoch}"
-        require(lines.count(listen) == 1 and lines.index(confirmation) < lines.index(listen),
-                "signed-media network listened before durable BootEpoch confirmation")
+        network = f"V020_SEC_N_CONFIRMED_BOOT a={net_boot_epoch} b=1 c=1"
+        require(lines.count(listen) == 1
+                and lines.index(confirmation) < lines.index(network) < lines.index(listen),
+                "signed-media network listened before durable BootEpoch binding")
+    else:
+        require(not confirmed, "unexpected signed scratch network binding")
     flags = {
         "frame_meta": words[129] == 1,
         "recovery": (words[131] == RECOVERY_ACCUMULATORS and words[133] == 1
@@ -780,6 +787,7 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
         "staging_confirmed_epoch": words[148] if staging else None,
         "staging_previous_epoch": words[163] if staging else None,
         "staging_reopened": modes.media_reopen,
+        "native_tls_confirmed_boot_epoch": confirmed[0][0] if confirmed else None,
         "w11_completion_marker": expected,
     }
 

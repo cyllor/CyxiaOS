@@ -319,7 +319,7 @@ fn open_stream<'a>(
 /// the production boot.
 fn relay(
     stream: &mut Stream<'_>,
-    identity: sec_n_broker::BootIdentity,
+    identity: sec_n_broker::BootIdentity<'_>,
     source: u32,
     accepted_ns: u64,
     entropy: &mut sec_n_broker::EntropyFill<'_>,
@@ -352,7 +352,7 @@ fn relay(
             Some(StreamPort::poll_normal_close),
             Some(&mut signer),
         );
-        sec_n_broker::discard_guest_session(&layout, identity.boot_epoch);
+        sec_n_broker::discard_guest_session(&layout, identity.boot_epoch());
         signer.discard();
         outcome
     }
@@ -363,18 +363,26 @@ fn relay(
 }
 
 /// One-shot SEC-N service run on CPU0 (after the advice chain).
-pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity) -> NetOutcome {
+pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity<'_>) -> NetOutcome {
     #[cfg(feature = "v020-production-authenticated-net")]
     if let Err(error) = identity.qualify_packages() {
         report(
             "V020_SEC_N_PACKAGE_REJECTED",
-            identity.boot_epoch,
+            identity.boot_epoch(),
             error as u64,
             0,
         );
         return NetOutcome::default();
     }
-    let outcome = match net_device::with_device(info, identity.boot_epoch, |dev| {
+    if let Some(installation) = identity.confirmed_installation() {
+        report(
+            "V020_SEC_N_CONFIRMED_BOOT",
+            identity.boot_epoch(),
+            installation.verifier_generation,
+            installation.signer_generation,
+        );
+    }
+    let outcome = match net_device::with_device(info, identity.boot_epoch(), |dev| {
         serve_attached_network(info, dev, identity)
     }) {
         Ok(outcome) => outcome,
@@ -389,7 +397,7 @@ pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity) -> Ne
             return NetOutcome::default();
         }
     };
-    let retained = match net_device::terminal_custody(identity.boot_epoch) {
+    let retained = match net_device::terminal_custody(identity.boot_epoch()) {
         Ok(retained) => retained,
         Err(error) => {
             report("V020_SEC_D_NET_RESET_UNCONFIRMED", error as u64, 0, 0);
@@ -407,7 +415,7 @@ pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity) -> Ne
     let [rx, tx] = retained.chains;
     report(
         "V020_SEC_D_NET_RESET_CUSTODY",
-        identity.boot_epoch,
+        identity.boot_epoch(),
         rx.iter().flatten().count() as u64,
         tx.iter().flatten().count() as u64,
     );
@@ -453,10 +461,10 @@ fn serve_attached_network(
     )]
     info: &BootInfo,
     dev: &mut BatchedNet,
-    identity: sec_n_broker::BootIdentity,
+    identity: sec_n_broker::BootIdentity<'_>,
 ) -> NetOutcome {
     #[cfg(feature = "v020-production-authenticated-net")]
-    let mut rng = match net_entropy::Entropy::attach(info, identity.boot_epoch) {
+    let mut rng = match net_entropy::Entropy::attach(info, identity.boot_epoch()) {
         Ok(rng) => rng,
         Err(error) => {
             report("V020_W12_NET_ENTROPY_UNAVAILABLE", error as u64, 0, 0);
@@ -508,7 +516,7 @@ fn serve_attached_network(
 
 fn serve_stream(
     dev: &mut BatchedNet,
-    identity: sec_n_broker::BootIdentity,
+    identity: sec_n_broker::BootIdentity<'_>,
     random_seed: u64,
     entropy: &mut sec_n_broker::EntropyFill<'_>,
 ) -> NetOutcome {

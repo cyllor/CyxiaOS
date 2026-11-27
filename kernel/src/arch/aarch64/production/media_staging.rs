@@ -115,10 +115,7 @@ static MOUNT_REQUIRES_RECOVERY: AtomicBool = AtomicBool::new(false);
 
 /// Result of the one-shot staging run (evidence words 145..149).
 #[cfg_attr(
-    not(any(
-        cyxia_signed_resident,
-        feature = "v020-production-fsync-scratch"
-    )),
+    not(any(cyxia_signed_resident, feature = "v020-production-media-signed")),
     derive(Clone, Copy)
 )]
 #[derive(Default)]
@@ -131,9 +128,7 @@ pub(super) struct StagingOutcome {
     pub(super) unified_map_validated: bool,
     /// `BootEpochAuthority::confirmed_epoch`, 0 = not confirmed.
     pub(super) confirmed_epoch: u64,
-    #[cfg(feature = "v020-production-media-signed")]
-    network_boot: Option<super::super::sec_n_broker::BootIdentity>,
-    #[cfg(cyxia_signed_resident)]
+    #[cfg(any(cyxia_signed_resident, feature = "v020-production-media-signed"))]
     pub(super) resident_boot: Option<SignedResidentBoot>,
     #[cfg(feature = "v020-production-diagnostic")]
     pub(super) admission_flow_ok: bool,
@@ -165,13 +160,13 @@ pub(super) struct StagedReceiptQuery {
     pub(super) expected: FileReceiptV4,
 }
 
-#[cfg(cyxia_signed_resident)]
+#[cfg(any(cyxia_signed_resident, feature = "v020-production-media-signed"))]
 pub(super) struct SignedResidentBoot {
     epochs: cyxia_kernel_core::security::boot_epoch_v1::BootEpochAuthority,
     config: VerifiedOfflineConfig<'static>,
 }
 
-#[cfg(cyxia_signed_resident)]
+#[cfg(any(cyxia_signed_resident, feature = "v020-production-media-signed"))]
 impl SignedResidentBoot {
     pub(super) fn policy(
         &self,
@@ -186,8 +181,12 @@ impl SignedResidentBoot {
 #[cfg(feature = "v020-production-diagnostic")]
 impl StagingOutcome {
     #[cfg(feature = "v020-production-media-signed")]
-    pub(super) fn network_boot(&self) -> Option<super::super::sec_n_broker::BootIdentity> {
-        self.network_boot.filter(|_| self.chain_complete)
+    pub(super) fn network_boot(&self) -> Option<super::super::sec_n_broker::BootIdentity<'_>> {
+        if !self.chain_complete {
+            return None;
+        }
+        let policy = self.resident_boot.as_ref()?.policy().ok()?;
+        super::super::sec_n_broker::BootIdentity::from_signed_scratch(policy, signed::FIXTURE_TLS)
     }
 
     /// First missing staging result, including the independent in-vector probe.
@@ -464,11 +463,6 @@ fn run_chain(
         if committed.last_boot_epoch != out.confirmed_epoch {
             return None;
         }
-        out.network_boot = super::super::sec_n_broker::BootIdentity::from_signed_scratch(
-            &committed,
-            &verified,
-            signed::FIXTURE_TLS,
-        );
         out.receipt_query_digest =
             Some(volume::confirmed_receipt_query_digest(&mounted, &committed, &verified).ok()?);
         #[cfg(all(
@@ -560,7 +554,7 @@ fn run_chain(
         .ok()?;
         out.snapshot_catalog = Some(catalog);
     }
-    #[cfg(cyxia_signed_resident)]
+    #[cfg(any(cyxia_signed_resident, feature = "v020-production-media-signed"))]
     {
         out.resident_boot = Some(SignedResidentBoot {
             epochs: resident_epochs,
@@ -644,7 +638,7 @@ pub(super) fn stage_with_policy(
     if super::recovery::contain_terminal_block(out.confirmed_epoch) {
         out.mount_requires_recovery = true;
         out.chain_complete = false;
-        #[cfg(cyxia_signed_resident)]
+        #[cfg(any(cyxia_signed_resident, feature = "v020-production-media-signed"))]
         {
             out.resident_boot = None;
         }

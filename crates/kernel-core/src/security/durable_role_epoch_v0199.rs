@@ -107,10 +107,12 @@ pub struct DurableEpochGate {
 
 /// Current signed policy and durable boot identity. The borrow excludes a
 /// concurrent epoch or isolation transition while a protected owner uses it.
+#[derive(Clone, Copy)]
 pub struct ConfirmedBootPolicy<'a> {
     epochs: &'a DurableEpochGate,
     boot: u64,
     config_digest: [u8; 32],
+    key_manifest_hash: [u8; 32],
 }
 
 impl ConfirmedBootPolicy<'_> {
@@ -124,6 +126,47 @@ impl ConfirmedBootPolicy<'_> {
 
     pub fn service_generation(&self, role: Role) -> Result<u64, Error> {
         self.epochs.service_generation(role)
+    }
+
+    pub(super) fn verify_tls_installation(
+        &self,
+        installation: &super::network::TlsInstallation,
+    ) -> Result<(), Error> {
+        // The signed scratch TLS profile reserves these on-disk slots.
+        // Reject an overlapping protected control-role assignment.
+        const VERIFIER: usize = 12;
+        const SIGNER: usize = 13;
+        const TLS_SLOTS: u64 = (1 << VERIFIER) | (1 << SIGNER);
+        if self
+            .epochs
+            .slots
+            .iter()
+            .any(|binding| TLS_SLOTS & (1 << binding.slot) != 0)
+        {
+            return Err(Error::Conflict);
+        }
+        let state = &self.epochs.committed;
+        if state.isolated_service_bitmap & TLS_SLOTS != 0
+            || self.key_manifest_hash != installation.key_manifest_hash
+        {
+            return Err(Error::Unauthorized);
+        }
+        let generations = [
+            installation.verifier_generation,
+            installation.signer_generation,
+            installation.key_generation,
+        ];
+        if generations.contains(&0)
+            || generations
+                != [
+                    state.service_generations[VERIFIER],
+                    state.service_generations[SIGNER],
+                    state.key_generation,
+                ]
+        {
+            return Err(Error::Stale);
+        }
+        Ok(())
     }
 }
 
@@ -222,6 +265,7 @@ impl DurableEpochGate {
             epochs: self,
             boot: self.confirmed_config_boot(config)?,
             config_digest: config.digest(),
+            key_manifest_hash: config.header().key_manifest_hash,
         })
     }
     fn slot(&self, role: Role) -> Result<usize, Error> {

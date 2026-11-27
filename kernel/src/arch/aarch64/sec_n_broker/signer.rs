@@ -13,19 +13,19 @@ const SIGNER_STACK_PAGES: usize = 16;
 #[unsafe(export_name = "V020_SEC_N_SIGNER_SPACE_PAGES")]
 static mut SIGNER: AddressSpace<SIGNER_FRAMES, SIGNER_STACK_PAGES> = AddressSpace::ZERO;
 
-pub(crate) struct Signer {
+pub(crate) struct Signer<'a> {
     memory: Memory,
     layout: Layout,
-    identity: BootIdentity,
+    identity: BootIdentity<'a>,
     issued: Option<(Request, Option<[u8; SIGNATURE_BYTES]>)>,
 }
 
-impl Signer {
+impl<'a> Signer<'a> {
     pub(super) fn issued_for(&self, generation: u64) -> bool {
         matches!(self.issued, Some((request, Some(_))) if request.conn_generation == generation)
     }
 
-    pub(crate) fn load(identity: BootIdentity) -> Self {
+    pub(crate) fn load(identity: BootIdentity<'a>) -> Self {
         // SAFETY: the single CPU0 network owner loads this address space once.
         // Its key pages are separate from the verifier's virtual address space.
         let memory = unsafe { AddressSpace::memory(core::ptr::addr_of_mut!(SIGNER)) };
@@ -69,11 +69,11 @@ impl Signer {
         // authorization before entering the signer; failure cannot issue a
         // second nonce for the same pending connection.
         let request = Request {
-            boot_epoch: self.identity.boot_epoch,
-            verifier_generation: self.identity.verifier_generation,
+            boot_epoch: self.identity.boot_epoch(),
+            verifier_generation: self.identity.verifier_generation(),
             conn_id: connection,
             conn_generation: connection,
-            key_generation: self.identity.tls.key_generation,
+            key_generation: self.identity.tls().key_generation,
             nonce: 1,
             expires_ns,
             transcript_hash,
@@ -97,8 +97,8 @@ impl Signer {
         let pages = discard_role_space(&self.memory, &self.layout);
         report(
             "V020_SEC_N_SIGNER_DISCARDED",
-            self.identity.boot_epoch,
-            self.identity.tls.key_generation,
+            self.identity.boot_epoch(),
+            self.identity.tls().key_generation,
             pages as u64,
         );
     }

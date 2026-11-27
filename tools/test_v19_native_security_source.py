@@ -614,7 +614,7 @@ class NativeSecurityWiring(unittest.TestCase):
         arm = ROOT / "kernel/src/arch/aarch64"
         net = source(arm / "production/net.rs")
         self.assertIn("net_device::with_device(", net)
-        self.assertIn("net_device::terminal_custody(identity.boot_epoch)", net)
+        self.assertIn("net_device::terminal_custody(identity.boot_epoch())", net)
         self.assertNotIn("LoopbackPort", net)
         self.assertNotIn("RateLimiter", net)
         self.assertIn("evidence::W11_TLS_ECHO_TURN_VERIFIED, 0", net)
@@ -780,7 +780,7 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertEqual(scope.count("f()"), 1)
         self.assertTrue(scope.rstrip().endswith("\n    out"))
         net = source(arm / "production/net.rs")
-        self.assertIn("pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity) -> NetOutcome", net)
+        self.assertIn("pub(super) fn serve(info: &BootInfo, identity: sec_n_broker::BootIdentity<'_>) -> NetOutcome", net)
 
     def test_v020_wave11_production_parks_halted_cpus_with_wfi(self):
         # Final fix wave I1: under TCG a WFE park spins a host core per halted

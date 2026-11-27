@@ -632,9 +632,14 @@ class W11Validation(unittest.TestCase):
             "V020_W13_MEDIA_SCOPE test_key=true format_golden=false signed_config=true",
         ]
         modes = v.Modes(signed_media=True)
+        self.rejects("confirmed TLS boot binding", words=words, lines=lines,
+                     staging=True, modes=modes)
+        lines.insert(lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0"),
+                     "V020_SEC_N_CONFIRMED_BOOT a=1 b=1 c=1")
         obs = self.check(words=words, lines=lines, staging=True, modes=modes)
         self.assertTrue(obs["signed_test_config_verified"])
         self.assertEqual(obs["signed_config_bound_boot_epoch"], 1)
+        self.assertEqual(obs["native_tls_confirmed_boot_epoch"], 1)
         self.assertEqual(obs["signed_receipt_view_sha256"],
                          b"".join(word.to_bytes(8, "little") for word in (2, 3, 4, 5)).hex())
         self.rejects("signed receipt view", words=words,
@@ -666,6 +671,8 @@ class W11Validation(unittest.TestCase):
             "V020_W13_SIGNED_SCRATCH a=1 b=2 c=1",
             "V020_W13_MEDIA_SCOPE test_key=true format_golden=false signed_config=true",
         ]
+        lines.insert(lines.index("V020_W11_NET_LISTEN a=7 b=0 c=0"),
+                     "V020_SEC_N_CONFIRMED_BOOT a=2 b=1 c=1")
         self.rejects("wrong generation", words=words, lines=lines, staging=True, modes=modes)
         prefix = "V020_SEC_D_NET_RESET_PROOF "
         for index, line in enumerate(lines):
