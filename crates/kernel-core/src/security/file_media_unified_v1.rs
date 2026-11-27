@@ -26,6 +26,9 @@ use super::Error;
 use super::file_media_v0199::{SnapshotMediaKind, crc32c_zeroed, probe_snapshot_media_pair};
 use super::file_structure_v1::{INODE_BYTES, INODES, SystemKind, SystemObject};
 
+#[cfg(not(target_os = "none"))]
+#[path = "snapshot_catalog_candidate.rs"]
+pub mod catalog_candidate;
 #[path = "snapshot_protection_candidate.rs"]
 pub mod protection_candidate;
 #[cfg(not(target_os = "none"))]
