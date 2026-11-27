@@ -363,11 +363,19 @@ class Production:
         before, start, end, restored = lock_ticks
         require(0 < before <= start <= end <= restored and before < restored,
                 "missing or invalid raw D01 target-lock counters")
-        work_ticks = end - start
-        total_ticks = restored - before
-        measured = tuple((ticks * 1_000_000_000 + TARGET_LOCK_COUNTER_HZ - 1)
-                         // TARGET_LOCK_COUNTER_HZ
-                         for ticks in (work_ticks, total_ticks - work_ticks, total_ticks))
+
+        def elapsed_ns(ticks: int) -> int:
+            return (ticks * 1_000_000_000 + TARGET_LOCK_COUNTER_HZ - 1) // TARGET_LOCK_COUNTER_HZ
+
+        # The outer samples include IRQ masking and restoration. Compute the
+        # combined overhead before rounding so splitting it leaves its bound intact.
+        acquire_ticks = start - before
+        release_ticks = restored - end
+        measured = (
+            elapsed_ns(end - start),
+            elapsed_ns(acquire_ticks + release_ticks),
+            elapsed_ns(restored - before),
+        )
         require((work_ns, overhead_ns, irq_off_ns) == measured,
                 "D01 target-lock durations differ from raw counters")
         # Safety budgets are checked independently from the bridge observation.
@@ -465,6 +473,8 @@ class Production:
             "causal_label": words[12],
             "unique_native_accept_count": words[13],
             "target_lock_work_ns": work_ns,
+            "target_lock_mask_and_acquire_ns": elapsed_ns(acquire_ticks),
+            "target_lock_release_and_restore_ns": elapsed_ns(release_ticks),
             "target_lock_overhead_ns": overhead_ns,
             "target_lock_irq_off_ns": irq_off_ns,
             "target_lock_raw_ticks": lock_ticks,

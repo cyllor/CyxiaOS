@@ -166,6 +166,8 @@ class W11Validation(unittest.TestCase):
         self.assertEqual(obs["recovery_writer_takeovers"], 3)
         self.assertEqual(obs["policy_lock_measured_overruns"], 1)
         self.assertEqual(obs["policy_lock_unmeasured"], 3)
+        self.assertEqual(obs["target_lock_mask_and_acquire_ns"], 320)
+        self.assertEqual(obs["target_lock_release_and_restore_ns"], 192)
         self.assertEqual(obs["target_lock_irq_off_ns"], 704)
         self.assertEqual(obs["target_lock_raw_ticks"], (1000, 1020, 1032, 1044))
         self.assertFalse(obs["target_lock_closed_new_work"])
@@ -198,6 +200,29 @@ class W11Validation(unittest.TestCase):
         self.rejects("raw D01 target-lock counters", words=words)
         words[156:160] = [1000, 1020, 1033, 1044]
         self.rejects("D01 target-lock durations differ from raw counters", words=words)
+
+    def test_target_lock_phase_ticks_preserve_the_combined_budgets(self):
+        for work, release, fault in (
+            (2812, 112, 0),  # 44,992 ns work + 4,992 ns overhead
+            (2812, 113, 2),  # 5,008 ns overhead, exactly 50,000 ns IRQ-off
+            (2812, 114, 6),  # overhead and IRQ-off overrun
+            (2813, 112, 1),  # 45,008 ns work, exactly 50,000 ns IRQ-off
+        ):
+            with self.subTest(work=work, release=release):
+                words = w11_words()
+                words[156:160] = [1000, 1200, 1200 + work, 1200 + work + release]
+                lines = w11_lines()
+                lock_idx = lines.index("V020_SEC_S_TARGET_LOCK a=192 b=512 c=704")
+                overhead = 16 * (200 + release)
+                lines[lock_idx] = (
+                    f"V020_SEC_S_TARGET_LOCK a={16 * work} b={overhead} c={16 * work + overhead}"
+                )
+                lines[lock_idx + 1] = f"V020_SEC_S_TARGET_INSTALL a=7 b=4 c={fault}"
+                obs = self.check(words=words, lines=lines)
+                self.assertEqual(obs["target_lock_mask_and_acquire_ns"], 3200)
+                self.assertEqual(obs["target_lock_release_and_restore_ns"], 16 * release)
+                self.assertEqual(obs["target_lock_overhead_ns"], overhead)
+                self.assertEqual(obs["target_lock_closed_new_work"], bool(fault))
 
     def test_rejects_missing_net_device(self):
         words = w11_words()
