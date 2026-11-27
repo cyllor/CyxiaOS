@@ -11,10 +11,15 @@ on:
       - 'crates/kernel-core/src/security/file_*'
       - 'crates/kernel-core/src/security/snapshot_*'
       - 'crates/kernel-core/tests/snapshot_*'
+      - 'crates/kernel-core/tests/media_staging.rs'
       - 'tests/host/test_snapshot*'
       - 'tools/test_snapshot_probe.py'
       - 'tools/run_snapshot_probe.py'
       - 'tools/host_prototype_library.py'
+      - 'tools/test_v020_g1_genesis.py'
+      - 'tools/v020_g1_genesis.py'
+      - 'tools/v020_snapshot_slot_vectors.py'
+      - 'tools/fixtures/v020-g1-*'
       - 'kernel/src/runtime/files/**'
       - 'crates/prototype/src/journal*'
       - 'crates/prototype/src/storage*'
@@ -98,6 +103,12 @@ jobs:
           printf '%s\n' 'HOST_COMPONENT_ONLY; no mount or device FLUSH proof' > artifacts/snapshot-media/scope.txt
           cargo test --locked --offline -p cyxia-kernel-core security::file_ 2>&1 | tee artifacts/snapshot-media/guard.log
           cargo test --locked --offline -p cyxia-kernel-core --test snapshot_list_v4 --test snapshot_read_v4 2>&1 | tee artifacts/snapshot-media/snapshot-read.log
+      - name: Compare independent candidate G1 bytes
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest -v tools.test_v020_g1_genesis 2>&1 | tee artifacts/snapshot-media/genesis.log
+          python3 -B tools/v020_snapshot_slot_vectors.py check 2>&1 | tee artifacts/snapshot-media/slot.log
+          cargo test --locked --offline -p cyxia-kernel-core --test media_staging --test snapshot_slot_candidate --test snapshot_protection_candidate 2>&1 | tee artifacts/snapshot-media/g1-rust.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

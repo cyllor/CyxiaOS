@@ -28,6 +28,9 @@ use super::file_structure_v1::{INODE_BYTES, INODES, SystemKind, SystemObject};
 
 #[path = "snapshot_protection_candidate.rs"]
 pub mod protection_candidate;
+#[cfg(not(target_os = "none"))]
+#[path = "snapshot_slot_candidate.rs"]
+pub mod slot_candidate;
 
 // Baseline-frozen layout constants, re-exported as the unified contract's
 // single source (never re-derived here).
