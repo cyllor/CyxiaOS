@@ -196,6 +196,51 @@ impl BootPairRedo {
             .chain(self.commit.iter())
             .all(|&v| v == 0)
     }
+    /// With the successor checkpoint selected, recognize only zero blocks
+    /// and exact blocks from its previously committed boot-only transaction.
+    /// The caller must verify the selected checkpoint and all mounted homes
+    /// before retiring this extent. This check never writes to the device.
+    pub fn verify_checkpointed_residue(
+        &mut self,
+        io: &mut impl EpochBlockIo,
+        prior: SuperblockV1,
+        first: u32,
+        homes: [u32; 2],
+        state: SecurityStateStoreV2,
+    ) -> Result<(), Error> {
+        Self::extent(first)?;
+        if state.fs_uuid != prior.fs_uuid || state.last_boot_epoch != prior.generation {
+            return Err(Error::Conflict);
+        }
+        let boot = BootEpochStoreV1 {
+            fs_uuid: state.fs_uuid,
+            boot_epoch: state.last_boot_epoch,
+        };
+        self.encode(
+            prior,
+            homes[0],
+            homes[1],
+            state.last_boot_epoch,
+            prior
+                .checkpoint_lsn
+                .checked_add(4)
+                .ok_or(Error::Exhausted)?,
+            &state.encode()?,
+            &boot.encode()?,
+        )?;
+        let mut raw = [0; BLOCK];
+        let records = core::iter::once(self.begin.as_slice())
+            .chain(self.state_redo.chunks_exact(BLOCK))
+            .chain(self.boot_redo.chunks_exact(BLOCK))
+            .chain(core::iter::once(self.commit.as_slice()));
+        for (offset, expected) in records.enumerate() {
+            io.read(first + offset as u32, &mut raw)?;
+            if raw != [0; BLOCK] && raw != expected {
+                return Err(Error::Conflict);
+            }
+        }
+        Ok(())
+    }
     pub fn state_image(&self) -> &[u8; BLOCK] {
         self.state_redo[64..4160].try_into().unwrap()
     }
