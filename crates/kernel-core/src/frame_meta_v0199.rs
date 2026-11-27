@@ -162,7 +162,8 @@ pub struct Ledger<'a> {
     fixed_total: u32,
     // Bounded static mode: the table covers exactly `fixed_count` registered
     // permanent regions tiling the whole row window; there is no ordinary
-    // free pool. Full-RAM mode keeps fixed_count == 4 and static_mode false.
+    // free pool. Full-RAM mode keeps its four fixed ranges first, followed by
+    // optional typed subregions of the permanent boot arena.
     static_mode: bool,
     // Bounded pool-accounting mode: rows mirror a frames::FramePool geometry
     // and transition only through the PoolBridge recording helpers; the
@@ -414,16 +415,37 @@ impl<'a> Ledger<'a> {
         Ok(l)
     }
 
+    /// Classify permanent pages already covered by the narrow boot arena.
+    /// This grants no additional reservations and leaves inventory totals
+    /// unchanged. A full-RAM ledger can install its static records once.
+    pub fn register_arena_statics(&mut self, regions: &[StaticRegion]) -> Result<u32, Error> {
+        if self.static_mode || self.pool_mode || self.fixed_count != 4 {
+            return Err(Error::Busy);
+        }
+        if regions.is_empty() || regions.len() > MAX_STATIC_REGIONS - 4 {
+            return Err(Error::Invalid);
+        }
+        let arena = self.fixed[0];
+        let end = arena.end().map_err(|_| Error::Invalid)?;
+        let (fixed, classes, total) = sparse_records(arena.start.0, end, regions)?;
+        let count = 4 + regions.len();
+        self.fixed[4..count].copy_from_slice(&fixed[..regions.len()]);
+        self.classes[4..count].copy_from_slice(&classes[..regions.len()]);
+        self.fixed_count = count;
+        Ok(total)
+    }
+
     /// Check that a byte span fits one registered static region of the
     /// required class and that every touched row is permanently pinned.
     /// A gap row is permanent too, but it conveys no backing authority.
     pub fn statically_pinned(&self, span: core::ops::Range<u64>, class: StaticClass) -> bool {
-        if !self.static_mode || span.start >= span.end || span.start < self.base {
+        if self.pool_mode || span.start >= span.end || span.start < self.base {
             return false;
         }
-        if !self.fixed[..self.fixed_count]
+        let start = if self.static_mode { 0 } else { 4 };
+        if !self.fixed[start..self.fixed_count]
             .iter()
-            .zip(&self.classes)
+            .zip(&self.classes[start..])
             .any(|(region, registered)| {
                 *registered == class
                     && region.start.0 <= span.start
@@ -1038,6 +1060,21 @@ mod tests {
         let mut l = Ledger::initialize(&mut rows, ram, fixed, &fw).unwrap();
         let before = l.inventory().unwrap();
         assert_eq!(before.permanent, 16384 + 2560 + 2048 + 2048 + 1);
+        let control = static_region(PAGE, 2 * PAGE, StaticClass::Control);
+        assert_eq!(
+            l.register_arena_statics(&[static_region(
+                64 * 1024 * 1024,
+                PAGE,
+                StaticClass::Control
+            )]),
+            Err(Error::Invalid)
+        );
+        assert_eq!(l.register_arena_statics(&[control]), Ok(2));
+        assert_eq!(l.register_arena_statics(&[control]), Err(Error::Busy));
+        let start = control.region.start.0;
+        assert!(l.statically_pinned(start + PAGE - 1..start + PAGE + 1, StaticClass::Control));
+        assert!(!l.statically_pinned(start - 1..start + 1, StaticClass::Control));
+        assert_eq!(l.inventory().unwrap(), before);
         let h = l
             .reserve(Owner {
                 slot: 1,

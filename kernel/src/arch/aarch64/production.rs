@@ -1176,11 +1176,12 @@ pub(crate) fn run(info: &BootInfo) -> ! {
         0,
         "only boot CPU0 owns the production control plane"
     );
+    #[cfg(not(feature = "v020-production-frame-pool"))]
     frames::register_or_fatal();
     #[cfg(feature = "v020-production-frame-pool")]
     let reserved_info = {
         let mut reserved = *info;
-        frames::prove_pool_or_fatal(&mut reserved);
+        frames::prepare_pool_or_fatal(&mut reserved);
         reserved
     };
     #[cfg(feature = "v020-production-frame-pool")]
@@ -1234,6 +1235,8 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(PIE_MEMBERS), pie_members);
     }
+    #[cfg(all(feature = "v020-production-frame-pool", feature = "prototype-memory"))]
+    frames::prove_dense_pool_or_fatal(&pie_manifest);
     report(
         "V020_PROD_PIE_LOAD",
         ROLE_COUNT as u64,

@@ -94,6 +94,7 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/scratch_blk.rs",
     "kernel/src/arch/aarch64/production/evidence.rs",
     "kernel/src/arch/aarch64/production/frames.rs",
+    "kernel/src/arch/aarch64/production/frames/dense.rs",
     "kernel/src/arch/aarch64/production/frames/pool.rs",
     "kernel/src/arch/aarch64/production/file_read.rs",
     "kernel/src/arch/aarch64/production/file_read/sessions.rs",
@@ -819,6 +820,66 @@ def supervisor_copy_windows(elf, qmp, output, lines, *, snapshot_lists=None, fil
     }
 
 
+def dense_frame_meta(qmp, output, lines, permanent_observed):
+    require = verify_smp.require
+
+    def observed(name):
+        records = w11_rows(lines, "V020_SEC_M_DENSE_FRAME_" + name)
+        require(len(records) == 1, "missing one dense FrameMeta " + name + " witness")
+        return records[0]
+
+    page = 4096
+    ram_base, arena_end, ram_end = 0x40000000, 0x44000000, 0x80000000
+    table, count, table_bytes = observed("TABLE")
+    control, progress, pool_bytes = observed("POOLS")
+    permanent, free, reserved = observed("ROWS")
+    slot, actor, actor_generation = observed("OWNER")
+    frame, previous_generation, generation = observed("REVOKE")
+    row = struct.Struct("<IIQQIIII")
+    require(count == (ram_end - ram_base) // page and table_bytes == count * row.size
+            and pool_bytes == 8 * 1024 * 1024, "dense FrameMeta geometry differs")
+    ranges = sorted((start, start + size) for start, size in (
+        (table, table_bytes), (control, pool_bytes), (progress, pool_bytes), (frame, page),
+    ))
+    require(all(arena_end <= start < end <= ram_end and start % page == 0 for start, end in ranges)
+            and all(before[1] <= after[0] for before, after in zip(ranges, ranges[1:])),
+            "dense FrameMeta reservations or ordinary frame overlap")
+    require(slot == len(PIE_ROLE_IDS) - 1 and actor == PIE_ROLE_IDS[slot]
+            and any(record[:2] == (actor, actor_generation)
+                    for record in w11_rows(lines, "V020_PROD_PIE_ROLE")),
+            "dense FrameMeta allocation owner differs from the native Supervisor")
+    require(previous_generation > 0 and generation == previous_generation + 1,
+            "dense FrameMeta did not advance the reclaimed frame generation")
+
+    path = output / "dense-frame-meta.bin"
+    qmp.execute("pmemsave", {"val": table, "size": table_bytes, "filename": str(path)})
+    raw = path.read_bytes()
+    require(len(raw) == table_bytes, "incomplete dense FrameMeta readback")
+    permanent_rows = 0
+    for owner, flags, owner_generation, _, refs, pins, dma, shares in row.iter_unpack(raw):
+        require(owner == 0xFFFFFFFF and not any((owner_generation, refs, pins, dma, shares))
+                and flags in (0, 4, 8), "dense FrameMeta leaked a frame or reference")
+        permanent_rows += flags == 4
+    require((permanent, free, reserved) == (permanent_rows, count - permanent_rows, 0)
+            and permanent == permanent_observed, "dense FrameMeta inventory differs from the table")
+    for start, end in [(ram_base, arena_end), (table, table + table_bytes),
+                       (control, control + pool_bytes), (progress, progress + pool_bytes)]:
+        begin, finish = ((pa - ram_base) // page * row.size for pa in (start, end))
+        require(all(record == (0xFFFFFFFF, 4, 0, 0, 0, 0, 0, 0)
+                    for record in row.iter_unpack(raw[begin:finish])),
+                "a fixed dense FrameMeta reservation was not permanent")
+    require(row.unpack_from(raw, (frame - ram_base) // page * row.size)
+            == (0xFFFFFFFF, 0, 0, generation, 0, 0, 0, 0), "reclaimed frame row differs")
+    sample = output / "dense-scrubbed-frame.bin"
+    qmp.execute("pmemsave", {"val": frame, "size": page, "filename": str(sample)})
+    require(sample.read_bytes() == bytes(page), "reclaimed frame was not scrubbed")
+    return {"table_pa": hex(table), "row_count": count, "table_bytes": table_bytes,
+            "control_pool_pa": hex(control), "progress_pool_pa": hex(progress),
+            "permanent_rows": permanent, "free_rows": free, "probe_pa": hex(frame),
+            "owner_slot": slot, "actor": actor, "actor_generation": actor_generation,
+            "frame_generation": generation, "scrubbed": True}
+
+
 def source_manifest() -> dict:
     names = {}
     for name in PRODUCTION_SOURCES:
@@ -951,9 +1012,14 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                     report["observations"] = acceptance.validate(
                         bytes(decoded), page, len(actual_cpus), pending_fsync_blocks=pending_fsync_blocks,
                         expected_fsync_epoch=expected_fsync_epoch)
+                    lines = decoded.decode("ascii").splitlines()
+                    if modes.frame_pool and staging:
+                        report["dense_frame_meta"] = dense_frame_meta(
+                            qmp, output, lines, report["observations"]["frame_meta_permanent_rows"],
+                        )
                     if modes.snapshot_catalog or modes.file_read or modes.fsync_scratch:
                         report.update(supervisor_copy_windows(
-                            elf.read_bytes(), qmp, output, decoded.decode("ascii").splitlines(),
+                            elf.read_bytes(), qmp, output, lines,
                             snapshot_lists=(report["observations"]["snapshot_catalog_lists"]
                                             if modes.snapshot_catalog else None),
                             file_copy=modes.file_read or modes.fsync_scratch,
