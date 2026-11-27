@@ -79,7 +79,11 @@ impl Trace {
 
     pub(super) fn seal(self) {
         V0199_BUDGET_TRACE.header[0].store(MAGIC, Ordering::Relaxed);
-        V0199_BUDGET_TRACE.header[1].store(3, Ordering::Relaxed);
+        V0199_BUDGET_TRACE.header[1].store(4, Ordering::Relaxed);
         V0199_BUDGET_TRACE.header[2].store(self.next as u64, Ordering::Release);
+    }
+
+    pub(super) fn intervals(&self) -> usize {
+        self.next
     }
 }

@@ -78,7 +78,8 @@ class Bringup:
         ]
         recovery_slices = (sum(struct.unpack_from("<8Q", page, 56 * 8)),
                            max(struct.unpack_from("<8Q", page, 64 * 8)))
-        return verify_trace(path.read_bytes(), summary, replacement_roles, recovery_slices)
+        return verify_trace(path.read_bytes(), summary, replacement_roles, recovery_slices,
+                            boot_accounting=self.boot_accounting)
     @staticmethod
     def metadata():
         return dict(scope='v0199-eight-distinct-native-bootstrap-packages',
@@ -105,6 +106,14 @@ class Bringup:
                     require(match is not None,'malformed '+tag)
                     matches.append(tuple(map(int,match.groups())))
             return matches
+        early = rows('V0199_BOOTSTRAP_EARLY_ACCOUNTING')
+        require(len(early) <= 1, 'duplicate early boot accounting')
+        self.boot_accounting = early[0] if early else None
+        if early:
+            boot_order = [serial.find(tag) for tag in (b'SMP_BOOT_OK ',
+                          b'V0199_BOOTSTRAP_EARLY_ACCOUNTING ', b'V0199_INITIAL_LOAD ')]
+            require(0 <= boot_order[0] < boot_order[1] < boot_order[2],
+                    'early boot accounting outside the SMP boot prefix')
         boot=rows('V0199_BOOTSTRAP_ROLE');charges=rows('V0199_BOOTSTRAP_CHARGE')
         require(len(boot)==8 and len(charges)==8,'eight independent packages did not all run')
         roots=set();spans=[];selectors=set();details=[]

@@ -17,9 +17,9 @@ class BudgetTraceTests(unittest.TestCase):
         ]
         self.summary = [1_200, 1_200, 1_100, 1, self.start, self.rows[-1][0], 0, 0, 500, 600, 100, 0]
 
-    def evidence(self):
+    def evidence(self, version=3):
         raw = bytearray(TRACE_BYTES)
-        HEADER.pack_into(raw, 0, MAGIC, 3, len(self.rows), self.start, 1_000, self.start - 16)
+        HEADER.pack_into(raw, 0, MAGIC, version, len(self.rows), self.start, 1_000, self.start - 16)
         for index, row in enumerate(self.rows):
             ROW.pack_into(raw, HEADER.size + index * ROW.size, *row)
         return raw
@@ -29,6 +29,22 @@ class BudgetTraceTests(unittest.TestCase):
         self.assertEqual(result["budget_intervals_replayed"], 4)
         self.assertEqual(result["budget_grants_replayed"], 2)
         self.assertEqual(result["budget_max_window_upper_ns"], 1_100)
+
+    def test_boot_coordination_matches_the_sealed_trace_prefix(self):
+        boundary = (1, self.rows[0][0], 100)
+        result = verify_trace(self.evidence(version=4), self.summary, boot_accounting=boundary)
+        self.assertEqual(result["early_boot_coordination_intervals"], 1)
+        self.assertEqual(result["early_boot_coordination_cpu_ns"], 100)
+        with self.assertRaisesRegex(ValueError, "early boot accounting"):
+            verify_trace(self.evidence(version=4), self.summary)
+        with self.assertRaisesRegex(ValueError, "early boot accounting"):
+            verify_trace(self.evidence(), self.summary, boot_accounting=boundary)
+        with self.assertRaisesRegex(ValueError, "early boot debit differs"):
+            verify_trace(self.evidence(version=4), self.summary,
+                         boot_accounting=(1, self.rows[0][0], 99))
+        with self.assertRaisesRegex(ValueError, "role grant during early boot"):
+            verify_trace(self.evidence(version=4), self.summary,
+                         boot_accounting=(2, self.rows[1][0], 600))
 
     def test_grant_must_precede_deadline_and_have_enough_credit(self):
         end, counter, _, deadline, scope, lower = self.rows[1]

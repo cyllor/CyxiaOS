@@ -234,12 +234,11 @@ fn observe_budget_clock() -> budget_trace::Sample {
     }
     fatal(692);
 }
-/// Continuous attribution from BEFORE the first role package load through
-/// the final UART output. Every interval is charged exactly once: admitted
-/// role/recovery work or the protected EL1 coordination envelope.
-/// Earlier architecture/SMP initialization and the tiny final evidence seal
-/// remain outside this diagnostic interval; no full production claim.
-struct BudgetMeter {
+/// Continuous attribution from PMU setup at Rust EL1 entry through final
+/// UART output. Every interval uses an admitted turn or the existing EL1
+/// coordination envelope. Early assembly and the final memory seal are
+/// outside the sampled interval.
+pub(crate) struct BudgetMeter {
     ledger: Cpu0BudgetLedger,
     initial_tick: u64,
     initial_ns: u64,
@@ -249,6 +248,16 @@ struct BudgetMeter {
     trace: budget_trace::Trace,
 }
 impl BudgetMeter {
+    #[cfg(feature = "v0199-control-bringup")]
+    pub(crate) fn begin_boot() -> Self {
+        assert_eq!(cpu::slot(), 0);
+        // SAFETY: CPU0 has entered EL1 with its vectors and stack. Only the
+        // pinned QEMU accounting diagnostic selects this initializer.
+        unsafe { timer::init_cpu_accounting() };
+        init_timer_frequency();
+        Self::new()
+    }
+
     fn new() -> Self {
         let sample = observe_budget_clock();
         let wall = sample.wall_ns;
@@ -480,7 +489,7 @@ impl BudgetMeter {
         self.settle_coordination(token, began);
         result
     }
-    fn wait_for(&mut self, mut ready: impl FnMut() -> bool) {
+    pub(super) fn wait_for(&mut self, mut ready: impl FnMut() -> bool) {
         let until = now_ns().checked_add(5_000_000_000).unwrap();
         while !ready() {
             check_failures();
@@ -1546,17 +1555,20 @@ pub(super) fn disk_security_run(generation: u64, bank: usize, stop: bool) -> Dis
     }
 }
 
-pub(super) fn run() -> ! {
+pub(super) fn run(mut budget: BudgetMeter) -> ! {
     assert_eq!(cpu::slot(), 0);
     assert_eq!(ONLINE.load(Ordering::Acquire), 15);
-    gic()
-        .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
-        .unwrap();
-    unsafe {
-        timer::init_cpu_accounting();
-    }
-    init_timer_frequency();
-    let mut budget = BudgetMeter::new();
+    let (boot_end, boot_tick) = budget.sample_gap();
+    let boot_cpu_ns = timer::cpu_ns(boot_tick.checked_sub(budget.initial_tick).unwrap());
+    let boot_intervals = budget.trace.intervals();
+    budget.coordinated(|| {
+        report(
+            "V0199_BOOTSTRAP_EARLY_ACCOUNTING",
+            boot_intervals as u64,
+            boot_end,
+            boot_cpu_ns,
+        );
+    });
     let pairs: [(NativeRole, Running); ROLE_COUNT] =
         core::array::from_fn(|i| budget.load_initial(i));
     let members = core::array::from_fn(|i| pairs[i].0);

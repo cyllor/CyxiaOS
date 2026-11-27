@@ -107,6 +107,8 @@ compile_error!("v0199-advice-e2e-selftest requires the plain smp-selftest profil
 ))]
 #[path = "v0199_control_bringup.rs"]
 mod v0199_control_bringup;
+#[cfg(feature = "v0199-control-bringup")]
+pub(super) use v0199_control_bringup::BudgetMeter;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_d02_fixture.rs"]
 mod v0199_d02_fixture;
@@ -1189,7 +1191,10 @@ pub(crate) fn boot_progress() -> [u64; 5] {
 // fixture dispatch below is intentionally bypassed (still live for every other
 // smp-selftest profile).
 #[cfg_attr(feature = "v020-production", allow(dead_code))]
-pub fn run(info: &BootInfo) -> ! {
+pub fn run(
+    info: &BootInfo,
+    #[cfg(feature = "v0199-control-bringup")] mut budget: BudgetMeter,
+) -> ! {
     #[cfg(feature = "unified-runtime")]
     crate::boot_recovery::formal::el1();
     if info.cpu_count != REQUIRED {
@@ -1251,6 +1256,12 @@ pub fn run(info: &BootInfo) -> ! {
         );
         assert_eq!(result, 0, "CPU_ON must report success");
     }
+    #[cfg(feature = "v0199-control-bringup")]
+    {
+        gic().enable(irq).unwrap();
+        budget.wait_for(|| ONLINE.load(Ordering::Acquire) == 15);
+    }
+    #[cfg(not(feature = "v0199-control-bringup"))]
     wait(|| ONLINE.load(Ordering::Acquire) == 15);
     report(
         "SMP_BOOT_OK",
@@ -1297,7 +1308,7 @@ pub fn run(info: &BootInfo) -> ! {
     #[cfg(feature = "v0199-sec-n-selftest")]
     v0199_sec_n_fixture::run(info);
     #[cfg(feature = "v0199-control-bringup")]
-    v0199_control_bringup::run();
+    v0199_control_bringup::run(budget);
     #[cfg(all(
         feature = "v0199-cpu0-role-selftest",
         not(any(

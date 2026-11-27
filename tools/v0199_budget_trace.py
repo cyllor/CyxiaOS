@@ -25,11 +25,16 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None):
-    """Verify the original scalar accounting, including conservative gap carry."""
+def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, boot_accounting=None):
+    """Replay scalar accounting and bind the optional boot-entry prefix."""
     require(len(raw) == TRACE_BYTES, "wrong stopped CPU0 trace size")
     magic, version, count, wall, counter, before = HEADER.unpack_from(raw)
-    require((magic, version) == (MAGIC, 3) and 0 < count <= CAPACITY, "unsealed CPU0 trace")
+    require(magic == MAGIC and version in (3, 4) and 0 < count <= CAPACITY, "unsealed CPU0 trace")
+    require((version == 4) == (boot_accounting is not None), "missing or unexpected early boot accounting")
+    boot_intervals, boot_end, boot_cpu_ns = boot_accounting or (0, 0, 0)
+    if version == 4:
+        require(0 < boot_intervals < count and wall < boot_end and boot_cpu_ns > 0,
+                "invalid early boot accounting")
     require(before < wall and before // WINDOW == wall // WINDOW, "CPU0 sample straddles a window")
     end_offset = HEADER.size + count * ROW.size
     require(not any(raw[end_offset:]), "unexpected unused CPU0 trace bytes")
@@ -74,7 +79,8 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None):
             require(kernel_coordination + charge <= KERNEL_COORDINATION_LIMIT,
                     "EL1 coordination sublimit exceeded")
 
-    for end, tick, quota, deadline, scope, lower in ROW.iter_unpack(raw[HEADER.size:end_offset]):
+    for index, row in enumerate(ROW.iter_unpack(raw[HEADER.size:end_offset]), 1):
+        end, tick, quota, deadline, scope, lower = row
         require(end >= wall and tick >= counter, "regressed CPU0 counter or wall clock")
         require(before <= lower < end and lower // WINDOW == end // WINDOW,
                 "CPU0 sample straddles a window")
@@ -83,6 +89,11 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None):
         # never exceed the distance from the earliest possible start to the
         # latest possible end, even if the PMU samples were near the bounds.
         require(actual <= end - before, "CPU0 execution exceeds wall-clock bounds")
+        if index <= boot_intervals:
+            require(scope == 0, "role grant during early boot")
+            if index == boot_intervals:
+                require((end, tick - start_counter) == (boot_end, boot_cpu_ns),
+                        "early boot debit differs from UART accounting")
         start_window = wall // WINDOW
         last_window = max(wall, end - 1) // WINDOW
         enter(start_window)
@@ -167,5 +178,9 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None):
     if recovery_slices is not None:
         require((recovery_count, largest_recovery) == recovery_slices,
                 "trace recovery slices differ from native evidence")
-    return {"budget_intervals_replayed": count, "budget_grants_replayed": grants,
-            "budget_max_window_upper_ns": peak, "budget_accounting_replayed": True}
+    result = {"budget_intervals_replayed": count, "budget_grants_replayed": grants,
+              "budget_max_window_upper_ns": peak, "budget_accounting_replayed": True}
+    if version == 4:
+        result.update(early_boot_coordination_intervals=boot_intervals,
+                      early_boot_coordination_cpu_ns=boot_cpu_ns)
+    return result

@@ -16,6 +16,8 @@ compile_error!(
 
 #[unsafe(no_mangle)]
 extern "C" fn boot_entry() -> ! {
+    #[cfg(feature = "v0199-control-bringup")]
+    let budget = smp::BudgetMeter::begin_boot();
     let ptr = (HIGH + cyxia_platform_virt::RAM_BASE) as *const u8;
     let header = unsafe { core::slice::from_raw_parts(ptr, 40) };
     let len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
@@ -61,7 +63,11 @@ extern "C" fn boot_entry() -> ! {
     #[cfg(all(feature = "smp-selftest", feature = "v020-production"))]
     smp::production::run(&info);
     #[cfg(all(feature = "smp-selftest", not(feature = "v020-production")))]
-    smp::run(&info);
+    smp::run(
+        &info,
+        #[cfg(feature = "v0199-control-bringup")]
+        budget,
+    );
     #[cfg(all(feature = "legacy-desktop", not(feature = "smp-selftest")))]
     primary_services(info)
 }
