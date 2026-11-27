@@ -37,7 +37,7 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         memory: &'static mut BatchMemory,
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        Self::attach_inner::<false>(t, memory, p)
+        Self::attach_inner::<false>(t, memory, None, p)
     }
 
     /// Attach a writable device using only VERSION_1 and FLUSH. A read-only
@@ -47,12 +47,24 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
         memory: &'static mut BatchMemory,
         p: &impl Platform,
     ) -> Result<Self, Error> {
-        Self::attach_inner::<true>(t, memory, p)
+        Self::attach_inner::<true>(t, memory, None, p)
+    }
+
+    /// Require a writable device with the admitted geometry before publishing
+    /// any DMA queue. A mismatched capacity returns `Error::Response`.
+    pub fn attach_writable_exact(
+        t: Transport,
+        memory: &'static mut BatchMemory,
+        sectors: u64,
+        p: &impl Platform,
+    ) -> Result<Self, Error> {
+        Self::attach_inner::<true>(t, memory, Some(sectors), p)
     }
 
     fn attach_inner<const WRITABLE_ONLY: bool>(
         mut t: Transport,
         memory: &'static mut BatchMemory,
+        expected_sectors: Option<u64>,
         p: &impl Platform,
     ) -> Result<Self, Error> {
         if BYTES == 0 || BYTES > 4096 - 16 || !BYTES.is_multiple_of(SECTOR_BYTES) {
@@ -103,6 +115,11 @@ impl<const BYTES: usize> BatchedBlockIo<BYTES> {
                 return Err(error);
             }
         };
+        if expected_sectors.is_some_and(|expected| expected != sectors) {
+            t.fail();
+            p.barrier();
+            return Err(Error::Response);
+        }
         let queue = BatchQueue::configure(&mut t, memory, 0, p)?;
         t.start(p)?;
         Ok(Self {
@@ -506,6 +523,30 @@ mod tests {
                 assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (15, 1));
             }
         }
+    }
+
+    #[test]
+    fn exact_writable_capacity_is_checked_before_dma_queue_publication() {
+        const SCRATCH_SECTORS: u64 = 1_048_576;
+        let (mmio, platform, memory) = attach_fixture(FLUSH, false);
+        let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+        assert!(matches!(
+            BatchedBlock::attach_writable_exact(transport, memory, SCRATCH_SECTORS, &platform),
+            Err(Error::Response)
+        ));
+        assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (11 | 128, 0));
+        for register in [0x80, 0x84, 0x90, 0x94, 0xa0, 0xa4] {
+            assert_eq!(mmio.get32(register), 0);
+        }
+
+        let (mmio, platform, memory) = attach_fixture(FLUSH, false);
+        mmio.put32(0x100, SCRATCH_SECTORS as u32);
+        let transport = unsafe { Transport::attach(mmio.address(), 4096).unwrap() };
+        let driver =
+            BatchedBlock::attach_writable_exact(transport, memory, SCRATCH_SECTORS, &platform)
+                .unwrap();
+        assert_eq!(driver.sectors(), SCRATCH_SECTORS);
+        assert_eq!((mmio.get32(0x70), mmio.get32(0x44)), (15, 1));
     }
 
     #[test]

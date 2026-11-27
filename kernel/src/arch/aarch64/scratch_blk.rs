@@ -182,11 +182,16 @@ pub(crate) fn attach(info: &BootInfo) -> Result<ScratchBlock, AttachError> {
     // SAFETY: attach is called at most once per boot on CPU0 (module header);
     // this is the only &mut to QUEUE and it moves into the device.
     let queue = unsafe { &mut *core::ptr::addr_of_mut!(QUEUE) };
-    let mut device =
-        ScratchBlock::attach_writable(transport, queue, &Board).map_err(|_| AttachError::Device)?;
-    if device.sectors() != u64::from(BLOCK_COUNT) * SECTORS_PER_BLOCK {
-        return Err(AttachError::Geometry);
-    }
+    let mut device = ScratchBlock::attach_writable_exact(
+        transport,
+        queue,
+        u64::from(BLOCK_COUNT) * SECTORS_PER_BLOCK,
+        &Board,
+    )
+    .map_err(|error| match error {
+        DriverError::Response => AttachError::Geometry,
+        _ => AttachError::Device,
+    })?;
     // Bounded fixture notify policy: batch both requests for one block.
     // FLUSH requests stay synchronous regardless of the batch policy.
     let now = Board.now_ns();
