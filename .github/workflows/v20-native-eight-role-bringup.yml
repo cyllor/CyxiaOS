@@ -49,7 +49,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ram: [256, 1024]
+        include:
+          - ram: 256
+            profile: 256m
+            feature: v0199-control-bringup
+          - ram: 1024
+            profile: 1024m
+            feature: v0199-control-bringup-1g
+          - ram: 1024
+            profile: 1024m-sustained
+            feature: v0199-control-load-selftest
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -67,9 +76,7 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
           rustup override set 1.95.0
           cargo fetch --locked
-          feature=v0199-control-bringup
-          if [ '${{ matrix.ram }}' = 1024 ]; then feature=v0199-control-bringup-1g; fi
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features "$feature" 2>&1 | tee artifacts/eight-native/build.log
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features '${{ matrix.feature }}' 2>&1 | tee artifacts/eight-native/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/eight-native/kernel.elf
           catalog=$(find target/aarch64-unknown-none-softfloat/debug/build -name v0199-role-catalog.rs)
           test "$(printf '%s\n' "$catalog" | wc -l)" = 1
@@ -79,7 +86,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: v020-eight-package-build-${{ matrix.ram }}m-${{ github.sha }}
+          name: v020-eight-package-build-${{ matrix.profile }}-${{ github.sha }}
           path: artifacts/eight-native/
           retention-days: 7
   qemu-accounting:
@@ -122,7 +129,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ram: [256, 1024]
+        include:
+          - ram: 256
+            profile: 256m
+          - ram: 1024
+            profile: 1024m
+          - ram: 1024
+            profile: 1024m-sustained
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -131,7 +144,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: v020-eight-package-build-${{ matrix.ram }}m-${{ github.sha }}
+          name: v020-eight-package-build-${{ matrix.profile }}-${{ github.sha }}
           path: artifacts/eight-native
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -147,9 +160,11 @@ jobs:
           (cd artifacts/eight-qemu; sha256sum -c binary.sha256)
           chmod +x artifacts/eight-qemu/bin/qemu-system-aarch64
           sha256sum -c artifacts/eight-qemu/patch.sha256
+          args=()
+          if [ '${{ matrix.profile }}' = 1024m-sustained ]; then args+=(--sustained-load); fi
           status=0
           for attempt in 1 2 3; do
-            if PATH="$PWD/artifacts/eight-qemu/bin:$PATH" python3 -B tools/verify_v0199_eight_packages.py \
+            if PATH="$PWD/artifacts/eight-qemu/bin:$PATH" python3 -B tools/verify_v0199_eight_packages.py "${args[@]}" \
               --elf artifacts/eight-native/kernel.elf --packages artifacts/eight-native/packages \
               --qemu-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/binary.sha256)" \
               --patch-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/patch.sha256)" \
@@ -164,7 +179,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: v020-eight-native-evidence-${{ matrix.ram }}m-${{ github.sha }}
+          name: v020-eight-native-evidence-${{ matrix.profile }}-${{ github.sha }}
           path: artifacts/eight-native/
           retention-days: 7
 
