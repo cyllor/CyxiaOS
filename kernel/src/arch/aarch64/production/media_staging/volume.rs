@@ -358,7 +358,7 @@ fn staging_acl(
                 != (Extent {
                     logical: 0,
                     physical: SCRATCH_FILE_BLOCK,
-                    count: 1,
+                    count: file_size.div_ceil(BLOCK_BYTES) as u32,
                 }))
     {
         return Err(SecurityError::Conflict);
@@ -595,7 +595,7 @@ pub(super) fn validate_fsync_homes(
         || e.structure.live_inodes != 6
         || e.structure.directory_entries != 1
         || e.system_blocks != 13
-        || e.structure.data_blocks != 15
+        || e.structure.data_blocks != 14 + file_size.div_ceil(BLOCK_BYTES) as u32
         || e.receipts.occupied != 1
         || e.receipts.unresolved != usize::from(receipt_bound)
     {

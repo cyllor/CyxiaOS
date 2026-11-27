@@ -837,19 +837,23 @@ class W11Validation(unittest.TestCase):
                 (29, 7, fsync.LEGACY_FINAL_LSN, fsync.FINAL, 24),
                 (29, 7, fsync.FINAL_LSN, fsync.FINAL, 28),
                 (fsync.BLOCK, 49, fsync.FINAL_LSN, b"x" * fsync.BLOCK, 29),
+                (fsync.BLOCK + 1, 49, fsync.GROWTH_FINAL_LSN,
+                 (b"x" * (fsync.BLOCK + 1)).ljust(2 * fsync.BLOCK, b"\0"), 31),
             ):
                 with self.subTest(size=size, lsn=lsn):
                     log = fsync.boot_one_log(lsn, contents, size, seq)
                     with disk.open("wb") as image:
                         image.seek(fsync.FIRST * fsync.BLOCK)
-                        image.write(log.ljust(34 * fsync.BLOCK, b"\0"))
+                        span = (media.FSYNC_LOG_END - fsync.FIRST) * fsync.BLOCK
+                        image.write(log.ljust(span, b"\0"))
                     pending = media.count_fsync_retirement_blocks(disk)
                     self.assertEqual(pending, retired)
                     recovered = lines + [f"V020_FSYNC_RECOVERED a=2 b={lsn} c={seq}"]
-                    io = f"V020_W11_MEDIA_IO a=20950 b={14 + retired} c=5"
+                    writes = 14 + retired + 2 * (lsn == fsync.GROWTH_FINAL_LSN)
+                    io = f"V020_W11_MEDIA_IO a=20950 b={writes} c=5"
                     v.check_w11_staging(tuple(words), recovered + [io], b"", True, 3, modes,
                                         pending_fsync_blocks=pending)
-                    off_by_one = f"V020_W11_MEDIA_IO a=20950 b={13 + retired} c=5"
+                    off_by_one = f"V020_W11_MEDIA_IO a=20950 b={writes - 1} c=5"
                     with self.assertRaisesRegex(ValueError, "writes and flushes"):
                         v.check_w11_staging(tuple(words), recovered + [off_by_one], b"", True,
                                             3, modes, pending_fsync_blocks=pending)

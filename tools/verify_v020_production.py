@@ -621,9 +621,12 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
         event = "V020_FSYNC_RECOVERED" if reopen else "V020_FSYNC_COMMITTED"
         terminal = w11_rows(lines, event)
         legacy = [(epoch, 19, 7)] if reopen else [(19, 7, 29)]
+        commit = terminal[0][1 if reopen else 0] if len(terminal) == 1 else 0
+        growth = commit == 23
+        low, high = (4097, 8192) if growth else (29, 4096)
         current = len(terminal) == 1 and (
-            terminal[0][:2] == (epoch, 21) and terminal[0][2] > 0 if reopen else
-            terminal[0][0] == 21 and terminal[0][1] > 0 and 29 <= terminal[0][2] <= 4096
+            terminal[0][0] == epoch and commit in (21, 23) and terminal[0][2] > 0 if reopen else
+            commit in (21, 23) and terminal[0][1] > 0 and low <= terminal[0][2] <= high
         )
         require(terminal == legacy or current, "media staging FSYNC terminal differs")
         if reopen and epoch > 2:
@@ -634,13 +637,13 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
         elif reopen:
             # The data REDO's continuation only needs clearing if the final
             # 64 bytes are nonzero. Archived 29-byte runs have no such block.
-            allowed = (28, 29) if current else (24,)
+            allowed = (30, 31, 32) if growth else ((28, 29) if current else (24,))
             retired = allowed[0] if pending_fsync_blocks is None else pending_fsync_blocks
             require(retired in allowed, "pre-replay FSYNC journal block count differs")
-            # Seven replay homes, one checkpoint and six new BootEpoch blocks.
-            expected_io = (14 + retired, 5)
+            # Growth adds a data home and its bitmap to the legacy closure.
+            expected_io = (14 + retired + 2 * growth, 5)
         else:
-            expected_io = (4167 if current else 4163, 12)
+            expected_io = (4171 if growth else (4167 if current else 4163), 12)
     require(len(io) == 1 and io[0][0] > 0 and io[0][1:] == expected_io,
             "media staging device writes and flushes disagree with the selected protocol")
     evidence = {}

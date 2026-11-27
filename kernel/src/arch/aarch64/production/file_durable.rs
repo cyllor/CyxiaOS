@@ -7,8 +7,10 @@ use copy_window::StackSpan;
 use core::ptr::addr_of_mut;
 use cyxia_kernel_core::security::{
     Error as SecurityError,
-    file_index_v0199::BLOCK_BYTES,
-    file_read_v4::{ENDPOINT, FileBlockService, MAX_FRAME, MAX_REPLY, ReadError, StagedFile},
+    file_read_v4::{
+        ENDPOINT, FSYNC_SCRATCH_MAX_BYTES, FileFsyncService, MAX_FRAME, MAX_REPLY, ReadError,
+        StagedFile,
+    },
     file_receipt_query_v4::{RECEIPT_KEY_BYTES, ReceiptKey},
     file_service_v4::{REPLY_HEADER, REQUEST_HEADER, Request},
 };
@@ -40,7 +42,7 @@ struct Job {
 struct Grant {
     holder: NativeRole,
     pie_cap: u64,
-    service: FileBlockService,
+    service: FileFsyncService,
     key: ReceiptKey,
     jobs: [Option<Job>; 2],
 }
@@ -227,7 +229,7 @@ impl<'a> Client<'a> {
 
     pub(super) fn start(&mut self, file: StagedFile, key: ReceiptKey) -> Result<(), SecurityError> {
         let service =
-            FileBlockService::new_allocated_block(file).map_err(|_| SecurityError::Unauthorized)?;
+            FileFsyncService::new_fsync_file(file).map_err(|_| SecurityError::Unauthorized)?;
         self.wait(FATAL + 1, |state| state.pending_open);
         // SAFETY: the CPU0 owner writes this slot while the role is stopped.
         unsafe {
@@ -266,7 +268,7 @@ impl<'a> Client<'a> {
         &self,
         frame: Frame,
         sequence: u64,
-        out: &mut [u8; BLOCK_BYTES],
+        out: &mut [u8; FSYNC_SCRATCH_MAX_BYTES],
     ) -> Result<usize, SecurityError> {
         // SAFETY: a queued FSYNC prevents the stopped holder's mutations.
         let grant = unsafe { (*addr_of_mut!(STATE)).grant.as_ref().unwrap() };

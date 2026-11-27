@@ -69,6 +69,7 @@ pub(super) fn receipt_is_committed(reply: &[u8; 128]) -> bool {
         && match field(40) {
             19 => field(32) == 29 && field(120) == 7,
             21 => (29..=4096).contains(&field(32)) && field(120) > 0,
+            23 => (4097..=8192).contains(&field(32)) && field(120) > 0,
             _ => false,
         }
         && field(56) == 4
