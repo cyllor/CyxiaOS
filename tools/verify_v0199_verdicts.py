@@ -147,6 +147,17 @@ def aggregate(manifest_raw,locked_digest,root):
                 and item["checker_id"]&0xffff and 0<item["checker_version"]<2**32,
                 "invalid expected checker")
         expected[key]=item
+    # The reserved verdict namespace must contain only canonical names for
+    # proofs actually committed by this frozen run. Extra records must not
+    # be ignored, even if every expected proof individually validates.
+    verdict_dir = root / "verdicts"
+    require(not verdict_dir.is_symlink() and
+            (not verdict_dir.exists() or verdict_dir.is_dir()),
+            "invalid verdict directory")
+    if verdict_dir.exists():
+        allowed = {f"{test:08x}-{proof}.bin" for test, proof in expected}
+        for entry in verdict_dir.iterdir():
+            require(entry.name in allowed, "unexpected verdict: " + entry.name)
     rows={}
     for key in sorted(g5):
         base=dict(test_id=key[0],id=ids[key[0]],proof_class=NAMES[key[1]])

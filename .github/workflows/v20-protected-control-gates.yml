@@ -14,6 +14,7 @@ on:
       - '.github/workflows/v20-protected-control-gates.yml'
       - 'tools/verify_v0199_verdicts.py'
       - 'tools/test_verify_v0199_verdicts.py'
+      - 'tools/test_v0199_verdict_archive_membership.py'
       - 'tools/test_v0199_action_vectors.py'
       - 'tools/v0199-action-payload-vectors.tsv'
       - 'tools/v0199-apply-wire-vectors.tsv'
@@ -69,7 +70,7 @@ jobs:
           cargo test --locked --offline -p cyxia-prototype --lib snapshot::tests 2>&1 | tee artifacts/control-gates/snapshot-retention.log
           cargo test --locked --offline -p cyxia-kernel-core --lib file_mount_v1 2>&1 | tee artifacts/control-gates/file-mount-v1.log
           cargo test --locked --offline -p cyxia-kernel-core --lib frame_meta_v0199 2>&1 | tee artifacts/control-gates/frame-meta.log
-          (cd tools; python3 -B -m unittest -v test_verify_v0199_verdicts) 2>&1 | tee artifacts/control-gates/verdict-custody.log
+          (cd tools; python3 -B -m unittest -v test_verify_v0199_verdicts test_v0199_verdict_archive_membership) 2>&1 | tee artifacts/control-gates/verdict-custody.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
