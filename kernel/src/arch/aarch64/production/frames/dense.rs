@@ -1,20 +1,32 @@
-//! The canonical FrameMeta owner in the 1 GiB native frame-pool lane.
+//! The canonical FrameMeta owner in the native 1 GiB profiles.
 //! Static classifications are subregions of the reserved boot arena.
 //! CPU0 owns all changes to the physical record table.
 
-use super::super::{NativeRoleManifest, Role, role_loader::high_leaf};
+use super::super::role_loader::high_leaf;
+#[cfg(feature = "v020-production-frame-pool")]
+use super::super::{NativeRoleManifest, Role};
 use super::{
     COUNT, Error, FrameMeta, Ledger, LedgerError, MemoryRegion, Ordering, PAGE, REGISTERED,
-    RegionKind, evidence, install_ledger, native_ledger, publish_counts, report, service_arena,
-    statics,
+    RegionKind, install_ledger, publish_counts, report, service_arena, statics,
 };
-use core::{ptr, sync::atomic::AtomicU64};
+#[cfg(feature = "v020-production-frame-pool")]
+use super::{evidence, native_ledger};
+use core::ptr;
+#[cfg(feature = "v020-production-frame-pool")]
+use core::sync::atomic::AtomicU64;
 use cyxia_contracts::BootInfo;
-use cyxia_kernel_core::frame_meta_v0199::{Owner, POOL_BYTES, RAM_BYTES, Reference, TABLE_BYTES};
+use cyxia_kernel_core::frame_meta_v0199::{Inventory, POOL_BYTES, RAM_BYTES, TABLE_BYTES};
+#[cfg(feature = "v020-production-frame-pool")]
+use cyxia_kernel_core::frame_meta_v0199::{Owner, Reference};
 use cyxia_platform_virt::{KERNEL_POOL_END, RAM_BASE, USER_RAM_END, reserve_user_pool};
 
 const EL1_RAM_LEAF: u64 = 0x0060_0000_0000_0703;
+const MAP_BATCH: usize = 128 * PAGE as usize;
+const ZERO_BATCH: usize = 1024;
+
+#[cfg(feature = "v020-production-frame-pool")]
 const PROBE_PAGES: usize = 4;
+#[cfg(feature = "v020-production-frame-pool")]
 static PROVED_FREE: AtomicU64 = AtomicU64::new(0);
 
 fn mapped_page(pa: u64) -> Result<*mut u64, LedgerError> {
@@ -29,7 +41,21 @@ fn mapped_page(pa: u64) -> Result<*mut u64, LedgerError> {
     Ok(ptr::without_provenance_mut((crate::HIGH + pa) as usize))
 }
 
-pub(super) fn register(info: &mut BootInfo) -> Result<(), Error> {
+pub(in super::super) struct Registration {
+    ledger: Ledger<'static>,
+    inventory: Inventory,
+    registered: u32,
+    service_pages: u64,
+    metadata: MemoryRegion,
+    control: MemoryRegion,
+    progress: MemoryRegion,
+}
+
+pub(in super::super) fn prepare(
+    info: &mut BootInfo,
+    checkpoint: &mut impl FnMut() -> Result<(), LedgerError>,
+) -> Result<Registration, Error> {
+    checkpoint().map_err(Error::Ledger)?;
     if REGISTERED.swap(true, Ordering::AcqRel) {
         return Err(Error::Once);
     }
@@ -49,59 +75,82 @@ pub(super) fn register(info: &mut BootInfo) -> Result<(), Error> {
         ..ram
     };
     let metadata = reserve_user_pool(info, TABLE_BYTES as u64).map_err(|_| Error::Range)?;
+    checkpoint().map_err(Error::Ledger)?;
     let control = reserve_user_pool(info, POOL_BYTES).map_err(|_| Error::Range)?;
+    checkpoint().map_err(Error::Ledger)?;
     let progress = reserve_user_pool(info, POOL_BYTES).map_err(|_| Error::Range)?;
-    for pa in (metadata.start.0..metadata.end().map_err(|_| Error::Range)?).step_by(PAGE as usize) {
-        mapped_page(pa).map_err(Error::Ledger)?;
+    let end = metadata.end().map_err(|_| Error::Range)?;
+    for start in (metadata.start.0..end).step_by(MAP_BATCH) {
+        checkpoint().map_err(Error::Ledger)?;
+        for pa in (start..end.min(start + MAP_BATCH as u64)).step_by(PAGE as usize) {
+            mapped_page(pa).map_err(Error::Ledger)?;
+        }
     }
     let table = mapped_page(metadata.start.0)
         .map_err(Error::Ledger)?
         .cast::<FrameMeta>();
-    // SAFETY: BootInfo now reserves the whole mapped metadata extent for
-    // this one-shot owner. It has no allocator, EL0 or DMA borrowers.
-    let rows = unsafe {
-        ptr::write_bytes(table, 0, COUNT);
-        core::slice::from_raw_parts_mut(table, COUNT)
-    };
-    let mut ledger = Ledger::initialize(
+    // SAFETY: BootInfo reserves the mapped table exclusively for this
+    // one-shot owner. It has no allocator, EL0 or DMA borrowers.
+    for offset in (0..COUNT).step_by(ZERO_BATCH) {
+        checkpoint().map_err(Error::Ledger)?;
+        unsafe { ptr::write_bytes(table.add(offset), 0, ZERO_BATCH.min(COUNT - offset)) };
+    }
+    // Every row is initialized, and the backing stays reserved for this boot.
+    let rows = unsafe { core::slice::from_raw_parts_mut(table, COUNT) };
+    let (mut ledger, inventory) = Ledger::initialize_checkpointed(
         rows,
         ram,
         [arena, metadata, control, progress],
         &info.reserved[..previous_reservations],
+        checkpoint,
     )
     .map_err(Error::Ledger)?;
+    checkpoint().map_err(Error::Ledger)?;
     let service = service_arena()?;
     let registered = ledger
         .register_arena_statics(&statics(service)?)
         .map_err(Error::Ledger)?;
-    let inventory = ledger.inventory().map_err(Error::Ledger)?;
-    install_ledger(ledger);
-    publish_counts(
-        u64::from(registered),
-        u64::from(inventory.permanent),
-        service.region.len / PAGE,
-    );
-    report(
-        "V020_SEC_M_DENSE_FRAME_TABLE",
-        metadata.start.0,
-        COUNT as u64,
-        TABLE_BYTES as u64,
-    );
-    report(
-        "V020_SEC_M_DENSE_FRAME_POOLS",
-        control.start.0,
-        progress.start.0,
-        POOL_BYTES,
-    );
-    report(
-        "V020_SEC_M_DENSE_FRAME_ROWS",
-        u64::from(inventory.permanent),
-        u64::from(inventory.free),
-        0,
-    );
-    Ok(())
+    Ok(Registration {
+        ledger,
+        inventory,
+        registered,
+        service_pages: service.region.len / PAGE,
+        metadata,
+        control,
+        progress,
+    })
 }
 
+impl Registration {
+    pub(in super::super) fn publish(self) {
+        install_ledger(self.ledger);
+        publish_counts(
+            u64::from(self.registered),
+            u64::from(self.inventory.permanent),
+            self.service_pages,
+        );
+        report(
+            "V020_SEC_M_DENSE_FRAME_TABLE",
+            self.metadata.start.0,
+            COUNT as u64,
+            TABLE_BYTES as u64,
+        );
+        report(
+            "V020_SEC_M_DENSE_FRAME_POOLS",
+            self.control.start.0,
+            self.progress.start.0,
+            POOL_BYTES,
+        );
+        report(
+            "V020_SEC_M_DENSE_FRAME_ROWS",
+            u64::from(self.inventory.permanent),
+            u64::from(self.inventory.free),
+            0,
+        );
+    }
+}
+
+#[cfg(feature = "v020-production-frame-pool")]
 fn zero_page(pa: u64) -> Result<(), LedgerError> {
     let page = mapped_page(pa)?;
     // SAFETY: the dense ledger supplies a reserved or fully quiescent
@@ -115,6 +164,7 @@ fn zero_page(pa: u64) -> Result<(), LedgerError> {
     Ok(())
 }
 
+#[cfg(feature = "v020-production-frame-pool")]
 pub(super) fn exercise(manifest: &NativeRoleManifest) -> Result<(), LedgerError> {
     manifest.validate().map_err(|_| LedgerError::Unauthorized)?;
     let index = manifest
@@ -196,6 +246,7 @@ pub(super) fn exercise(manifest: &NativeRoleManifest) -> Result<(), LedgerError>
     Ok(())
 }
 
+#[cfg(feature = "v020-production-frame-pool")]
 pub(super) fn publish() {
     let free = PROVED_FREE.load(Ordering::Acquire);
     assert_eq!(free, PROBE_PAGES as u64);

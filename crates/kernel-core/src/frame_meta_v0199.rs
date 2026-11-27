@@ -221,6 +221,8 @@ fn sparse_records(base: u64, limit: u64, regions: &[StaticRegion]) -> Result<Spa
     }
     Ok((fixed, classes, total))
 }
+const ROW_BATCH: usize = 1024;
+
 impl<'a> Ledger<'a> {
     /// fixed = actual pinned boot/kernel/DMA arena, FrameMeta table,
     /// control pool, progress pool. Ranges must be disjoint. Firmware
@@ -232,6 +234,20 @@ impl<'a> Ledger<'a> {
         fixed: [MemoryRegion; 4],
         firmware: &[MemoryRegion],
     ) -> Result<Self, Error> {
+        Self::initialize_checkpointed(rows, ram, fixed, firmware, &mut || Ok(()))
+            .map(|(ledger, _)| ledger)
+    }
+
+    /// Report progress before every bounded row batch. A failing checkpoint
+    /// leaves the caller responsible for the unpublished backing.
+    pub fn initialize_checkpointed(
+        rows: &'a mut [FrameMeta],
+        ram: MemoryRegion,
+        fixed: [MemoryRegion; 4],
+        firmware: &[MemoryRegion],
+        checkpoint: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<(Self, Inventory), Error> {
+        checkpoint()?;
         let base = ram.start.0;
         if rows.len() != COUNT
             || ram.kind != RegionKind::Ram
@@ -265,14 +281,23 @@ impl<'a> Ledger<'a> {
                 return Err(Error::Conflict);
             }
         }
-        if rows.iter().any(|r| *r != FrameMeta::ZERO) {
-            return Err(Error::Busy);
+        for batch in rows.chunks(ROW_BATCH) {
+            checkpoint()?;
+            if batch.iter().any(|r| *r != FrameMeta::ZERO) {
+                return Err(Error::Busy);
+            }
         }
-        rows.fill(FrameMeta::unowned(FREE | DIRTY, 0));
+        for batch in rows.chunks_mut(ROW_BATCH) {
+            checkpoint()?;
+            batch.fill(FrameMeta::unowned(FREE | DIRTY, 0));
+        }
         let mut total = 0u32;
         for r in fixed {
             let (a, b) = span(r, base)?;
-            rows[a..b].fill(FrameMeta::unowned(PERMANENT, 0));
+            for batch in rows[a..b].chunks_mut(ROW_BATCH) {
+                checkpoint()?;
+                batch.fill(FrameMeta::unowned(PERMANENT, 0));
+            }
             total = total.checked_add((b - a) as u32).ok_or(Error::Capacity)?;
         }
         let mut firmware_extra = 0u32;
@@ -283,10 +308,14 @@ impl<'a> Ledger<'a> {
             if a >= b {
                 continue;
             }
-            for row in &mut rows[((a - base) / PAGE) as usize..((b - base) / PAGE) as usize] {
-                if row.flags != PERMANENT {
-                    *row = FrameMeta::unowned(PERMANENT, 0);
-                    firmware_extra += 1;
+            let region = &mut rows[((a - base) / PAGE) as usize..((b - base) / PAGE) as usize];
+            for batch in region.chunks_mut(ROW_BATCH) {
+                checkpoint()?;
+                for row in batch {
+                    if row.flags != PERMANENT {
+                        *row = FrameMeta::unowned(PERMANENT, 0);
+                        firmware_extra += 1;
+                    }
                 }
             }
         }
@@ -306,8 +335,8 @@ impl<'a> Ledger<'a> {
             fixed_count: 4,
             classes: [StaticClass::Arena; MAX_STATIC_REGIONS],
         };
-        l.inventory()?;
-        Ok(l)
+        let inventory = l.inventory_checkpointed(checkpoint)?;
+        Ok((l, inventory))
     }
     /// Bounded static initialization: register physically contiguous
     /// permanent regions into an existing caller-provided FrameMeta table
@@ -553,36 +582,50 @@ impl<'a> Ledger<'a> {
         Ok(l)
     }
     pub fn inventory(&self) -> Result<Inventory, Error> {
+        self.inventory_checkpointed(&mut || Ok(()))
+    }
+
+    fn inventory_checkpointed(
+        &self,
+        checkpoint: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<Inventory, Error> {
         let mut counts = [0u32; 5];
-        for r in self.rows.iter() {
-            let state = r.flags & STATE;
-            if r.flags & !(STATE | DIRTY | SECRET) != 0 || state > PERMANENT {
-                return Err(Error::Conflict);
-            }
-            // Pool-mode quarantine mirrors the pool's unowned dirty pages
-            // (failed zeroing or completed revocation): fenced from reuse
-            // until a zero proof, with no owner and possibly generation 0.
-            if state == FREE
-                || state == PERMANENT
-                || (self.pool_mode && state == QUARANTINED && r.owner_slot == NONE)
-            {
-                if r.owner_slot != NONE
-                    || r.owner_generation != 0
-                    || !r.empty_refs()
-                    || r.flags & SECRET != 0
-                    || state == PERMANENT && r.flags != PERMANENT
+        for batch in self.rows.chunks(ROW_BATCH) {
+            checkpoint()?;
+            for r in batch {
+                let state = r.flags & STATE;
+                if r.flags & !(STATE | DIRTY | SECRET) != 0 || state > PERMANENT {
+                    return Err(Error::Conflict);
+                }
+                // Pool-mode quarantine mirrors the pool's unowned dirty pages
+                // (failed zeroing or completed revocation): fenced from reuse
+                // until a zero proof, with no owner and possibly generation 0.
+                if state == FREE
+                    || state == PERMANENT
+                    || (self.pool_mode && state == QUARANTINED && r.owner_slot == NONE)
+                {
+                    if r.owner_slot != NONE
+                        || r.owner_generation != 0
+                        || !r.empty_refs()
+                        || r.flags & SECRET != 0
+                        || state == PERMANENT && r.flags != PERMANENT
+                    {
+                        return Err(Error::Conflict);
+                    }
+                } else if r.owner_slot == NONE || r.owner_generation == 0 || r.frame_generation == 0
                 {
                     return Err(Error::Conflict);
                 }
-            } else if r.owner_slot == NONE || r.owner_generation == 0 || r.frame_generation == 0 {
-                return Err(Error::Conflict);
+                counts[state as usize] += 1;
             }
-            counts[state as usize] += 1;
         }
         for r in self.fixed[..self.fixed_count].iter().copied() {
             let (a, b) = span(r, self.base)?;
-            if self.rows[a..b].iter().any(|r| r.flags != PERMANENT) {
-                return Err(Error::Conflict);
+            for batch in self.rows[a..b].chunks(ROW_BATCH) {
+                checkpoint()?;
+                if batch.iter().any(|r| r.flags != PERMANENT) {
+                    return Err(Error::Conflict);
+                }
             }
         }
         // A static ledger (tiled or sparse) has no ordinary pool: every row

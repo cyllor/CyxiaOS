@@ -21,6 +21,7 @@ ROLE_GRANTS = (
 SIGNED_CAPACITY = 1024
 SIGNED_EARLY_CAPACITY = 4096
 SIGNED_HEADER = struct.Struct("<20Q")
+SIGNED_FRAME_SPAN = struct.Struct("<2Q")
 SIGNED_ROW = struct.Struct("<8Q")
 SIGNED_TRACE_BYTES = ((SIGNED_HEADER.size + SIGNED_CAPACITY * SIGNED_ROW.size + 4095) // 4096) * 4096
 SIGNED_EARLY_TRACE_BYTES = ((SIGNED_HEADER.size + SIGNED_EARLY_CAPACITY * SIGNED_ROW.size + 4095) // 4096) * 4096
@@ -262,10 +263,12 @@ def _replay_intervals(intervals, origin, summary, replacement_roles=None, recove
     return result
 
 
-def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *, media_budget=None):
+def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
+                        media_budget=None, frame_budget=None):
     """Bind a sealed prefix to the durable role inventory and native UART."""
     trace_sizes = {1: (SIGNED_TRACE_BYTES, SIGNED_CAPACITY),
-                   2: (SIGNED_EARLY_TRACE_BYTES, SIGNED_EARLY_CAPACITY)}
+                   2: (SIGNED_EARLY_TRACE_BYTES, SIGNED_EARLY_CAPACITY),
+                   3: (SIGNED_EARLY_TRACE_BYTES, SIGNED_EARLY_CAPACITY)}
     require(len(raw) in (SIGNED_TRACE_BYTES, SIGNED_EARLY_TRACE_BYTES),
             "wrong signed CPU0 trace size")
     (magic, version, count, wall, tick, before, epoch, phase_start, phase_end,
@@ -279,9 +282,18 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *, media_
     require(before < wall and before // WINDOW == wall // WINDOW, "CPU0 sample straddles a window")
     elapsed = end_tick - tick
     require((elapsed, charged, idle) in uart_budget, "trace endpoint differs from the UART CPU0 ledger")
-    end_offset = SIGNED_HEADER.size + count * SIGNED_ROW.size
+    require((version == 3) == (frame_budget is not None),
+            "missing or unexpected FrameMeta Recovery settlement")
+    rows_offset = SIGNED_HEADER.size
+    frame_start = frame_end = 0
+    if frame_budget is not None:
+        frame_start, frame_end = SIGNED_FRAME_SPAN.unpack_from(raw, rows_offset)
+        rows_offset += SIGNED_FRAME_SPAN.size
+        require(frame_start == 1 and frame_start < frame_end < phase_start,
+                "FrameMeta accounting does not precede policy and media")
+    end_offset = rows_offset + count * SIGNED_ROW.size
     require(not any(raw[end_offset:]), "unexpected unused signed CPU0 trace bytes")
-    intervals = list(SIGNED_ROW.iter_unpack(raw[SIGNED_HEADER.size:end_offset]))
+    intervals = list(SIGNED_ROW.iter_unpack(raw[rows_offset:end_offset]))
     replay = (elapsed, charged, peak, None, wall, end_wall, *classes)
     if version == 1:
         require(media_budget is None and len(recovery) == 2 and phase_start <= wall // WINDOW
@@ -295,23 +307,40 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *, media_
             "missing signed media accounting span")
     media_rows = intervals[phase_start:phase_end]
     require(all(row[4] in (0, RECOVERY + 1) for row in intervals[:phase_end])
-            and sum(row[4] == RECOVERY + 1 for row in intervals[:phase_start]) == 2
+            and sum(row[4] == RECOVERY + 1 for row in intervals[:frame_start]) == int(version == 3)
+            and sum(row[4] == RECOVERY + 1 for row in intervals[frame_end:phase_start])
+            == (1 if version == 3 else 2)
             and media_rows[-1][4] == RECOVERY + 1, "invalid signed media scope")
     current = tick
     media_recovery = []
+    frame_recovery = []
     startup_recovery = []
     for index, row in enumerate(intervals):
         if row[4] == RECOVERY + 1:
-            debits = media_recovery if phase_start <= index < phase_end else startup_recovery
+            debits = startup_recovery
+            if frame_start <= index < frame_end:
+                debits = frame_recovery
+            elif phase_start <= index < phase_end:
+                debits = media_recovery
             debits.append(row[1] - current)
         current = row[1]
+    if frame_budget is not None:
+        require(intervals[frame_end - 1][4] == RECOVERY + 1
+                and all(0 <= used <= SIGNED_RECOVERY_QUOTA for used in frame_recovery)
+                and frame_budget == (len(frame_recovery), sum(frame_recovery), SIGNED_RECOVERY_QUOTA)
+                and sum(frame_recovery) > 0, "FrameMeta PMU debits differ from UART")
     require(startup_recovery == list(recovery) and all(used >= 0 for used in media_recovery)
             and media_budget == (len(media_recovery), sum(media_recovery), SIGNED_RECOVERY_QUOTA)
             and sum(media_recovery) > 0, "signed media PMU debits differ from UART")
     result = _replay_intervals(
         intervals, (wall, tick, before), replay, signed_roles=roles,
-        recovery_slices=(len(media_recovery) + 3, max(startup_recovery + media_recovery)),
+        recovery_slices=(len(frame_recovery) + len(media_recovery) + 3,
+                         max(startup_recovery + frame_recovery + media_recovery)),
     )
+    if frame_budget is not None:
+        result.update(boot_frame_meta_recovery_batches=len(frame_recovery),
+                      boot_frame_meta_recovery_cpu_ns=sum(frame_recovery),
+                      boot_frame_meta_accounting_intervals=frame_end - frame_start)
     result.update(boot_media_recovery_batches=len(media_recovery),
                   boot_media_recovery_cpu_ns=sum(media_recovery),
                   boot_media_accounting_intervals=len(media_rows),

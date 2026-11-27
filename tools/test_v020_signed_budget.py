@@ -3,8 +3,8 @@
 import unittest
 
 from v0199_budget_trace import (
-    ROLE_GRANTS, SIGNED_EARLY_TRACE_BYTES, SIGNED_HEADER, SIGNED_MAGIC, SIGNED_ROW, SIGNED_TRACE_BYTES,
-    WINDOW, verify_signed_trace,
+    ROLE_GRANTS, SIGNED_EARLY_TRACE_BYTES, SIGNED_FRAME_SPAN, SIGNED_HEADER, SIGNED_MAGIC,
+    SIGNED_ROW, SIGNED_TRACE_BYTES, WINDOW, verify_signed_trace,
 )
 
 
@@ -38,11 +38,15 @@ class SignedBudgetTraceTests(unittest.TestCase):
                        1_100, 500, *lifetime]
         self.uart = [(tick - initial_tick, tick - initial_tick, 500)]
 
-    def evidence(self, size=SIGNED_TRACE_BYTES):
+    def evidence(self, size=SIGNED_TRACE_BYTES, frame_span=None):
         raw = bytearray(size)
         SIGNED_HEADER.pack_into(raw, 0, *self.header)
+        offset = SIGNED_HEADER.size
+        if frame_span is not None:
+            SIGNED_FRAME_SPAN.pack_into(raw, offset, *frame_span)
+            offset += SIGNED_FRAME_SPAN.size
         for index, row in enumerate(self.rows):
-            SIGNED_ROW.pack_into(raw, SIGNED_HEADER.size + index * SIGNED_ROW.size, *row)
+            SIGNED_ROW.pack_into(raw, offset + index * SIGNED_ROW.size, *row)
         return raw
 
     def replay(self, epoch=2):
@@ -73,12 +77,13 @@ class SignedBudgetTraceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "class or total window limit"):
             self.replay()
 
-    def test_replays_boot_and_media_before_the_existing_role_windows(self):
+    def early_boot(self, dense=False):
         initial_tick = self.header[4]
         prefix = []
         wall = self.origin
         tick = initial_tick
-        for step, used in enumerate((100, 200, 300)):
+        debits = (100, 400, 200, 300) if dense else (100, 200, 300)
+        for step, used in enumerate(debits):
             if step:
                 wall = (step + 1) * WINDOW + 32
                 tick += 10
@@ -86,30 +91,52 @@ class SignedBudgetTraceTests(unittest.TestCase):
             tick += used
             prefix.append((wall + 1_000, tick, 8_000_000, wall + 50_000_000, 5,
                            wall + 984, 0, 0))
-        wall = 4 * WINDOW + 32
+        shift_wall = len(debits) * WINDOW
+        wall = self.origin + shift_wall
         tick += 10
         prefix.append((wall, tick, 0, 0, 0, wall - 16, 0, 0))
         shift = tick - initial_tick
-        self.rows = prefix + [(end + 3 * WINDOW, end_tick + shift, quota,
-                               deadline + 3 * WINDOW if deadline else 0,
-                               scope, lower + 3 * WINDOW, actor, generation)
+        self.rows = prefix + [(end + shift_wall, end_tick + shift, quota,
+                               deadline + shift_wall if deadline else 0,
+                               scope, lower + shift_wall, actor, generation)
                               for end, end_tick, quota, deadline, scope, lower, actor,
                               generation in self.rows]
-        self.header[1:3] = (2, len(self.rows))
-        self.header[7:9] = (3, 5)
-        self.header[9] += 3 * WINDOW
+        self.header[1:3] = (3 if dense else 2, len(self.rows))
+        self.header[7:9] = (len(prefix) - 3, len(prefix) - 1)
+        self.header[9] += shift_wall
         self.header[10] += shift
         self.header[11] += shift
         self.header[12] += 10
-        self.header[17] += 30
-        self.header[18] += 600
+        self.header[17] += 10 * len(debits)
+        self.header[18] += sum(debits)
         self.uart = [(self.header[11], self.header[11], 500)]
+
+    def test_replays_boot_and_media_before_the_existing_role_windows(self):
+        self.early_boot()
         raw = self.evidence(SIGNED_EARLY_TRACE_BYTES)
         result = verify_signed_trace(raw, 2, self.roles, (100, 200, 1_000), self.uart,
                                      media_budget=(1, 300, 8_000_000))
         self.assertEqual(result["early_boot_recovery_cpu_ns"], 100)
         self.assertEqual(result["boot_media_recovery_cpu_ns"], 300)
         self.assertEqual(result["budget_complete_eight_role_windows"], list(range(5, 13)))
+
+    def test_requires_a_separate_frame_meta_phase_before_signed_policy(self):
+        self.early_boot(dense=True)
+        raw = self.evidence(SIGNED_EARLY_TRACE_BYTES, frame_span=(1, 3))
+        args = (2, self.roles, (100, 200, 1_000), self.uart)
+        media = (1, 300, 8_000_000)
+        result = verify_signed_trace(raw, *args, media_budget=media,
+                                     frame_budget=(1, 400, 8_000_000))
+        self.assertEqual(result["boot_frame_meta_recovery_cpu_ns"], 400)
+        self.assertEqual(result["boot_frame_meta_accounting_intervals"], 2)
+        self.assertEqual(result["budget_complete_eight_role_windows"], list(range(6, 14)))
+        with self.assertRaisesRegex(ValueError, "missing or unexpected FrameMeta"):
+            verify_signed_trace(raw, *args, media_budget=media)
+        with self.assertRaisesRegex(ValueError, "FrameMeta PMU debits"):
+            verify_signed_trace(raw, *args, media_budget=media, frame_budget=(1, 401, 8_000_000))
+        invalid = self.evidence(SIGNED_EARLY_TRACE_BYTES, frame_span=(1, 5))
+        with self.assertRaisesRegex(ValueError, "precede policy and media"):
+            verify_signed_trace(invalid, *args, media_budget=media, frame_budget=(1, 400, 8_000_000))
 
 
 if __name__ == "__main__":
