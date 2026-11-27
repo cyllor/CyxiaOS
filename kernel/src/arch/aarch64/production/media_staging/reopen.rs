@@ -23,6 +23,16 @@ pub(super) fn identify(disk: &mut Disk) -> Result<SuperblockV1, Error> {
     volume::read_checkpoint(disk, &mut [0; BLOCK_BYTES])
 }
 
+/// SAFETY: only the one-shot CPU0 staging owner may borrow this workspace.
+pub(super) unsafe fn workspace() -> &'static mut RecoveryWorkspace {
+    // SAFETY: the caller excludes all other workspace access until release.
+    unsafe {
+        let dest = core::ptr::addr_of_mut!(RECOVERY).cast::<RecoveryWorkspace>();
+        core::ptr::copy_nonoverlapping(&INITIAL_RECOVERY, dest, 1);
+        &mut *dest
+    }
+}
+
 pub(super) fn recover(
     disk: &mut Disk,
     sb: SuperblockV1,
@@ -42,11 +52,7 @@ pub(super) fn recover(
 
     // SAFETY: CPU0 borrows the workspace only inside the synchronous, one-shot
     // staging run; initialization precedes every use, including in host tests.
-    let workspace = unsafe {
-        let dest = core::ptr::addr_of_mut!(RECOVERY).cast::<RecoveryWorkspace>();
-        core::ptr::copy_nonoverlapping(&INITIAL_RECOVERY, dest, 1);
-        &mut *dest
-    };
+    let workspace = unsafe { workspace() };
     let mut mounted = None;
     let (chain, checkpoint) =
         recovery_v1::recover_checkpoint_with_evidence(disk, workspace, |disk, current| {

@@ -107,15 +107,29 @@ compile_error!("v0199-advice-e2e-selftest requires the plain smp-selftest profil
 ))]
 #[path = "v0199_control_bringup.rs"]
 mod v0199_control_bringup;
+#[cfg(feature = "v0199-control-bringup")]
+pub(super) use v0199_control_bringup::BudgetMeter;
+#[cfg(feature = "v0199-d01-scheduler-selftest")]
+#[path = "v0199_d01_fixture.rs"]
+mod v0199_d01_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_d02_fixture.rs"]
 mod v0199_d02_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_d05_fixture.rs"]
+mod v0199_d05_fixture;
+#[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_d07_fixture.rs"]
 mod v0199_d07_fixture;
+#[cfg(feature = "v0199-d11-rng-selftest")]
+#[path = "v0199_d11_fixture.rs"]
+mod v0199_d11_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_d15_fixture.rs"]
 mod v0199_d15_fixture;
+#[cfg(feature = "v0199-epoch-disk-selftest")]
+#[path = "v0199_effect_fixture.rs"]
+mod v0199_effect_fixture;
 #[cfg(feature = "v0199-epoch-disk-selftest")]
 #[path = "v0199_epoch_disk.rs"]
 mod v0199_epoch_disk;
@@ -200,6 +214,11 @@ const PRIVATE_SPACES: usize = C * 2
         8
     } else {
         0
+    }
+    + if cfg!(feature = "v0199-d01-scheduler-selftest") {
+        2
+    } else {
+        0
     };
 const STACK_BYTES: usize = 4096 + 65536;
 const CODE: u64 = 0x10000;
@@ -215,6 +234,7 @@ core::arch::global_asm!(include_str!("../../../../crates/arch-aarch64/src/second
 core::arch::global_asm!(
     include_str!("smp_user.S"),
     d02_enabled = const cfg!(feature = "v0199-epoch-disk-selftest") as u8,
+    d01_enabled = const cfg!(feature = "v0199-d01-scheduler-selftest") as u8,
 );
 #[cfg(feature = "v0199-advice-e2e-selftest")]
 core::arch::global_asm!(include_str!("v0199_advice_user.S"));
@@ -947,7 +967,18 @@ fn secondary_work(slot: usize) -> ! {
         // ordinary fixed business gate. It exclusively reuses the dormant
         // private slot 3 after actual architectural stop/TLBI/scrub.
         #[cfg(feature = "v0199-epoch-disk-selftest")]
-        if slot == 1 && token.plane == Plane::Business && v0199_d02_fixture::worker_step() {
+        if slot == 1
+            && token.plane == Plane::Business
+            && (v0199_d02_fixture::worker_step() || v0199_d05_fixture::worker_step())
+        {
+            drop(permit);
+            continue;
+        }
+        #[cfg(feature = "v0199-d01-scheduler-selftest")]
+        if slot == 1
+            && token.plane == Plane::Business
+            && v0199_d01_fixture::worker_step(token.generation)
+        {
             drop(permit);
             continue;
         }
@@ -1177,7 +1208,10 @@ pub(crate) fn boot_progress() -> [u64; 5] {
 // fixture dispatch below is intentionally bypassed (still live for every other
 // smp-selftest profile).
 #[cfg_attr(feature = "v020-production", allow(dead_code))]
-pub fn run(info: &BootInfo) -> ! {
+pub fn run(
+    info: &BootInfo,
+    #[cfg(feature = "v0199-control-bringup")] mut budget: BudgetMeter,
+) -> ! {
     #[cfg(feature = "unified-runtime")]
     crate::boot_recovery::formal::el1();
     if info.cpu_count != REQUIRED {
@@ -1239,6 +1273,12 @@ pub fn run(info: &BootInfo) -> ! {
         );
         assert_eq!(result, 0, "CPU_ON must report success");
     }
+    #[cfg(feature = "v0199-control-bringup")]
+    {
+        gic().enable(irq).unwrap();
+        budget.wait_for(|| ONLINE.load(Ordering::Acquire) == 15);
+    }
+    #[cfg(not(feature = "v0199-control-bringup"))]
     wait(|| ONLINE.load(Ordering::Acquire) == 15);
     report(
         "SMP_BOOT_OK",
@@ -1285,7 +1325,7 @@ pub fn run(info: &BootInfo) -> ! {
     #[cfg(feature = "v0199-sec-n-selftest")]
     v0199_sec_n_fixture::run(info);
     #[cfg(feature = "v0199-control-bringup")]
-    v0199_control_bringup::run();
+    v0199_control_bringup::run(budget);
     #[cfg(all(
         feature = "v0199-cpu0-role-selftest",
         not(any(

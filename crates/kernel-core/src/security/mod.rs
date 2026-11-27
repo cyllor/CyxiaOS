@@ -23,6 +23,7 @@ pub mod file;
 pub mod file_admission_flow_v1;
 pub mod file_auth_context_v1;
 pub mod file_auth_v3;
+pub mod file_fsync_v1;
 pub mod file_index_v0199;
 pub mod file_media_v0199;
 pub mod file_receipt_query_v4;
@@ -42,6 +43,7 @@ pub mod durable_role_epoch_v0199;
 pub mod epoch_redo_v0199;
 
 pub mod offline_config_v1;
+pub mod startup_catalog_v0199;
 
 pub mod cap_record_v3;
 

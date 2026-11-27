@@ -9,6 +9,7 @@ authority. No production G0/G4 claim.
 from __future__ import annotations
 import argparse
 import hashlib
+import re
 import json
 from pathlib import Path
 import struct
@@ -166,8 +167,10 @@ def check_disk(path,epoch,out):
 class EpochFixture:
     scratch_epoch_disk=True
     completion=b'V0199_EPOCH_DISK_FIXTURE_PASS production=false\n'
-    def __init__(self,epoch,qemu_hash,patch_hash,role7_hash):
+    def __init__(self,epoch,qemu_hash,patch_hash,role7_hash,d11_rng=False,d01_scheduler=False):
         self.epoch=epoch;self.qemu_hash=qemu_hash;self.role7_hash=role7_hash
+        self.dedicated_d11_rng=d11_rng
+        self.d01_scheduler=d01_scheduler
         verify_smp.require(verify_smp.sha(PATCH)==patch_hash,'accounting patch mismatch')
     def verify_qemu(self,binary,version):
         verify_smp.require(version.splitlines()[0].startswith('QEMU emulator version 10.2.2')
@@ -185,6 +188,26 @@ class EpochFixture:
                 matches.append(elf[seg['offset']+delta:seg['offset']+delta+end-start])
         verify_smp.require(len(matches)==1,'D02 code not uniquely backed by ELF')
         self.d02_code=(start,end-start,hashlib.sha256(matches[0]).digest())
+        d05_proof=verify_smp.symbol(elf,'V0199_D05_EVIDENCE')
+        verify_smp.require(d05_proof['pa']%BLOCK==0 and d05_proof['size']==BLOCK,
+                           'invalid D05 evidence extent')
+        self.d05_proof_pa=d05_proof['pa']
+        if self.dedicated_d11_rng:
+            proof=verify_smp.symbol(elf,'V0199_D11_EVIDENCE')
+            dma=verify_smp.symbol(elf,'V0199_D11_DMA')
+            verify_smp.require(proof['pa']%BLOCK==0 and proof['size']==BLOCK
+                               and dma['pa']%BLOCK==0 and dma['size']==19*BLOCK
+                               and (proof['pa']+BLOCK<=dma['pa']
+                                    or dma['pa']+dma['size']<=proof['pa']),
+                               'invalid dedicated D11 evidence or DMA extent')
+            self.d11_proof_pa=proof['pa']
+            self.d11_dma_pa=dma['pa']
+        if self.d01_scheduler:
+            proof=verify_smp.symbol(elf,'V0199_D01_EVIDENCE')
+            entry=verify_smp.symbol(elf,'smp_d01_yield')
+            verify_smp.require(proof['pa']%BLOCK==0 and proof['size']==2*BLOCK
+                               and start<=entry['pa']<end,'invalid D01 native effect extent')
+            self.d01_proof_pa=proof['pa']
         return verify_smp.profile(elf)
     @staticmethod
     def metadata():
@@ -401,6 +424,15 @@ class EpochFixture:
                 and 0<w[396]<=BLOCK and (w[395],w[396])==self.d02_code[:2],
                 'invalid D02 diagnostic package extent or ELF mismatch')
         require(serial.count(b'V0199_D02_EFFECT a=2 b=4 c=3\n')==1,'missing actual D02 UART evidence')
+        require(serial.count(b'V0199_D05_EFFECT a=4 b=1 c=4\n')==1,'missing actual D05 UART evidence')
+        if self.dedicated_d11_rng:
+            rows=re.findall(rb'^V0199_D11_EFFECT a=(\d+) b=(\d+) c=(\d+)\n',serial,re.M)
+            require(len(rows)==1,'missing or duplicate D11 UART effect')
+            self.d11_uart=tuple(map(int,rows[0]))
+        if self.d01_scheduler:
+            rows=re.findall(rb'^V0199_D01_EFFECT a=(\d+) b=(\d+) c=(\d+)\n',serial,re.M)
+            require(len(rows)==1,'missing or duplicate D01 UART effect')
+            self.d01_uart=tuple(map(int,rows[0]))
         require(all(v==0 for v in w[397:]),'nonzero reserved evidence')
         expected=f'V0199_EPOCH_DISK_COMMITTED a={e-1} b={e} c={flushes}\n'.encode()
         require(serial.count(expected)==1 and serial.count(self.completion)==1,'UART and QMP evidence disagree')
@@ -430,6 +462,286 @@ class EpochFixture:
                     native_diagnostic_restart_verified=True,role7_abi3_package_verified=True,
                     role7_package_sha256=self.role7_hash.hex(),private_stack_bytes=stack_bytes,
                     role7_operator_results=[old_score,new_score],production_service_restart_verified=False)
+
+    def capture_d05(self,qmp,out,custody):
+        require=verify_smp.require
+        path=out/'d05-effect.bin'
+        qmp.execute('pmemsave',{'val':self.d05_proof_pa,'size':BLOCK,'filename':str(path)})
+        proof=path.read_bytes()
+        require(len(proof)==BLOCK,'incomplete native D05 evidence')
+        rows=struct.unpack('<512Q',proof)
+        magic,boot,sample,accept,cpu,depth,occ,applied_batch,total,version,applied,retained,base=rows[:13]
+        require((magic,boot,cpu,depth,occ,base,applied_batch,total,version,retained)
+                    ==(0x4359443035465831,self.epoch,1,9,70,4,1,10,4,4)
+                and 0<sample<=accept<sample+100_000_000 and accept<=applied,
+                'native D05 observation, version or delivery counts differ')
+        require(rows[13:16]==(0,0,0) and not any(proof[1051:144*8])
+                and not any(proof[(144+6*14)*8:]),'noncanonical native D05 proof padding')
+        snap,rules,plan,decision,report=(proof[a:b] for a,b in
+                                      ((128,392),(392,480),(480,693),(696,952),(952,1051)))
+        require(proof[693:696]==bytes(3) and struct.unpack_from('<IHH',snap)==(0x4359534e,3,72)
+                and struct.unpack_from('<7Q',snap,8)==(4,self.epoch,1,1,5,1,sample)
+                and struct.unpack_from('<HHI',snap,64)==(5,12,0),'D05 exact observation scope mismatch')
+        for i,value in enumerate([None]*8+[depth,None,None,occ]):
+            at=72+i*16
+            require(struct.unpack_from('<HB5xQ',snap,at)==(16+i,int(value is not None),value or 0)
+                    and snap[at+3:at+8]==bytes(5),'D05 snapshot observation format')
+        expected=bytearray(88)
+        put(expected,0,'IHHQIIQ',0x43595255,2,32,4,1,88,0)
+        put(expected,32,'IHHQHHHHII',1,5,1,5,0,1,1,0,56,0)
+        put(expected,64,'HB5xQ',1,3,8)
+        require(rules==bytes(expected),'D05 exact rule fixture mismatch')
+        h=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
+        h.update(hashlib.sha256(b'CYX/D05-FIXTURE/0=8,1/1=32,4/2=64,8/3=128,16').digest())
+        h.update(snap);h.update(bytes(1))
+        for value in [depth,None,None,occ,1,depth,1]:
+            h.update(struct.pack('<BQ',value is not None,value or 0))
+        h.update(struct.pack('<H',4))
+        for ordinal,(budget,batch) in enumerate(((8,1),(32,4),(64,8),(128,16))):
+            h.update(struct.pack('<HBHB',ordinal,3,budget,batch))
+        digest=h.digest()
+        require(struct.unpack_from('<IHHIHH6Q',plan)==(0x43594c31,2,64,213,1,0,4,3,0,1,4,sample+10_000_000_000)
+                and struct.unpack_from('<IHHHHI8Q',plan,64)==(0x43595031,2,144,5,1,5,1,4,4,5,1,1,1,sample+100_000_000)
+                and plan[144:176]==bytes(32) and plan[176:208]==digest and plan[208:]==bytes([0,0,8,0,1]),
+                'D05 publication differs from independently fixed rule and observation')
+        require(struct.unpack_from('<10Q',decision,8)==(self.epoch,1,4,4,4,5,1,1,1,4)
+                and struct.unpack_from('<IHHH',decision,88)==(1,0,5,1)
+                and decision[98:102]==bytes(4) and struct.unpack_from('<HH',decision,102)==(0,65535)
+                and struct.unpack_from('<IHH',decision,152)==(1,0,0)
+                and decision[160:192]==hashlib.sha256(rules).digest()
+                and decision[192:224]==hashlib.sha256(plan).digest() and decision[224:256]==digest,
+                'D05 exact decision binding mismatch')
+        require(struct.unpack_from('<QQQHHHHQQQQiIQ',report)==(self.epoch,1,4,0,5,1,0,5,1,1,4,0,3,applied)
+                and report[80:96]==bytes(16) and report[96:]==bytes([8,0,1])
+                and custody.count(decision)==custody.count(report)==1,'D05 retained native receipt mismatch')
+        previous=0
+        for i in range(1,15):
+            n,seq,payload,copied,acked,worker=rows[144+6*(i-1):144+6*i]
+            require((n,seq,payload,worker)==(48,i,0xc50000+i,1) and 0<copied<=acked and previous<=copied,
+                    'D05 native EL0 actual FIFO/copy/ACK proof mismatch')
+            require((acked<=sample if i<=4 else accept<=applied<=copied)
+                    and acked<sample+10_000_000_000,'D05 delivery originated outside its policy interval')
+            previous=acked
+        return dict(native_d05_effect_fixture_verified=True,d05_real_el0_messages=14,
+                    d05_baseline_batch=base,d05_approved_batch=applied_batch,
+                    d05_evidence_sha256=hashlib.sha256(proof).hexdigest())
+
+    def capture_d11(self,qmp,out,custody):
+        require=verify_smp.require
+        path=out/'d11-effect.bin'
+        qmp.execute('pmemsave',{'val':self.d11_proof_pa,'size':BLOCK,'filename':str(path)})
+        proof=path.read_bytes()
+        require(len(proof)==BLOCK,'invalid D11 evidence length')
+        (magic,boot,mmio,capacity,sample,accept,b_pub,b_done,b_doorbells,b_batch,b_version,
+         b_bytes,b_finish,c_pub,c_done,c_doorbells,c_batch,c_version,c_bytes,c_finish,
+         retained,n)=struct.unpack_from('<22Q',proof)
+        require((magic,boot,capacity,b_batch,b_version,c_version,retained,n)
+                    ==(0x4359443131465831,self.epoch,8,1,0,5,5,97)
+                and 0x0a000000<=mmio<0x0a200000 and mmio%0x200==0
+                and 0<b_finish<=sample<=accept<c_finish<=sample+10_000_000_000,
+                'D11 device identity, generation or lease differs')
+        require((b_pub,b_done,c_pub,c_done)==(capacity,)*4 and 0<c_doorbells<b_doorbells<=capacity
+                and 2<=c_batch<=4,'D11 approved batching did not change actual notifications')
+        require(self.d11_uart==(b_doorbells,c_doorbells,c_version),'D11 UART and physical effect disagree')
+        require(not any(proof[176:192]) and not any(proof[755:760])
+                and not any(proof[1113:]),'noncanonical D11 proof padding')
+        snap,rules,plan,decision,report=(proof[a:b] for a,b in
+                                        ((192,456),(456,544),(544,755),(760,1016),(1016,1113)))
+        require(struct.unpack_from('<IHH',snap)==(0x4359534e,3,72)
+                and struct.unpack_from('<7Q',snap,8)==(5,self.epoch,1,1,11,1,sample)
+                and struct.unpack_from('<HHI',snap,64)==(11,12,0),'D11 exact observation scope mismatch')
+        for i,value in enumerate([None]*8+[0,0,0,None]):
+            at=72+i*16
+            require(struct.unpack_from('<HB5xQ',snap,at)==(16+i,int(value is not None),value or 0)
+                    and snap[at+3:at+8]==bytes(5),'D11 queue observation fields differ')
+        expected=bytearray(88)
+        put(expected,0,'IHHQIIQ',0x43595255,2,32,5,1,88,0)
+        put(expected,32,'IHHQHHHHII',1,11,1,11,0,1,1,0,56,0)
+        put(expected,64,'HB5xQ',5,3,0)
+        put(expected,80,'HHI',2,0,0)
+        require(rules==bytes(expected),'D11 exact fixed rule differs')
+        h=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
+        h.update(hashlib.sha256(b'CYX/D11-RNG-FIXTURE/0=1,1=2,2=4,3=8').digest())
+        h.update(snap);h.update(bytes(1))
+        for value in [0,0,0,None,0,0,1]:
+            h.update(struct.pack('<BQ',value is not None,value or 0))
+        h.update(struct.pack('<H',4))
+        for ordinal,tier in enumerate((1,2,4,8)):
+            h.update(struct.pack('<HBB',ordinal,1,tier))
+        digest=h.digest()
+        require(struct.unpack_from('<IHHIHH6Q',plan)==(0x43594c31,2,64,211,1,0,5,4,0,1,5,sample+10_000_000_000)
+                and struct.unpack_from('<IHHHHI8Q',plan,64)==(0x43595031,2,144,11,1,3,1,5,5,11,1,1,1,sample+100_000_000)
+                and plan[144:176]==bytes(32) and plan[176:208]==digest and plan[208:]==bytes([2,0,4]),
+                'D11 publish differs from deterministic rule and observation')
+        require(struct.unpack_from('<10Q',decision,8)==(self.epoch,1,5,5,5,11,1,1,1,5)
+                and struct.unpack_from('<IHHH',decision,88)==(1,0,11,1)
+                and decision[98:102]==bytes(4) and struct.unpack_from('<HH',decision,102)==(2,65535)
+                and struct.unpack_from('<IHH',decision,152)==(4,2,0)
+                and decision[160:192]==hashlib.sha256(rules).digest()
+                and decision[192:224]==hashlib.sha256(plan).digest() and decision[224:256]==digest,
+                'D11 exact decision binding differs')
+        require(struct.unpack_from('<QQQHHHHQQQQiIQ',report)==(self.epoch,1,5,0,11,1,0,11,1,1,5,0,1,c_finish)
+                and report[80:96]==bytes(16) and report[96:]==bytes([4])
+                and custody.count(decision)==custody.count(report)==1,'D11 retained APPLIED receipt differs')
+        # Capture only split-ring metadata. Never copy entropy response pages.
+        ring_path=out/'d11-rings.bin'
+        qmp.execute('pmemsave',{'val':self.d11_dma_pa,'size':3*BLOCK,'filename':str(ring_path)})
+        rings=ring_path.read_bytes()
+        require(len(rings)==3*BLOCK,'incomplete D11 descriptor and ring dump')
+        avail,used=rings[BLOCK:2*BLOCK],rings[2*BLOCK:]
+        require(struct.unpack_from('<H',avail,2)[0]==struct.unpack_from('<H',used,2)[0]==16,
+                'D11 actual avail and used indices differ')
+        for slot in range(capacity):
+            at=slot*32
+            # BatchMemory owns desc, avail, used, 8 request pages and
+            # 8 dedicated response pages. RNG uses writable-only heads.
+            require(struct.unpack_from('<QIHH',rings,at)==(self.d11_dma_pa+(11+slot)*BLOCK,256,2,0)
+                    and not any(rings[at+16:at+32]),'D11 descriptor does not own its exact RNG DMA span')
+        expect_heads=list(range(0,16,2))
+        for i,expected_bytes in enumerate((b_bytes,c_bytes)):
+            start=i*capacity
+            heads=list(struct.unpack_from('<8H',avail,4+start*2))
+            entries=list(struct.unpack_from('<2I',used,4+8*j) for j in range(start,start+capacity))
+            require(heads==expect_heads and sorted(head for head,_ in entries)==expect_heads
+                    and all(1<=n<=256 for _,n in entries)
+                    and sum(n for _,n in entries)==expected_bytes,
+                    'D11 used-ring chains or actual completed byte counts differ')
+        return dict(native_d11_rng_effect_fixture_verified=True,d11_rng_chains=16,
+                    d11_baseline_doorbells=b_doorbells,d11_approved_doorbells=c_doorbells,
+                    d11_approved_max_batch=c_batch,d11_effect_sha256=hashlib.sha256(proof).hexdigest(),
+                    d11_ring_metadata_sha256=hashlib.sha256(rings).hexdigest())
+
+    def capture_d01(self,qmp,out,custody):
+        require=verify_smp.require
+        def physical(name,pa,size=BLOCK):
+            path=out/name
+            qmp.execute('pmemsave',{'val':pa,'size':size,'filename':str(path)})
+            raw=path.read_bytes()
+            require(len(raw)==size,'short D01 physical evidence')
+            return raw
+
+        proof=physical('d01-scheduler.bin',self.d01_proof_pa,2*BLOCK)
+        magic,boot,seq,accept,n,retained=struct.unpack_from('<6Q',proof)
+        require((magic,boot,seq,n,retained)==(0x4359443031465831,self.epoch,
+                    6 if self.dedicated_d11_rng else 5,98,seq),'D01 publication identities differ')
+        require(not any(proof[48:64]) and not any(proof[820:824])
+                and not any(proof[1178:BLOCK]) and not any(proof[BLOCK+48*80:]),
+                'noncanonical D01 evidence padding')
+        baseline=struct.unpack_from('<11Q',proof,64)
+        weighted=struct.unpack_from('<11Q',proof,152)
+        roots=struct.unpack_from('<2Q',proof,240)
+        require(baseline[0]//100_000_000<weighted[0]//100_000_000
+                and 0<baseline[0]<=baseline[1]<=accept<baseline[1]+100_000_000
+                and accept<=weighted[0]<=weighted[1]<baseline[1]+10_000_000_000
+                and baseline[7:9]==(2,0) and weighted[7:9]==(2,seq)
+                and baseline[9:11]==weighted[9:11]
+                and self.d01_uart==(baseline[4],weighted[4],seq),
+                'D01 aligned phases, requester or installed version differs')
+        last_dispatch=[0,0]
+        for phase,header,weights in ((0,baseline,(1,1)),(1,weighted,(4,1))):
+            spent=[0,0]
+            count=[0,0]
+            ready=[header[0],header[0]]
+            waits=[]
+            previous=header[0]
+            for i in range(24):
+                at=BLOCK+80*(phase*24+i)
+                serial,task,start,finish,actual,wait,version,work,esr,reserve=struct.unpack_from('<10Q',proof,at)
+                expect=min(range(2),key=lambda g:(spent[g]*weights[1-g],last_dispatch[g],g))
+                require(task==expect and serial==phase*24+i+1
+                        and previous<=start<=finish<=header[1]
+                        and start//100_000_000==finish//100_000_000==header[0]//100_000_000
+                        and esr==0x56000000 and 0<actual<=reserve,
+                        'D01 real weighted CPU1 dispatch or return differs')
+                credit=min(2_000_000,10_000_000-spent[task],90_000_000-sum(spent),
+                           (start//100_000_000+1)*100_000_000-start)
+                require(reserve==credit and wait==start-ready[task] and wait<100_000_000
+                        and version==(seq if phase and task==0 else 0)
+                        and work==(count[task]+1)*2048,
+                        'D01 dispatch reservation, readiness or EL0 work count differs')
+                count[task]+=1
+                spent[task]+=actual
+                ready[task]=finish
+                last_dispatch[task]=serial
+                waits.append(wait)
+                previous=finish
+            p99=(max(waits)+999)//1000  # nearest rank with 24 observations
+            require((*spent,*count,p99)==header[2:7] and all(count),
+                    'D01 actual CPU debit or snapshot wait p99 differs')
+        require(weighted[2]*baseline[3]>weighted[3]*baseline[2],
+                'approved D01 group did not gain measured execution share')
+        mask=0x0000fffffffff000
+        user_leaf=3|(1<<6)|(3<<8)|(1<<10)|(1<<11)|(1<<53)
+        rx=user_leaf|(1<<7)
+        rw=user_leaf|(1<<54)
+        pages=[self.d02_code[0]]
+        def checked(pa):
+            require(pa%BLOCK==0 and 0x40000000<=pa<0x44000000 and pa not in pages,
+                    'D01 private mapping overlaps or leaves pinned kernel pages')
+            pages.append(pa)
+            return pa
+        for i,(root,data,completed) in enumerate(zip(roots,weighted[9:11],weighted[4:6])):
+            root_page=physical(f'd01-root-{i}.bin',checked(root))
+            mid_raw=struct.unpack_from('<Q',root_page)[0]
+            middle=physical(f'd01-middle-{i}.bin',checked(mid_raw&mask))
+            leaf_raw=struct.unpack_from('<Q',middle)[0]
+            leaf=physical(f'd01-leaf-{i}.bin',checked(leaf_raw&mask))
+            require(mid_raw&~mask==leaf_raw&~mask==3 and not any(root_page[8:])
+                    and not any(middle[8:]),'D01 invalid private table descriptors')
+            entries=struct.unpack('<512Q',leaf)
+            code_pte,data_pte,stack_pte=(entries[va//BLOCK] for va in (0x10000,0x20000,0x30000))
+            stack=checked(stack_pte&mask)
+            require((code_pte,data_pte,stack_pte)==(self.d02_code[0]|rx,data|rw,stack|rw)
+                    and sum(pte!=0 for pte in entries)==3,
+                    'D01 EL0 code, private writable data or stack mapping differs')
+            data_page=physical(f'd01-private-data-{i}.bin',checked(data))
+            require(struct.unpack_from('<Q',data_page)[0]==completed*2048,
+                    'D01 final physical EL0 counter differs from CPU debit')
+        snap,rules,plan,decision,report=(proof[a:b] for a,b in
+                                        ((256,520),(520,608),(608,820),(824,1080),(1080,1178)))
+        sample=baseline[1]
+        require(struct.unpack_from('<IHH',snap)==(0x4359534e,3,72)
+                and struct.unpack_from('<7Q',snap,8)==(seq,self.epoch,1,1,17,1,sample)
+                and struct.unpack_from('<HHI',snap,64)==(1,12,0),'D01 snapshot scope differs')
+        for i,value in enumerate([None]*8+[2,baseline[6],None,None]):
+            at=72+i*16
+            require(struct.unpack_from('<HB5xQ',snap,at)==(16+i,int(value is not None),value or 0)
+                    and snap[at+3:at+8]==bytes(5),'D01 scheduler observation fields differ')
+        expected=bytearray(88)
+        put(expected,0,'IHHQIIQ',0x43595255,2,32,seq,1,88,0)
+        put(expected,32,'IHHQHHHHII',1,1,1,17,0,1,1,0,56,0)
+        put(expected,64,'HB5xQ',1,3,2)
+        put(expected,80,'HHI',2,0,0)
+        require(rules==bytes(expected),'D01 exact deterministic rule differs')
+        h=hashlib.sha256(b'CYX/REGISTERED-CANDIDATES/v0199')
+        h.update(hashlib.sha256(b'CYX/D01-CPU1-FIXTURE/0=1,1=2,2=4,3=8').digest())
+        h.update(snap);h.update(bytes(1))
+        for value in [2,baseline[6],None,None,0,2,1]:
+            h.update(struct.pack('<BQ',value is not None,value or 0))
+        h.update(struct.pack('<H',4))
+        for ordinal,tier in enumerate((1,2,4,8)):
+            h.update(struct.pack('<HBH',ordinal,2,tier))
+        digest=h.digest()
+        require(struct.unpack_from('<IHHIHH6Q',plan)==(0x43594c31,2,64,212,1,0,seq,seq-1,0,1,seq,sample+10_000_000_000)
+                and struct.unpack_from('<IHHHHI8Q',plan,64)==(0x43595031,2,144,1,1,4,1,seq,seq,17,1,1,1,sample+100_000_000)
+                and plan[144:176]==bytes(32) and plan[176:208]==digest and plan[208:]==bytes([2,0,4,0]),
+                'D01 publication differs from observed deterministic decision')
+        require(struct.unpack_from('<IHH',decision)==(0x43594431,3,256)
+                and struct.unpack_from('<10Q',decision,8)==(self.epoch,1,seq,seq,seq,17,1,1,1,seq)
+                and struct.unpack_from('<IHHH',decision,88)==(1,0,1,1)
+                and decision[98:102]==bytes(4) and struct.unpack_from('<HHHI',decision,102)==(2,65535,0,3)
+                and struct.unpack_from('<5Q',decision,112)==(0,0,0,0,sample+100_000_000)
+                and struct.unpack_from('<IHH',decision,152)==(4,2,0)
+                and decision[160:192]==hashlib.sha256(rules).digest()
+                and decision[192:224]==hashlib.sha256(plan).digest() and decision[224:256]==digest,
+                'D01 exact decision binding differs')
+        require(struct.unpack_from('<QQQHHHHQQQQiIQ',report)==(self.epoch,1,seq,0,1,1,0,17,1,1,seq,0,2,weighted[1])
+                and report[80:96]==bytes(16) and report[96:]==bytes([4,0])
+                and custody.count(decision)==custody.count(report)==1,'D01 protected APPLIED receipt differs')
+        return dict(native_d01_scheduler_effect_fixture_verified=True,d01_common_cpu=1,
+                    d01_observed_real_dispatches=48,d01_baseline_cpu_ns=list(baseline[2:4]),
+                    d01_approved_cpu_ns=list(weighted[2:4]),d01_baseline_turns=list(baseline[4:6]),
+                    d01_approved_turns=list(weighted[4:6]),d01_evidence_sha256=hashlib.sha256(proof).hexdigest())
 
     def capture_extra(self,qmp,out,page):
         # This hook runs after validate(), with all four CPUs stopped.
@@ -573,7 +885,9 @@ class EpochFixture:
                     effect_owner_pool_sha256=hashlib.sha256(owner_raw).hexdigest(),
                     native_d02_effect_fixture_verified=True,d02_retired_pages_verified=True,
                     d02_actual_cpu1_creations=6,d02_async_ticket_acknowledgements_verified=6,
-                    d02_diagnostic_package_sha256=package.hex())
+                    d02_diagnostic_package_sha256=package.hex(),**self.capture_d05(qmp,out,custody),
+                    **(self.capture_d11(qmp,out,custody) if self.dedicated_d11_rng else {}),
+                    **(self.capture_d01(qmp,out,custody) if self.d01_scheduler else {}))
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -582,6 +896,8 @@ def main():
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--qemu-sha256',required=True)
     p.add_argument('--patch-sha256',required=True)
+    p.add_argument('--d11-rng',action='store_true',help='require dedicated VirtIO RNG effect evidence')
+    p.add_argument('--d01-scheduler',action='store_true',help='require native D01 CPU1 scheduler evidence')
     a=p.parse_args()
     out=a.output.resolve()
     out.mkdir(parents=True,exist_ok=False)
@@ -592,7 +908,7 @@ def main():
         previous=verify_smp.sha(disk)
         for epoch in (1,2):
             capture=out/f'boot-{epoch}'
-            summary=verify_smp.run(a.elf,capture,45,4,acceptance=EpochFixture(epoch,a.qemu_sha256,a.patch_sha256,hashlib.sha256(a.role7.read_bytes()).digest()),
+            summary=verify_smp.run(a.elf,capture,45,4,acceptance=EpochFixture(epoch,a.qemu_sha256,a.patch_sha256,hashlib.sha256(a.role7.read_bytes()).digest(),a.d11_rng,a.d01_scheduler),
                                    ram_mib=1024,scratch_disk=disk)
             result['boots'].append(summary)
             verify_smp.require(summary['status']=='PASS' and summary.get('forced_process_stop'),
@@ -611,7 +927,21 @@ def main():
         result['cross_process_formatted_mount_checkpoint_verified']=True
         result['native_d15_actual_effect_fixture_verified']=True
         result['native_d07_actual_effect_fixture_verified']=True
+        verify_smp.require(all(
+            b.get('observations',{}).get('native_d05_effect_fixture_verified') is True
+            for b in result['boots']),'missing D05 real IPC copy and feedback proof')
         result['native_d02_actual_effect_fixture_verified']=True
+        result['native_d05_actual_effect_fixture_verified']=True
+        if a.d11_rng:
+            verify_smp.require(all(
+                b.get('observations',{}).get('native_d11_rng_effect_fixture_verified') is True
+                for b in result['boots']),'missing dedicated D11 RNG effect proof')
+            result['native_d11_rng_actual_effect_fixture_verified']=True
+        if a.d01_scheduler:
+            verify_smp.require(all(
+                b.get('observations',{}).get('native_d01_scheduler_effect_fixture_verified') is True
+                for b in result['boots']),'missing native D01 scheduler effect proof')
+            result['native_d01_scheduler_actual_effect_fixture_verified']=True
         result['status']='PASS'
     except (OSError,ValueError,RuntimeError) as e:
         result['status']='FAIL'

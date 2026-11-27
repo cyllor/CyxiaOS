@@ -168,6 +168,9 @@ impl<'a> ValidatedRoleManifest<'a> {
     pub fn manifest(&self) -> &'a NativeRoleManifest {
         self.0
     }
+    pub fn can_act(&self, role: Role, actor: Identity, cap: u64, cpu: usize) -> Result<(), Error> {
+        self.0.can_act_validated(role, actor, cap, cpu)
+    }
     pub fn check_snapshot_view(
         &self,
         actor: Identity,
@@ -362,7 +365,16 @@ impl NativeRoleManifest {
     /// No independent role manifests may remap the sole control CPU to a
     /// business core or grant publishers to either advisory brain.
     pub fn can_act(&self, role: Role, actor: Identity, cap: u64, cpu: usize) -> Result<(), Error> {
-        self.validate()?;
+        self.validated()?.can_act(role, actor, cap, cpu)
+    }
+
+    fn can_act_validated(
+        &self,
+        role: Role,
+        actor: Identity,
+        cap: u64,
+        cpu: usize,
+    ) -> Result<(), Error> {
         if cpu != CONTROL_CPU || cap == 0 || cap.count_ones() != 1 {
             return Err(Error::Denied);
         }

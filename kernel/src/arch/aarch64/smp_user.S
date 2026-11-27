@@ -225,6 +225,45 @@ smp_d02_business:
  mov x8, #1
  svc #0
  b .
+// D05 diagnostic ABI3 client. A fresh owned address space supplies the
+// service arguments. Record what EL0 actually sees after the native copy.
+.global smp_d05_ipc
+smp_d05_ipc:
+ svc #0
+ str x0, [x6]
+ cmp x8, #0x31
+ b.ne 1f
+ cmp x0, #48
+ b.ne 1f
+ ldr x10, [x1, #16]
+ ldr x11, [x1, #40]
+ stp x10, x11, [x6, #8]
+1:
+ mov x0, #0
+ mov x1, #0
+ mov x2, #0
+ mov x3, #0
+ mov x4, #0
+ mov x5, #0
+ mov x8, #1
+ svc #0
+ b .
+.endif
+.if {d01_enabled}
+// Both D01 tasks execute this same bounded body through distinct private
+// TTBR0 roots. The EL0 counter advances before each real ABI3 Yield.
+.global smp_d01_yield
+smp_d01_yield:
+ ldr x10, [x20]
+ mov x11, #2048
+1:
+ add x10, x10, #1
+ subs x11, x11, #1
+ b.ne 1b
+ str x10, [x20]
+ mov x8, #2
+ svc #0
+ b smp_d01_yield
 .endif
 .global smp_user_end
 smp_user_end:

@@ -434,18 +434,34 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         Ok(())
     }
 
-    fn check_identity_and_context(&self, context: TrustedRegistrationScope) -> Result<(), Error> {
+    fn authorize_request(
+        &self,
+        actor: Identity,
+        expected_actor: Identity,
+        context: &TrustedRegistrationScope,
+    ) -> Result<(), Error> {
+        if actor != expected_actor {
+            return Err(Error::Denied);
+        }
+        // The boot and controller identities are required even for an exact
+        // retry of an already accepted request. Only fresh work rechecks the
+        // volatile rule/resource snapshot and lease below.
+        if context.boot_epoch != self.boot_epoch
+            || context.controller_epoch != self.controller_epoch
+        {
+            return Err(Error::Stale);
+        }
+        Ok(())
+    }
+
+    fn check_current_context(&self, context: TrustedRegistrationScope) -> Result<(), Error> {
         if self.fenced {
             return Err(Error::NotReady);
         }
         if context.base_plan_version == u64::MAX {
             return Err(Error::Exhausted);
         }
-        if context.boot_epoch != self.boot_epoch
-            || context.controller_epoch != self.controller_epoch
-            || context.boot_epoch == 0
-            || context.controller_epoch == 0
-            || context.rules_generation == 0
+        if context.rules_generation == 0
             || context.rules_hash == [0; 32]
             || context.ledger_generation == 0
             || context.core_generation == 0
@@ -473,9 +489,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         actions: &[FrozenAction<'_>],
         context: TrustedRegistrationScope,
     ) -> Result<Registration, Error> {
-        if actor != self.controller {
-            return Err(Error::Denied);
-        }
+        self.authorize_request(actor, self.controller, &context)?;
         let plan = PlanV2::decode(plan_wire)?;
         if let Some(pending) = self
             .lookup(plan.header.plan_seq)
@@ -579,7 +593,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         context: TrustedRegistrationScope,
         causal_fallback: bool,
     ) -> Result<(), Error> {
-        self.check_identity_and_context(context)?;
+        self.check_current_context(context)?;
         if plan.header.flags != 0 {
             return Err(Error::NotReady);
         }
@@ -689,9 +703,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         context: TrustedRegistrationScope,
         native_accept: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Publication, Error> {
-        if actor != self.publisher {
-            return Err(Error::Denied);
-        }
+        self.authorize_request(actor, self.publisher, &context)?;
         let plan = PlanV2::decode(plan_wire)?;
         let pending = self
             .lookup(plan.header.plan_seq)
@@ -745,7 +757,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         context: TrustedRegistrationScope,
         table: &super::trial_permit_v1::TrialTable,
     ) -> Result<(super::trial_permit_v1::Permit, u16), Error> {
-        self.check_identity_and_context(context)?;
+        self.check_current_context(context)?;
         if plan.header.flags != 0
             || plan.header.action_count != 1
             || rule_profile_mismatch(profile, context)
@@ -833,9 +845,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         context: TrustedRegistrationScope,
         table: &super::trial_permit_v1::TrialTable,
     ) -> Result<Registration, Error> {
-        if actor != self.controller {
-            return Err(Error::Denied);
-        }
+        self.authorize_request(actor, self.controller, &context)?;
         let plan = PlanV2::decode(plan_wire)?;
         if let Some(p) = self
             .lookup(plan.header.plan_seq)
@@ -913,9 +923,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         native_accept: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Publication, Error> {
         use super::trial_permit_v1::UseKey;
-        if actor != self.publisher {
-            return Err(Error::Denied);
-        }
+        self.authorize_request(actor, self.publisher, &context)?;
         let plan = PlanV2::decode(plan_wire)?;
         let p = self.lookup(plan.header.plan_seq).ok_or(Error::Stale)?;
         let trial = p.trial.ok_or(Error::Denied)?;
@@ -1016,7 +1024,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         scope: &AssistedScope<'_>,
         advice_wire: &[u8; ADVICE_BYTES],
     ) -> Result<(), Error> {
-        self.check_identity_and_context(context)?;
+        self.check_current_context(context)?;
         let trusted = scope.advice;
         if !scope.assisted_mode
             || !scope.offline_model_authorized
@@ -1119,9 +1127,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         scope: &AssistedScope<'_>,
         ledger: &mut EvidenceLedger,
     ) -> Result<Registration, Error> {
-        if actor != self.controller {
-            return Err(Error::Denied);
-        }
+        self.authorize_request(actor, self.controller, &context)?;
         let plan = PlanV2::decode(plan_wire)?;
         if let Some(p) = self
             .lookup(plan.header.plan_seq)
@@ -1230,9 +1236,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         ledger: &mut EvidenceLedger,
         verify_hard_rejection: impl FnOnce(&AdviceEnvelopeV1, &FrozenAction<'_>) -> Result<(), Error>,
     ) -> Result<Registration, Error> {
-        if actor != self.controller {
-            return Err(Error::Denied);
-        }
+        self.authorize_request(actor, self.controller, &context)?;
         let plan = PlanV2::decode(plan_wire)?;
         let disp = AdviceDispositionV1::decode(disposition)?;
         let rec = DecisionRecordV3::decode(record)?;
@@ -1382,9 +1386,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         context: TrustedRegistrationScope,
         native_accept: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Publication, Error> {
-        if actor != self.publisher {
-            return Err(Error::Denied);
-        }
+        self.authorize_request(actor, self.publisher, &context)?;
         let plan = PlanV2::decode(plan_wire)?;
         let rec = DecisionRecordV3::decode(record)?;
         let p = self.lookup(plan.header.plan_seq).ok_or(Error::Stale)?;
@@ -1433,9 +1435,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         scope: &AssistedScope<'_>,
         native_accept: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Publication, Error> {
-        if actor != self.publisher {
-            return Err(Error::Denied);
-        }
+        self.authorize_request(actor, self.publisher, &context)?;
         let plan = PlanV2::decode(plan_wire)?;
         let p = self
             .lookup(plan.header.plan_seq)
@@ -2314,8 +2314,34 @@ mod tests {
             Ok(Publication::AdapterAccepted)
         );
         assert_eq!(invoked, 1);
+        for stale in [
+            TrustedRegistrationScope {
+                boot_epoch: ctx.boot_epoch + 1,
+                ..ctx
+            },
+            TrustedRegistrationScope {
+                controller_epoch: ctx.controller_epoch + 1,
+                ..ctx
+            },
+        ] {
+            assert_eq!(
+                gate.register_rule_only(CONTROLLER, &plan, &records, &catalog, &frozen, stale),
+                Err(Error::Stale)
+            );
+            assert_eq!(
+                gate.publish_once(PUBLISHER, &plan, &records, &catalog, &frozen, stale, || {
+                    panic!("stale publisher reached the native accept callback")
+                }),
+                Err(Error::Stale)
+            );
+        }
+        let later = TrustedRegistrationScope {
+            base_plan_version: ctx.base_plan_version + 1,
+            now_ns: ctx.now_ns + 100_000_000,
+            ..ctx
+        };
         assert_eq!(
-            gate.publish_once(PUBLISHER, &plan, &records, &catalog, &frozen, ctx, || {
+            gate.publish_once(PUBLISHER, &plan, &records, &catalog, &frozen, later, || {
                 invoked += 1;
                 Ok(())
             }),

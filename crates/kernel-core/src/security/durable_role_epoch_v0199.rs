@@ -104,6 +104,29 @@ pub struct DurableEpochGate {
     startup_verified: bool,
     paired_confirmed: bool,
 }
+
+/// Current signed policy and durable boot identity. The borrow excludes a
+/// concurrent epoch or isolation transition while a protected owner uses it.
+pub struct ConfirmedBootPolicy<'a> {
+    epochs: &'a DurableEpochGate,
+    boot: u64,
+    config_digest: [u8; 32],
+}
+
+impl ConfirmedBootPolicy<'_> {
+    pub fn boot_epoch(&self) -> u64 {
+        self.boot
+    }
+
+    pub(super) fn config_digest(&self) -> [u8; 32] {
+        self.config_digest
+    }
+
+    pub fn service_generation(&self, role: Role) -> Result<u64, Error> {
+        self.epochs.service_generation(role)
+    }
+}
+
 impl DurableEpochGate {
     /// The native storage/manifest adapter must verify the recovered state
     /// against real volume identity, committed redo chain, offline config and
@@ -189,6 +212,17 @@ impl DurableEpochGate {
         }
         self.verify_startup_config(config)?;
         self.boot_epoch().ok_or(Error::Busy)
+    }
+
+    pub(super) fn confirmed_boot_policy(
+        &self,
+        config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+    ) -> Result<ConfirmedBootPolicy<'_>, Error> {
+        Ok(ConfirmedBootPolicy {
+            epochs: self,
+            boot: self.confirmed_config_boot(config)?,
+            config_digest: config.digest(),
+        })
     }
     fn slot(&self, role: Role) -> Result<usize, Error> {
         self.slots

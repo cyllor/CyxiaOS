@@ -10,7 +10,6 @@
 //! an unsigned fixed test input, not a signed boot catalog; no production
 //! format path, production mount or ordinary file authority is established.
 use super::*;
-use cyxia_driver_virtio::block::BatchedBlock;
 use cyxia_kernel_core::security::{
     Error as SecurityError,
     boot_epoch_v1::BootEpochStoreV1,
@@ -82,13 +81,13 @@ fn record_trace(kind: u64, block: u32) {
     }
 }
 struct Disk {
-    device: BatchedBlock,
+    device: super::scratch_blk::ScratchBlock,
     reads: u64,
     writes: u64,
     flushes: u64,
 }
 impl Disk {
-    // Block plumbing (eight validated sector requests per block, isolated
+    // Block plumbing (two validated four-sector requests per block, isolated
     // synchronous FLUSH) is shared with the V0.20 media-staging lane.
     fn sectors(
         &mut self,

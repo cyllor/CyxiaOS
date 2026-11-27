@@ -67,24 +67,16 @@ fn rpc(e: RpcError) -> Error {
     }
 }
 impl Owner {
-    pub fn bind(
-        boot: u64,
-        executor: u64,
-        ep: Endpoint,
-        sender: Identity,
-        verify_ordinary: impl FnOnce(Endpoint, Identity) -> Result<(), Error>,
-    ) -> Result<Self, Error> {
-        if boot == 0 || executor == 0 {
-            return Err(Error::Invalid);
-        }
-        verify_ordinary(ep, sender)?;
-        Ok(Self {
-            queue: DirectionalEndpoint::new(ep, sender).map_err(rpc)?,
-            boot,
-            executor,
+    /// Storage for a native business owner. It admits no operations until
+    /// its exact endpoint and executor generation have been bound.
+    pub const fn empty() -> Self {
+        Self {
+            queue: DirectionalEndpoint::unbound(),
+            boot: 0,
+            executor: 0,
             target: Identity {
-                id: ep.id,
-                generation: ep.generation,
+                id: 0,
+                generation: 0,
             },
             version: 0,
             budget: 32,
@@ -98,9 +90,47 @@ impl Owner {
             active: None,
             work: None,
             fenced: false,
-        })
+        }
+    }
+    pub fn bind(
+        boot: u64,
+        executor: u64,
+        ep: Endpoint,
+        sender: Identity,
+        verify_ordinary: impl FnOnce(Endpoint, Identity) -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        let mut owner = Self::empty();
+        owner.initialize(boot, executor, ep, sender, verify_ordinary)?;
+        Ok(owner)
+    }
+    pub fn initialize(
+        &mut self,
+        boot: u64,
+        executor: u64,
+        ep: Endpoint,
+        sender: Identity,
+        verify_ordinary: impl FnOnce(Endpoint, Identity) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if self.boot != 0 || self.fenced {
+            return Err(Error::Busy);
+        }
+        if boot == 0 || executor == 0 {
+            return Err(Error::Invalid);
+        }
+        verify_ordinary(ep, sender)?;
+        self.queue.bind_unbound(ep, sender).map_err(rpc)?;
+        self.boot = boot;
+        self.executor = executor;
+        self.target = Identity {
+            id: ep.id,
+            generation: ep.generation,
+        };
+        Ok(())
     }
     fn clock(&self, now: u64) -> Result<(), Error> {
+        if self.boot == 0 {
+            return Err(Error::NotReady);
+        }
         if now == 0 || now < self.last {
             return Err(Error::Clock);
         }
@@ -477,6 +507,31 @@ mod tests {
         id: 21,
         generation: 1,
     };
+    #[test]
+    fn business_arena_binds_once_without_replacing_live_queue() {
+        let ep = Endpoint {
+            id: 5,
+            generation: 1,
+            receiver: RECV,
+        };
+        let mut owner = Owner::empty();
+        assert_eq!(
+            owner.send(SEND, 1, b"first", 10, || panic!()),
+            Err(Error::NotReady)
+        );
+        assert_eq!(
+            owner.initialize(4, 1, ep, SEND, |_, _| Err(Error::Denied)),
+            Err(Error::Denied)
+        );
+        owner.initialize(4, 1, ep, SEND, |_, _| Ok(())).unwrap();
+        owner.send(SEND, 1, b"first", 10, || Ok(())).unwrap();
+        assert_eq!(
+            owner.initialize(4, 1, ep, SEND, |_, _| panic!()),
+            Err(Error::Busy)
+        );
+        assert_eq!(owner.pending(), 1);
+    }
+
     #[test]
     fn shrink_keeps_fifo_and_exact_retry_batch_effect_after_copy() {
         let ep = Endpoint {

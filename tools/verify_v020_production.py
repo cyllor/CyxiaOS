@@ -99,6 +99,7 @@ PRODUCTION_SOURCES = [
     "kernel/src/arch/aarch64/production/net_entropy.rs",
     "kernel/src/arch/aarch64/production/media_staging.rs",
     "kernel/src/arch/aarch64/production/media_staging/authority.rs",
+    "kernel/src/arch/aarch64/production/media_staging/fsync.rs",
     "kernel/src/arch/aarch64/production/media_staging/reopen.rs",
     "kernel/src/arch/aarch64/production/media_staging/signed.rs",
     "kernel/src/arch/aarch64/production/media_staging/volume.rs",
@@ -110,6 +111,10 @@ PRODUCTION_SOURCES = [
     "crates/arch-aarch64/src/entry.S",
     "crates/arch-aarch64/src/timer.rs",
     "crates/platform-virt/src/lib.rs",
+    "crates/driver-virtio/src/lib.rs",
+    "crates/driver-virtio/src/block.rs",
+    "crates/driver-virtio/src/block/batched.rs",
+    "crates/driver-virtio/src/queue.rs",
     "crates/kernel-core/src/security/recovery_proof_v2.rs",
     "crates/kernel-core/src/security/boot_epoch_v1.rs",
     "crates/kernel-core/src/security/durable_role_epoch_v0199.rs",
@@ -118,6 +123,8 @@ PRODUCTION_SOURCES = [
     "crates/kernel-core/src/security/file_format_v1.rs",
     "crates/kernel-core/src/security/file_media_unified_v1.rs",
     "crates/kernel-core/src/security/file_mount_v1.rs",
+    "crates/kernel-core/src/security/file_fsync_v1.rs",
+    "crates/kernel-core/src/security/recovery_v1.rs",
     "crates/kernel-core/src/security/file_receipt_query_v4.rs",
     "crates/kernel-core/src/security/file_receipt_store_v0199.rs",
     "crates/kernel-core/src/security/file_index_v0199.rs",
@@ -151,6 +158,7 @@ PRODUCTION_SOURCES = [
     "user/local-echo/src/lib.rs",
     "user/local-echo/src/runtime.rs",
     "tools/verify_v020_production.py",
+    "tools/verify_v020_fsync_scratch.py",
     "tools/qmp_stdio.py",
     "tools/v020_production_media.py",
     "tools/v020_production_modes.py",
@@ -159,6 +167,7 @@ PRODUCTION_SOURCES = [
     "tools/v020_snapshot_envelopes.py",
     "tools/v020_tls_peer.py",
     "tests/fixtures/v020-signed-scratch/config.bin",
+    "tests/fixtures/v020-signed-scratch/fsync-config.bin",
 ]
 GUEST_ELF = "target/aarch64-unknown-none/release/cyxia-local-echo"
 MAGIC = 0x4359_5052_4431_3030
@@ -498,13 +507,13 @@ def check_w11_net(words: tuple, lines: list, serial: bytes) -> None:
 
 
 def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
-                      snapshot_calls: int, modes: Modes) -> None:
+                      snapshot_calls: int, modes: Modes) -> dict:
     require = verify_smp.require
     if not staging:
         require(all(v == 0 for v in words[144:152]),
                 "media staging words 144..151 must be zero in the G-A lane")
         require(b"V020_W11_MEDIA_" not in serial, "media staging markers in the G-A lane")
-        return
+        return {}
     require(b"V020_W11_MEDIA_ABSENT" not in serial, "V020_W11_MEDIA_ABSENT: no scratch disk")
     require(STAGING_INCOMPLETE not in serial,
             "guest reported V020_W11_MEDIA_STAGING_INCOMPLETE: a staging step failed")
@@ -520,7 +529,7 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     require(lines.count(STAGING_MARKER) == 1,
             "staging marker with golden_vector_pending=1 must appear exactly once")
     steps = w11_rows(lines, "V020_W11_MEDIA_STEP")
-    live_inodes = (9 if modes.media_unified else 5) + int(modes.file_read)
+    live_inodes = (9 if modes.media_unified else 5) + int(modes.file_read or modes.fsync_scratch)
     require([step[:2] for step in steps] == [(index, 1) for index in range(1, 6)]
             and steps[0][2] == 1 and steps[1][2] == live_inodes and steps[2][2] == 151 and steps[4][2] == 1,
             "media staging serial steps must show format, mount, map, epoch and admission success")
@@ -530,11 +539,26 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     if modes.media_unified:
         fresh_writes = 4276 + int(modes.file_read)
     expected_io = (15, 5) if reopen else (fresh_writes, 6)
+    if modes.fsync_scratch:
+        # Fresh writes one extra file and 24 additional log blocks. Reopen
+        # replays seven homes, checkpoints, clears 24 nonzero old blocks and
+        # appends the six-block BootEpoch pair.
+        expected_io = (38, 5) if reopen else (4163, 12)
     require(len(io) == 1 and io[0][0] > 0 and io[0][1:] == expected_io,
             "media staging device writes and flushes disagree with the selected protocol")
     snapshot = w11_rows(lines, "V020_W11_MEDIA_SNAPSHOT_0X40")
     require(snapshot == [(snapshot_calls, EAGAIN_RESULT, 0)],
             "media staging snapshot refusal must match in-vector EAGAIN role calls")
+    queue = w11_rows(lines, "V020_W11_MEDIA_QUEUE")
+    if not queue:
+        return {}  # Historical staging ELFs report only logical block operations.
+    reads, writes, flushes = io[0]
+    expected = 2 * (reads + writes) + flushes
+    require(len(queue) == 1 and queue[0][:2] == (expected, expected)
+            and 0 <= queue[0][2] <= expected,
+            "scratch queue requests disagree with logical blocks and isolated flushes")
+    return {"scratch_virtio_requests_completed": expected,
+            "scratch_virtio_doorbells": queue[0][2]}
 
 
 def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
@@ -544,7 +568,7 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
     check_w11_baseline(words)
     measured_rows = check_w11_rows(words, lines)
     check_w11_net(words, lines, serial)
-    check_w11_staging(words, lines, serial, staging, snapshot_calls, modes)
+    media_rows = check_w11_staging(words, lines, serial, staging, snapshot_calls, modes)
     flags = {
         "frame_meta": words[129] == 1,
         "recovery": (words[131] == RECOVERY_ACCUMULATORS and words[133] == 1
@@ -565,6 +589,7 @@ def validate_w11(words: tuple, lines: list, serial: bytes, staging: bool,
         "frame_meta_production_statics": True,
         "frame_meta_registered_static_pages": words[130],
         **measured_rows,
+        **media_rows,
         "recovery_accumulators": words[131],
         "degraded_events": words[132],
         "recovery_required_publish_rejected": words[133],
@@ -607,6 +632,8 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
     require(staging or not modes.file_volatile_write, "file volatile write requires the staging lane")
     require(staging or not modes.signed_media, "signed media requires the staging lane")
     require(staging or not modes.snapshot_envelopes, "snapshot envelopes require the staging lane")
+    require(not modes.fsync_scratch or not modes.snapshot_envelopes,
+            "baseline FSYNC scratch requires an envelope-free volume")
     require(not modes.snapshot_read or (staging and modes.snapshot_catalog and modes.file_read),
             "snapshot read requires the staging lane, snapshot catalog and file read")
     require(not modes.file_sessions or (staging and modes.file_read),
@@ -724,7 +751,8 @@ def run(elf: Path, output: Path, timeout: float = 120, staging: bool = False,
                     require(before == source_manifest(), "production source changed during guest run")
                     if modes.signed_media:
                         epoch = report["observations"]["signed_config_bound_boot_epoch"]
-                        report["signed_scratch_policy_sha256"] = verify_signed_disk(scratch, epoch)
+                        report["signed_scratch_policy_sha256"] = verify_signed_disk(
+                            scratch, epoch, fsync_scratch=modes.fsync_scratch)
                         report["signed_receipt_view_disk_sha256"] = verify_signed_receipt_view(
                             scratch, report["observations"]["signed_receipt_view_sha256"])
                         report["signed_config"] = True

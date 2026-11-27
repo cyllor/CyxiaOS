@@ -161,7 +161,7 @@ impl SystemKind {
 }
 /// Exact locations from independently authenticated boot catalog, never
 /// guessed from old snapshot-v2 offsets or passed by ordinary FileCap.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SystemObject {
     pub kind: SystemKind,
     pub inode: u16,

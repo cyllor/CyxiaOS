@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import struct
 import verify_smp
+from v0199_budget_trace import TRACE_BYTES, verify_trace
 
 ROLES=(6,7,2,8,9,3,10,11)
 MAGIC=0x43595838424f4f54
@@ -55,9 +56,30 @@ class Bringup:
                            'wrong pinned QEMU version')
         verify_smp.require(hashlib.sha256(binary.read_bytes()).hexdigest()==self.qemu_sha256,
                            'wrong accounting-enabled QEMU binary')
-    @staticmethod
-    def profile(elf:bytes):
-        return verify_smp.profile(elf)
+    def profile(self, elf: bytes):
+        evidence = verify_smp.profile(elf)
+        trace = verify_smp.symbol(elf, "V0199_BUDGET_TRACE")
+        trace_end = trace["pa"] + trace["size"]
+        verify_smp.require(trace["size"] == TRACE_BYTES and trace["pa"] % 4096 == 0
+                           and (trace_end <= evidence["pa"]
+                                or evidence["pa"] + evidence["size"] <= trace["pa"]),
+                           "invalid CPU0 accounting evidence extent")
+        self.trace = trace
+        return evidence
+
+    def capture_extra(self, qmp, output, page):
+        path = output / "cpu0-budget-trace.bin"
+        qmp.execute("pmemsave", {"val": self.trace["pa"], "size": TRACE_BYTES,
+                                "filename": str(path)})
+        summary = struct.unpack_from("<12Q", page, 481 * 8)
+        replacement_roles = [
+            struct.unpack_from("<2Q", page, (128 + i * 20 + 9) * 8)
+            for i in range(len(ROLES))
+        ]
+        recovery_slices = (sum(struct.unpack_from("<8Q", page, 56 * 8)),
+                           max(struct.unpack_from("<8Q", page, 64 * 8)))
+        return verify_trace(path.read_bytes(), summary, replacement_roles, recovery_slices,
+                            boot_accounting=self.boot_accounting)
     @staticmethod
     def metadata():
         return dict(scope='v0199-eight-distinct-native-bootstrap-packages',
@@ -84,6 +106,14 @@ class Bringup:
                     require(match is not None,'malformed '+tag)
                     matches.append(tuple(map(int,match.groups())))
             return matches
+        early = rows('V0199_BOOTSTRAP_EARLY_ACCOUNTING')
+        require(len(early) <= 1, 'duplicate early boot accounting')
+        self.boot_accounting = early[0] if early else None
+        if early:
+            boot_order = [serial.find(tag) for tag in (b'SMP_BOOT_OK ',
+                          b'V0199_BOOTSTRAP_EARLY_ACCOUNTING ', b'V0199_INITIAL_LOAD ')]
+            require(0 <= boot_order[0] < boot_order[1] < boot_order[2],
+                    'early boot accounting outside the SMP boot prefix')
         boot=rows('V0199_BOOTSTRAP_ROLE');charges=rows('V0199_BOOTSTRAP_CHARGE')
         require(len(boot)==8 and len(charges)==8,'eight independent packages did not all run')
         roots=set();spans=[];selectors=set();details=[]

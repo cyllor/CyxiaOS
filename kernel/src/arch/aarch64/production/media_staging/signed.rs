@@ -1,22 +1,35 @@
-//! Immutable, public test catalog for a single repository scratch policy.
-//! Only the signed scratch feature includes the fixture in a guest image.
-//! This exact empty-list test payload grants no services, trials or objects.
+//! Immutable, public test catalog for the selected repository scratch policy.
+//! The FSYNC profile pins a separate volume and the exact diagnostic owner.
 use super::volume::UUID;
 use cyxia_kernel_core::security::{
     Error,
     offline_config_v1::{CatalogBindings, VerifiedOfflineConfig},
 };
 
+#[cfg(not(feature = "v020-production-fsync-scratch"))]
 pub(super) const WIRE: &[u8] =
     include_bytes!("../../../../../../tests/fixtures/v020-signed-scratch/config.bin");
+#[cfg(feature = "v020-production-fsync-scratch")]
+pub(super) const WIRE: &[u8] =
+    include_bytes!("../../../../../../tests/fixtures/v020-signed-scratch/fsync-config.bin");
+#[cfg(not(feature = "v020-production-fsync-scratch"))]
+const PAYLOAD: &[u8] = &[0; 12];
+#[cfg(feature = "v020-production-fsync-scratch")]
+const PAYLOAD: &[u8] = b"CYX-SCRATCH-FSYNC/v1:inode=1,principal=1";
 // RFC 8032 test vector 1, public verifying key.
 const PUBLIC_KEY: [u8; 32] = [
     0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
     0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
 ];
+#[cfg(not(feature = "v020-production-fsync-scratch"))]
 const WIRE_DIGEST: [u8; 32] = [
     0xff, 0xff, 0x2c, 0x6b, 0x9f, 0xde, 0x3b, 0x53, 0x11, 0xc4, 0xdf, 0x1c, 0x87, 0x1f, 0xf6, 0xb3,
     0x83, 0x08, 0x17, 0xfd, 0x1d, 0x76, 0xe0, 0xa1, 0xfb, 0x4b, 0xc0, 0x7a, 0xaa, 0x36, 0x9b, 0xcf,
+];
+#[cfg(feature = "v020-production-fsync-scratch")]
+const WIRE_DIGEST: [u8; 32] = [
+    0xe9, 0x87, 0xd0, 0x63, 0xb8, 0x3b, 0xff, 0x1c, 0xf6, 0x0b, 0x1d, 0x00, 0x08, 0x45, 0x27, 0x6f,
+    0x01, 0x72, 0x59, 0x9f, 0x3e, 0x36, 0xee, 0xc4, 0xff, 0x1a, 0xbf, 0x4c, 0x6e, 0x6c, 0x14, 0xd1,
 ];
 const CATALOG: CatalogBindings = CatalogBindings {
     rule_generation: 1,
@@ -55,7 +68,7 @@ pub(super) fn verify<'a>(
                 || header.generation != 1
                 || header.mode != 0
                 || header.clear_isolation_bitmap != 0
-                || lists != [0; 12]
+                || lists != PAYLOAD
                 || principals
                     .iter()
                     .enumerate()

@@ -24,8 +24,8 @@ use super::super::{
     report,
 };
 use super::{
-    BACKING, Backing, COPY_BUFFER, CopyBuffer, EXEC_TARGET, ExecTarget, ROLE_COUNT, TABLES, Tables,
-    evidence,
+    BACKING, Backing, COPY_BUFFER, CopyBuffer, EXEC_TARGET, ExecTarget, PLAN_POOL, PLAN_POOL_BYTES,
+    ROLE_COUNT, TABLES, Tables, evidence,
 };
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -43,7 +43,7 @@ mod pool;
 /// The 160 KiB of row backing fits within the FrameMeta reservation.
 const ROWS: usize = 4096;
 const _: () = assert!(ROWS <= COUNT);
-const STATICS: usize = 11;
+const STATICS: usize = 12;
 /// Fatal code when production static registration fails.
 const FATAL_FRAME_META: u64 = 0x5731_1290;
 
@@ -104,6 +104,7 @@ fn statics(service: StaticRegion) -> Result<[StaticRegion; STATICS], Error> {
             core::mem::size_of::<CopyBuffer>(),
             Control,
         )?,
+        region(addr_of!(PLAN_POOL) as u64, PLAN_POOL_BYTES, Control)?,
         region(
             addr_of!(STACKS) as u64,
             core::mem::size_of::<Stacks>(),

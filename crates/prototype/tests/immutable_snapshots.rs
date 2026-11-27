@@ -62,6 +62,30 @@ impl BlockDevice for Disk {
         self.edge(true)
     }
 }
+
+struct ReadOnlySample<'a>(&'a BTreeMap<u32, [u8; BLOCK_SIZE]>);
+
+impl BlockDevice for ReadOnlySample<'_> {
+    type Error = ();
+
+    fn block_count(&self) -> u32 {
+        TOTAL_BLOCKS
+    }
+
+    fn read_block(&mut self, block: u32, out: &mut [u8; BLOCK_SIZE]) -> Result<(), ()> {
+        *out = self.0.get(&block).copied().unwrap_or([0; BLOCK_SIZE]);
+        Ok(())
+    }
+
+    fn write_block(&mut self, block: u32, _: &[u8; BLOCK_SIZE]) -> Result<(), ()> {
+        panic!("read-only sample received a write to block {block}");
+    }
+
+    fn flush(&mut self) -> Result<(), ()> {
+        panic!("read-only sample received a flush");
+    }
+}
+
 fn large(f: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
@@ -150,12 +174,17 @@ fn restore_payload(key: SnapshotKey, mode: u32) -> [u8; 48] {
     p[40..44].copy_from_slice(&mode.to_le_bytes());
     p
 }
-fn read(fs: &mut FileSystem<64>, j: &mut Journal, d: &mut Disk, h: Handle) -> Vec<u8> {
+fn read<D: BlockDevice>(fs: &mut FileSystem<64>, j: &mut Journal, d: &mut D, h: Handle) -> Vec<u8> {
     let mut bytes = [0; 65536];
     let n = fs.read(h, 0, &mut bytes, 0, j, d, &mut [0; 8192]).unwrap();
     bytes[..n].to_vec()
 }
-fn read_path(fs: &mut FileSystem<64>, j: &mut Journal, d: &mut Disk, path: &str) -> Vec<u8> {
+fn read_path<D: BlockDevice>(
+    fs: &mut FileSystem<64>,
+    j: &mut Journal,
+    d: &mut D,
+    path: &str,
+) -> Vec<u8> {
     let h = fs.open(path, OpenMode::Read, j, d, &mut [0; 8192]).unwrap();
     let result = read(fs, j, d, h);
     fs.close(h).unwrap();
@@ -174,6 +203,116 @@ fn write_file(
         .unwrap();
     fs.write(h, 0, bytes, j, d, &mut [0; 8192]).unwrap();
     h
+}
+
+#[test]
+fn read_only_history_holds_root_references_without_changing_retention() {
+    large(|| {
+        const PATH: &str = "/records/report";
+        const PREFIX: &str = "/records";
+        let (mut memory, mut journal, mut fs) = blank();
+        let mut scratch = [0; 8192];
+        fs.mkdir(PREFIX, &mut journal, &mut memory, &mut scratch)
+            .unwrap();
+        let live = write_file(&mut fs, &mut journal, &mut memory, PATH, b"original");
+        let key = capture(&mut fs, &mut journal, &mut memory, 1).snapshot_key;
+        let slot = key.slot as usize;
+        let saved = fs.snapshot_entries().unwrap()[slot];
+        assert_eq!(saved.state, State::Active);
+        assert_eq!(saved.snapshot_id, key.snapshot_id);
+        assert_eq!(saved.slot_generation, key.slot_generation);
+        assert_eq!(
+            saved.retain_until_ns - saved.created_online_age_ns,
+            3600 * snapshot::SECOND_NS
+        );
+        fs.write(
+            live,
+            0,
+            b"modified",
+            &mut journal,
+            &mut memory,
+            &mut scratch,
+        )
+        .unwrap();
+        fs.fsync(live, &mut journal, &mut memory, &mut scratch)
+            .unwrap();
+        fs.close(live).unwrap();
+        fs.create(
+            "/records/live-only",
+            &mut journal,
+            &mut memory,
+            &mut scratch,
+        )
+        .unwrap();
+        journal.checkpoint(&mut memory, &mut scratch).unwrap();
+
+        // All fixture construction above used memory. The reader below only
+        // receives the committed blocks and cannot modify them.
+        let mut sample = ReadOnlySample(&memory.stable);
+        let mut reader = FileSystem::<64>::new();
+        reader
+            .mount(&mut journal, &mut sample, &mut scratch)
+            .unwrap();
+        assert_eq!(reader.snapshot_root_refs(slot), Ok(0));
+        assert_eq!(
+            read_path(&mut reader, &mut journal, &mut sample, PATH),
+            b"modified"
+        );
+
+        for (bad_key, path, prefix, error) in [
+            (
+                SnapshotKey {
+                    slot_generation: key.slot_generation + 1,
+                    ..key
+                },
+                PATH,
+                PREFIX,
+                Error::Stale,
+            ),
+            (key, PATH, "/record", Error::Auth),
+            (key, "/records/live-only", PREFIX, Error::NotFound),
+        ] {
+            assert_eq!(
+                reader.snapshot_open(
+                    bad_key,
+                    path,
+                    prefix,
+                    &mut journal,
+                    &mut sample,
+                    &mut scratch
+                ),
+                Err(error)
+            );
+            assert_eq!(reader.snapshot_root_refs(slot), Ok(0));
+        }
+
+        let file = reader
+            .snapshot_open(key, PATH, PREFIX, &mut journal, &mut sample, &mut scratch)
+            .unwrap();
+        assert_eq!(reader.snapshot_root_refs(slot), Ok(1));
+        let directory = reader
+            .snapshot_open(key, PREFIX, PREFIX, &mut journal, &mut sample, &mut scratch)
+            .unwrap();
+        assert_eq!(reader.snapshot_root_refs(slot), Ok(2));
+        assert_eq!(
+            read(&mut reader, &mut journal, &mut sample, file),
+            b"original"
+        );
+        let entry = reader
+            .readdir(directory, 0, &mut journal, &mut sample, &mut scratch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&entry.name[..usize::from(entry.name_len)], b"report");
+        reader.close(directory).unwrap();
+        assert_eq!(reader.snapshot_root_refs(slot), Ok(1));
+        assert_eq!(
+            read(&mut reader, &mut journal, &mut sample, file),
+            b"original"
+        );
+        reader.close(file).unwrap();
+        assert_eq!(reader.snapshot_root_refs(slot), Ok(0));
+        assert_eq!(reader.snapshot_entries().unwrap()[slot], saved);
+    });
 }
 
 #[test]

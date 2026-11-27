@@ -86,6 +86,13 @@ pub struct MountEvidence {
     pub receipts: ReceiptStoreSummary,
     pub usage: [Usage; 16],
     pub system_blocks: u32,
+    baseline_system: Option<[SystemObject; 4]>,
+}
+
+impl MountEvidence {
+    pub(super) const fn baseline_system(&self) -> Option<&[SystemObject; 4]> {
+        self.baseline_system.as_ref()
+    }
 }
 pub struct Workspace {
     structure: file_structure_v1::Workspace,
@@ -246,6 +253,7 @@ struct BaselinePayloads {
     boot: BootEpochStoreV1,
     security: SecurityStateStoreV2,
     receipts: ReceiptStoreSummary,
+    system: [SystemObject; 4],
 }
 fn read_baseline_payloads(
     io: &mut impl EpochBlockIo,
@@ -290,6 +298,7 @@ fn read_baseline_payloads(
         boot,
         security,
         receipts,
+        system: *system,
     })
 }
 impl BaselinePayloads {
@@ -314,6 +323,7 @@ impl BaselinePayloads {
             receipts: self.receipts,
             usage,
             system_blocks,
+            baseline_system: (expected_objects == BASELINE_SYSTEM_OBJECTS).then_some(self.system),
         })
     }
 }
@@ -758,29 +768,26 @@ mod tests {
         assert!(e.usage[1..].iter().all(|u| *u == Usage::default()));
     }
 
-    #[test]
-    fn unified_mount_retains_signed_receipt_query_inputs_after_snapshot_scan() {
+    fn signed_fixture(wire: &mut [u8; 577]) -> VerifiedOfflineConfig<'_> {
         use crate::security::offline_config_v1::{CatalogBindings, SIGNATURE_LABEL};
         use ed25519_dalek::{Signer, SigningKey};
 
-        let (mut disk, baseline, snapshot) = unified_fixture();
         // A host-only signature, using the fixture's actual UUID and principals.
-        let mut wire = [0u8; 577];
-        p32(&mut wire, 0, 0x4359_4f46);
-        p16(&mut wire, 4, 1);
-        p16(&mut wire, 6, 256);
-        p32(&mut wire, 8, 577);
-        p32(&mut wire, 12, 257);
+        p32(wire, 0, 0x4359_4f46);
+        p16(wire, 4, 1);
+        p16(wire, 6, 256);
+        p32(wire, 8, 577);
+        p32(wire, 12, 257);
         wire[16..32].copy_from_slice(&CHECKPOINT.fs_uuid);
         for at in [32, 40, 48, 56] {
-            p64(&mut wire, at, 1);
+            p64(wire, at, 1);
         }
         wire[64..96].fill(2);
         wire[96..128].fill(3);
         wire[128..160].fill(4);
         for (i, principal) in principals().iter().enumerate() {
-            p64(&mut wire, 256 + i * 16, principal.id);
-            p64(&mut wire, 264 + i * 16, principal.generation);
+            p64(wire, 256 + i * 16, principal.id);
+            p64(wire, 264 + i * 16, principal.generation);
         }
         wire[512] = 42;
         let payload_hash = Sha256::digest(&wire[256..513]);
@@ -799,8 +806,8 @@ mod tests {
             key_manifest_hash: [4; 32],
         };
         let mut scratch = [0u8; SIGNATURE_LABEL.len() + 513];
-        let config = VerifiedOfflineConfig::verify(
-            &wire,
+        VerifiedOfflineConfig::verify(
+            wire,
             &signer.verifying_key().to_bytes(),
             catalog,
             &mut scratch,
@@ -812,8 +819,14 @@ mod tests {
                 }
             },
         )
-        .unwrap();
+        .unwrap()
+    }
 
+    #[test]
+    fn unified_mount_retains_signed_receipt_query_inputs_after_snapshot_scan() {
+        let (mut disk, baseline, snapshot) = unified_fixture();
+        let mut wire = [0; 577];
+        let config = signed_fixture(&mut wire);
         let mut state =
             SecurityStateStoreV2::decode(disk.0.get(&STATE_HOME).unwrap().as_ref()).unwrap();
         state.offline_config_hash = config.digest();
@@ -851,6 +864,375 @@ mod tests {
             w.confirmed_receipt_query_digest(&prior, &state, &config),
             Err(Error::Conflict)
         );
+    }
+
+    #[test]
+    fn signed_fsync_binds_then_recovers_segmented_data_and_receipt() {
+        use crate::security::{
+            file_admission_flow_v1::FileAdmissionFlowV1,
+            file_auth_context_v1::{AdmissionLedgerV1, AuthContextV1, AuthorityFacts},
+            file_auth_v3::{
+                AdmitRequestV3, CompleteRequestV1, FILE_SERVICE_ROLE, TerminalState, Verdict,
+            },
+            file_fsync_v1::{FsyncJob, FsyncProgress, FsyncWorkspace, commit_segment},
+            file_media_v0199::{BLOCK_COUNT, FileReceiptV4, RECEIPT_BYTES},
+            file_receipt_query_v4::ReceiptKey,
+            file_service_v4::{REQUEST_HEADER, REQUEST_MAGIC, REQUEST_VERSION},
+            recovery_v1::{
+                RecoveryWorkspace, RedoWriter, recover_checkpoint_with_evidence,
+                retire_checkpointed_log,
+            },
+        };
+        use std::fs::{File, OpenOptions};
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        struct FileDisk(File);
+        impl EpochBlockIo for FileDisk {
+            fn read(&mut self, block: u32, out: &mut [u8; BLOCK]) -> Result<(), Error> {
+                self.0
+                    .seek(SeekFrom::Start(u64::from(block) * BLOCK as u64))
+                    .and_then(|_| self.0.read_exact(out))
+                    .map_err(|_| Error::Unknown)
+            }
+            fn write(&mut self, block: u32, data: &[u8; BLOCK]) -> Result<(), Error> {
+                self.0
+                    .seek(SeekFrom::Start(u64::from(block) * BLOCK as u64))
+                    .and_then(|_| self.0.write_all(data))
+                    .map_err(|_| Error::Unknown)
+            }
+            fn flush(&mut self) -> Result<(), Error> {
+                self.0.sync_data().map_err(|_| Error::Unknown)
+            }
+        }
+        struct RemoveImage(std::path::PathBuf);
+        impl Drop for RemoveImage {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        fn superblock(sb: SuperblockV1) -> [u8; BLOCK] {
+            let mut raw = [0; BLOCK];
+            p32(&mut raw, 0, 0x4359_4653);
+            p16(&mut raw, 4, 1);
+            p16(&mut raw, 6, 80);
+            p32(&mut raw, 8, BLOCK as u32);
+            p32(&mut raw, 12, BLOCK_COUNT);
+            raw[16..32].copy_from_slice(&sb.fs_uuid);
+            p64(&mut raw, 32, sb.generation);
+            p64(&mut raw, 40, sb.checkpoint_lsn);
+            p64(&mut raw, 48, sb.log_epoch);
+            for (offset, value) in [
+                (56, BITMAP_START),
+                (60, INODE_START),
+                (64, DATA_START),
+                (68, 256),
+            ] {
+                p32(&mut raw, offset, value);
+            }
+            seal(&mut raw, 76);
+            raw
+        }
+        const DATA: u32 = 9000;
+        const PAGES: usize = 121;
+        const SIZE: usize = 120 * BLOCK + 17;
+        const FSYNC: u64 = 1 << 13;
+        const CAP: u64 = 9;
+        const BOOT: u64 = 2;
+        const RECEIPT_SLOT: usize = 21;
+        let mut source = fixture();
+        source.set_allocated(STATE_HOME + 1, false);
+        for block in DATA..DATA + PAGES as u32 {
+            source.set_allocated(block, true);
+        }
+        inode(source.inode_slot(1), 1, SIZE as u64, DATA, PAGES as u32);
+        let acl = source.acl_slot(1);
+        p32(acl, 32, FILE_RIGHTS);
+        seal(acl, 60);
+        let mut wire = [0; 577];
+        let config = signed_fixture(&mut wire);
+        let mut state = SecurityStateStoreV2::decode(source.0[&STATE_HOME].as_ref()).unwrap();
+        state.offline_config_hash = config.digest();
+        source
+            .0
+            .insert(STATE_HOME, Box::new(state.encode().unwrap()));
+        let key = ReceiptKey {
+            fs_uuid: CHECKPOINT.fs_uuid,
+            issued_boot_epoch: BOOT,
+            group_id: 0,
+            group_generation: 1,
+            stream_slot: 0,
+            stream_generation: 1,
+            request_seq: 1,
+        };
+        let mut index = FileStreamIndexV4::decode(source.0[&(RECEIPTS + 6)].as_ref()).unwrap();
+        index.groups[0].flags = 1;
+        index.groups[0].generation = 1;
+        index.groups[0].boot_epoch = BOOT;
+        index.streams[0].flags = 1;
+        index.streams[0].generation = 1;
+        index.streams[0].issued_hi = 1;
+        index
+            .encode_into(source.0.get_mut(&(RECEIPTS + 6)).unwrap())
+            .unwrap();
+        let issued = FileReceiptV4 {
+            fs_uuid: key.fs_uuid,
+            issued_boot_epoch: BOOT,
+            group_id: 0,
+            group_generation: 1,
+            stream_slot: 0,
+            stream_generation: 1,
+            request_seq: 1,
+            log_epoch: 0,
+            txid: 0,
+            commit_lsn: 0,
+            write_seq: 0,
+            status: 1,
+            result: 0,
+            completed_prefix: 0,
+            operation_digest: [0; 32],
+            output_digest: [0; 32],
+            request_id: key.request_id().unwrap(),
+            owner_principal_id: 1,
+        }
+        .encode()
+        .unwrap();
+        let mut first = [0; BLOCK];
+        let mut second = [0; BLOCK];
+        let receipt_at = RECEIPT_SLOT * RECEIPT_BYTES % BLOCK;
+        first[receipt_at..].copy_from_slice(&issued[..BLOCK - receipt_at]);
+        second[..RECEIPT_BYTES - (BLOCK - receipt_at)]
+            .copy_from_slice(&issued[BLOCK - receipt_at..]);
+        source.0.insert(RECEIPTS, Box::new(first));
+        source.0.insert(RECEIPTS + 1, Box::new(second));
+        source.0.insert(
+            0,
+            Box::new(superblock(SuperblockV1 {
+                generation: 1,
+                checkpoint_lsn: 0,
+                log_epoch: 1,
+                ..CHECKPOINT
+            })),
+        );
+        source.0.insert(1, Box::new(superblock(CHECKPOINT)));
+
+        let path =
+            std::env::temp_dir().join(std::format!("cyx-fsync-test-{}.raw", std::process::id()));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let image = RemoveImage(path);
+        file.set_len(u64::from(BLOCK_COUNT) * BLOCK as u64).unwrap();
+        let mut disk = FileDisk(file);
+        for (block, data) in source.0 {
+            disk.write(block, &data).unwrap();
+        }
+        disk.flush().unwrap();
+        let system = systems();
+        let mut mount_workspace = Workspace::new();
+        let mounted = validate_signed(
+            &mut disk,
+            CHECKPOINT,
+            &system,
+            &config,
+            &mut mount_workspace,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            (mounted.receipts.occupied, mounted.receipts.unresolved),
+            (1, 1)
+        );
+
+        let mut frozen = std::vec![0; PAGES * BLOCK];
+        frozen[..SIZE].fill(0x59);
+        let pages: std::vec::Vec<&[u8; BLOCK]> = frozen
+            .chunks_exact(BLOCK)
+            .map(|page| page.try_into().unwrap())
+            .collect();
+        let mut frame = [0; REQUEST_HEADER + 8];
+        p32(&mut frame, 0, REQUEST_MAGIC);
+        p16(&mut frame, 4, REQUEST_VERSION);
+        p16(&mut frame, 6, REQUEST_HEADER as u16);
+        p16(&mut frame, 8, 5);
+        p32(&mut frame, 12, 8);
+        p64(&mut frame, 16, key.request_id().unwrap());
+        p64(&mut frame, REQUEST_HEADER, 17);
+        let mut flow = FileAdmissionFlowV1::freeze(
+            AuthContextV1::new(3, 1, FILE_SERVICE_ROLE, 1, BOOT).unwrap(),
+            &frame,
+            CAP,
+            AdmitRequestV3 {
+                auth_context_id: 0,
+                target_id: 1,
+                target_generation: 1,
+                required_rights: FSYNC,
+                request_seq: 1,
+                prepared_version: 0,
+                acl_generation: 1,
+                frozen_data_digest: [0; 32],
+                operation_digest: [0; 32],
+            },
+            0,
+            &frozen,
+        )
+        .unwrap();
+        let mut ledger = AdmissionLedgerV1::new(BOOT).unwrap();
+        flow.admit(
+            &mut ledger,
+            &AuthorityFacts {
+                current_generation: 1,
+                verdict: Verdict::Admitted,
+                deny_generation: 0,
+                accepted_local_ns: 1,
+            },
+        )
+        .unwrap();
+        flow.execute(&mut ledger, flow.request().prepared_version, true)
+            .unwrap();
+        let mut job = FsyncJob {
+            config: &config,
+            mounted: &mounted,
+            admission: &flow,
+            ledger: &ledger,
+            inode_id: 1,
+            cap_selector: CAP,
+            frame: &frame,
+            key,
+            pages: &pages,
+        };
+        let mut work = FsyncWorkspace::new();
+        let mut journal = RecoveryWorkspace::new();
+        let mut writer = RedoWriter::open(&mut disk, &mut journal, CHECKPOINT).unwrap();
+        let mut committed = |writer: &mut RedoWriter<'_, FileDisk>, job: &FsyncJob<'_>, blocks| {
+            let FsyncProgress::Committed { receipt, redo } =
+                commit_segment(writer, job, &mut work, |plan| {
+                    assert_eq!(plan.log_blocks, blocks);
+                    Ok(())
+                })
+                .unwrap()
+            else {
+                panic!("expected durable segment");
+            };
+            assert_eq!(receipt.commit_lsn, redo.transaction().commit_lsn);
+            (receipt, redo.ordered_digest())
+        };
+        let mut raw = [0; BLOCK];
+        let (bound, _) = committed(&mut writer, &job, 6);
+        assert_eq!((bound.status, bound.completed_prefix), (2, 0));
+        writer.read_committed(DATA, &mut raw).unwrap();
+        assert!(raw.iter().all(|&byte| byte == 0));
+        let (prefix, _) = committed(&mut writer, &job, 246);
+        assert_eq!(
+            (prefix.status, prefix.completed_prefix as usize),
+            (2, 120 * BLOCK)
+        );
+        writer.read_committed(INODE_START, &mut raw).unwrap();
+        assert_eq!(Inode::decode(&raw[256..512]).unwrap().durable_write_seq, 0);
+        writer.read_committed(DATA + 120, &mut raw).unwrap();
+        assert!(raw.iter().all(|&byte| byte == 0));
+        let (before_final, checkpoint) =
+            recover_checkpoint_with_evidence(&mut disk, &mut journal, |io, sb| {
+                let state =
+                    validate_signed(io, sb, &system, &config, &mut mount_workspace, |_, _, _| {
+                        Ok(())
+                    })?;
+                assert_eq!((state.receipts.occupied, state.receipts.unresolved), (1, 1));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(before_final.transactions, 2);
+        assert_eq!(checkpoint.checkpoint_lsn, prefix.commit_lsn);
+        assert!(retire_checkpointed_log(&mut disk, &mut journal, checkpoint).unwrap() > 0);
+        let mut writer = RedoWriter::open(&mut disk, &mut journal, checkpoint).unwrap();
+        let (done, committed_digest) = committed(&mut writer, &job, 10);
+        assert_eq!(done.log_epoch, prefix.log_epoch + 1);
+        assert_eq!(
+            (done.status, done.completed_prefix as usize, done.write_seq),
+            (3, SIZE, 17)
+        );
+        let mut changed = pages.clone();
+        changed[0] = &[0; BLOCK];
+        job.pages = &changed;
+        assert_eq!(
+            commit_segment(&mut writer, &job, &mut work, |_| panic!("changed snapshot")).err(),
+            Some(Error::Conflict)
+        );
+        job.pages = &pages;
+        assert!(matches!(
+            commit_segment(&mut writer, &job, &mut work, |_| panic!("already committed")).unwrap(),
+            FsyncProgress::AlreadyDone(receipt) if receipt == done
+        ));
+        ledger
+            .complete(
+                FILE_SERVICE_ROLE,
+                false,
+                &CompleteRequestV1 {
+                    admission_id: flow.admission_id(),
+                    terminal_state: TerminalState::Done,
+                    evidence_digest: committed_digest,
+                },
+            )
+            .unwrap();
+        let terminal_job = FsyncJob {
+            config: &config,
+            mounted: &mounted,
+            admission: &flow,
+            ledger: &ledger,
+            inode_id: 1,
+            cap_selector: CAP,
+            frame: &frame,
+            key,
+            pages: &pages,
+        };
+        assert_eq!(
+            commit_segment(&mut writer, &terminal_job, &mut work, |_| panic!(
+                "terminal admission"
+            ))
+            .err(),
+            Some(Error::Unauthorized)
+        );
+        drop(disk);
+
+        let mut disk = FileDisk(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&image.0)
+                .unwrap(),
+        );
+        let mut reopened = RecoveryWorkspace::new();
+        let (evidence, next) =
+            recover_checkpoint_with_evidence(&mut disk, &mut reopened, |io, sb| {
+                let mounted =
+                    validate_signed(io, sb, &system, &config, &mut mount_workspace, |_, _, _| {
+                        Ok(())
+                    })?;
+                assert_eq!(
+                    (mounted.receipts.occupied, mounted.receipts.unresolved),
+                    (1, 0)
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(evidence.transactions, 1);
+        assert_eq!(next.checkpoint_lsn, done.commit_lsn);
+        disk.read(INODE_START, &mut raw).unwrap();
+        assert_eq!(Inode::decode(&raw[256..512]).unwrap().durable_write_seq, 17);
+        let mut contents = Sha256::new();
+        for block in DATA..DATA + PAGES as u32 {
+            disk.read(block, &mut raw).unwrap();
+            contents.update(raw);
+        }
+        assert_eq!(&contents.finalize()[..], &done.output_digest);
+        let mut receipt = [0; RECEIPT_BYTES];
+        disk.read(RECEIPTS, &mut raw).unwrap();
+        receipt[..BLOCK - receipt_at].copy_from_slice(&raw[receipt_at..]);
+        disk.read(RECEIPTS + 1, &mut raw).unwrap();
+        receipt[BLOCK - receipt_at..].copy_from_slice(&raw[..RECEIPT_BYTES - (BLOCK - receipt_at)]);
+        assert_eq!(FileReceiptV4::decode(&receipt).unwrap(), done);
     }
 
     #[test]

@@ -19,6 +19,7 @@ const REQUEST_ID: u64 = 0x0102_0304_0506_0708;
 const UUID: [u8; 16] = *b"CYX-W11-STAGING!";
 const CATALOG_GENERATION: u64 = 29;
 const BOOT_EPOCH: u64 = 13;
+const VECTORS: &str = include_str!("../../../tools/fixtures/v020-snapshot-read-v4.tsv");
 
 fn frame(op: u16, payload_len: usize) -> Vec<u8> {
     let mut bytes = vec![0; REQUEST_HEADER + payload_len];
@@ -57,6 +58,77 @@ fn history_frame(key: SnapshotKey, path: &[u8]) -> Vec<u8> {
     payload[40..42].copy_from_slice(&(path.len() as u16).to_le_bytes());
     payload[48..].copy_from_slice(path);
     bytes
+}
+
+fn hex_vector(digits: &str) -> Vec<u8> {
+    assert_eq!(digits.len() % 2, 0);
+    (0..digits.len())
+        .step_by(2)
+        .map(|offset| u8::from_str_radix(&digits[offset..offset + 2], 16).unwrap())
+        .collect()
+}
+
+#[test]
+fn independent_vectors_bind_the_history_key_scope_and_staging_frame() {
+    let key = SnapshotKey {
+        snapshot_id: 0x5060_7080_90a0_b0c0,
+        slot_generation: 0xfedc_ba98_7654_3210,
+        ..KEY
+    };
+    let prefix = "/团队".as_bytes();
+    let digest: [u8; 32] = VECTORS
+        .lines()
+        .find_map(|line| line.strip_prefix("prefix-digest\tdigest\t"))
+        .map(hex_vector)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    assert_eq!(history_prefix_digest(prefix), digest);
+
+    let view = slot_proof(&envelope(UnifiedSystemKind::SnapshotSlot), None).unwrap();
+    let mut count = 0;
+    for line in VECTORS.lines().filter(|line| !line.starts_with('#')) {
+        let fields: Vec<_> = line.split('\t').collect();
+        let [name, verdict, digits] = fields[..] else {
+            panic!("malformed snapshot read vector row: {line}");
+        };
+        let raw = hex_vector(digits);
+        match (name, verdict) {
+            ("prefix-digest", "digest") => assert_eq!(raw, digest),
+            ("query", "accept") => {
+                assert_eq!(raw, query_frame(key));
+                let request = ReadRequest::decode(&raw).unwrap();
+                assert_eq!(request.request_id, REQUEST_ID);
+                assert_eq!(request.path(), None);
+                assert!(request.authorized(LIST_SELECTOR, &view, b"", &[0; 32]));
+            }
+            ("history", "accept") | ("history-sibling", "scope") => {
+                let path = if verdict == "accept" {
+                    "/团队/报告.txt"
+                } else {
+                    "/团队预览/报告.txt"
+                };
+                assert_eq!(raw, history_frame(key, path.as_bytes()));
+                let request = ReadRequest::decode(&raw).unwrap();
+                assert_eq!(request.request_id, REQUEST_ID);
+                assert_eq!(request.path(), Some(path.as_bytes()));
+                assert_eq!(
+                    request.authorized(HISTORY_SELECTOR, &view, prefix, &digest),
+                    verdict == "accept",
+                    "{name}"
+                );
+            }
+            (_, "format") => {
+                assert_eq!(ReadRequest::decode(&raw), Err(ListError::Format), "{name}")
+            }
+            (_, "schema") => {
+                assert_eq!(ReadRequest::decode(&raw), Err(ListError::Schema), "{name}")
+            }
+            _ => panic!("unknown snapshot read vector: {name} {verdict}"),
+        }
+        count += 1;
+    }
+    assert_eq!(count, 11);
 }
 
 #[test]

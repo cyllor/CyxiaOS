@@ -736,6 +736,8 @@ class NativeSecurityWiring(unittest.TestCase):
         # The callees are the real implementations, not stubs.
         frames = source(arm / "production/frames.rs")
         self.assertRegex(frames, r"fn register_or_fatal\(\) \{\s*match register_production_statics\(\)")
+        self.assertIn("RegisteredDecisionGate::with_pool(", prod)
+        self.assertIn("region(addr_of!(PLAN_POOL) as u64, PLAN_POOL_BYTES, Control)?", frames)
         recovery = source(arm / "production/recovery.rs")
         self.assertIn("with_gate(|staged| staged.gate.raise(&staged.pair))", recovery)
         self.assertIn("acc.takeover_stopped_writer(", recovery)

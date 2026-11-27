@@ -23,6 +23,9 @@ use cyxia_kernel_core::control_plane::{
 use cyxia_kernel_core::security::syscall::{StableCopy, Syscall};
 use cyxia_kernel_core::security::syscall_v3::decode_aarch64_svc_v3;
 
+#[path = "v0199_control_bringup/budget_trace.rs"]
+mod budget_trace;
+
 const PAGE: usize = 4096;
 const IMAGE: usize = 64 * 1024;
 const COPY: usize = 128 * 1024;
@@ -212,23 +215,53 @@ fn ticks_for(ns: u64) -> u64 {
         .expect("timer ticks")
         .max(1)
 }
-/// Continuous attribution from BEFORE the first role package load through
-/// the final UART output. Every interval is charged exactly once: admitted
-/// role/recovery work or the protected EL1 coordination envelope.
-/// Earlier architecture/SMP initialization and the tiny final evidence seal
-/// remain outside this diagnostic interval; no full production claim.
-struct BudgetMeter {
+
+fn observe_budget_clock() -> budget_trace::Sample {
+    let tick_ns = 1_000_000_000u64.div_ceil(timer_frequency());
+    for _ in 0..8 {
+        let before_ns = now_ns();
+        let cpu_tick = timer::cpu_ticks();
+        // Include the complete timer quantum. A record may use these
+        // observations only if they prove the PMU read's containing window.
+        let wall_ns = now_ns().checked_add(tick_ns).expect("monotonic ns");
+        if before_ns < wall_ns && before_ns / WINDOW_NS == wall_ns / WINDOW_NS {
+            return budget_trace::Sample {
+                before_ns,
+                wall_ns,
+                cpu_tick,
+            };
+        }
+    }
+    fatal(692);
+}
+/// Continuous attribution from PMU setup at Rust EL1 entry through final
+/// UART output. Every interval uses an admitted turn or the existing EL1
+/// coordination envelope. Early assembly and the final memory seal are
+/// outside the sampled interval.
+pub(crate) struct BudgetMeter {
     ledger: Cpu0BudgetLedger,
     initial_tick: u64,
     initial_ns: u64,
     cursor: u64,
     wall: u64,
     crossed_gaps: u64,
+    trace: budget_trace::Trace,
 }
 impl BudgetMeter {
+    #[cfg(feature = "v0199-control-bringup")]
+    pub(crate) fn begin_boot() -> Self {
+        assert_eq!(cpu::slot(), 0);
+        // SAFETY: CPU0 has entered EL1 with its vectors and stack. Only the
+        // pinned QEMU accounting diagnostic selects this initializer.
+        unsafe { timer::init_cpu_accounting() };
+        init_timer_frequency();
+        Self::new()
+    }
+
     fn new() -> Self {
-        let wall = now_ns();
-        let tick = timer::cpu_ticks();
+        let sample = observe_budget_clock();
+        let wall = sample.wall_ns;
+        let tick = sample.cpu_tick;
         let mut ledger = Cpu0BudgetLedger::new();
         ledger
             .start_continuous(cpu::slot(), wall, || Ok(()))
@@ -240,11 +273,13 @@ impl BudgetMeter {
             cursor: tick,
             wall,
             crossed_gaps: 0,
+            trace: budget_trace::Trace::new(sample),
         }
     }
     fn sample_gap(&mut self) -> (u64, u64) {
-        let wall = now_ns();
-        let tick = timer::cpu_ticks();
+        let sample = observe_budget_clock();
+        let wall = sample.wall_ns;
+        let tick = sample.cpu_tick;
         let actual = timer::cpu_ns(
             tick.checked_sub(self.cursor)
                 .expect("PMU counter regressed"),
@@ -255,6 +290,7 @@ impl BudgetMeter {
             .expect("continuous EL1 coordination interval");
         self.cursor = tick;
         self.wall = wall;
+        self.trace.record(sample, None);
         if receipt.crossed_window {
             self.crossed_gaps += 1;
         }
@@ -271,8 +307,9 @@ impl BudgetMeter {
     }
     fn settle(&mut self, token: Turn, began: u64) -> Settlement {
         assert_eq!(began, self.cursor);
-        let wall = now_ns();
-        let tick = timer::cpu_ticks();
+        let sample = observe_budget_clock();
+        let wall = sample.wall_ns;
+        let tick = sample.cpu_tick;
         let actual = timer::cpu_ns(tick.checked_sub(began).expect("PMU counter regressed"));
         let receipt = self
             .ledger
@@ -280,6 +317,7 @@ impl BudgetMeter {
             .expect("same CPU0 owner");
         self.cursor = tick;
         self.wall = wall;
+        self.trace.record(sample, Some(token));
         receipt
     }
     /// No work was admitted. Use a real masked physical timer wakeup rather
@@ -451,7 +489,7 @@ impl BudgetMeter {
         self.settle_coordination(token, began);
         result
     }
-    fn wait_for(&mut self, mut ready: impl FnMut() -> bool) {
+    pub(super) fn wait_for(&mut self, mut ready: impl FnMut() -> bool) {
         let until = now_ns().checked_add(5_000_000_000).unwrap();
         while !ready() {
             check_failures();
@@ -1517,17 +1555,20 @@ pub(super) fn disk_security_run(generation: u64, bank: usize, stop: bool) -> Dis
     }
 }
 
-pub(super) fn run() -> ! {
+pub(super) fn run(mut budget: BudgetMeter) -> ! {
     assert_eq!(cpu::slot(), 0);
     assert_eq!(ONLINE.load(Ordering::Acquire), 15);
-    gic()
-        .enable(TIMER_IRQ.load(Ordering::Acquire) as u32)
-        .unwrap();
-    unsafe {
-        timer::init_cpu_accounting();
-    }
-    init_timer_frequency();
-    let mut budget = BudgetMeter::new();
+    let (boot_end, boot_tick) = budget.sample_gap();
+    let boot_cpu_ns = timer::cpu_ns(boot_tick.checked_sub(budget.initial_tick).unwrap());
+    let boot_intervals = budget.trace.intervals();
+    budget.coordinated(|| {
+        report(
+            "V0199_BOOTSTRAP_EARLY_ACCOUNTING",
+            boot_intervals as u64,
+            boot_end,
+            boot_cpu_ns,
+        );
+    });
     let pairs: [(NativeRole, Running); ROLE_COUNT] =
         core::array::from_fn(|i| budget.load_initial(i));
     let members = core::array::from_fn(|i| pairs[i].0);
@@ -1539,6 +1580,7 @@ pub(super) fn run() -> ! {
         // one-MiB bootstrap metadata allowance inside the control pool.
         other_protected_pool_bytes: core::mem::size_of::<[Tables; 2 * ROLE_COUNT]>()
             + COPY
+            + budget_trace::BYTES
             + 1024 * 1024,
         other_control_ns_per_100ms: OTHER_CPU_NS,
     };
@@ -1767,6 +1809,7 @@ pub(super) fn run() -> ! {
     for (i, value) in ledger_row.into_iter().enumerate() {
         SMP_EVIDENCE.words[481 + i].store(value, Ordering::Relaxed);
     }
+    budget.trace.seal();
     SMP_EVIDENCE.words[2].store(1, Ordering::Release);
     super::super::halt()
 }

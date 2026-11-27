@@ -52,6 +52,8 @@
 //!   ptr::write-initialized once in init_control_guards() before any dispatch.
 //!   Every later &mut/&* is created and consumed within one synchronous CPU0
 //!   call (the in-vector dispatcher or the run() settlement), never aliasing.
+//! * PLAN_POOL: the one CPU0 boot claim transfers its exclusive borrow into
+//!   the decision gate. The FrameMeta scanner takes only the base address.
 //! * TRUSTED_* byte artifacts + ADVICE_WIRE (static mut): written once by run()
 //!   before the first EL0 turn; the dispatcher reads them on CPU0 only.
 //! * MANIFEST_MEMBERS / PIE_MEMBERS (static mut): written once by run() before
@@ -92,8 +94,8 @@ use cyxia_kernel_core::control_plane::{
     },
     plan_wire_v2::PlanV2,
     registered_gate_v3::{
-        AssistedScope, FrozenAction, Publication, RegisteredDecisionGate, Registration,
-        TrustedRegistrationScope,
+        AssistedScope, FrozenAction, MAX_PUBLISHED_PLANS, Publication, PublishedPlanPool,
+        RegisteredDecisionGate, Registration, TrustedRegistrationScope,
     },
     role_manifest_v0199::{
         DECISION_REGISTER, NativeRole, NativeRoleManifest, PUBLISH_PLAN, PrivateRegion, ROLE_COUNT,
@@ -230,6 +232,11 @@ static mut EXEC_TARGET: ExecTarget = ExecTarget(Page::ZERO);
 // Large control-plane guards in static storage (never the bounded EL1 stack).
 static mut LEDGER: MaybeUninit<EvidenceLedger> = MaybeUninit::uninit();
 static mut GATE: MaybeUninit<RegisteredDecisionGate<'static>> = MaybeUninit::uninit();
+#[repr(C, align(4096))]
+struct PlanPoolMemory(PublishedPlanPool);
+const PLAN_POOL_BYTES: usize = core::mem::size_of::<PlanPoolMemory>();
+static mut PLAN_POOL: PlanPoolMemory = PlanPoolMemory(PublishedPlanPool::new());
+static PLAN_POOL_CLAIMED: AtomicBool = AtomicBool::new(false);
 // Persistent operations/security intake pair (matches the advice-e2e Fixture.pair).
 static mut PAIR: MaybeUninit<Pair> = MaybeUninit::uninit();
 // Trusted EL1 decision artifacts (written once by run() before dispatch).
@@ -609,9 +616,19 @@ fn trusted_scope() -> TrustedAdviceScope<'static> {
 fn init_control_guards() {
     let ledger = EvidenceLedger::new(OPS, CTRL, SUPER, BOOT, ADVISOR_EPOCH).expect("causal ledger");
     unsafe { core::ptr::write(ledger_ptr(), ledger) };
-    let gate = RegisteredDecisionGate::new_with_terminal_owner(CTRL, PUB, SUPER, BOOT, CTRL_EPOCH)
-        .expect("registered decision gate");
+    assert!(!PLAN_POOL_CLAIMED.swap(true, Ordering::AcqRel));
+    // SAFETY: CPU0 claims this storage once before running any EL0 carrier.
+    // The resulting gate exclusively owns the borrow until boot terminates.
+    let pool = unsafe { &mut *core::ptr::addr_of_mut!(PLAN_POOL.0) };
+    let gate = RegisteredDecisionGate::with_pool(CTRL, PUB, SUPER, BOOT, CTRL_EPOCH, pool)
+        .expect("registered decision gate with protected plan storage");
     unsafe { core::ptr::write(gate_ptr(), gate) };
+    report(
+        "V020_PLAN_POOL",
+        MAX_PUBLISHED_PLANS as u64,
+        1,
+        PLAN_POOL_BYTES as u64,
+    );
     let pair = Pair::new(OPS, SEC).expect("distinct operations/security brains");
     unsafe { core::ptr::write(pair_ptr(), pair) };
 }
@@ -1379,7 +1396,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     // ---- Phase 1: load + run the eight ABI3 PIE role packages ----
     let pie_members: [NativeRole; ROLE_COUNT] = core::array::from_fn(load_role);
     let other_protected_pool_bytes =
-        core::mem::size_of::<[Tables; ROLE_COUNT]>() + COPY + 1024 * 1024;
+        core::mem::size_of::<[Tables; ROLE_COUNT]>() + COPY + PLAN_POOL_BYTES + 1024 * 1024;
     #[cfg(feature = "v020-production-live-control")]
     let other_protected_pool_bytes = other_protected_pool_bytes + observations::protected_bytes();
     #[cfg(feature = "v020-production-snapshot-catalog")]
@@ -1483,7 +1500,7 @@ pub(crate) fn run(info: &BootInfo) -> ! {
     let manifest = NativeRoleManifest {
         online_mask: profile::ONLINE,
         members,
-        other_protected_pool_bytes: 5 * 1024 * 1024,
+        other_protected_pool_bytes: 5 * 1024 * 1024 + PLAN_POOL_BYTES,
         other_control_ns_per_100ms: 45_000_000,
     };
     manifest

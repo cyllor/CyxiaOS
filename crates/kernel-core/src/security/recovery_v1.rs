@@ -62,6 +62,7 @@ pub struct RecoveryWorkspace {
     next_log_block: u32,
     last_txid: u64,
     checkpoint_required: bool,
+    retire_after: Option<SuperblockV1>,
     obsolete: [u8; LOG_BLOCKS],
 }
 impl RecoveryWorkspace {
@@ -78,6 +79,7 @@ impl RecoveryWorkspace {
             next_log_block: FIRST,
             last_txid: 0,
             checkpoint_required: false,
+            retire_after: None,
             obsolete: [0; LOG_BLOCKS],
         }
     }
@@ -397,6 +399,7 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
             workspace.evidence = None;
             return Err(Error::Conflict);
         }
+        workspace.retire_after = None;
         Ok(Self { io, workspace })
     }
 
@@ -422,6 +425,11 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
             first_log_block: w.next_log_block,
             log_blocks,
         })
+    }
+
+    /// Bounded scan and independently verified appends in this session.
+    pub fn evidence(&self) -> Option<RecoveryEvidence> {
+        self.workspace.evidence
     }
 
     /// Append into a reserved span of blank blocks and verified obsolete
@@ -586,6 +594,7 @@ pub fn replay_home(
         read_exact_image(io, w.rows[i], e.superblock.log_epoch, &mut w.raw)?;
     }
     w.checkpoint_required = true;
+    w.retire_after = None;
     for i in 0..w.count {
         let row = w.rows[i];
         read_exact_image(io, row, e.superblock.log_epoch, &mut w.raw)
@@ -666,7 +675,53 @@ pub fn recover_checkpoint_with_evidence<I: EpochBlockIo>(
     }
     w.evidence = None;
     w.checkpoint_required = false;
+    w.retire_after = Some(next);
     Ok((e, next))
+}
+
+/// Clear an unused log epoch after this same owner durably advanced its
+/// checkpoint. A fresh scan proves the selected checkpoint and absence of
+/// any new committed or incomplete chain. Callers hold exclusive device
+/// ownership and the checkpoint progress reservation for the whole operation.
+/// An interrupted erase can leave ambiguously framed bytes. The read-only
+/// scanner rejects such evidence, even though confirmed homes survive.
+pub fn retire_checkpointed_log(
+    io: &mut impl EpochBlockIo,
+    w: &mut RecoveryWorkspace,
+    checkpoint: SuperblockV1,
+) -> Result<u32, Error> {
+    if w.checkpoint_required || w.retire_after != Some(checkpoint) {
+        return Err(Error::Stale);
+    }
+    let current = scan(io, w)?;
+    if current.superblock != checkpoint || current.transactions != 0 || current.incomplete_tail {
+        return Err(Error::Conflict);
+    }
+    same_superblocks(io, w)?;
+    w.retire_after = None;
+    w.evidence = None;
+    w.checkpoint_required = true;
+    let scratch: &mut [u8; BLOCK] = (&mut w.raw[..BLOCK]).try_into().unwrap();
+    let zero = [0; BLOCK];
+    let mut retired = 0;
+    for block in FIRST..END {
+        io.read(block, scratch).map_err(|_| Error::Unknown)?;
+        if *scratch != zero {
+            io.write(block, &zero).map_err(|_| Error::Unknown)?;
+            retired += 1;
+        }
+    }
+    if retired > 0 {
+        io.flush().map_err(|_| Error::Unknown)?;
+        for block in FIRST..END {
+            io.read(block, scratch).map_err(|_| Error::Unknown)?;
+            if *scratch != zero {
+                return Err(Error::Unknown);
+            }
+        }
+    }
+    w.checkpoint_required = false;
+    Ok(retired)
 }
 
 #[cfg(test)]
@@ -686,6 +741,7 @@ mod tests {
         events: Vec<u32>,
         flushes: u32,
         fail_flush: u32,
+        fail_write: Option<u32>,
     }
     impl EpochBlockIo for Disk {
         fn read(&mut self, block: u32, out: &mut [u8; BLOCK]) -> Result<(), Error> {
@@ -698,6 +754,9 @@ mod tests {
         }
         fn write(&mut self, block: u32, data: &[u8; BLOCK]) -> Result<(), Error> {
             self.events.push(block);
+            if self.fail_write == Some(block) {
+                return Err(Error::Unknown);
+            }
             self.blocks.insert(block, Box::new(*data));
             Ok(())
         }
@@ -1077,6 +1136,50 @@ mod tests {
             (1, 2)
         );
         assert_eq!(next_checkpoint.checkpoint_lsn, plan.commit_lsn);
+    }
+
+    #[test]
+    fn interrupted_retirement_keeps_checkpoint_and_rejects_orphaned_record_bytes() {
+        let mut d = blank_disk();
+        let mut w = RecoveryWorkspace::new();
+        let sb = SuperblockV1::decode(&superblock()).unwrap();
+        let mut archived = [0; BLOCK];
+        RedoEncoding {
+            epoch: 1,
+            txid: 1,
+            begin_lsn: 1,
+            count: 1,
+        }
+        .begin(&mut archived)
+        .unwrap();
+        let mut data = [1; BLOCK];
+        data[BLOCK - 64..].copy_from_slice(&archived[..64]);
+        let mut writer = RedoWriter::open(&mut d, &mut w, sb).unwrap();
+        let plan = writer.prepare(1).unwrap();
+        writer
+            .append(
+                plan,
+                &[RedoImage {
+                    home: 7000,
+                    contents: &data,
+                }],
+                |_| Ok(()),
+            )
+            .unwrap();
+        let checkpoint = recover_checkpoint(&mut d, &mut w, |_, _| Ok(())).unwrap();
+        d.fail_write = Some(4); // The older REDO start cleared, with its continuation still present.
+        assert_eq!(
+            retire_checkpointed_log(&mut d, &mut w, checkpoint),
+            Err(Error::Unknown)
+        );
+        assert_eq!(
+            RedoWriter::open(&mut d, &mut w, checkpoint).err(),
+            Some(Error::Unknown)
+        );
+        let mut fresh = RecoveryWorkspace::new();
+        assert_eq!(scan(&mut d, &mut fresh), Err(Error::Unknown));
+        assert_eq!(SuperblockV1::decode(d.blocks[&1].as_ref()), Ok(checkpoint));
+        assert!(d.blocks[&7000].as_ref() == &data);
     }
 
     #[test]

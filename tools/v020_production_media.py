@@ -19,8 +19,10 @@ from verify_smp import require
 
 
 SIGNED_POLICY_SHA256 = "ffff2c6b9fde3b5311c4df1c871ff6b3830817fd1d76e0a1fb4bc07aaa369bcf"
+FSYNC_POLICY_SHA256 = "e987d063b83bff1cf60b1d000845276f0172599f3e36eec4ff1abf4c6e6c14d1"
 BLOCK_BYTES = 4096
 STAGING_UUID = b"CYX-W11-STAGING!"
+FSYNC_UUID = b"CYX-FSYNC-TEST!!"
 SECURITY_HOME = 4130
 SECURITY_REDO = 3
 REDO_HEADER_BYTES = 64
@@ -29,8 +31,10 @@ MOUNT_UNAUTHORIZED = 1
 MOUNT_CONFLICT = 3
 
 
-def verify_signed_disk(path: Path, epoch: int) -> str:
+def verify_signed_disk(path: Path, epoch: int, *, fsync_scratch: bool = False) -> str:
     """Check the frozen SecurityState header at home and in the appended redo."""
+    uuid = FSYNC_UUID if fsync_scratch else STAGING_UUID
+    digest = FSYNC_POLICY_SHA256 if fsync_scratch else SIGNED_POLICY_SHA256
     with path.open("rb") as disk:
         for offset, expected_epoch in (
             (SECURITY_HOME * BLOCK_BYTES, epoch - 1),
@@ -38,12 +42,12 @@ def verify_signed_disk(path: Path, epoch: int) -> str:
         ):
             disk.seek(offset)
             state = disk.read(120)
-            require(len(state) == 120 and state[:4] == b"SSYC" and state[8:24] == STAGING_UUID
+            require(len(state) == 120 and state[:4] == b"SSYC" and state[8:24] == uuid
                     and int.from_bytes(state[64:72], "little") == expected_epoch
                     and int.from_bytes(state[80:88], "little") == 1
-                    and state[88:120].hex() == SIGNED_POLICY_SHA256,
+                    and state[88:120].hex() == digest,
                     "signed policy digest or epoch in the scratch disk differs from the fixture")
-    return SIGNED_POLICY_SHA256
+    return digest
 
 
 def verify_signed_receipt_view(path: Path, expected: str) -> str:

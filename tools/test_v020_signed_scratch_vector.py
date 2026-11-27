@@ -12,7 +12,10 @@ import unittest
 from pathlib import Path
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests/fixtures/v020-signed-scratch/config.bin"
+FSYNC_FIXTURE = FIXTURE.with_name("fsync-config.bin")
 UUID = b"CYX-W11-STAGING!"
+FSYNC_UUID = b"CYX-FSYNC-TEST!!"
+FSYNC_POLICY = b"CYX-SCRATCH-FSYNC/v1:inode=1,principal=1"
 LABEL = b"CYX/OFFLINE/v1"
 SEED = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
 # Three empty test-only lists. The guest accepts precisely these twelve bytes.
@@ -24,25 +27,26 @@ def sha(data):
     return hashlib.sha256(data).digest()
 
 
-def unsigned_bytes():
-    payload = b"".join(struct.pack("<QQ", i, 1) for i in range(1, 17)) + bytes(12)
+def unsigned_bytes(uuid=UUID, lists=bytes(12)):
+    payload = b"".join(struct.pack("<QQ", i, 1) for i in range(1, 17)) + lists
     header = struct.pack("<IHHII16s4Q", 0x43594F46, 1, 256, 320 + len(payload), len(payload),
-                         UUID, 1, 1, 1, 1)
+                         uuid, 1, 1, 1, 1)
     header += b"".join(map(sha, CATALOG)) + sha(payload) + bytes(64)
     assert len(header) == 256
     return header + payload
 
 
-def signed_vector(path):
+def signed_vector(path, uuid=UUID, lists=bytes(12)):
     # PKCS#8 Ed25519 private key, RFC 8410. No production key material.
     key = path / "test-key.der"
     key.write_bytes(bytes.fromhex("302e020100300506032b657004220420") + SEED)
     message = path / "message"
-    message.write_bytes(LABEL + unsigned_bytes())
+    unsigned = unsigned_bytes(uuid, lists)
+    message.write_bytes(LABEL + unsigned)
     signature = subprocess.check_output(["openssl", "pkeyutl", "-sign", "-rawin",
                                           "-inkey", str(key), "-keyform", "DER",
                                           "-in", str(message)])
-    return unsigned_bytes() + signature
+    return unsigned + signature
 
 
 class SignedScratchVector(unittest.TestCase):
@@ -52,6 +56,13 @@ class SignedScratchVector(unittest.TestCase):
             encoded = signed_vector(Path(directory))
             self.assertEqual(FIXTURE.read_bytes(), encoded)
             self.assertEqual(sha(encoded).hex(), EXPECTED_SHA256)
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL required for independent encoder")
+    def test_separate_fsync_fixture_signature(self):
+        with tempfile.TemporaryDirectory() as directory:
+            encoded = signed_vector(Path(directory), FSYNC_UUID, FSYNC_POLICY)
+            self.assertEqual(FSYNC_FIXTURE.read_bytes(), encoded)
+            self.assertNotEqual(sha(encoded).hex(), EXPECTED_SHA256)
 
 
 if __name__ == "__main__":

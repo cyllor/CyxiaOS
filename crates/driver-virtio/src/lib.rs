@@ -167,6 +167,10 @@ impl Page {
     fn put64(&self, offset: usize, value: u64) {
         unsafe { write_volatile((self.address() + offset) as *mut u64, value.to_le()) }
     }
+    fn get8(&self, offset: usize) -> u8 {
+        debug_assert!(offset < 4096);
+        unsafe { read_volatile((self.address() + offset) as *const u8) }
+    }
     fn get16(&self, offset: usize) -> u16 {
         u16::from_le(unsafe { read_volatile((self.address() + offset) as *const u16) })
     }

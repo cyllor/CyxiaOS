@@ -16,7 +16,11 @@ pub struct BlockCompletion {
     pub notify_version: u64,
     pub latency_ns: u64,
 }
-pub struct BatchedBlock {
+pub type BatchedBlock = BatchedBlockIo<SECTOR_BYTES>;
+
+/// A queue whose read and write commands transfer a fixed whole number of
+/// sectors. The header or status and the data must fit in their DMA page.
+pub struct BatchedBlockIo<const BYTES: usize> {
     transport: Transport,
     queue: BatchQueue,
     sectors: u64,
@@ -25,12 +29,15 @@ pub struct BatchedBlock {
     failed: bool,
     last_completed: u64,
 }
-impl BatchedBlock {
+impl<const BYTES: usize> BatchedBlockIo<BYTES> {
     pub fn attach(
         mut t: Transport,
         memory: &'static mut BatchMemory,
         p: &impl Platform,
     ) -> Result<Self, Error> {
+        if BYTES == 0 || BYTES > 4096 - 16 || !BYTES.is_multiple_of(SECTOR_BYTES) {
+            return Err(Error::Address);
+        }
         if t.device_id() != 2 {
             return Err(Error::Device);
         }
@@ -129,7 +136,7 @@ impl BatchedBlock {
     pub fn begin(
         &mut self,
         operation: Operation,
-        data: &[u8; SECTOR_BYTES],
+        data: &[u8; BYTES],
         synchronous: bool,
         isolated: bool,
         p: &impl Platform,
@@ -143,24 +150,24 @@ impl BatchedBlock {
             Operation::Write(_) => return Err(Error::Unsupported),
             Operation::Flush => (4, 0),
         };
-        if kind != 4 && sector >= self.sectors {
+        if kind != 4
+            && self
+                .sectors
+                .checked_sub(sector)
+                .is_none_or(|remaining| remaining < (BYTES / SECTOR_BYTES) as u64)
+        {
             return Err(Error::Address);
         }
-        let mut request = [0; 16 + SECTOR_BYTES];
-        request[..4].copy_from_slice(&kind.to_le_bytes());
-        request[8..16].copy_from_slice(&sector.to_le_bytes());
-        let len = if kind == 1 {
-            request[16..].copy_from_slice(data);
-            request.len()
-        } else {
-            16
-        };
-        let writable = if kind == 0 { 513 } else { 1 };
+        let mut header = [0; 16];
+        header[..4].copy_from_slice(&kind.to_le_bytes());
+        header[8..16].copy_from_slice(&sector.to_le_bytes());
+        let payload = if kind == 1 { data.as_slice() } else { &[] };
+        let writable = if kind == 0 { BYTES + 1 } else { 1 };
         // Like the single-request block owner, require an explicit device
         // status write. A correct used length alone is not proof of success.
-        let token = match self.queue.enqueue_with_response_tail(
+        let token = match self.queue.enqueue_parts(
             &mut self.transport,
-            &request[..len],
+            (&header, payload),
             (writable, Some(0xff)),
             synchronous || kind == 4,
             isolated,
@@ -189,7 +196,7 @@ impl BatchedBlock {
     }
     pub fn poll(
         &mut self,
-        out: &mut [u8; SECTOR_BYTES],
+        out: &mut [u8; BYTES],
         p: &impl Platform,
     ) -> Result<Option<BlockCompletion>, Error> {
         if self.failed {
@@ -201,14 +208,17 @@ impl BatchedBlock {
         // A later poll still uses the original start and 250 ms deadline, and
         // its fresh completion observation always precedes any timeout verdict.
         let observed_ms = p.now_ms();
-        let mut bytes = [0; 513];
-        let completion = match self.queue.poll(&mut self.transport, &mut bytes, p) {
-            Ok(c) => c,
-            Err(e) => {
-                self.fail(p);
-                return Err(e);
-            }
-        };
+        let completion =
+            match self
+                .queue
+                .poll_in_place_with_checkpoint(&mut self.transport, p, &mut || {})
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    self.fail(p);
+                    return Err(e);
+                }
+            };
         if let Some(c) = completion {
             // The queue acquires DMA and acknowledges the interrupt after its
             // initial status check. A reset in that interval cannot certify a
@@ -221,17 +231,18 @@ impl BatchedBlock {
                 self.fail(p);
                 return Err(Error::Queue);
             };
-            let expected = if matches!(operation, Operation::Read(_)) {
-                513
-            } else {
-                1
+            let read = matches!(operation, Operation::Read(_));
+            let expected = if read { BYTES + 1 } else { 1 };
+            let Ok(response) = self.queue.completed_response(c.token) else {
+                self.fail(p);
+                return Err(Error::Queue);
             };
-            if token != c.token || c.len != expected || bytes[expected - 1] != 0 {
+            if token != c.token || c.len != expected || response.get8(expected - 1) != 0 {
                 self.fail(p);
                 return Err(Error::Response);
             }
-            if expected == 513 {
-                out.copy_from_slice(&bytes[..512]);
+            if read {
+                response.copy_prefix_to(out, BYTES);
             }
             // A device completion is not the caller's acknowledgment.
             // Retain the original token/custody until acknowledge() actually
@@ -316,6 +327,9 @@ mod tests {
         }
     }
     fn fixture() -> (BatchedBlock, Host, usize) {
+        fixture_with_width()
+    }
+    fn fixture_with_width<const BYTES: usize>() -> (BatchedBlockIo<BYTES>, Host, usize) {
         let mmio = Box::leak(Box::new(Page::zeroed()));
         let p = Host {
             clock: Cell::new(0),
@@ -334,7 +348,7 @@ mod tests {
         let base = m as *mut _ as usize;
         let q = BatchQueue::configure(&mut t, m, 0, &p).unwrap();
         (
-            BatchedBlock {
+            BatchedBlockIo {
                 transport: t,
                 queue: q,
                 sectors: 4096,
@@ -352,26 +366,101 @@ mod tests {
     }
 
     unsafe fn complete_with_status(base: usize, slot: u8, read: bool, status: Option<u8>) {
+        let bytes = if read { 512 } else { 0 };
+        unsafe { complete_transfer(base, slot, bytes, bytes as u32 + 1, status) }
+    }
+
+    unsafe fn complete_transfer(
+        base: usize,
+        slot: u8,
+        bytes: usize,
+        used_len: u32,
+        status: Option<u8>,
+    ) {
         unsafe {
             let desc = base + usize::from(slot) * 32 + 16;
             let response = u64::from_le(read_volatile(desc as *const u64)) as usize;
-            if read {
-                for i in 0..512 {
-                    write_volatile((response + i) as *mut u8, 0x5a);
-                }
+            for i in 0..bytes {
+                write_volatile((response + i) as *mut u8, 0x5a);
             }
             if let Some(status) = status {
-                write_volatile((response + if read { 512 } else { 0 }) as *mut u8, status);
+                write_volatile((response + bytes) as *mut u8, status);
             }
             let used = base + 8192;
             let n = u16::from_le(read_volatile((used + 2) as *const u16));
             let at = used + 4 + usize::from(n % 16) * 8;
             write_volatile(at as *mut u32, u32::from(slot * 2).to_le());
-            write_volatile(
-                (at + 4) as *mut u32,
-                (if read { 513u32 } else { 1u32 }).to_le(),
-            );
+            write_volatile((at + 4) as *mut u32, used_len.to_le());
             write_volatile((used + 2) as *mut u16, n.wrapping_add(1).to_le());
+        }
+    }
+    #[test]
+    fn four_sector_transfers_cover_the_full_range_and_keep_exact_custody() {
+        const BYTES: usize = 4 * SECTOR_BYTES;
+        let (mut b, p, memory) = fixture_with_width::<BYTES>();
+        let data = [0x42; BYTES];
+        let mut out = [0; BYTES];
+        for sector in [4093, u64::MAX] {
+            assert_eq!(
+                b.begin(Operation::Write(sector), &data, true, true, &p),
+                Err(Error::Address)
+            );
+        }
+        assert!(b.is_quiescent());
+
+        let op = Operation::Write(4092);
+        let token = b.begin(op, &data, true, true, &p).unwrap();
+        let head = memory + usize::from(token.slot) * 32;
+        let request = unsafe { u64::from_le(read_volatile(head as *const u64)) } as usize;
+        assert_eq!(
+            unsafe { ((head + 8) as *const u32).read_volatile() },
+            2064u32.to_le()
+        );
+        assert_eq!(
+            unsafe { ((request + 8) as *const u64).read_volatile() },
+            4092u64.to_le()
+        );
+        assert_eq!(
+            unsafe { ((request + 16 + BYTES - 1) as *const u8).read_volatile() },
+            0x42
+        );
+        unsafe { complete_transfer(memory, token.slot, 0, 1, Some(0)) };
+        let completion = b.poll(&mut out, &p).unwrap().unwrap();
+        assert_eq!((completion.token, completion.operation), (token, op));
+        assert_eq!(b.free(), 7);
+        b.acknowledge(token).unwrap();
+
+        let op = Operation::Read(4092);
+        let token = b.begin(op, &data, true, true, &p).unwrap();
+        let response = memory + usize::from(token.slot) * 32 + 16;
+        assert_eq!(
+            unsafe { ((response + 8) as *const u32).read_volatile() },
+            2049u32.to_le()
+        );
+        unsafe { complete_transfer(memory, token.slot, BYTES, 2049, Some(0)) };
+        let completion = b.poll(&mut out, &p).unwrap().unwrap();
+        assert_eq!((completion.token, completion.operation), (token, op));
+        assert_eq!(out, [0x5a; BYTES]);
+        assert_eq!(b.free(), 7);
+        b.acknowledge(token).unwrap();
+        assert!(b.is_quiescent());
+    }
+    #[test]
+    fn four_sector_read_with_short_or_missing_status_keeps_dma_quarantined() {
+        const BYTES: usize = 4 * SECTOR_BYTES;
+        for (len, status) in [(2048, Some(0)), (2049, None), (2049, Some(1))] {
+            let (mut b, p, memory) = fixture_with_width::<BYTES>();
+            let mut out = [0xaa; BYTES];
+            let token = b.begin(Operation::Read(0), &out, true, true, &p).unwrap();
+            unsafe { complete_transfer(memory, token.slot, BYTES, len, status) };
+            assert_eq!(b.poll(&mut out, &p), Err(Error::Response));
+            assert_eq!(out, [0xaa; BYTES]);
+            assert_eq!(b.free(), 7);
+            assert_eq!(b.acknowledge(token), Err(Error::Response));
+            assert_eq!(
+                b.begin(Operation::Read(0), &out, true, true, &p),
+                Err(Error::Device)
+            );
         }
     }
     #[test]

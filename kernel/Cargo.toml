@@ -75,6 +75,8 @@ v020-production-media-staging = ["v020-production-diagnostic", "prototype-memory
 v020-production-authenticated-net = ["v020-production-diagnostic"]
 v020-production-media-reopen = ["v020-production-media-staging"]
 v020-production-media-signed = ["v020-production-media-staging"]
+# Separate signed baseline-v1 file owner on one dedicated test disk.
+v020-production-fsync-scratch = ["v020-production-media-signed"]
 v020-production-media-envelopes = ["v020-production-media-staging"]
 v020-production-media-unified = ["v020-production-media-envelopes"]
 v020-production-live-control = ["v020-production-diagnostic"]
@@ -90,6 +92,10 @@ v0199-control-bringup = ["v0199-cpu0-role-selftest"]
 v0199-control-bringup-1g = ["v0199-control-bringup", "prototype-memory"]
 # Separate native scratch journal, never a production mounted filesystem.
 v0199-epoch-disk-selftest = ["v0199-cpu0-role-selftest", "prototype-memory", "dep:sha2"]
+# Adds an independent, dedicated VirtIO RNG to the epoch effect fixture.
+v0199-d11-rng-selftest = ["v0199-epoch-disk-selftest"]
+# Adds two private real CPU1 tasks to verify scheduler weight effects.
+v0199-d01-scheduler-selftest = ["v0199-epoch-disk-selftest"]
 # Separate native all-zero scratch format fixture: the §9.2.1 formatter
 # contract runs against real VirtIO block with guest FLUSH-ordering proof.
 # Never a production format path, signed catalog or mounted filesystem.

@@ -296,16 +296,23 @@ impl BatchQueue {
         isolated: bool,
         p: &impl Platform,
     ) -> Result<Token, Error> {
-        self.enqueue_with_response_tail(t, request, (writable, None), synchronous, isolated, p)
+        self.enqueue_parts(
+            t,
+            (request, &[]),
+            (writable, None),
+            synchronous,
+            isolated,
+            p,
+        )
     }
 
     /// Optionally initialize the final device-writable byte while the slot
     /// is still private. Block status must not inherit a successful zero
     /// from initial allocation or the preceding release.
-    pub(crate) fn enqueue_with_response_tail(
+    pub(crate) fn enqueue_parts(
         &mut self,
         t: &mut Transport,
-        request: &[u8],
+        request: (&[u8], &[u8]),
         response: (usize, Option<u8>),
         synchronous: bool,
         isolated: bool,
@@ -319,9 +326,11 @@ impl BatchQueue {
             self.poison(t, p);
             return Err(Error::Device);
         }
-        if request.len() > 4096
+        let (header, payload) = request;
+        let readable = header.len().saturating_add(payload.len());
+        if readable > 4096
             || writable > 4096
-            || (request.is_empty() && writable == 0)
+            || (readable == 0 && writable == 0)
             || (tail.is_some() && writable == 0)
         {
             return Err(Error::Address);
@@ -337,7 +346,8 @@ impl BatchQueue {
         let m = &self.memory;
         let request_pa = p.physical(m.request[at].address(), 4096)?;
         let response_pa = p.physical(m.response[at].address(), 4096)?;
-        m.request[at].copy_prefix_from(0, request);
+        m.request[at].copy_prefix_from(0, header);
+        m.request[at].copy_prefix_from(header.len(), payload);
         // A Free slot is either zero-initialized or has passed through
         // release(), which clears its complete prior descriptor-owned range.
         // A later wider descriptor exposes only the still-zero initial tail,
@@ -348,23 +358,23 @@ impl BatchQueue {
         }
         let head = at * 2;
         let desc = head * 16;
-        let descriptors = u16::from(!request.is_empty()) + u16::from(writable != 0);
-        if !request.is_empty() {
+        let descriptors = u16::from(readable != 0) + u16::from(writable != 0);
+        if readable != 0 {
             m.desc.put64(desc, request_pa);
-            m.desc.put32(desc + 8, request.len() as u32);
+            m.desc.put32(desc + 8, readable as u32);
             m.desc.put16(desc + 12, if writable == 0 { 0 } else { 1 });
             m.desc.put16(desc + 14, (head + 1) as u16);
         }
         if writable != 0 {
-            let d = desc + if request.is_empty() { 0 } else { 16 };
+            let d = desc + if readable == 0 { 0 } else { 16 };
             m.desc.put64(d, response_pa);
             m.desc.put32(d + 8, writable as u32);
             m.desc.put16(d + 12, 2);
             m.desc.put16(d + 14, 0);
         }
         unsafe {
-            if !request.is_empty() {
-                p.sync(m.request[at].address(), request.len());
+            if readable != 0 {
+                p.sync(m.request[at].address(), readable);
             }
             if writable != 0 {
                 p.sync(m.response[at].address(), writable);
@@ -385,7 +395,7 @@ impl BatchQueue {
         self.slots[at] = Slot {
             state: State::Private,
             generation: token.generation,
-            readable: request.len() as u32,
+            readable: readable as u32,
             writable: writable as u32,
             descriptors,
             version: self.frozen_version,

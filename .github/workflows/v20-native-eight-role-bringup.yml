@@ -11,8 +11,11 @@ on:
       - 'user/v0199-control/**'
       - 'kernel/build/v0199_roles.rs'
       - 'kernel/src/arch/aarch64/v0199_control_bringup.rs'
+      - 'kernel/src/arch/aarch64/v0199_control_bringup/**'
       - 'crates/kernel-core/src/control_plane/role_budget_v0199.rs'
       - 'tools/verify_v0199_eight_packages.py'
+      - 'tools/v0199_budget_trace.py'
+      - 'tools/test_v0199_budget_trace.py'
       - 'tools/verify_smp.py'
       - 'tools/qmp_stdio.py'
       - 'tools/test_qmp_stdio.py'
@@ -22,8 +25,14 @@ on:
       - 'crates/arch-aarch64/src/lib.rs'
       - 'crates/control-model/src/native_v0199.rs'
       - 'crates/kernel-core/src/security/epoch_redo_v0199.rs'
+      - 'kernel/src/arch/aarch64/smp.rs'
+      - 'kernel/src/arch/aarch64/smp_user.S'
+      - 'crates/prototype/src/domains/tasks/scheduler.rs'
       - 'kernel/src/arch/aarch64/v0199_epoch_disk.rs'
       - 'kernel/src/arch/aarch64/v0199_d*_fixture.rs'
+      - 'kernel/src/arch/aarch64/v0199_effect_fixture.rs'
+      - 'crates/driver-virtio/src/queue.rs'
+      - 'crates/driver-virtio/src/rng/batched.rs'
       - 'crates/kernel-core/src/control_plane/d*_owner_v0199.rs'
       - 'crates/kernel-core/src/control_plane/desired_plan_v0199.rs'
       - 'crates/kernel-core/src/control_plane/pie_image_v0199.rs'
@@ -176,6 +185,7 @@ jobs:
           cargo fetch --locked
           mkdir -p artifacts/epoch-components
           python3 -B -m unittest -v tools.test_qmp_stdio 2>&1 | tee artifacts/epoch-components/qmp-stdio.log
+          PYTHONPATH=tools python3 -B -m unittest -v tools.test_v0199_budget_trace 2>&1 | tee artifacts/epoch-components/cpu0-budget-trace.log
           cargo test --locked --offline -p cyxia-arch-aarch64 2>&1 | tee artifacts/epoch-components/arch-memory.log
           cargo test --locked --offline -p cyxia-control-model native_v0199 2>&1 | tee artifacts/epoch-components/model.log
           cargo test --locked --offline -p cyxia-kernel-core epoch_redo_v0199 2>&1 | tee artifacts/epoch-components/redo.log
@@ -186,6 +196,16 @@ jobs:
           path: artifacts/epoch-components/
           retention-days: 7
   arm-epoch-disk:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: epoch-disk
+            feature: v0199-epoch-disk-selftest
+          - artifact: epoch-disk-d11
+            feature: v0199-d11-rng-selftest
+          - artifact: epoch-disk-d01
+            feature: v0199-d01-scheduler-selftest
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -202,7 +222,7 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal --no-self-update --target aarch64-unknown-none-softfloat
           rustup override set 1.95.0
           cargo fetch --locked
-          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features v0199-epoch-disk-selftest 2>&1 | tee artifacts/epoch-disk/build.log
+          cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat --no-default-features --features '${{ matrix.feature }}' 2>&1 | tee artifacts/epoch-disk/build.log
           cp target/aarch64-unknown-none-softfloat/debug/cyxia-kernel artifacts/epoch-disk/kernel.elf
           catalog=$(find target/aarch64-unknown-none-softfloat/debug/build -name v0199-role-catalog.rs)
           test "$(printf '%s\n' "$catalog" | wc -l)" = 1
@@ -211,11 +231,15 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: v020-epoch-disk-build-${{ github.sha }}
+          name: v020-${{ matrix.artifact }}-build-${{ github.sha }}
           path: artifacts/epoch-disk/
           retention-days: 7
   native-epoch-disk:
     needs: [arm-epoch-disk,qemu-accounting]
+    strategy:
+      fail-fast: false
+      matrix:
+        artifact: [epoch-disk, epoch-disk-d11, epoch-disk-d01]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -224,7 +248,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: v020-epoch-disk-build-${{ github.sha }}
+          name: v020-${{ matrix.artifact }}-build-${{ github.sha }}
           path: artifacts/epoch-disk
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -240,7 +264,14 @@ jobs:
           (cd artifacts/eight-qemu; sha256sum -c binary.sha256)
           chmod +x artifacts/eight-qemu/bin/qemu-system-aarch64
           sha256sum -c artifacts/eight-qemu/patch.sha256
-          PATH="$PWD/artifacts/eight-qemu/bin:$PATH" python3 -B tools/verify_v0199_epoch_disk.py \
+          args=()
+          if [ '${{ matrix.artifact }}' = epoch-disk-d11 ]; then
+            args+=(--d11-rng)
+          fi
+          if [ '${{ matrix.artifact }}' = epoch-disk-d01 ]; then
+            args+=(--d01-scheduler)
+          fi
+          PATH="$PWD/artifacts/eight-qemu/bin:$PATH" python3 -B tools/verify_v0199_epoch_disk.py "${args[@]}" \
             --elf artifacts/epoch-disk/kernel.elf --role7 artifacts/epoch-disk/role7.elf \
             --qemu-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/binary.sha256)" \
             --patch-sha256 "$(cut -d' ' -f1 artifacts/eight-qemu/patch.sha256)" \
@@ -248,6 +279,6 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: v020-epoch-disk-evidence-${{ github.sha }}
+          name: v020-${{ matrix.artifact }}-evidence-${{ github.sha }}
           path: artifacts/epoch-disk/
           retention-days: 7

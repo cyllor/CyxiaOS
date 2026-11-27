@@ -346,6 +346,16 @@ class W11Validation(unittest.TestCase):
                  if not x.startswith("V020_W11_MEDIA_STAGING")]
         self.rejects("golden_vector_pending", lines=lines, staging=True)
 
+    def test_scratch_queue_counts_match_both_transfers_and_flush(self):
+        lines = w11_lines(staging=True)
+        marker = "V020_W11_MEDIA_QUEUE a=279000 b=279000 c=139503"
+        observation = self.check(lines=lines + [marker], staging=True)
+        self.assertEqual(observation["scratch_virtio_requests_completed"], 279000)
+        self.assertEqual(observation["scratch_virtio_doorbells"], 139503)
+        for rows in ([marker.replace("b=279000", "b=278999")], [marker, marker]):
+            self.rejects("scratch queue requests", lines=lines + rows, staging=True)
+        self.assertNotIn("scratch_virtio_requests_completed", self.check(staging=True))
+
     def test_staging_requires_every_step(self):
         for at in range(144, 151):
             words = w11_words(staging=True)

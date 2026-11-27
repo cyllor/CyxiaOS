@@ -9,5 +9,9 @@ cyxia-control-model = { path = "../control-model" }
 sha2 = { version = "=0.10.9", default-features = false }
 ed25519-dalek = { version = "=2.2.0", default-features = false }
 
+[target.'cfg(all(target_arch = "aarch64", target_os = "none"))'.dependencies]
+# Immutable upstream basepoint precomputation for the same strict verifier.
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast"] }
+
 [dev-dependencies]
 cyxia-prototype = { path = "../prototype" }
