@@ -30,6 +30,7 @@ RECEIPT_AT = 21 * 192
 REQUEST_ID = 0x0100_0000_0000_0001
 FINAL_LSN = 21
 LEGACY_FINAL_LSN = 19
+BOUND_LSN = 14
 FIRST = 2
 LOG_END = 4098
 INITIAL = b"CyxiaOS V0.20 signed scratch\n".ljust(BLOCK, b"\0")
@@ -142,14 +143,16 @@ def boot_one_log(final_lsn=FINAL_LSN, contents=FINAL, size=29, write_seq=7):
     legacy = final_lsn == LEGACY_FINAL_LSN
     index = [(INDEX, index_page(True))]
     segment_index = [] if legacy else index
-    return b''.join((
+    bound = b''.join((
         boot_tx(1, 1),
         tx(2, 1, 5, receipt_blocks(1, final_lsn, contents, size, write_seq) + index),
         tx(3, 1, 10, receipt_blocks(2, final_lsn, contents, size, write_seq) + segment_index),
-        tx(4, 1, 14 if legacy else 15, [(DATA, contents)]
-           + receipt_blocks(3, final_lsn, contents, size, write_seq)
-           + segment_index + [(INODE, inode_page(True, size, write_seq))]),
     ))
+    if final_lsn == BOUND_LSN:
+        return bound
+    return bound + tx(4, 1, 14 if legacy else 15, [(DATA, contents)]
+                      + receipt_blocks(3, final_lsn, contents, size, write_seq)
+                      + segment_index + [(INODE, inode_page(True, size, write_seq))])
 
 
 def read(disk, block, size=BLOCK):
@@ -165,7 +168,7 @@ def checkpoint_lsn(epoch, final_lsn):
 
 def verify_disk(path, reopened, final_lsn=FINAL_LSN, *, contents=FINAL, size=29, write_seq=7,
                 boot_epoch=None):
-    require(final_lsn in (FINAL_LSN, LEGACY_FINAL_LSN), "unrecognized FSYNC redo closure")
+    require(final_lsn in (FINAL_LSN, LEGACY_FINAL_LSN, BOUND_LSN), "unrecognized FSYNC redo closure")
     require(29 <= size <= BLOCK and len(contents) == BLOCK and not any(contents[size:])
             and write_seq > 0 and (final_lsn != LEGACY_FINAL_LSN or (size, write_seq) == (29, 7)),
             "expected caller content must fit one allocated file block")
@@ -173,7 +176,8 @@ def verify_disk(path, reopened, final_lsn=FINAL_LSN, *, contents=FINAL, size=29,
     require(epoch >= 1 and reopened == (epoch > 1), "invalid FSYNC checkpoint epoch")
     expected = (boot_tx(epoch, checkpoint_lsn(epoch, final_lsn) + 1) if reopened else
                 boot_one_log(final_lsn, contents, size, write_seq))
-    done = reopened
+    done = reopened and final_lsn != BOUND_LSN
+    status = (3 if done else 2) if reopened else 0
     prior_checkpoint = max(1, epoch - 1)
     first, second = (prior_checkpoint, epoch) if epoch % 2 == 0 else (epoch, prior_checkpoint)
     with path.open("rb") as disk:
@@ -190,8 +194,8 @@ def verify_disk(path, reopened, final_lsn=FINAL_LSN, *, contents=FINAL, size=29,
                 and read(disk, DATA) == (contents if done else INITIAL),
                 "FSYNC inode size, write sequence or visible data differs")
         require(read(disk, RECEIPT, 6 * BLOCK)
-                == receipts(3 if done else 0, final_lsn, contents, size, write_seq)
-                and read(disk, INDEX) == index_page(done),
+                == receipts(status, final_lsn, contents, size, write_seq)
+                and read(disk, INDEX) == index_page(reopened),
                 "FSYNC receipt or stream index homes differ")
         acl = read(disk, ACL)[64:128]
         require(struct.unpack_from('<IIQQQIIQ', acl) == (1, 1, 1, 1, 1, 0x2300, 0, 1)
@@ -200,16 +204,18 @@ def verify_disk(path, reopened, final_lsn=FINAL_LSN, *, contents=FINAL, size=29,
     return sha256(expected).hexdigest()
 
 
-def run_healthy_boots(fresh, reopen, output, timeout, qmp_stdio, boot_count, content=FINAL[:29]):
+def run_healthy_boots(fresh, reopen, output, timeout, qmp_stdio, boot_count, content=FINAL[:29],
+                      *, bound_only=False):
     """Run repeated independent QEMU boots on the same healthy signed volume."""
     require(boot_count >= 2 and 29 <= len(content) <= BLOCK, "invalid FSYNC healthy boot fixture")
     output.mkdir(parents=True, exist_ok=False)
-    fresh_modes = Modes(authenticated_net=True, fsync_scratch=True)
+    fresh_modes = Modes(authenticated_net=True, fsync_scratch=True, fsync_bound=bound_only)
     reopen_modes = replace(fresh_modes, media_reopen=True)
     size = len(content)
     padded = content.ljust(BLOCK, b"\0")
     write_seq = max(7, (size + 83) // 84)
-    retained_digest = sha256(receipts(3, FINAL_LSN, padded, size, write_seq)
+    receipt_lsn = BOUND_LSN if bound_only else FINAL_LSN
+    retained_digest = sha256(receipts(2 if bound_only else 3, receipt_lsn, padded, size, write_seq)
                              + index_page(True)).hexdigest()
     boots = []
     with tempfile.TemporaryDirectory(prefix="cyx-fsync-healthy-") as tmp:
@@ -227,23 +233,28 @@ def run_healthy_boots(fresh, reopen, output, timeout, qmp_stdio, boot_count, con
                         "healthy FSYNC reboot must use the same verified disk")
             observations = result["observations"]
             endpoint = "native_file_receipt_query" if reopened else "native_file_fsync"
-            require(observations.get(endpoint) == {
-                        "boot_epoch": epoch, "actor": 11, "service_generation": 1,
-                    }, "missing epoch-bound native file client")
+            if reopened or not bound_only:
+                require(observations.get(endpoint) == {
+                            "boot_epoch": epoch, "actor": 11, "service_generation": 1,
+                        }, "missing epoch-bound native file client")
             lines = (case / "serial.txt").read_text().splitlines()
             if reopened:
-                require(rows(lines, "V020_FSYNC_RECOVERED") == [(epoch, FINAL_LSN, write_seq)]
+                event = "V020_FSYNC_UNKNOWN_RECOVERED" if bound_only else "V020_FSYNC_RECOVERED"
+                require(rows(lines, event) == [(epoch, receipt_lsn, write_seq)]
                         and observations["signed_receipt_view_sha256"] == retained_digest,
                         "reboot changed the retained receipt or stream index")
+            elif bound_only:
+                require(rows(lines, "V020_FSYNC_BOUND") == [(receipt_lsn, write_seq, 0)],
+                        "initial FSYNC binding differs from the frozen request")
             else:
-                require(rows(lines, "V020_FSYNC_COMMITTED") == [(FINAL_LSN, write_seq, size)],
+                require(rows(lines, "V020_FSYNC_COMMITTED") == [(receipt_lsn, write_seq, size)],
                         "initial FSYNC receipt differs from the caller's write")
             _, writes, flushes = rows(lines, "V020_W11_MEDIA_IO")[0]
             boots.append({
                 "boot_epoch": epoch,
-                "checkpoint_lsn": checkpoint_lsn(epoch, FINAL_LSN),
-                "journal_sha256": verify_disk(disk, reopened, contents=padded, size=size,
-                                               write_seq=write_seq, boot_epoch=epoch),
+                "checkpoint_lsn": checkpoint_lsn(epoch, receipt_lsn),
+                "journal_sha256": verify_disk(disk, reopened, receipt_lsn, contents=padded,
+                                               size=size, write_seq=write_seq, boot_epoch=epoch),
                 "disk_sha256": result["scratch_disk"]["scratch_after_sha256"],
                 "receipt_view_sha256": observations["signed_receipt_view_sha256"],
                 "writes": writes,
@@ -252,8 +263,16 @@ def run_healthy_boots(fresh, reopen, output, timeout, qmp_stdio, boot_count, con
                 "qemu_sha256": result["qemu_sha256"],
             })
     report = {"status": "PASS", "scope": "signed-baseline-v1-native-fsync-diagnostic",
-              "file_bytes": size, "file_write_seq": write_seq, "file_commit_lsn": FINAL_LSN,
-              "file_sha256": sha256(content).hexdigest(), "boots": boots}
+              "receipt_status": "BOUND" if bound_only else "DONE",
+              "receipt_commit_lsn": receipt_lsn, "boots": boots}
+    if bound_only:
+        report.update({"file_bytes": 29, "file_write_seq": 0,
+                       "file_sha256": sha256(INITIAL[:29]).hexdigest(),
+                       "frozen_request_bytes": size, "frozen_write_seq": write_seq,
+                       "later_query_status": "UNKNOWN", "later_query_errno": -6})
+    else:
+        report.update({"file_bytes": size, "file_write_seq": write_seq,
+                       "file_commit_lsn": receipt_lsn, "file_sha256": sha256(content).hexdigest()})
     (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 
@@ -333,17 +352,21 @@ def main():
                         help="boot and repeatedly reopen one healthy volume")
     parser.add_argument("--contents", type=Path,
                         help="expected file payload of the prebuilt fresh ELF in a healthy run")
+    parser.add_argument("--bound-only", action="store_true",
+                        help="verify a complete BOUND transaction and later UNKNOWN queries")
     args = parser.parse_args()
     if bool(args.fresh_elf) != bool(args.reopen_elf):
         parser.error("pass both kernel ELFs, or let the verifier build both")
     if args.healthy_boots is not None and args.healthy_boots < 2:
         parser.error("--healthy-boots requires at least 2")
+    if args.bound_only and args.healthy_boots is None:
+        parser.error("--bound-only requires --healthy-boots")
     if args.contents is not None and (args.healthy_boots is None or args.fresh_elf is None):
         parser.error("--contents requires --healthy-boots and prebuilt ELFs")
     with tempfile.TemporaryDirectory(prefix="cyx-fsync-elf-") as scratch:
         fresh, reopen = args.fresh_elf, args.reopen_elf
         if fresh is None:
-            modes = Modes(authenticated_net=True, fsync_scratch=True)
+            modes = Modes(authenticated_net=True, fsync_scratch=True, fsync_bound=args.bound_only)
             fresh = Path(scratch) / "fresh.elf"
             shutil.copy2(build(True, modes), fresh)
             reopen = build(True, replace(modes, media_reopen=True))
@@ -352,7 +375,7 @@ def main():
         else:
             content = args.contents.read_bytes() if args.contents else FINAL[:29]
             report = run_healthy_boots(fresh, reopen, args.output, args.timeout, args.qmp_stdio,
-                                       args.healthy_boots, content)
+                                       args.healthy_boots, content, bound_only=args.bound_only)
     print(json.dumps(report, indent=2))
 
 

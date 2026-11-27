@@ -39,8 +39,10 @@ class Modes:
     file_sessions: bool = False
     file_volatile_write: bool = False
     fsync_scratch: bool = False
+    fsync_bound: bool = False
 
     def __post_init__(self) -> None:
+        require(not self.fsync_bound or self.fsync_scratch, "BOUND receipt proof requires FSYNC scratch")
         if self.fsync_scratch:
             object.__setattr__(self, "signed_media", True)
         if self.file_volatile_write:
@@ -54,7 +56,7 @@ class Modes:
     def unsigned_fixture(self) -> "Modes":
         return replace(self, media_reopen=False, signed_media=False, snapshot_catalog=False,
                        file_read=False, snapshot_read=False, file_sessions=False,
-                       file_volatile_write=False, fsync_scratch=False)
+                       file_volatile_write=False, fsync_scratch=False, fsync_bound=False)
 
     def features(self, staging: bool) -> str:
         require(not self.file_volatile_write or staging or self.media_reopen,

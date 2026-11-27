@@ -575,6 +575,7 @@ pub(super) fn validate_fsync_homes(
     config: &VerifiedOfflineConfig<'_>,
     epoch: u64,
     file_size: usize,
+    receipt_bound: bool,
 ) -> Result<MountEvidence, SecurityError> {
     // SAFETY: the one-shot CPU0 mount excludes all other MOUNT borrows.
     let w = unsafe { &mut *core::ptr::addr_of_mut!(MOUNT) };
@@ -596,7 +597,7 @@ pub(super) fn validate_fsync_homes(
         || e.system_blocks != 13
         || e.structure.data_blocks != 15
         || e.receipts.occupied != 1
-        || e.receipts.unresolved != 0
+        || e.receipts.unresolved != usize::from(receipt_bound)
     {
         return Err(SecurityError::Conflict);
     }

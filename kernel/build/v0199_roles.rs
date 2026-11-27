@@ -213,8 +213,13 @@ pub fn build() {
     let file_read = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_READ").is_some();
     let fsync = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FSYNC_SCRATCH").is_some();
     let reopen = env::var_os("CARGO_FEATURE_V020_PRODUCTION_MEDIA_REOPEN").is_some();
+    println!("cargo:rustc-check-cfg=cfg(cyxia_fsync_bound_fixture)");
+    println!("cargo:rerun-if-env-changed=CYXIA_FSYNC_TEST_BOUND");
     if fsync && !reopen {
         build_fsync_client_fixture(&out);
+        if env::var("CYXIA_FSYNC_TEST_BOUND").as_deref() == Ok("1") {
+            println!("cargo:rustc-cfg=cyxia_fsync_bound_fixture");
+        }
     }
     let file_sessions = env::var_os("CARGO_FEATURE_V020_PRODUCTION_FILE_SESSIONS").is_some();
     let file_volatile_write =

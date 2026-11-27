@@ -48,23 +48,43 @@ fn query(request: &[u8; 88], reply: &mut [u8; 128]) -> i64 {
     )
 }
 
-pub(super) fn receipt_is_committed(reply: &[u8; 128]) -> bool {
-    let field = |at| u64::from_le_bytes(reply[at..at + 8].try_into().unwrap());
+fn field(reply: &[u8; 128], at: usize) -> u64 {
+    u64::from_le_bytes(reply[at..at + 8].try_into().unwrap())
+}
+
+fn receipt_identity(reply: &[u8; 128]) -> bool {
     reply[..8] == [0x52, 0x46, 0x59, 0x43, 3, 0, 128, 0]
-        && field(8) == ID
-        && field(16) == 1
+        && field(reply, 8) == ID
+        && field(reply, 16) == 1
+        && field(reply, 48) == 1
+        && field(reply, 64) == 0
+        && field(reply, 72) == 0
+        && field(reply, 112) == ID
+}
+
+pub(super) fn receipt_is_committed(reply: &[u8; 128]) -> bool {
+    let field = |at| field(reply, at);
+    receipt_identity(reply)
         && field(24) == 3
         && match field(40) {
             19 => field(32) == 29 && field(120) == 7,
             21 => (29..=4096).contains(&field(32)) && field(120) > 0,
             _ => false,
         }
-        && field(48) == 1
         && field(56) == 4
-        && field(64) == 0
-        && field(72) == 0
         && reply[80..112] != [0; 32]
-        && field(112) == ID
+}
+
+#[cfg(file_receipt_query_probe)]
+fn receipt_is_unknown(reply: &[u8; 128]) -> bool {
+    receipt_identity(reply)
+        && reply[24..28] == [5, 0, 0, 0]
+        && i32::from_le_bytes(reply[28..32].try_into().unwrap()) == -6
+        && field(reply, 32) == 0
+        && field(reply, 40) == 14
+        && field(reply, 56) == 3
+        && reply[80..112] == [0; 32]
+        && field(reply, 120) > 0
 }
 
 #[cfg(file_receipt_query_probe)]
@@ -76,7 +96,7 @@ pub(super) fn run() -> ! {
     let mut reply = [0xa5; 128];
     loop {
         match query(&wire, &mut reply) {
-            0 if receipt_is_committed(&reply) => break,
+            0 if receipt_is_committed(&reply) || receipt_is_unknown(&reply) => break,
             EAGAIN if reply == [0xa5; 128] => yield_now(),
             _ => reject_startup(),
         }

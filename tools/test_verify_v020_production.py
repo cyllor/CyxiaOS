@@ -843,6 +843,22 @@ class W11Validation(unittest.TestCase):
                                      pending_fsync_blocks=4, expected_fsync_epoch=3)
         self.assertEqual(result["native_file_receipt_query"]["boot_epoch"], 3)
 
+    def test_fsync_bound_reopen_confirms_only_unknown_query(self):
+        modes = v.Modes(fsync_scratch=True, fsync_bound=True, media_reopen=True)
+        words = w11_words(staging=True)
+        words[145:151] = [0, 1, 1, 2, 1, 1]
+        words[162:164] = [1, 1]
+        lines = [v.STAGING_MARKER, "V020_W12_MEDIA_EPOCH a=1 b=2 c=1",
+                 "V020_FSYNC_UNKNOWN_RECOVERED a=2 b=14 c=49",
+                 "V020_FSYNC_RECEIPT_ABI a=2 b=11 c=1",
+                 "V020_W11_MEDIA_IO a=20950 b=30 c=5",
+                 f"V020_W11_MEDIA_SNAPSHOT_0X40 a=3 b={v.EAGAIN_RESULT} c=0"]
+        lines += [f"V020_W11_MEDIA_STEP a={index} b=1 c={detail}"
+                  for index, detail in enumerate((1, 6, 151, 2, 1), start=1)]
+        result = v.check_w11_staging(tuple(words), lines, b"", True, 3, modes,
+                                     pending_fsync_blocks=18, expected_fsync_epoch=2)
+        self.assertEqual(result["native_file_receipt_query"]["boot_epoch"], 2)
+
 
 class FileSessionsEvidence(unittest.TestCase):
     def setUp(self):

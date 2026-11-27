@@ -598,7 +598,23 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     if modes.media_unified:
         fresh_writes = 4276 + int(modes.file_read)
     expected_io = (15, 5) if reopen else (fresh_writes, 6)
-    if modes.fsync_scratch:
+    if modes.fsync_bound:
+        event = "V020_FSYNC_UNKNOWN_RECOVERED" if reopen else "V020_FSYNC_BOUND"
+        terminal = w11_rows(lines, event)
+        require(len(terminal) == 1 and (
+                    (terminal[0][:2] == (epoch, 14) and terminal[0][2] > 0) if reopen else
+                    (terminal[0][0] == 14 and terminal[0][1] > 0 and terminal[0][2] == 0)
+                ) and not any(w11_rows(lines, marker) for marker in (
+                    "V020_FSYNC_COMMITTED", "V020_FSYNC_RECOVERED",
+                )), "BOUND receipt must preserve uncertainty")
+        if not reopen:
+            expected_io = (4155, 10)
+        elif epoch == 2:
+            require(pending_fsync_blocks in (None, 18), "pre-replay BOUND log block count differs")
+            expected_io = (30, 5)  # Five homes, a checkpoint, 18 retirements, six boot records.
+        else:
+            require(pending_fsync_blocks in (None, 4), "pre-replay BootEpoch pair block count differs")
+    elif modes.fsync_scratch:
         event = "V020_FSYNC_RECOVERED" if reopen else "V020_FSYNC_COMMITTED"
         terminal = w11_rows(lines, event)
         legacy = [(epoch, 19, 7)] if reopen else [(19, 7, 29)]
@@ -627,7 +643,7 @@ def check_w11_staging(words: tuple, lines: list, serial: bytes, staging: bool,
     evidence = {}
     synced = w11_rows(lines, "V020_FSYNC_WRITE_ABI")
     if synced:
-        require(modes.fsync_scratch and not reopen and synced == [(1, 11, 1)],
+        require(modes.fsync_scratch and not modes.fsync_bound and not reopen and synced == [(1, 11, 1)],
                 "unexpected native file FSYNC client identity")
         evidence["native_file_fsync"] = {
             "boot_epoch": synced[0][0],
@@ -955,6 +971,10 @@ def build(staging: bool, modes: Modes = Modes()) -> Path:
     feature = modes.features(staging)
     kernel_env = dict(os.environ)
     kernel_env.pop("RUSTFLAGS", None)
+    if modes.fsync_bound and not modes.media_reopen:
+        kernel_env["CYXIA_FSYNC_TEST_BOUND"] = "1"
+    else:
+        kernel_env.pop("CYXIA_FSYNC_TEST_BOUND", None)
     subprocess.run(
         verify_v0199_sec_n.cargo_prefix()
         + "cargo build --locked --offline -p cyxia-kernel --target aarch64-unknown-none-softfloat "

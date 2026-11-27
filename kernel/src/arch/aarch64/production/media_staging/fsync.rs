@@ -52,6 +52,8 @@ const LOG_END: u32 = 36;
 const LEGACY_LOG_END: u32 = 32;
 const BOOT_COMMIT_LSN: u64 = 4;
 const ISSUE_COMMIT_LSN: u64 = 9;
+const BOUND_LSN: u64 = 14;
+const BOUND_STATUS: u16 = 2;
 pub(super) const FINAL_LSN: u64 = 21;
 const LEGACY_FINAL_LSN: u64 = 19;
 const KEY: ReceiptKey = ReceiptKey {
@@ -70,7 +72,7 @@ const REQUEST_ID: u64 = 0x0100_0000_0000_0001;
 pub(super) fn receipt_lsn(checkpoint: SuperblockV1) -> Option<u64> {
     let boot_lsns = checkpoint.generation.checked_sub(2)?.checked_mul(4)?;
     let original = checkpoint.checkpoint_lsn.checked_sub(boot_lsns)?;
-    matches!(original, FINAL_LSN | LEGACY_FINAL_LSN).then_some(original)
+    matches!(original, FINAL_LSN | LEGACY_FINAL_LSN | BOUND_LSN).then_some(original)
 }
 
 #[cfg_attr(target_os = "none", unsafe(link_section = ".bss.sec_n"))]
@@ -335,13 +337,19 @@ pub(super) fn execute(
     };
     let FsyncProgress::Committed { receipt: bound, .. } =
         commit_segment(&mut writer, &job, work, |p| {
-            reserve(p, BIND_START, 8, 3, 14)
+            reserve(p, BIND_START, 8, 3, BOUND_LSN)
         })?
     else {
         return Err(Error::Conflict);
     };
-    if bound.status != 2 || bound.completed_prefix != 0 {
+    if bound.status != BOUND_STATUS || bound.completed_prefix != 0 {
         return Err(Error::Conflict);
+    }
+    if cfg!(cyxia_fsync_bound_fixture) {
+        // The fixture ends with the fully committed binding. Its caller
+        // received EAGAIN and never receives a successful FSYNC completion.
+        report("V020_FSYNC_BOUND", bound.commit_lsn, bound.write_seq, 0);
+        return Ok(());
     }
     let FsyncProgress::Committed { receipt, redo } =
         commit_segment(&mut writer, &job, work, |p| {
@@ -432,6 +440,30 @@ fn final_receipt(
     })
 }
 
+fn verify_binding(receipt: FileReceiptV4) -> Result<FileReceiptV4, Error> {
+    let expected = FileReceiptV4 {
+        log_epoch: 1,
+        txid: 3,
+        commit_lsn: BOUND_LSN,
+        write_seq: receipt.write_seq,
+        status: BOUND_STATUS,
+        operation_digest: receipt.operation_digest,
+        ..issued_receipt()
+    };
+    if receipt != expected || receipt.write_seq == 0 || receipt.operation_digest == [0; 32] {
+        return Err(Error::Conflict);
+    }
+    Ok(receipt)
+}
+
+fn file_size(receipt: FileReceiptV4) -> usize {
+    if receipt.status == BOUND_STATUS {
+        FILE_LEN
+    } else {
+        receipt.completed_prefix as usize
+    }
+}
+
 fn verify_block(
     writer: &mut RedoWriter<'_, Disk>,
     home: u32,
@@ -463,7 +495,8 @@ pub(super) fn recover(
                 checkpoint,
                 config,
                 epoch,
-                expected.completed_prefix as usize,
+                file_size(expected),
+                expected.status == BOUND_STATUS,
             )
         });
     }
@@ -494,30 +527,53 @@ pub(super) fn recover(
     let mut writer = RedoWriter::open(disk, workspace, checkpoint)?;
     let summary = writer.evidence().ok_or(Error::Conflict)?;
     let final_lsn = summary.last_commit_lsn;
-    if summary.transactions != 4 || summary.distinct_home_blocks != 7 {
-        return Err(Error::Conflict);
-    }
-    let index_lsn = match final_lsn {
-        FINAL_LSN => FINAL_LSN,
+    let (transactions, homes, index_lsn) = match final_lsn {
+        FINAL_LSN => (4, 7, FINAL_LSN),
         // The legacy segment did not repeat the unchanged issued index.
-        LEGACY_FINAL_LSN if legacy_tail_blank => ISSUE_COMMIT_LSN,
+        LEGACY_FINAL_LSN if legacy_tail_blank => (4, 7, ISSUE_COMMIT_LSN),
+        BOUND_LSN => (3, 5, BOUND_LSN),
         _ => return Err(Error::Conflict),
     };
-    let mut snapshot = [0; FROZEN_BYTES];
-    let block: &mut [u8; BLOCK] = (&mut snapshot[SIZE_BYTES..]).try_into().unwrap();
-    writer.read_committed_at(INODE_START, final_lsn, block)?;
-    let (size, write_seq) = recovered_version(block, final_lsn)?;
-    file[16..24].copy_from_slice(&(size as u64).to_le_bytes());
-    file[24..32].copy_from_slice(&write_seq.to_le_bytes());
-    let crc = crc32c_zeroed(file, 252)?;
-    file[252..].copy_from_slice(&crc.to_le_bytes());
-    if *block != inode {
+    if summary.incomplete_tail
+        || (summary.transactions, summary.distinct_home_blocks) != (transactions, homes)
+    {
         return Err(Error::Conflict);
     }
-    writer.read_committed_at(SCRATCH_FILE_BLOCK, final_lsn, block)?;
-    let receipt = final_receipt(&mut snapshot, size, write_seq, final_lsn)?;
+    let receipt = if final_lsn == BOUND_LSN {
+        // The frozen input belongs to the prior caller. Preserve its
+        // persisted digest without trying to reconstruct it from old data.
+        for (offset, block) in image[..2 * BLOCK].chunks_exact_mut(BLOCK).enumerate() {
+            writer.read_committed_at(
+                RECEIPTS_HOME + offset as u32,
+                BOUND_LSN,
+                block.try_into().unwrap(),
+            )?;
+        }
+        let bound = verify_binding(FileReceiptV4::decode(
+            &image[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES],
+        )?)?;
+        image.fill(0);
+        bound
+    } else {
+        let mut snapshot = [0; FROZEN_BYTES];
+        let block: &mut [u8; BLOCK] = (&mut snapshot[SIZE_BYTES..]).try_into().unwrap();
+        writer.read_committed_at(INODE_START, final_lsn, block)?;
+        let (size, write_seq) = recovered_version(block, final_lsn)?;
+        file[16..24].copy_from_slice(&(size as u64).to_le_bytes());
+        file[24..32].copy_from_slice(&write_seq.to_le_bytes());
+        let crc = crc32c_zeroed(file, 252)?;
+        file[252..].copy_from_slice(&crc.to_le_bytes());
+        if *block != inode {
+            return Err(Error::Conflict);
+        }
+        writer.read_committed_at(SCRATCH_FILE_BLOCK, final_lsn, block)?;
+        final_receipt(&mut snapshot, size, write_seq, final_lsn)?
+    };
+    if writer.prepare(1)?.txid != receipt.txid + 1 {
+        return Err(Error::Conflict);
+    }
     image[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES].copy_from_slice(&receipt.encode()?);
-    // The seven required homes must be in their respective commits even
+    // The required homes must be in their respective commits even
     // when an after-image matches its checkpoint bytes. Together with the
     // exact union count this excludes unapproved targets before replay.
     verify_block(
@@ -556,11 +612,16 @@ pub(super) fn recover(
             return Err(Error::Conflict);
         }
         mounted = Some(volume::validate_fsync_homes(
-            disk, selected, config, 1, size,
+            disk,
+            selected,
+            config,
+            1,
+            file_size(receipt),
+            receipt.status == BOUND_STATUS,
         )?);
         Ok(())
     })?;
-    if chain.transactions != 4 || next.checkpoint_lsn != final_lsn {
+    if chain.transactions != transactions || next.checkpoint_lsn != final_lsn {
         return Err(Error::Conflict);
     }
     retire_checkpointed_log(disk, workspace, next)?;
@@ -572,8 +633,23 @@ fn read_retained_receipt(
     commit_lsn: u64,
     receipts: &mut [u8; RECEIPT_STORE_BYTES],
 ) -> Result<FileReceiptV4, Error> {
+    for (block, output) in receipts.chunks_exact_mut(BLOCK).enumerate() {
+        disk.read(RECEIPTS_HOME + block as u32, output.try_into().unwrap())?;
+    }
+    let retained = FileReceiptV4::decode(&receipts[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES])?;
     let mut raw = [0; BLOCK];
     disk.read(INODE_START, &mut raw)?;
+    if commit_lsn == BOUND_LSN {
+        let inode = Inode::decode(&raw[INODE_AT..INODE_AT + INODE_BYTES])?;
+        if inode.size != FILE_LEN as u64 || inode.durable_write_seq != 0 {
+            return Err(Error::Conflict);
+        }
+        disk.read(SCRATCH_FILE_BLOCK, &mut raw)?;
+        if raw[..FILE_LEN] != *SCRATCH_FILE_DATA || raw[FILE_LEN..].iter().any(|&byte| byte != 0) {
+            return Err(Error::Conflict);
+        }
+        return verify_binding(retained);
+    }
     let (size, write_seq) = recovered_version(&raw, commit_lsn)?;
     let mut snapshot = [0; FROZEN_BYTES];
     disk.read(
@@ -581,10 +657,7 @@ fn read_retained_receipt(
         (&mut snapshot[SIZE_BYTES..]).try_into().unwrap(),
     )?;
     let expected = final_receipt(&mut snapshot, size, write_seq, commit_lsn)?;
-    for (block, output) in receipts.chunks_exact_mut(BLOCK).enumerate() {
-        disk.read(RECEIPTS_HOME + block as u32, output.try_into().unwrap())?;
-    }
-    if FileReceiptV4::decode(&receipts[RECEIPT_AT..RECEIPT_AT + RECEIPT_BYTES])? != expected {
+    if retained != expected {
         return Err(Error::Conflict);
     }
     Ok(expected)
