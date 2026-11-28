@@ -14,9 +14,10 @@ def archive(root, keys):
     (root/'evidence').mkdir()
     payload=b'synthetic structural regression, not runtime/static/model evidence'
     (root/'evidence'/'fixture.bin').write_bytes(payload)
-    members=json.dumps({'files':[{'path':'evidence/fixture.bin','bytes':len(payload),'sha256':v.digest(payload)}]}).encode()
     proofs=[]
     for test,proof in sorted(keys):
+        members=json.dumps({'run_id':1,'test_id':test,'proof_class':v.NAMES[proof],
+                            'files':[{'path':'evidence/fixture.bin','bytes':len(payload),'sha256':v.digest(payload)}]}).encode()
         checker=(test>>16<<16)|1
         item=dict(test_id=test,proof_class=v.NAMES[proof],checker_id=checker,checker_version=1,
                   boot_epoch=1,controller_epoch=1,security_epoch=0,object_or_stream_generation=1,seed=0,fault_point_id=0)

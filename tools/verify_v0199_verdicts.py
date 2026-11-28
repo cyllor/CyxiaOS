@@ -223,13 +223,17 @@ def aggregate(manifest_raw, locked_digest, root, *, a53_lock=None):
                 require(digest(m)==v["evidence_digest"],"evidence manifest digest mismatch")
                 evidence = strict_json(m)
                 require(isinstance(evidence, dict), "invalid evidence manifest")
+                # Bind the evidence envelope to the proof independently of
+                # its filename and digest. Raw members may be shared, but a
+                # different case, class or run cannot supply this envelope.
+                require(type(evidence.get("run_id")) is int and type(evidence.get("test_id")) is int
+                        and (evidence["run_id"], evidence["test_id"], evidence.get("proof_class"))
+                        == (run, key[0], NAMES[key[1]]),
+                        "evidence manifest does not bind the run and proof key")
                 if physical:
-                    require(type(evidence.get("run_id")) is int and type(evidence.get("test_id")) is int
-                            and (evidence["run_id"], evidence["test_id"], evidence.get("proof_class"))
-                            == (run, key[0], "ARCH_A53")
-                            and evidence.get("platform_lock_sha256") == a53_lock["manifest_sha256"]
+                    require(evidence.get("platform_lock_sha256") == a53_lock["manifest_sha256"]
                             and evidence.get("raw_capture_sha256") == a53_lock["raw_capture_sha256"],
-                            "ARCH_A53 evidence does not bind the run and physical capture")
+                            "ARCH_A53 evidence does not bind the physical capture")
                 members=evidence["files"]
                 require(isinstance(members,list) and len(members)==v["evidence_count"],"evidence count mismatch")
                 identities=set()

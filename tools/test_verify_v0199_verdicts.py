@@ -24,7 +24,8 @@ class VerdictTests(unittest.TestCase):
         (root/"evidence").mkdir(exist_ok=True)
         e=b"synthetic test fixture, not runtime proof"
         (root/"evidence"/"object.bin").write_bytes(e)
-        m=json.dumps({"files":[{"path":"evidence/object.bin","bytes":len(e),"sha256":v.digest(e)}]}).encode()
+        m=json.dumps({"run_id":1,"test_id":test,"proof_class":v.NAMES[proof],
+                      "files":[{"path":"evidence/object.bin","bytes":len(e),"sha256":v.digest(e)}]}).encode()
         manifest=self.frozen_evidence(manifest,1,m)
         (root/"evidence"/f"{stem}.json").write_bytes(m)
         record=bytearray(320)
@@ -39,14 +40,15 @@ class VerdictTests(unittest.TestCase):
             root = Path(directory)
             frozen_manifest, verdict = self.setup_run(root)
             evidence = root / "evidence" / f"{verdict.stem}.json"
-            members = json.loads(evidence.read_bytes())["files"]
+            envelope = json.loads(evidence.read_bytes())
+            members = envelope["files"]
             contents = b"second complete evidence object"
             second = "evidence/other.bin"
             (root / second).write_bytes(contents)
             members.append({"path": second, "bytes": len(contents), "sha256": v.digest(contents)})
 
             def write_evidence(entries):
-                raw = json.dumps({"files": entries}).encode()
+                raw = json.dumps({**envelope, "files": entries}).encode()
                 evidence.write_bytes(raw)
                 record = bytearray(verdict.read_bytes())
                 struct.pack_into("<I", record, 36, len(entries))
@@ -65,6 +67,43 @@ class VerdictTests(unittest.TestCase):
             reversed_raw = write_evidence(list(reversed(members)))
             frozen_reversed = self.frozen_evidence(frozen_manifest, 2, reversed_raw)
             self.assertEqual(check(frozen_reversed)["status"], "BLOCKED_INVALID_EVIDENCE")
+
+    def test_every_nonphysical_evidence_envelope_binds_exact_run_case_class(self):
+        # Even a consistently rehashed archive and expected manifest must
+        # not silently accept an envelope belonging to another proof.
+        for pair in ((0x10001, 1), (0x10009, 2), (0x10002, 4)):
+            for status, reason in ((1, 0), (2, 4)):
+                with self.subTest(pair=pair, status=status), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    manifest, verdict = self.setup_run(root, status, reason, pair=pair)
+                    path = root / "evidence" / (verdict.stem + ".json")
+                    valid = json.loads(path.read_bytes())
+                    initial_record = verdict.read_bytes()
+                    def check(envelope):
+                        raw = json.dumps(envelope).encode()
+                        path.write_bytes(raw)
+                        record = bytearray(initial_record)
+                        record[256:288] = hashlib.sha256(raw).digest()
+                        record[288:] = hashlib.sha256(b"CYX/VERDICT/v4"+record[:288]).digest()
+                        verdict.write_bytes(record)
+                        locked = self.frozen_evidence(manifest, 1, raw)
+                        report = v.aggregate(locked, v.digest(locked), root)
+                        return next(row for row in report["proofs"]
+                                    if (row["test_id"], v.CLASSES[row["proof_class"]]) == pair)
+                    self.assertEqual(check(valid)["status"], v.STATUS[status])
+                    wrong = [
+                        {**valid, "run_id": 2},
+                        {**valid, "test_id": 0x10003},
+                        {**valid, "proof_class": "ARCH_A53"},
+                        {**valid, "run_id": True},
+                        {**valid, "test_id": float(pair[0])},
+                    ]
+                    wrong.extend({k: value for k, value in valid.items() if k != field}
+                                 for field in ("run_id", "test_id", "proof_class"))
+                    for envelope in wrong:
+                        row = check(envelope)
+                        self.assertEqual(row["status"], "INVALID_EVIDENCE")
+                        self.assertEqual(row["reason"], "evidence manifest does not bind the run and proof key")
 
     def test_stable_ids_and_required_runtime_proofs_are_enforced(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -133,14 +172,15 @@ class VerdictTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             r=Path(d);m,p=self.setup_run(r)
             f=r/"evidence"/(p.stem+".json")
-            members=json.loads(f.read_bytes())["files"]
+            envelope=json.loads(f.read_bytes())
+            members=envelope["files"]
             old=r/members[0]["path"]
             alias=r/"evidence"/"alias.bin"
             os.link(old,alias)
             for spelling in ("evidence/./object.bin","evidence//object.bin","evidence/alias.bin"):
                 entries = [members[0], {**members[0], "path": spelling}]
                 entries.sort(key=lambda entry: entry["path"].encode("utf-8"))
-                ambiguous=json.dumps({"files":entries}).encode()
+                ambiguous=json.dumps({**envelope,"files":entries}).encode()
                 f.write_bytes(ambiguous)
                 rec=bytearray(p.read_bytes());struct.pack_into("<I",rec,36,2)
                 rec[256:288]=hashlib.sha256(ambiguous).digest()
