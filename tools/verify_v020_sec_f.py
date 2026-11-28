@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import struct
 
+import v020_g1_snapshot_wire as snapshot_wire
 from v020_g1_genesis import ACL, BOOT, INDEX, ROOT, SECURITY, _genesis_blocks
 from v020_snapshot_catalog_vectors import Catalog, Entry, encode as encode_catalog
 from v020_snapshot_envelopes import (BITMAP_START, BLOCK_BYTES, BLOCK_COUNT, INODE_START,
@@ -142,6 +143,76 @@ def nonempty_pages(config):
     return blocks
 
 
+def restored_pages(config):
+    """A disposable checkpoint after RESTORE committed and before OPEN_WRITES."""
+    blocks = nonempty_pages(config)
+    uuid = config[16:32]
+    raw = bytearray(blocks[1])
+    struct.pack_into("<3Q", raw, 32, 2, 4, 2)
+    blocks[1] = seal(raw, 76)
+    raw = bytearray(blocks[BOOT])
+    struct.pack_into("<Q", raw, 24, 1)
+    blocks[BOOT] = seal(raw, 32)
+    raw = bytearray(blocks[SECURITY])
+    previous, = struct.unpack_from("<Q", raw, 24)
+    struct.pack_into("<Q", raw, 24, previous + 1)
+    struct.pack_into("<Q", raw, 64, 1)
+    blocks[SECURITY] = seal(raw, 72)
+
+    blocks[INODE_START] = blocks[4133]
+    raw = bytearray(blocks[BITMAP_START])
+    for block in (ROOT, ROOT + 1):
+        raw[block // 8] &= ~(1 << (block % 8))
+    blocks[BITMAP_START] = bytes(raw)
+
+    key = struct.pack("<16sIQQ", uuid, 15, 1, 1)
+    source = struct.pack("<16sQIIQ", uuid, 1, 0, 0, 1)
+    body = source + struct.pack("<II", 2, 0)
+    result = source + struct.pack("<QQ16sQQII", 1, 2, uuid, 1, 1, 1, 0)
+    request = snapshot_wire.read_request(snapshot_wire.frame(0x23, 1, body, key, 1), 9)
+    record = snapshot_wire.record(request, state=2, snapshot=source, new_view=2,
+                                  log=1, txid=1, payload=result, lsn=4)
+    _, state, _, _, _, lsn, view, digest = snapshot_wire.read_record(record)
+    require((state, lsn, view) == (2, 4, 2), "independent RESTORE record differs")
+    blocks[4252] = snapshot_wire.header({15: (1, 1)}, uuid=uuid, generation=2)
+    blocks[4260] = record.ljust(BLOCK_BYTES, b"\0")
+    raw = bytearray(blocks[4268])
+    struct.pack_into("<Q", raw, 56, 2)
+    raw[137:139] = bytes((2, 1))
+    raw[176:208] = digest
+    blocks[4268] = seal(raw, 32)
+    return blocks
+
+
+def verify_retained_restore(args, config):
+    pages = restored_pages(config)
+    name = "retained-restore"
+    image = args.output / f"{name}.raw"
+    with create_raw(image) as disk:
+        write_pages(disk, pages)
+    result = boot(str(args.qemu), args.unified_elf, args.output / name, args.timeout,
+                  image, 2, expected_policy_envelope=config)
+    require(result["status"] == "PASS", f"{name}: {result.get('error')}")
+    lines = (args.output / name / "serial.txt").read_text().splitlines()
+    require(rows(lines, "V020_SEC_F_SNAPSHOT_RESTORE_RETAINED") == [(1, 2, 4)]
+            and rows(lines, "V020_SEC_F_SNAPSHOT_MOUNT") == [(1, 0, 0)],
+            "authenticated cold reopen did not retain the exact closed restore")
+    with image.open("rb") as disk:
+        require(at(disk, 4260) == pages[4260] and at(disk, 4268) == pages[4268]
+                and at(disk, INODE_START) == pages[INODE_START]
+                and at(disk, ROOT + 3) == pages[ROOT + 3],
+                "restore receipt, protection or committed live root changed on boot")
+
+    name = "restore-missing-receipt"
+    image = args.output / f"{name}.raw"
+    pages[4260] = bytes(BLOCK_BYTES)
+    with create_raw(image) as disk:
+        write_pages(disk, pages)
+    refused = rejected(args, args.unified_elf, name, image)
+    return {"boot_epoch": 2, "live_view_epoch": 2, "restore_lsn": 4,
+            "writes_open": False, "missing_receipt": refused}
+
+
 def independent_file_readback(image, completed):
     with image.open("rb") as disk:
         copies = [at(disk, index) for index in range(2)]
@@ -245,6 +316,7 @@ def run(args):
             evidence["cases"][name] = {"boot_epochs": [1, 2], "historical_only_blocks": 2, "writes_open": False}
         else:
             evidence["cases"][name] = rejected(args, elf, name, image)
+    evidence["cases"]["retained-restore"] = verify_retained_restore(args, config)
     evidence["status"] = "PASS"
     (args.output / "verification.json").write_text(json.dumps(evidence, indent=2) + "\n")
 

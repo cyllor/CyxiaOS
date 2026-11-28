@@ -9,7 +9,7 @@ use cyxia_kernel_core::security::{
             CatalogContext, CatalogEntry, CatalogRecord,
             lifecycle::{
                 CaptureRequest, CaptureWorkspace, ExpectedState, SlotClass, commit_capture,
-                extend_retention, mark_expired, verify_restore_source,
+                extend_retention, verify_restore_source,
             },
             verify_catalog,
         },
@@ -17,7 +17,7 @@ use cyxia_kernel_core::security::{
         protection_candidate::{ProtectionRecord, RestorePhase},
     },
     file_media_v0199::crc32c_zeroed,
-    recovery_v1::{RecoveryWorkspace, RedoImage, RedoWriter},
+    recovery_v1::{RecoveryWorkspace, RedoWriter},
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -262,60 +262,6 @@ fn capture_and_retention_replay_bind_one_frozen_view() {
         extend_retention(&mut writer, after, identity, 155, |_| panic!(
             "stale owner view"
         )),
-        Err(Error::Stale)
-    ));
-    after.catalog.committed_lsn = extension_lsn;
-    after.protection_sha256 = Sha256::digest(raw).into();
-    assert!(matches!(
-        mark_expired(&mut writer, after, identity, |_| panic!(
-            "retention remains active"
-        )),
-        Err(Error::Busy)
-    ));
-
-    // Simulate an independently authorized advance of the persisted age.
-    expected_protection.online_age_ns = 150;
-    expected_protection.object_generation += 1;
-    expected_protection.encode(&mut raw).unwrap();
-    let clock = writer.prepare(1).unwrap();
-    writer
-        .append(
-            clock,
-            &[RedoImage {
-                home: SNAPSHOT_PROTECTION_BLOCK,
-                contents: &raw,
-            }],
-            |_| Ok(()),
-        )
-        .unwrap();
-    after.catalog.committed_lsn = clock.commit_lsn;
-    after.catalog.online_age_ns = expected_protection.online_age_ns;
-    after.protection_sha256 = Sha256::digest(raw).into();
-    let drop_root = mark_expired(&mut writer, after, identity, |_| Ok(()))
-        .unwrap()
-        .transaction();
-    writer
-        .read_committed_at(SNAPSHOT_CATALOG_BLOCK, drop_root.commit_lsn, &mut raw)
-        .unwrap();
-    after.catalog.committed_lsn = drop_root.commit_lsn;
-    after.catalog.catalog_generation += 1;
-    after.catalog_sha256 = Sha256::digest(raw).into();
-    let dropped = CatalogRecord::decode(SNAPSHOT_CATALOG_BLOCK, &raw).unwrap();
-    assert!(matches!(
-        dropped.entries[6],
-        CatalogEntry::Deleting { binding, root_drop_commit_lsn }
-            if binding.identity == identity && root_drop_commit_lsn == drop_root.commit_lsn
-    ));
-    assert!(matches!(
-        commit_capture(&mut writer, after, REQUEST, &mut capture, |_, _, _| {
-            panic!("deleting slot remains in custody")
-        }),
-        Err(Error::Busy)
-    ));
-    assert!(matches!(
-        verify_restore_source(&mut writer, after, identity, |_, _| {
-            panic!("deleting slot is unavailable to restore lookup")
-        }),
         Err(Error::Stale)
     ));
     // The captured mirror is still committed at its original capture.

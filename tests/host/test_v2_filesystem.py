@@ -5,6 +5,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tools'))
 from check_v2_filesystem import inspect, crc32c, BLOCK, FIRST_BUSINESS_BLOCK as BUSINESS
@@ -167,6 +168,73 @@ class SnapshotVolume(unittest.TestCase):
         self.assertEqual(result['snapshots'][0]['files']['/value']['sha256'], hashlib.sha256(b'A' * BLOCK).hexdigest())
         self.assertEqual(result['reachable_business_blocks'], 3)
         self.assertEqual(result['garbage_blocks'], 0)
+
+    def test_g1_export_keeps_live_and_historical_versions_and_watermarks(self):
+        import json
+        from v020_g1_export_v2 import export_volume
+
+        self.capture()
+        self.write(BUSINESS + 2, b'B' * BLOCK)
+        table = bytearray(self.read(4102))
+        table[256:512] = node(1, 1, BLOCK, 0, BUSINESS + 2, sequence=2)
+        bitmap = bytearray(self.read(4098))
+        bitmap[(BUSINESS + 2) // 8] |= 1 << ((BUSINESS + 2) % 8)
+        system_inodes = bytearray(self.read(4116))
+        system_inodes[256:512] = node(225, 1, 64, 224, 4241, sequence=6)
+        boot = bytearray(self.read(4241))
+        struct.pack_into('<Q', boot, 24, 6)
+        struct.pack_into('<I', boot, 32, crc32c(boot[:32]))
+        requests = bytearray(self.read(8338))
+        watermark = bytearray(requests[512:640])
+        struct.pack_into('<QQ', watermark, 16, 4, 9)
+        requests[512:640] = seal(watermark, 124)
+        records = bytearray(self.read(8339))
+        pending = bytearray(records[:512])
+        struct.pack_into('<IH', pending, 8, 1, 0x20)
+        struct.pack_into('<16sIQQ', pending, 16, UUID, 0, 4, 9)
+        records[:512] = seal(pending, 508)
+        self.transaction(2, 1, 1, [(4102, table), (4098, bitmap), (4116, system_inodes),
+                                   (4241, boot), (8338, seal(requests, 508)), (8339, records)])
+        before = self.path.stat()
+        output = self.path.with_name('export.zip')
+
+        report = export_volume(self.path, output)
+        with zipfile.ZipFile(output) as archive:
+            manifest = json.loads(archive.read('manifest.json'))
+            live = manifest['live']['files']['/value']
+            snapshot = manifest['snapshots'][0]
+            historic = snapshot['files']['/value']
+            self.assertEqual((live['durable_write_seq'], historic['durable_write_seq']), (2, 1))
+            self.assertEqual(archive.read(f"objects/{live['sha256']}"), b'B' * BLOCK)
+            self.assertEqual(archive.read(f"objects/{historic['sha256']}"), b'A' * BLOCK)
+            self.assertNotEqual(manifest['live']['logical_tree_sha256'], snapshot['logical_tree_sha256'])
+            self.assertEqual(snapshot['retain_until_ns'], 3600 * 10**9)
+            self.assertEqual(manifest['slot_generations'], [0, 0, 0, 0, 0, 0, 1, 0])
+            self.assertEqual(manifest['request_watermarks'][0], {'slot': 0, 'generation': 4, 'issued_hi': 9})
+            self.assertEqual(manifest['boot_epoch'], 6)
+            self.assertEqual(manifest['volume']['last_commit_lsn'], 8)
+            self.assertEqual(manifest['request_records'], [
+                {'index': 0, 'state': 1, 'operation': 0x20, 'client_slot': 0,
+                 'client_generation': 4, 'request_seq': 9}])
+            self.assertEqual(archive.read('legacy/requests.bin')[:2 * BLOCK], requests + records)
+        self.assertEqual(struct.unpack_from('<Q', self.read(4241), 24)[0], 0)
+        self.assertEqual(report['source_sha256'], manifest['source_sha256'])
+        self.assertEqual((self.path.stat().st_ino, self.path.stat().st_mtime_ns), (before.st_ino, before.st_mtime_ns))
+        digest = hashlib.sha256(output.read_bytes()).digest()
+        with self.assertRaises(FileExistsError):
+            export_volume(self.path, output)
+        self.assertEqual(hashlib.sha256(output.read_bytes()).digest(), digest)
+
+    def test_g1_export_refuses_mixed_media_without_publishing_an_archive(self):
+        from v020_g1_export_v2 import export_volume
+
+        incompatible = bytearray(self.read(1))
+        struct.pack_into('<H', incompatible, 4, 1)
+        self.write(1, seal(incompatible, 108))
+        output = self.path.with_name('export.zip')
+        with self.assertRaisesRegex(ValueError, 'v2 superblock pair'):
+            export_volume(self.path, output)
+        self.assertFalse(output.exists())
 
     def test_snapshot_digest_and_required_old_allocation_fail_closed(self):
         self.capture()

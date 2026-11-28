@@ -13,6 +13,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 mod business_package;
+pub mod file_owner;
 pub mod file_volume;
 mod lifecycle_packages;
 mod profile;
@@ -301,6 +302,41 @@ mod tests {
         assert_eq!(
             catalog.qualify_business_task_services(&policy, package, &expanded, &task_signature),
             Err(Error::Unauthorized)
+        );
+
+        let mut owner_grant = [0; file_owner::BYTES];
+        owner_grant[..8].copy_from_slice(b"CYXFSV01");
+        owner_grant[8..10].copy_from_slice(&12u16.to_le_bytes());
+        owner_grant[10..12].copy_from_slice(&3u16.to_le_bytes());
+        owner_grant[12..14].copy_from_slice(&3u16.to_le_bytes());
+        owner_grant[16..].copy_from_slice(&12_000_000u64.to_le_bytes());
+        let owner_message = [
+            &b"CYX/STARTUP-FILE-OWNER/v1"[..],
+            &policy.digest(),
+            &package,
+            &owner_grant,
+        ]
+        .concat();
+        let owner_signature = signer.sign(&owner_message).to_bytes();
+        use file_owner::FileOwnerGrant;
+        assert_eq!(
+            FileOwnerGrant::verify(&catalog, &policy, package, &owner_grant, &owner_signature),
+            Ok(FileOwnerGrant {
+                budget_ns: 12_000_000
+            })
+        );
+        assert_eq!(
+            FileOwnerGrant::verify(&catalog, &policy, package, &owner_grant, &task_signature),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            FileOwnerGrant::verify(&catalog, &policy, [22; 32], &owner_grant, &owner_signature),
+            Err(Error::Unauthorized)
+        );
+        owner_grant[12] = 2;
+        assert_eq!(
+            FileOwnerGrant::verify(&catalog, &policy, package, &owner_grant, &owner_signature),
+            Err(Error::Invalid)
         );
         let other_authority = PinnedStartupCatalog {
             boot_public_key: &SigningKey::from_bytes(&[0x39; 32])

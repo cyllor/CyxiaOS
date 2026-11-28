@@ -218,14 +218,14 @@ def read_record(raw):
     return key, state, code, log, txid, lsn, after, raw[184:216]
 
 
-def header(marks):
+def header(marks, uuid=UUID, generation=9):
     raw = bytearray(4096)
-    pack_into("<IHH16sQ", raw, 0, 0x43595152, 1, 40, UUID, 9)
+    pack_into("<IHH16sQ", raw, 0, 0x43595152, 1, 40, uuid, generation)
     pack_into("<8H", raw, 40, 1, 128, 512, 64, 16, 48, 8, 8)
     for slot in range(16):
-        generation, seq = marks.get(slot, (0, 0))
+        client_generation, seq = marks.get(slot, (0, 0))
         row = bytearray(128)
-        pack_into("<IHHIIQQ", row, 0, 0x4359574D, 1, 128, slot, 0, generation, seq)
+        pack_into("<IHHIIQQ", row, 0, 0x4359574D, 1, 128, slot, 0, client_generation, seq)
         raw[512 + 128 * slot:640 + 128 * slot] = sealed(row, 124)
     return sealed(raw, 32)
 

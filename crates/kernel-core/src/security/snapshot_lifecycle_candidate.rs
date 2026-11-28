@@ -5,29 +5,32 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::control_plane::Identity;
 use crate::security::{
     Error,
+    boot_epoch_v1::BootEpochStoreV1,
     epoch_redo_v0199::EpochBlockIo,
     file_media_unified_v1::{
-        BITMAP_START, INODE_START, PERIODIC_SLOTS, SHORT_TIER_SLOTS, SNAP_CAP_PROTECTION,
-        SNAP_OP_OPEN_WRITES, SNAP_OP_RESTORE, SNAPSHOT_CATALOG_BLOCK, SNAPSHOT_PROTECTION_BLOCK,
+        BITMAP_START, INODE_START, PERIODIC_SLOTS, SHORT_TIER_SLOTS, SNAP_OP_DELETE_EXPIRED,
+        SNAP_OP_OPEN_WRITES, SNAPSHOT_CATALOG_BLOCK, SNAPSHOT_PROTECTION_BLOCK,
         SNAPSHOT_REQUEST_START, SNAPSHOT_STRIDE, SUPER_BYTES, SuperblockV1, UnifiedSystemKind,
-        UnifiedSystemObject, cap_word_valid,
+        UnifiedSystemObject,
         protection_candidate::{ProtectionRecord, RestorePhase},
         request_store::{
-            RequestRecord, RequestState, RequestStoreHeader, inspect_request_store,
-            record_location, record_partition,
+            RequestRecord, RequestState, RequestStoreHeader, inspect_positioned_request_store,
+            inspect_request_store, record_location, record_partition,
         },
         slot_candidate::{SlotDescriptor, SlotIdentity, validate_mirror_page},
         unified_superblock_pair,
     },
-    file_mount_v1::{self, Acl, Workspace as MountWorkspace},
-    file_structure_v1::{Inode, SystemObject},
+    file_mount_v1::{self, Acl, MountEvidence, MountedSnapshots, Workspace as MountWorkspace},
+    file_structure_v1::{Inode, SystemKind, SystemObject},
     offline_config_v1::Principal,
     recovery_v1::{CommittedRedo, RedoImage, RedoTransaction, RedoWriter},
     snapshot_restore_gate::{RestoreGate, SnapshotKey},
-    snapshot_service_v4::{FileReqKey, Operation},
+    snapshot_service_v4::{
+        CallBinding, FileReqKey, Operation, SnapshotGrant, SnapshotKey as WireSnapshotKey,
+        SnapshotRequest,
+    },
 };
 
 use super::{
@@ -297,19 +300,22 @@ pub fn extend_retention<I: EpochBlockIo>(
     )
 }
 
-/// Drop the selected active root from lookup by durably marking its slot
-/// DELETING at the exact redo LSN. The protected owner independently
-/// authorizes deletion, blocks new readers and verifies all prior reference
-/// obligations in `reserve`. The slot and its bytes remain in GC custody.
-pub fn mark_expired<I: EpochBlockIo>(
-    writer: &mut RedoWriter<'_, I>,
-    expected: ExpectedState,
-    identity: SlotIdentity,
-    reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
-) -> Result<CommittedRedo, Error> {
-    let (mut catalog, protection) = read_current(writer, expected)?;
-    let binding = active_binding(&catalog, identity)?;
-    let slot = identity.slot as usize;
+fn expiring_binding(
+    catalog: &CatalogRecord,
+    protection: &ProtectionRecord,
+    target: WireSnapshotKey,
+) -> Result<CatalogBinding, Error> {
+    let slot = target.slot as usize;
+    let Some(CatalogEntry::Active(binding)) = catalog.entries.get(slot) else {
+        return Err(Error::Stale);
+    };
+    let identity = binding.identity;
+    if target.fs_uuid != identity.fs_uuid
+        || target.snapshot_id != identity.snapshot_id
+        || target.slot_generation != identity.slot_generation
+    {
+        return Err(Error::Stale);
+    }
     if protection.writes_open
         || protection.restore_phase != RestorePhase::Idle
         || protection.cleanup_frozen
@@ -332,29 +338,326 @@ pub fn mark_expired<I: EpochBlockIo>(
             return Err(Error::Busy);
         }
     }
-    let plan = writer.prepare(1)?;
-    catalog.generation = catalog.generation.checked_add(1).ok_or(Error::Exhausted)?;
-    catalog.entries[slot] = CatalogEntry::Deleting {
-        binding,
-        root_drop_commit_lsn: plan.commit_lsn,
+    Ok(*binding)
+}
+
+/// Reserve DELETE_EXPIRED for the exact authorized principal and active root.
+/// A same-key retry returns the original receipt before planning a new drop.
+pub fn admit_expiration<I: EpochBlockIo>(
+    writer: &mut RedoWriter<'_, I>,
+    call: SnapshotMutationCall<'_>,
+    work: &mut CaptureWorkspace,
+    reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
+) -> Result<SnapshotAdmission, Error> {
+    let Operation::DeleteExpired(target) = call.request.operation else {
+        return Err(Error::Invalid);
     };
-    let mut contents = [0; SUPER_BYTES];
-    catalog.encode(&mut contents)?;
-    writer.append(
-        plan,
-        &[RedoImage {
-            home: SNAPSHOT_CATALOG_BLOCK,
-            contents: &contents,
-        }],
+    admit_mutation(
+        writer,
+        call,
+        work,
+        None,
+        |snapshot, _| {
+            let catalog = snapshot.catalog.as_ref().ok_or(Error::Stale)?;
+            let protection = snapshot.protection.as_ref().ok_or(Error::Stale)?;
+            expiring_binding(catalog, protection, target)?;
+            Ok(())
+        },
         reserve,
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OpenWritesRequest {
-    pub actor: Identity,
-    pub rights: u32,
-    pub key: FileReqKey,
+/// Publish the DELETING catalog entry and exact DONE receipt together.
+/// The protected owner blocks new readers and verifies earlier reference
+/// obligations in `reserve`. The root's blocks remain in GC custody.
+pub fn mark_expired<I: EpochBlockIo>(
+    writer: &mut RedoWriter<'_, I>,
+    expected: ExpectedState,
+    call: SnapshotMutationCall<'_>,
+    work: &mut CaptureWorkspace,
+    reserve: impl FnOnce(&RedoTransaction, SlotIdentity) -> Result<(), Error>,
+) -> Result<CommittedRedo, Error> {
+    let Operation::DeleteExpired(target) = call.request.operation else {
+        return Err(Error::Invalid);
+    };
+    let [catalog_page, request_page, scratch, ..] = &mut work.pages;
+    let key = verify_mutation_call(writer, call, scratch)?;
+    let (mut catalog, protection) = read_current(writer, expected)?;
+    let binding = expiring_binding(&catalog, &protection, target)?;
+    let journal = writer.evidence().ok_or(Error::Unknown)?;
+    writer.read_committed(SNAPSHOT_REQUEST_START, scratch)?;
+    let header = RequestStoreHeader::decode(scratch)?.ok_or(Error::Conflict)?;
+    let mut pending = None;
+    let requests = inspect_positioned_request_store(
+        journal.superblock.fs_uuid,
+        header.generation,
+        journal.last_commit_lsn,
+        |home, page| writer.read_committed(home, page),
+        |index, record| {
+            if record.log_epoch > journal.superblock.log_epoch {
+                return Err(Error::Conflict);
+            }
+            if record.key == key {
+                pending = Some((index, *record));
+            }
+            Ok(())
+        },
+    )?;
+    let (index, pending) = pending.ok_or(Error::Stale)?;
+    if requests.nonterminal != 1 || pending.state != RequestState::Pending {
+        return Err(Error::Busy);
+    }
+    if pending.operation != SNAP_OP_DELETE_EXPIRED
+        || pending.request_digest != call.request.digest()?
+    {
+        return Err(Error::Conflict);
+    }
+
+    let plan = writer.prepare(2)?;
+    catalog.generation = catalog.generation.checked_add(1).ok_or(Error::Exhausted)?;
+    catalog.entries[target.slot as usize] = CatalogEntry::Deleting {
+        binding,
+        root_drop_commit_lsn: plan.commit_lsn,
+    };
+    catalog.encode(catalog_page)?;
+
+    let mut terminal = pending;
+    terminal.state = RequestState::Done;
+    terminal.log_epoch = plan.log_epoch;
+    terminal.txid = plan.txid;
+    terminal.commit_lsn = plan.commit_lsn;
+    let mut result = [0; 56];
+    result[..40].copy_from_slice(&target.encode()?);
+    result[40..48].copy_from_slice(&plan.commit_lsn.to_le_bytes());
+    result[48..52].copy_from_slice(&1u32.to_le_bytes());
+    terminal.replace_payload(&result)?;
+    terminal.seal_result()?;
+    pending.permits_transition(&terminal)?;
+    let (home, range) = record_location(index)?;
+    writer.read_committed(home, request_page)?;
+    terminal.encode(
+        (&mut request_page[range])
+            .try_into()
+            .map_err(|_| Error::Conflict)?,
+    )?;
+    let images = [
+        RedoImage {
+            home: SNAPSHOT_CATALOG_BLOCK,
+            contents: catalog_page,
+        },
+        RedoImage {
+            home,
+            contents: request_page,
+        },
+    ];
+    writer.append(plan, &images, |plan| reserve(plan, binding.identity))
+}
+
+/// The stopped caller and copied D7 request. The protected owner supplies
+/// the exact live grant and the authoritative service generation from its
+/// registry. This host candidate checks their binding and reads BootEpoch
+/// from committed media; it has no native dispatch or registry.
+#[derive(Clone, Copy)]
+pub struct SnapshotMutationCall<'a> {
+    pub mount: &'a MountEvidence,
+    pub binding: CallBinding,
+    pub grant: SnapshotGrant,
+    pub request: &'a SnapshotRequest<'a>,
+}
+
+pub struct SnapshotAdmission {
+    pub record: RequestRecord,
+    pub reserved: Option<CommittedRedo>,
+}
+
+/// Persist the exact PENDING request and sequence watermark together. The
+/// caller retains the checked grant, exclusive media ownership and progress
+/// reservation; qualification of a later write still requires the DONE proof.
+pub fn admit_open_writes<I: EpochBlockIo>(
+    writer: &mut RedoWriter<'_, I>,
+    gate: &RestoreGate,
+    call: SnapshotMutationCall<'_>,
+    work: &mut CaptureWorkspace,
+    reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
+) -> Result<SnapshotAdmission, Error> {
+    let request = call.request;
+    let Operation::OpenWrites { restore, .. } = request.operation else {
+        return Err(Error::Invalid);
+    };
+    admit_mutation(
+        writer,
+        call,
+        work,
+        Some(restore),
+        |snapshot, restored| {
+            let protection = snapshot.protection.ok_or(Error::Stale)?;
+            request.verify_new_mutation(
+                protection.live_view_epoch,
+                protection.protection_generation,
+            )?;
+            if protection.restore_phase != RestorePhase::RestoredFrozen
+                || protection.writes_open
+                || gate.view().protection_generation != protection.protection_generation
+            {
+                return Err(Error::Stale);
+            }
+            if !snapshot
+                .catalog
+                .as_ref()
+                .is_some_and(CatalogRecord::has_periodic_coverage)
+            {
+                return Err(Error::Busy);
+            }
+            let (prepared, commit) = gate.restore_for_reopen(call.binding.holder, gate.view())?;
+            let restored = restored.ok_or(Error::Stale)?;
+            if snapshot.completed_restore() != Some(&restored)
+                || !restored.identifies_restore(prepared, commit)
+            {
+                return Err(Error::Conflict);
+            }
+            Ok(())
+        },
+        reserve,
+    )
+}
+
+fn verify_mutation_call<I: EpochBlockIo>(
+    writer: &mut RedoWriter<'_, I>,
+    call: SnapshotMutationCall<'_>,
+    scratch: &mut [u8; SUPER_BYTES],
+) -> Result<FileReqKey, Error> {
+    call.request.verify_grant(call.binding, call.grant, &[])?;
+    if call.mount.snapshot.is_none() {
+        return Err(Error::Unauthorized);
+    }
+    let boot_home = call
+        .mount
+        .baseline_system()
+        .and_then(|objects| {
+            objects
+                .iter()
+                .find(|object| object.kind == SystemKind::BootEpoch)
+        })
+        .ok_or(Error::Unauthorized)?
+        .first_block;
+    let journal = writer.evidence().ok_or(Error::Unknown)?;
+    let boot = call.mount.boot;
+    let key = call.request.durable_key.ok_or(Error::Invalid)?;
+    if boot.boot_epoch != call.binding.boot_epoch
+        || boot.fs_uuid != key.fs_uuid
+        || journal.superblock.fs_uuid != boot.fs_uuid
+    {
+        return Err(Error::Stale);
+    }
+    if journal.incomplete_tail {
+        return Err(Error::Unknown);
+    }
+
+    writer.read_committed(boot_home, scratch)?;
+    if BootEpochStoreV1::decode(scratch)? != boot {
+        return Err(Error::Stale);
+    }
+    Ok(key)
+}
+
+fn admit_mutation<I: EpochBlockIo>(
+    writer: &mut RedoWriter<'_, I>,
+    call: SnapshotMutationCall<'_>,
+    work: &mut CaptureWorkspace,
+    prerequisite: Option<FileReqKey>,
+    qualify: impl FnOnce(&MountedSnapshots, Option<RequestRecord>) -> Result<(), Error>,
+    reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
+) -> Result<SnapshotAdmission, Error> {
+    let snapshot = call.mount.snapshot.as_ref().ok_or(Error::Unauthorized)?;
+    let [header_page, request_page, scratch, ..] = &mut work.pages;
+    let key = verify_mutation_call(writer, call, scratch)?;
+    let journal = writer.evidence().ok_or(Error::Unknown)?;
+    writer.read_committed(SNAPSHOT_REQUEST_START, header_page)?;
+    let mut header = RequestStoreHeader::decode(header_page)?.ok_or(Error::Conflict)?;
+    let mut retained = None;
+    let mut prior = None;
+    let requests = inspect_request_store(
+        key.fs_uuid,
+        header.generation,
+        journal.last_commit_lsn,
+        |block, page| writer.read_committed(block, page),
+        |record| {
+            if record.log_epoch > journal.superblock.log_epoch {
+                return Err(Error::Conflict);
+            }
+            if record.key == key {
+                retained = Some(*record);
+            }
+            if Some(record.key) == prerequisite {
+                prior = Some(*record);
+            }
+            Ok(())
+        },
+    )?;
+    // Inspect the exact previously retained request before generation checks
+    // for a new side effect. Any uncertain prior outcome is returned as-is.
+    if let Some(record) = retained {
+        if record.request_digest != call.request.digest()? {
+            return Err(Error::Conflict);
+        }
+        return Ok(SnapshotAdmission {
+            record,
+            reserved: None,
+        });
+    }
+    if requests.nonterminal != 0 {
+        return Err(Error::Busy);
+    }
+    snapshot.verify_current(scratch, |block, page| writer.read_committed(block, page))?;
+    qualify(snapshot, prior)?;
+
+    let mark = &mut header.watermarks[key.client_slot as usize];
+    if key.client_generation != mark.client_generation
+        || key.request_seq <= mark.highest_accepted_seq
+    {
+        return Err(Error::Stale);
+    }
+    *mark = mark.next(key)?;
+    header.generation = header.generation.checked_add(1).ok_or(Error::Exhausted)?;
+    header.encode(header_page)?;
+
+    // Each principal may consume only its physically reserved class.
+    let partition = record_partition(key.client_slot).ok_or(Error::Invalid)?;
+    let mut current_home = None;
+    let mut free = None;
+    for index in partition {
+        let (row_home, range) = record_location(index)?;
+        if current_home != Some(row_home) {
+            writer.read_committed(row_home, request_page)?;
+            current_home = Some(row_home);
+        }
+        if request_page[range.clone()].iter().all(|&byte| byte == 0) {
+            free = Some((row_home, range));
+            break;
+        }
+    }
+    let (home, range) = free.ok_or(Error::Capacity)?;
+    let record = RequestRecord::pending(call.request)?;
+    record.encode(
+        (&mut request_page[range])
+            .try_into()
+            .map_err(|_| Error::Conflict)?,
+    )?;
+    let images = [
+        RedoImage {
+            home: SNAPSHOT_REQUEST_START,
+            contents: header_page,
+        },
+        RedoImage {
+            home,
+            contents: request_page,
+        },
+    ];
+    let committed = writer.append(writer.prepare(images.len())?, &images, reserve)?;
+    Ok(SnapshotAdmission {
+        record,
+        reserved: Some(committed),
+    })
 }
 
 /// Complete a reserved OPEN_WRITES request under the independent protection
@@ -366,18 +669,21 @@ pub fn commit_open_writes<I: EpochBlockIo>(
     writer: &mut RedoWriter<'_, I>,
     expected: ExpectedState,
     gate: &mut RestoreGate,
-    request: OpenWritesRequest,
+    call: SnapshotMutationCall<'_>,
     work: &mut CaptureWorkspace,
     reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
 ) -> Result<CommittedRedo, Error> {
-    if !cap_word_valid(request.rights)
-        || request.rights & SNAP_CAP_PROTECTION == 0
-        || request.key.client_slot != 15
-    {
-        return Err(Error::Unauthorized);
-    }
+    let Operation::OpenWrites { restore, .. } = call.request.operation else {
+        return Err(Error::Invalid);
+    };
+    let [page, gate_page, ..] = &mut work.pages;
+    let key = verify_mutation_call(writer, call, page)?;
+    let actor = call.binding.holder;
     let (catalog, mut protection) = read_current(writer, expected)?;
+    call.request
+        .verify_new_mutation(protection.live_view_epoch, protection.protection_generation)?;
     let view = gate.view();
+    let (prepared, restore_commit) = gate.restore_for_reopen(actor, view)?;
     if protection.restore_phase != RestorePhase::RestoredFrozen
         || protection.writes_open
         || view.fs_uuid != protection.fs_uuid
@@ -390,18 +696,25 @@ pub fn commit_open_writes<I: EpochBlockIo>(
         return Err(Error::Busy);
     }
 
-    let [page, gate_page, ..] = &mut work.pages;
+    let journal = writer.evidence().ok_or(Error::Unknown)?;
     writer.read_committed(SNAPSHOT_REQUEST_START, page)?;
     let header = RequestStoreHeader::decode(page)?.ok_or(Error::Conflict)?;
     let mut open = None;
-    let requests = inspect_request_store(
+    let mut restored = None;
+    let requests = inspect_positioned_request_store(
         expected.catalog.fs_uuid,
         header.generation,
         expected.catalog.committed_lsn,
         |home, out| writer.read_committed(home, out),
-        |record| {
-            if record.key == request.key {
-                open = Some(*record);
+        |index, record| {
+            if record.log_epoch > journal.superblock.log_epoch {
+                return Err(Error::Conflict);
+            }
+            if record.key == key {
+                open = Some((index, *record));
+            }
+            if record.key == restore {
+                restored = Some(*record);
             }
             Ok(())
         },
@@ -409,51 +722,16 @@ pub fn commit_open_writes<I: EpochBlockIo>(
     if requests.nonterminal != 1 {
         return Err(Error::Busy);
     }
-    let open = open.ok_or(Error::Stale)?;
+    let (index, open) = open.ok_or(Error::Stale)?;
     if open.operation != SNAP_OP_OPEN_WRITES
         || open.state != RequestState::Pending
         || open.old_live_view_epoch != protection.live_view_epoch
     {
         return Err(Error::Stale);
     }
-    let Operation::OpenWrites {
-        protection_generation,
-        restore,
-    } = Operation::decode(open.operation, open.payload())?
-    else {
-        return Err(Error::Invalid);
-    };
-    if protection_generation != protection.protection_generation || restore.client_slot != 15 {
-        return Err(Error::Stale);
-    }
-
-    // Both recovery requests must be in the physically reserved class.
-    let first = record_partition(15).ok_or(Error::Invalid)?.start;
-    let (home, _) = record_location(first)?;
-    writer.read_committed(home, page)?;
-    let mut open_index = None;
-    let mut restored = None;
-    for index in record_partition(15).ok_or(Error::Invalid)? {
-        let (row_home, range) = record_location(index)?;
-        if row_home != home {
-            return Err(Error::Conflict);
-        }
-        let raw = &page[range];
-        if raw.iter().all(|&byte| byte == 0) {
-            continue;
-        }
-        let record = RequestRecord::decode(raw)?;
-        if record == open {
-            open_index = Some(index);
-        }
-        if record.key == restore {
-            restored = Some(record);
-        }
-    }
-    let slot = open_index.ok_or(Error::Conflict)?;
     let restored = restored.ok_or(Error::Stale)?;
-    if restored.operation != SNAP_OP_RESTORE
-        || restored.state != RequestState::Done
+    if open.request_digest != call.request.digest()?
+        || !restored.identifies_restore(prepared, restore_commit)
         || restored.new_live_view_epoch != protection.live_view_epoch
         || restored.result_digest != protection.restore_obligation_digest
     {
@@ -481,7 +759,8 @@ pub fn commit_open_writes<I: EpochBlockIo>(
     terminal.replace_payload(&result)?;
     terminal.seal_result()?;
     open.permits_transition(&terminal)?;
-    let (_, range) = record_location(slot)?;
+    let (home, range) = record_location(index)?;
+    writer.read_committed(home, page)?;
     terminal.encode((&mut page[range]).try_into().map_err(|_| Error::Invalid)?)?;
     protection.writes_open = true;
     protection.restore_phase = RestorePhase::Idle;
@@ -499,15 +778,7 @@ pub fn commit_open_writes<I: EpochBlockIo>(
         },
     ];
     let mut committed = None;
-    gate.reopen_next_protection(request.actor, view, |_, restore_commit| {
-        if restore_commit.key.request_seq != restored.key.request_seq
-            || restore_commit.txid != restored.txid
-            || restore_commit.log_epoch != restored.log_epoch
-            || restore_commit.commit_lsn != restored.commit_lsn
-            || restore_commit.request_hash != restored.request_digest
-        {
-            return Err(Error::Conflict);
-        }
+    gate.reopen_next_protection(actor, view, |_, _| {
         committed = Some(writer.append(plan, &images, reserve)?);
         Ok(())
     })?;
@@ -636,6 +907,9 @@ pub fn retire_deleted_snapshot<I: EpochBlockIo>(
         return Err(Error::Stale);
     };
     if binding.identity != target || *root_drop_commit_lsn > before.checkpoint_lsn {
+        return Err(Error::Conflict);
+    }
+    if !staged.has_committed_deletion(slot) {
         return Err(Error::Conflict);
     }
     if protection.writes_open

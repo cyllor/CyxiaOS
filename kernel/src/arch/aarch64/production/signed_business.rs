@@ -45,6 +45,8 @@ use zeroize::Zeroizing;
 mod task_services;
 #[cfg(cyxia_business_task_services)]
 pub(super) use task_services::GROUP_CPU;
+#[cfg(cyxia_file_owner_package)]
+mod file_owner;
 
 const BUSINESS_CORES: usize = 3;
 const PAGE: usize = 4096;
@@ -78,6 +80,8 @@ pub(super) struct ApprovedPackage {
     digest: [u8; 32],
     #[cfg(cyxia_business_task_services)]
     grant: task_services::Grant,
+    #[cfg(cyxia_file_owner_package)]
+    file_owner: file_owner::ApprovedPackage,
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +90,8 @@ pub(super) struct Layout {
     stack_top: u64,
     #[cfg(cyxia_business_task_services)]
     child: Option<(u64, u64)>,
+    #[cfg(cyxia_file_owner_package)]
+    file_owner: Option<(u64, u64)>,
 }
 
 #[repr(C, align(4096))]
@@ -142,6 +148,15 @@ pub(super) fn is_group_child_identity(slot: usize, actor: Identity) -> bool {
         && task_services::is_child(actor)
 }
 
+#[cfg(cyxia_file_owner_package)]
+pub(super) fn is_file_owner_identity(slot: usize, actor: Identity) -> bool {
+    file_owner::thread(slot, PUBLISHED.load(Ordering::Acquire))
+        == Some(ObjectKey {
+            id: actor.id,
+            generation: actor.generation,
+        })
+}
+
 pub(super) fn authorize(config: &VerifiedOfflineConfig<'_>) -> Result<ApprovedPackage, Error> {
     let digest = Sha256::digest(PACKAGE).into();
     startup_catalog::qualify_business_package(config, digest, SIGNATURE)
@@ -151,6 +166,8 @@ pub(super) fn authorize(config: &VerifiedOfflineConfig<'_>) -> Result<ApprovedPa
         digest,
         #[cfg(cyxia_business_task_services)]
         grant: task_services::qualify(config, digest)?,
+        #[cfg(cyxia_file_owner_package)]
+        file_owner: file_owner::qualify(config)?,
     })
 }
 
@@ -160,7 +177,8 @@ pub(super) fn addresses(
     #[cfg(cyxia_resident_net)] network_entropy: Option<&mut Entropy>,
     checkpoint: &mut impl FnMut() -> Result<(), SvcError>,
 ) -> Result<[Layout; BUSINESS_CORES], Error> {
-    const LAYOUTS: usize = BUSINESS_CORES + cfg!(cyxia_business_task_services) as usize;
+    const FILE_OWNER_INDEX: usize = BUSINESS_CORES + cfg!(cyxia_business_task_services) as usize;
+    const LAYOUTS: usize = FILE_OWNER_INDEX + cfg!(cyxia_file_owner_package) as usize;
     let mut randomness = Zeroizing::new([0u8; LAYOUTS * 16]);
     let mut standalone = || {
         super::net_entropy::startup_aslr(info, policy.boot_epoch(), &mut randomness[..], || {
@@ -200,6 +218,8 @@ pub(super) fn addresses(
             stack_top,
             #[cfg(cyxia_business_task_services)]
             child: (index + 1 == GROUP_CPU).then(|| limits(BUSINESS_CORES)),
+            #[cfg(cyxia_file_owner_package)]
+            file_owner: (index + 1 == file_owner::CPU).then(|| limits(FILE_OWNER_INDEX)),
         }
     }))
 }
@@ -303,11 +323,22 @@ fn stage_package(
     layout: Layout,
     args: &[u8],
 ) -> Result<user::Context, Error> {
+    stage_isolated_pie(storage, PACKAGE, package.digest, layout, args)
+}
+
+fn stage_isolated_pie(
+    storage: *mut Backing,
+    package: &[u8],
+    digest: [u8; 32],
+    layout: Layout,
+    args: &[u8],
+) -> Result<user::Context, Error> {
     // SAFETY: boot's serial CPU0 loader owns this registered scratch buffer.
     let scratch = unsafe { &mut *addr_of_mut!(COPY_BUFFER.0) };
-    scratch[..PACKAGE.len()].copy_from_slice(PACKAGE);
+    let input = scratch.get_mut(..package.len()).ok_or(Error::Invalid)?;
+    input.copy_from_slice(package);
     let result = (|| {
-        let pie = PieImage::parse_verified(&scratch[..PACKAGE.len()], package.digest)?;
+        let pie = PieImage::parse_verified(input, digest)?;
         // This profile only accepts statically self-relative packages. No
         // unbound relocations, dynamic symbols or loaders are consumed.
         let mut flags = [0u32; IMAGE_BYTES / PAGE];
@@ -441,6 +472,14 @@ pub(super) fn prepare(
     } else {
         budget_ns
     };
+    #[cfg(cyxia_file_owner_package)]
+    let budget_ns = if slot == file_owner::CPU {
+        budget_ns
+            .checked_sub(package.file_owner.budget_ns())
+            .ok_or(Error::Exhausted)?
+    } else {
+        budget_ns
+    };
     try_scheduler(|scheduler| {
         if PREPARED.load(Ordering::Relaxed) == 0 {
             scheduler.register_group(ordinary_group)?;
@@ -482,6 +521,25 @@ pub(super) fn prepare_group_child(
     task_services::prepare_child(policy, package)
 }
 
+#[cfg(cyxia_file_owner_package)]
+pub(super) fn prepare_file_owner(
+    policy: &ConfirmedBootPolicy<'_>,
+    package: &ApprovedPackage,
+    layouts: [Layout; BUSINESS_CORES],
+) -> Result<(), Error> {
+    let base = layouts[file_owner::CPU - 1];
+    let (image, stack_top) = base.file_owner.ok_or(Error::Invalid)?;
+    file_owner::prepare(
+        policy,
+        &package.file_owner,
+        Layout {
+            image,
+            stack_top,
+            ..base
+        },
+    )
+}
+
 pub(super) fn open(policy: &ConfirmedBootPolicy<'_>) -> Result<u64, Error> {
     let epoch = policy.boot_epoch();
     if cpu::slot() != 0
@@ -495,6 +553,10 @@ pub(super) fn open(policy: &ConfirmedBootPolicy<'_>) -> Result<u64, Error> {
     }
     #[cfg(cyxia_business_task_services)]
     if !task_services::prepared(epoch) {
+        return Err(Error::Denied);
+    }
+    #[cfg(cyxia_file_owner_package)]
+    if !file_owner::prepared(epoch) {
         return Err(Error::Denied);
     }
     let token = Token {
@@ -620,6 +682,8 @@ fn retire(
     context: &mut user::Context,
     #[cfg(cyxia_business_task_services)] group: &mut Option<&mut task_services::Group>,
 ) -> ! {
+    #[cfg(cyxia_file_owner_package)]
+    file_owner::retire(slot, task.generation);
     #[cfg(cyxia_business_task_services)]
     if let Some(group) = group {
         group.retire();
@@ -737,6 +801,8 @@ pub(crate) fn worker(slot: usize) -> ! {
         if let Some(group) = group.as_mut() {
             group.wake();
         }
+        #[cfg(cyxia_file_owner_package)]
+        file_owner::wake(slot, epoch);
         let start_ns = now_ns();
         if let Some(wake_ns) = sleeping_until {
             if start_ns < wake_ns {
@@ -748,6 +814,8 @@ pub(crate) fn worker(slot: usize) -> ! {
                 #[cfg(cyxia_business_task_services)]
                 let other_ready =
                     other_ready || group.as_ref().is_some_and(|group| group.has_child());
+                #[cfg(cyxia_file_owner_package)]
+                let other_ready = other_ready || file_owner::thread(slot, epoch).is_some();
                 if !other_ready {
                     sleep_until(wake_ns.min(start_ns.saturating_add(POLL_NS)));
                     continue;
@@ -858,6 +926,14 @@ pub(crate) fn worker(slot: usize) -> ! {
         {
             group.finish_join(context);
         }
+        #[cfg(cyxia_file_owner_package)]
+        let owner_turn = file_owner::thread(slot, epoch) == Some(dispatch.thread);
+        #[cfg(cyxia_file_owner_package)]
+        let exit_margin = if owner_turn {
+            file_owner::EXIT_MARGIN_NS
+        } else {
+            exit_margin
+        };
         let remaining = dispatch
             .reserved_ns
             .saturating_sub(exit_margin)
@@ -878,6 +954,10 @@ pub(crate) fn worker(slot: usize) -> ! {
                 break 'turn RunState::Runnable;
             }
             let deadline = u64::try_from(deadline).unwrap_or_else(|_| fatal(BUSINESS_FAULT));
+            #[cfg(cyxia_file_owner_package)]
+            if owner_turn {
+                break 'turn file_owner::drive(slot, epoch, exec, deadline);
+            }
             #[cfg(cyxia_business_task_services)]
             if dispatch.thread != thread {
                 let group = group
@@ -942,6 +1022,11 @@ pub(crate) fn worker(slot: usize) -> ! {
             });
         }
         if next == RunState::Exited {
+            #[cfg(cyxia_file_owner_package)]
+            if owner_turn {
+                file_owner::retire(slot, epoch);
+                continue;
+            }
             #[cfg(cyxia_business_task_services)]
             if dispatch.thread != thread {
                 group
@@ -960,6 +1045,11 @@ pub(crate) fn worker(slot: usize) -> ! {
             );
         }
     }
+}
+
+#[cfg(cyxia_file_owner_package)]
+pub(super) fn file_owner_active(epoch: u64) -> bool {
+    is_live_epoch(epoch) && file_owner::active(epoch)
 }
 
 fn lifecycle_syscall(context: &mut user::Context, sleeping_until: &mut Option<u64>) -> RunState {

@@ -1,6 +1,6 @@
 # V0.20 验收覆盖矩阵说明（127 个稳定 ID）
 
-覆盖映射中的 127 项原生验收判定均为 `NOT_RUN`。G0 待复审，G1 为 `NOT_READY`，G2/G3 和 G4-QEMU 为 `NOT_RUN`。宿主测试与原生机制夹具记录部分覆盖。V0.20 的最终验收门槛是 G4-QEMU。[V0.20 验收约束](../design/v0.20-native-local-system.md#7-验收与发布)
+覆盖映射中的 127 项原生验收判定均为 `NOT_RUN`。G0 基线已复审冻结，G1 为 `NOT_READY`，G2/G3 和 G4-QEMU 为 `NOT_RUN`。宿主测试与原生机制夹具记录部分覆盖。V0.20 的最终验收门槛是 G4-QEMU。[G0 基线](../design/v0.20-g0-baseline-freeze.md) · [V0.20 验收约束](../design/v0.20-native-local-system.md#7-验收与发布)
 
 配套工具：`tools/acceptance_coverage.py`（人工核定数据表，确定性输出，无 cargo/QEMU 依赖）。
 完整逐 ID 矩阵由该工具生成：

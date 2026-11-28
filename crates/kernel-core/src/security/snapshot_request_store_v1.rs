@@ -95,6 +95,30 @@ pub struct RequestRecord {
 }
 
 impl RequestRecord {
+    pub(crate) fn identifies_restore(
+        &self,
+        prepared: crate::security::snapshot_restore_gate::Prepared,
+        commit: crate::security::snapshot_restore_gate::Commit,
+    ) -> bool {
+        self.operation == SNAP_OP_RESTORE
+            && self.state == RequestState::Done
+            && self.key.client_slot == 15
+            && self.key.fs_uuid == commit.view.fs_uuid
+            && self.key.request_seq == commit.key.request_seq
+            && self.old_live_view_epoch == prepared.prior.live_epoch
+            && self.new_live_view_epoch == commit.view.live_epoch
+            && self.log_epoch == commit.log_epoch
+            && self.txid == commit.txid
+            && self.commit_lsn == commit.commit_lsn
+            && self.request_digest == commit.request_hash
+            && self.snapshot_key.is_some_and(|key| {
+                key.fs_uuid == prepared.snapshot.fs_uuid
+                    && key.snapshot_id == prepared.snapshot.snapshot_id
+                    && key.slot == u32::from(prepared.snapshot.slot)
+                    && key.slot_generation == prepared.snapshot.generation
+            })
+    }
+
     /// Build a pending admission from the exact copied and validated D7 frame.
     /// The owner must persist this record and advance its watermark atomically
     /// before making the admission available for execution.
@@ -601,8 +625,24 @@ pub fn inspect_request_store(
     fs_uuid: [u8; 16],
     expected_generation: u64,
     committed_lsn: u64,
-    mut read: impl FnMut(u32, &mut [u8; SUPER_BYTES]) -> Result<(), Error>,
+    read: impl FnMut(u32, &mut [u8; SUPER_BYTES]) -> Result<(), Error>,
     mut visit: impl FnMut(&RequestRecord) -> Result<(), Error>,
+) -> Result<RequestStoreEvidence, Error> {
+    inspect_positioned_request_store(
+        fs_uuid,
+        expected_generation,
+        committed_lsn,
+        read,
+        |_, record| visit(record),
+    )
+}
+
+pub(crate) fn inspect_positioned_request_store(
+    fs_uuid: [u8; 16],
+    expected_generation: u64,
+    committed_lsn: u64,
+    mut read: impl FnMut(u32, &mut [u8; SUPER_BYTES]) -> Result<(), Error>,
+    mut visit: impl FnMut(usize, &RequestRecord) -> Result<(), Error>,
 ) -> Result<RequestStoreEvidence, Error> {
     let mut raw = [0; SUPER_BYTES];
     read(SNAPSHOT_REQUEST_START, &mut raw)?;
@@ -653,7 +693,7 @@ pub fn inspect_request_store(
             sequences[evidence.occupied] = key.request_seq;
             evidence.occupied += 1;
             evidence.nonterminal += usize::from(!record.state.terminal());
-            visit(&record)?;
+            visit(index, &record)?;
         }
     }
     Ok(evidence)

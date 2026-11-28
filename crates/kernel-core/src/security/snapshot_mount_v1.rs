@@ -2,14 +2,18 @@
 //! committed view. The mount verifies data custody separately from permissions.
 
 use super::{
-    ENVELOPE_BYTES, Error, SNAP_OP_OPEN_WRITES, SNAP_OP_RESTORE, SUPER_BYTES, SuperblockV1,
-    UnifiedSystemKind, UnifiedSystemObject,
+    ENVELOPE_BYTES, Error, SNAP_CONTROL_CACHE_KIB, SNAP_OP_DELETE_EXPIRED, SNAP_OP_OPEN_WRITES,
+    SNAP_OP_RESTORE, SUPER_BYTES, SuperblockV1, UnifiedSystemKind, UnifiedSystemObject,
     catalog_candidate::{CatalogContext, CatalogEntry, CatalogRecord, verify_catalog},
     decode_envelope_header,
     protection_candidate::{ProtectionRecord, RestorePhase},
     request_store::{RequestRecord, RequestState, RequestStoreEvidence, inspect_request_store},
+    slot_candidate::SlotIdentity,
 };
-use crate::security::{epoch_redo_v0199::EpochBlockIo, snapshot_service_v4::request_digest};
+use crate::security::{
+    epoch_redo_v0199::EpochBlockIo,
+    snapshot_service_v4::{SnapshotKey, request_digest},
+};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,9 +24,14 @@ pub struct MountedSnapshots {
     pub protection_sha256: [u8; 32],
     pub historical_only_blocks: u32,
     pub requests: RequestStoreEvidence,
+    completed_restore: Option<RequestRecord>,
+    committed_deletions: u8,
     durable_open: bool,
     write_qualified: bool,
 }
+
+const _: () =
+    assert!(core::mem::size_of::<MountedSnapshots>() <= SNAP_CONTROL_CACHE_KIB as usize * 1024);
 
 impl MountedSnapshots {
     pub const fn writes_open(&self) -> bool {
@@ -33,11 +42,22 @@ impl MountedSnapshots {
         self.durable_open
     }
 
+    /// A completed RESTORE matched to this committed protection/view state.
+    pub const fn completed_restore(&self) -> Option<&RequestRecord> {
+        self.completed_restore.as_ref()
+    }
+
+    /// The exact durable DELETE receipt still pins this slot's retirement.
+    pub const fn has_committed_deletion(&self, slot: usize) -> bool {
+        slot < u8::BITS as usize && self.committed_deletions & (1 << slot) != 0
+    }
+
     pub(crate) fn qualify_writes(
         &mut self,
         gate: &crate::security::snapshot_restore_gate::RestoreGate,
         verify_boot: impl FnOnce() -> Result<(), Error>,
     ) -> Result<(), Error> {
+        self.write_qualified = false;
         let p = self.protection.ok_or(Error::Stale)?;
         if !self.has_open_proof()
             || !self
@@ -46,6 +66,12 @@ impl MountedSnapshots {
                 .is_some_and(CatalogRecord::has_periodic_coverage)
             || gate.view().fs_uuid != p.fs_uuid
             || !gate.may_write(p.live_view_epoch, p.protection_generation)
+            || !self
+                .completed_restore
+                .zip(gate.reopened_restore())
+                .is_some_and(|(record, (prepared, commit))| {
+                    record.identifies_restore(prepared, commit)
+                })
         {
             return Err(Error::Stale);
         }
@@ -85,6 +111,13 @@ impl MountedSnapshots {
 
 fn hash(page: &[u8; SUPER_BYTES]) -> [u8; 32] {
     Sha256::digest(page).into()
+}
+
+fn identifies_slot(key: SnapshotKey, identity: SlotIdentity) -> bool {
+    key.fs_uuid == identity.fs_uuid
+        && key.snapshot_id == identity.snapshot_id
+        && key.slot == identity.slot
+        && key.slot_generation == identity.slot_generation
 }
 
 fn trailing_zero(
@@ -198,6 +231,7 @@ pub(crate) fn verify_snapshot_homes(
     let mut proof_matches = 0;
     let mut restored: Option<RequestRecord> = None;
     let mut opened: Option<RequestRecord> = None;
+    let mut committed_deletions = 0;
     let requests = inspect_request_store(
         sb.fs_uuid,
         request_generation,
@@ -207,11 +241,29 @@ pub(crate) fn verify_snapshot_homes(
             if row.log_epoch > sb.log_epoch {
                 return Err(Error::Conflict);
             }
+            if row.operation == SNAP_OP_DELETE_EXPIRED
+                && row.state == RequestState::Done
+                && let Some(key) = row.snapshot_key
+                && let Some(CatalogEntry::Deleting {
+                    binding,
+                    root_drop_commit_lsn,
+                }) = catalog
+                    .as_ref()
+                    .and_then(|catalog| catalog.entries.get(key.slot as usize))
+                && row.commit_lsn == *root_drop_commit_lsn
+                && identifies_slot(key, binding.identity)
+            {
+                let bit = 1 << key.slot;
+                if committed_deletions & bit != 0 {
+                    return Err(Error::Conflict);
+                }
+                committed_deletions |= bit;
+            }
             if let Some(p) = protection {
                 if row.key.client_slot != 15 {
                     return Ok(());
                 }
-                if p.writes_open
+                if (p.writes_open || p.restore_phase == RestorePhase::RestoredFrozen)
                     && row.operation == SNAP_OP_RESTORE
                     && row.state == RequestState::Done
                     && row.new_live_view_epoch == p.live_view_epoch
@@ -254,6 +306,18 @@ pub(crate) fn verify_snapshot_homes(
         if (p.writes_open || p.restore_phase != RestorePhase::Idle) && proof_matches != 1 {
             return Err(Error::Conflict);
         }
+        if p.restore_phase == RestorePhase::RestoredFrozen {
+            let source = restored
+                .and_then(|record| record.snapshot_key)
+                .ok_or(Error::Conflict)?;
+            let entry = catalog
+                .as_ref()
+                .and_then(|catalog| catalog.entries.get(source.slot as usize));
+            if !matches!(entry, Some(CatalogEntry::Active(binding)) if identifies_slot(source, binding.identity))
+            {
+                return Err(Error::Conflict);
+            }
+        }
         if p.writes_open {
             let (restore, open) = restored.zip(opened).ok_or(Error::Conflict)?;
             let mut body = [0; 48];
@@ -286,6 +350,8 @@ pub(crate) fn verify_snapshot_homes(
         protection_sha256,
         historical_only_blocks: 0,
         requests,
+        completed_restore: restored,
+        committed_deletions,
         durable_open: writes_open,
         write_qualified: false,
     })
