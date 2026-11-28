@@ -3,12 +3,12 @@ use super::*;
 pub(crate) static UART: AtomicU64 = AtomicU64::new(0);
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static LOG_LOSS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "unified-runtime")]
+#[cfg(any(feature = "unified-runtime", feature = "v0199-control-load-selftest"))]
 #[repr(C, align(64))]
 pub struct PanicEvidence {
     pub words: [AtomicU64; 8],
 }
-#[cfg(feature = "unified-runtime")]
+#[cfg(any(feature = "unified-runtime", feature = "v0199-control-load-selftest"))]
 #[used]
 #[unsafe(no_mangle)]
 pub static PANIC_EVIDENCE: PanicEvidence = PanicEvidence {
@@ -233,7 +233,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let Some(slot) = cyxia_arch_aarch64::cpu::registered_slot() else {
         halt()
     };
-    #[cfg(feature = "unified-runtime")]
+    #[cfg(any(feature = "unified-runtime", feature = "v0199-control-load-selftest"))]
     {
         // Panic diagnostics never need the ordinary console/task/policy gate.
         // First writer keeps the original failure if a secondary also panics.

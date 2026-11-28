@@ -74,6 +74,39 @@ class BudgetTraceTests(unittest.TestCase):
                     "size": TRACE_BYTES, "filename": str(path)})
                 self.assertEqual(path.read_bytes(), raw)
 
+    def test_panic_capture_preserves_raw_bytes_and_rejects_unsealed_location(self):
+        bringup = Bringup.__new__(Bringup)
+        bringup.sustained_load = True
+        bringup.panic_extent = {"pa": 0x41000000, "size": 64}
+        bringup.trace = {"pa": 0x42000000, "size": TRACE_BYTES}
+        bringup.native_extent = {"pa": 0x43000000, "size": 4096}
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root)
+            qmp = Mock()
+            for values in ((0x435950414e490001, 0, 123, 45, 67, 8, 9, 10),
+                           (0, 0, 123, 45, 67, 8, 9, 10),
+                           (0x435950414e490001, 4, 123, 45, 67, 8, 9, 10),
+                           (0x435950414e490001, 0, 0, 45, 67, 8, 9, 10)):
+                raw = struct.pack("<8Q", *values)
+                def save(cmd, args):
+                    Path(args["filename"]).write_bytes(raw if args["size"] == 64
+                                                       else bytes(args["size"]))
+                qmp.execute.side_effect = save
+                if values[0] and values[1] == 0 and values[2] == 123:
+                    detail = bringup.capture_panic(qmp, output)
+                    self.assertEqual((detail["scope"], detail["line"], detail["column"]),
+                                     ("terminal_panic_only", 123, 45))
+                else:
+                    with self.assertRaises(ValueError):
+                        bringup.capture_panic(qmp, output)
+                self.assertEqual((output / "panic-location.bin").read_bytes(), raw)
+                self.assertEqual((output / "cpu0-budget-panic-raw.bin").stat().st_size, TRACE_BYTES)
+                self.assertEqual((output / "native-panic-page.bin").stat().st_size, 4096)
+            bringup.sustained_load = False
+            qmp.reset_mock()
+            self.assertIsNone(bringup.capture_panic(qmp, output))
+            qmp.execute.assert_not_called()
+
     def test_boundary_stop_and_gap_crossing_debit_once(self):
         result = verify_trace(self.evidence(), self.summary, recovery_slices=(1, 100))
         self.assertEqual(result["budget_intervals_replayed"], 4)
