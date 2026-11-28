@@ -1374,11 +1374,20 @@ pub fn run(
     unsafe {
         *core::ptr::addr_of_mut!(RESOURCE) = Some(resource);
         *core::ptr::addr_of_mut!(GICS).cast::<Option<Gic>>() = Some(Gic::new(resource).unwrap());
+        #[cfg(feature = "v0199-control-bringup")]
+        {
+            // The PPI is banked to CPU0. Its vectors and timer ownership are
+            // already installed; IRQs stay masked during these boot waits.
+            gic().enable(irq).unwrap();
+            budget.boot_checkpoint();
+        }
         #[cfg(feature = "unified-runtime")]
         crate::domain_platform::register_ipi_cpu(gic(), 0).expect("IPI bootstrap registration");
         #[cfg(feature = "unified-runtime")]
         enable_service_timer();
         init_memory();
+        #[cfg(feature = "v0199-control-bringup")]
+        budget.boot_checkpoint();
         #[cfg(feature = "register-v15-selftest")]
         register_evidence::init();
         #[cfg(feature = "ai-control-selftest")]
@@ -1409,12 +1418,11 @@ pub fn run(
             result as u64,
         );
         assert_eq!(result, 0, "CPU_ON must report success");
+        #[cfg(feature = "v0199-control-bringup")]
+        budget.boot_checkpoint();
     }
     #[cfg(feature = "v0199-control-bringup")]
-    {
-        gic().enable(irq).unwrap();
-        budget.wait_for(|| ONLINE.load(Ordering::Acquire) == 15);
-    }
+    budget.wait_for(|| ONLINE.load(Ordering::Acquire) == 15);
     #[cfg(not(feature = "v0199-control-bringup"))]
     wait(|| ONLINE.load(Ordering::Acquire) == 15);
     report(
@@ -1423,6 +1431,8 @@ pub fn run(
         ONLINE.load(Ordering::Acquire),
         0,
     );
+    #[cfg(feature = "v0199-control-bringup")]
+    budget.boot_checkpoint();
     #[cfg(feature = "register-v15-selftest")]
     register_evidence::finish();
     for (slot, gate) in GATES.iter().enumerate().take(REQUIRED).skip(1) {

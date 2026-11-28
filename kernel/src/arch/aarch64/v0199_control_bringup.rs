@@ -353,6 +353,33 @@ impl BudgetMeter {
             .unwrap();
         self.idle_until(next);
     }
+    /// Observe the pre-GIC boot prefix without trying to sleep before the
+    /// CPU0 timer PPI is ready. This is still the original coordination debit.
+    #[cfg(feature = "v0199-control-bringup")]
+    pub(crate) fn observe_boot_phase(&mut self) {
+        self.sample_gap();
+    }
+    /// At safe boot boundaries, leave headroom for the next indivisible step.
+    /// Once the local timer PPI is enabled, wait for an actual aligned window
+    /// rather than executing the entire SMP bootstrap in one coordination gap.
+    /// Every observation and the masked timer wait remain charged; an overrun
+    /// of any individual step still takes the existing terminal failure path.
+    #[cfg(feature = "v0199-control-bringup")]
+    pub(super) fn boot_checkpoint(&mut self) {
+        let until = now_ns().checked_add(5_000_000_000).unwrap();
+        loop {
+            let (now, _) = self.sample_gap();
+            if now >= until {
+                fatal(688);
+            }
+            if self.ledger.kernel_coordination_spent() < KERNEL_COORDINATION_LIMIT_NS / 2
+                && now % WINDOW_NS <= WINDOW_NS - 5_000_000
+            {
+                return;
+            }
+            self.idle_retry();
+        }
+    }
     // Startup has no admitted roles. Initial loader work uses the same
     // fixed EL1 coordination sub-budget, not the protected recovery quota.
     // No estimate is substituted for the actual PMU debit.

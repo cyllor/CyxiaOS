@@ -17,7 +17,7 @@ compile_error!(
 #[unsafe(no_mangle)]
 extern "C" fn boot_entry() -> ! {
     #[cfg(feature = "v0199-control-bringup")]
-    let budget = smp::BudgetMeter::begin_boot();
+    let mut budget = smp::BudgetMeter::begin_boot();
     let ptr = (HIGH + cyxia_platform_virt::RAM_BASE) as *const u8;
     let header = unsafe { core::slice::from_raw_parts(ptr, 40) };
     let len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
@@ -54,6 +54,8 @@ extern "C" fn boot_entry() -> ! {
     assert_eq!(vbar, core::ptr::addr_of!(exception_vectors) as u64);
     log(b"HIGH_VA_OK BOOTSTRAP\n");
     clock::init(&info);
+    #[cfg(feature = "v0199-control-bringup")]
+    budget.observe_boot_phase();
     #[cfg(feature = "unified-runtime")]
     unsafe {
         timer::init_cpu_accounting();

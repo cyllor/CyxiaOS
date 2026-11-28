@@ -96,6 +96,29 @@ class BudgetTraceTests(unittest.TestCase):
             verify_trace(self.evidence(version=4), self.summary,
                          boot_accounting=(2, self.rows[1][0], 600))
 
+    def test_early_boot_replenishment_keeps_both_window_bounds_and_full_debit(self):
+        self.start = 10_000_000
+        self.rows = [
+            (12_000_000, 1_201_000, 0, 0, 0, 11_999_984),
+            (WINDOW + 10_000, 1_251_000, 0, 0, 0, WINDOW + 9_984),
+            (WINDOW + 2_000_000, 2_451_000, 0, 0, 0, WINDOW + 1_999_984),
+            (WINDOW + 2_200_000, 2_551_000, 0, 0, 0, WINDOW + 2_199_984),
+        ]
+        self.summary = [2_550_000, 2_550_000, 1_350_000, 1, self.start,
+                        self.rows[-1][0], 0, 0, 0, 2_550_000, 0, 0]
+        boundary = (3, self.rows[2][0], 2_450_000)
+        result = verify_trace(self.evidence(version=4), self.summary, boot_accounting=boundary)
+        self.assertEqual(result["early_boot_coordination_cpu_ns"], 2_450_000)
+        self.assertEqual(result["budget_max_window_upper_ns"], 1_350_000)
+        # A mere extra sample without an actual window crossing cannot reset
+        # the 2ms coordination credit. Keep the same measured execution.
+        self.rows = [(end - (WINDOW - 20_000_000) if i else end, tick,
+                      quota, deadline, scope, lower - (WINDOW - 20_000_000) if i else lower)
+                     for i, (end, tick, quota, deadline, scope, lower) in enumerate(self.rows)]
+        with self.assertRaisesRegex(ValueError, "EL1 coordination sublimit"):
+            verify_trace(self.evidence(version=4), self.summary,
+                         boot_accounting=(3, self.rows[2][0], 2_450_000))
+
     def test_grant_must_precede_deadline_and_have_enough_credit(self):
         end, counter, _, deadline, scope, lower = self.rows[1]
         self.rows[1] = end, counter, 310_000, deadline, scope, lower
