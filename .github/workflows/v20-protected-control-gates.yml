@@ -1,7 +1,7 @@
 name: V0.20 protected control gate components
 on:
   push:
-    branches: [work/v020-integrated-eleven-gate-custody]
+    branches: [work/v020-integrated-eleven-gate-custody, CyxiaOS-V0.20]
   pull_request:
     branches: [CyxiaOS-V0.20]
     paths:
