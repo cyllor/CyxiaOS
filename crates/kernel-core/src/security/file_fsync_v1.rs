@@ -10,8 +10,8 @@ use super::{
     boot_epoch_v1::BootEpochStoreV1,
     epoch_redo_v0199::EpochBlockIo,
     file_admission_flow_v1::FileAdmissionFlowV1,
-    file_auth_context_v1::{AdmissionLedgerV1, Linearization},
-    file_auth_v3::{Completion, operation_digest},
+    file_auth_context_v1::{AdmissionLedgerV1, AuthContextV1, Linearization},
+    file_auth_v3::{AdmitRequestV3, Completion, operation_digest},
     file_index_v0199::{FileStreamIndexV4, STREAMS_PER_GROUP, SecurityStateStoreV2},
     file_media_unified_v1::{
         BUSINESS_INODES, CANONICAL_BUSINESS_START, FILE_TRANSACTION_WORKSPACE_KIB,
@@ -62,6 +62,50 @@ pub struct FsyncJob<'a> {
     /// An unchanged-size job uses the legacy pages-only digest.
     pub grown_size: Option<usize>,
     /// Complete frozen logical file, in order, with zero padding after EOF.
+    pub pages: &'a [&'a [u8; BLOCK]],
+}
+
+/// The exact in-flight admission and locally reverified freeze. Native
+/// transport may move it to the sole journal owner while the ledger and
+/// file service retain the in-flight reference and immutable data.
+#[derive(Clone, Copy)]
+pub struct FsyncAuthorization {
+    context: AuthContextV1,
+    proposal: AdmitRequestV3,
+}
+
+impl FsyncAuthorization {
+    pub fn from_execution(
+        admission: &FileAdmissionFlowV1,
+        ledger: &AdmissionLedgerV1,
+    ) -> Result<Self, Error> {
+        let context = admission.ctx();
+        let proposal = admission.request();
+        let registered = ledger
+            .entry_by_admission(admission.admission_id())
+            .ok_or(Error::Unauthorized)?;
+        if admission.state() != Linearization::Execute
+            || registered.completion != Completion::InFlight
+            || registered.key.auth_context_id != context.auth_context_id
+            || registered.key.request_seq != proposal.request_seq
+            || registered.proposal_digest != proposal.operation_digest
+            || ledger.boot_epoch() != context.boot_epoch
+        {
+            return Err(Error::Unauthorized);
+        }
+        Ok(Self { context, proposal })
+    }
+}
+
+pub struct AuthorizedFsyncJob<'a> {
+    pub config: &'a VerifiedOfflineConfig<'a>,
+    pub mounted: &'a MountEvidence,
+    pub authorization: FsyncAuthorization,
+    pub inode_id: u16,
+    pub cap_selector: u64,
+    pub frame: &'a [u8],
+    pub key: ReceiptKey,
+    pub grown_size: Option<usize>,
     pub pages: &'a [&'a [u8; BLOCK]],
 }
 
@@ -295,23 +339,34 @@ pub fn commit_segment_with_floor<I: EpochBlockIo>(
     allocation_floor: u32,
     reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
 ) -> Result<FsyncProgress, Error> {
+    let authorized = AuthorizedFsyncJob {
+        config: job.config,
+        mounted: job.mounted,
+        authorization: FsyncAuthorization::from_execution(job.admission, job.ledger)?,
+        inode_id: job.inode_id,
+        cap_selector: job.cap_selector,
+        frame: job.frame,
+        key: job.key,
+        grown_size: job.grown_size,
+        pages: job.pages,
+    };
+    commit_authorized_segment(writer, &authorized, work, allocation_floor, reserve)
+}
+
+pub fn commit_authorized_segment<I: EpochBlockIo>(
+    writer: &mut RedoWriter<'_, I>,
+    job: &AuthorizedFsyncJob<'_>,
+    work: &mut FsyncWorkspace,
+    allocation_floor: u32,
+    reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
+) -> Result<FsyncProgress, Error> {
     if !(DATA_START..BLOCK_COUNT).contains(&allocation_floor) {
         return Err(Error::Invalid);
     }
-    let ctx = job.admission.ctx();
-    let proposal = job.admission.request();
-    let registered = job
-        .ledger
-        .entry_by_admission(job.admission.admission_id())
-        .ok_or(Error::Unauthorized)?;
+    let ctx = job.authorization.context;
+    let proposal = job.authorization.proposal;
     let request = Request::decode(job.frame, job.cap_selector)?;
     if request.op != FSYNC
-        || job.admission.state() != Linearization::Execute
-        || registered.completion != Completion::InFlight
-        || registered.key.auth_context_id != ctx.auth_context_id
-        || registered.key.request_seq != job.key.request_seq
-        || registered.proposal_digest != proposal.operation_digest
-        || job.ledger.boot_epoch() != ctx.boot_epoch
         || ctx.boot_epoch != job.key.issued_boot_epoch
         || job.key.request_id() != Some(request.request_id)
         || proposal.request_seq != job.key.request_seq

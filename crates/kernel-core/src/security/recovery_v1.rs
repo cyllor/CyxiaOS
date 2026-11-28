@@ -91,6 +91,70 @@ impl RecoveryWorkspace {
         self.evidence
     }
 
+    /// Calculate the next extent in an established, exclusively owned journal.
+    pub fn next_transaction(&self, images: usize) -> Result<RedoTransaction, Error> {
+        let evidence = self.evidence.ok_or(Error::Unknown)?;
+        if self.checkpoint_required || evidence.incomplete_tail {
+            return Err(Error::Unknown);
+        }
+        if !(1..=MAX_REDO).contains(&images) {
+            return Err(Error::Capacity);
+        }
+        let log_blocks = 2 + 2 * images as u32;
+        if self.next_log_block + log_blocks > END {
+            return Err(Error::Capacity);
+        }
+        let begin_lsn = evidence.last_commit_lsn.checked_add(1).ok_or(Error::Exhausted)?;
+        Ok(RedoTransaction {
+            fs_uuid: evidence.superblock.fs_uuid,
+            log_epoch: evidence.superblock.log_epoch,
+            txid: self.last_txid.checked_add(1).ok_or(Error::Exhausted)?,
+            begin_lsn,
+            commit_lsn: begin_lsn
+                .checked_add(images as u64 + 1)
+                .ok_or(Error::Exhausted)?,
+            first_log_block: self.next_log_block,
+            log_blocks,
+        })
+    }
+
+    /// Include the checked after-image of the bounded service restart writer.
+    /// This shares its cursor with the ordinary append owner without rescanning.
+    pub fn include_service_restart(
+        &mut self,
+        committed: &super::epoch_redo_v0199::VerifiedRestartRedo,
+    ) -> Result<(), Error> {
+        let placement = committed.placement;
+        let plan = self.next_transaction(1)?;
+        if placement.fs_uuid != plan.fs_uuid
+            || placement.log_epoch != plan.log_epoch
+            || placement.txid != plan.txid
+            || placement.first != plan.first_log_block
+            || placement.commit_lsn != plan.commit_lsn
+            || !(BITMAP_START..BLOCK_COUNT).contains(&placement.state_home)
+        {
+            return Err(Error::Conflict);
+        }
+        self.pending[0] = Row {
+            home: placement.state_home,
+            log: plan.first_log_block + 1,
+            commit_lsn: plan.commit_lsn,
+            digest: committed.record_digest,
+        };
+        self.publish_rows(1, plan.commit_lsn)?;
+        self.advance(plan);
+        Ok(())
+    }
+
+    fn advance(&mut self, plan: RedoTransaction) {
+        self.next_log_block += plan.log_blocks;
+        self.last_txid = plan.txid;
+        let evidence = self.evidence.as_mut().unwrap();
+        evidence.last_commit_lsn = plan.commit_lsn;
+        evidence.transactions += 1;
+        evidence.distinct_home_blocks = self.count as u32;
+    }
+
     fn publish_rows(&mut self, count: usize, commit_lsn: u64) -> Result<(), Error> {
         for mut row in self.pending[..count].iter().copied() {
             row.commit_lsn = commit_lsn;
@@ -525,33 +589,68 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
         Ok(Self { io, workspace })
     }
 
+    /// Resume a workspace that has retained sole ownership of the journal.
+    /// The owner advances this workspace for every committed append, including
+    /// service generation transactions, and drops it after uncertain custody.
+    pub fn resume_exclusive(
+        io: &'a mut I,
+        workspace: &'a mut RecoveryWorkspace,
+        mounted: SuperblockV1,
+    ) -> Result<Self, Error> {
+        let evidence = workspace.evidence.ok_or(Error::Unknown)?;
+        if workspace.checkpoint_required || evidence.incomplete_tail || workspace.retire_after.is_some() {
+            return Err(Error::Unknown);
+        }
+        if evidence.superblock != mounted {
+            return Err(Error::Conflict);
+        }
+        same_superblocks(io, workspace)?;
+        Ok(Self { io, workspace })
+    }
+
     pub fn prepare(&self, images: usize) -> Result<RedoTransaction, Error> {
-        let w = &self.workspace;
-        let e = w.evidence.ok_or(Error::Unknown)?;
-        if !(1..=MAX_REDO).contains(&images) {
-            return Err(Error::Capacity);
-        }
-        let log_blocks = 2 + 2 * images as u32;
-        if w.next_log_block + log_blocks > END {
-            return Err(Error::Capacity);
-        }
-        let begin_lsn = e.last_commit_lsn.checked_add(1).ok_or(Error::Exhausted)?;
-        Ok(RedoTransaction {
-            fs_uuid: e.superblock.fs_uuid,
-            log_epoch: e.superblock.log_epoch,
-            txid: w.last_txid.checked_add(1).ok_or(Error::Exhausted)?,
-            begin_lsn,
-            commit_lsn: begin_lsn
-                .checked_add(images as u64 + 1)
-                .ok_or(Error::Exhausted)?,
-            first_log_block: w.next_log_block,
-            log_blocks,
-        })
+        self.workspace.next_transaction(images)
     }
 
     /// Bounded scan and independently verified appends in this session.
     pub fn evidence(&self) -> Option<RecoveryEvidence> {
         self.workspace.evidence
+    }
+
+    /// Check the complete planned extent before the owner starts a sequence
+    /// of dependent appends. The exclusive writer keeps the view serialized.
+    pub fn verify_append_extent(&mut self, plan: RedoTransaction) -> Result<(), Error> {
+        let images = (plan.log_blocks.checked_sub(2).ok_or(Error::Invalid)? / 2) as usize;
+        if self.prepare(images)? != plan {
+            return Err(Error::Stale);
+        }
+        self.check_extent(plan)
+    }
+
+    pub(crate) fn has_current_after_image(&self, home: u32) -> bool {
+        self.workspace.rows[..self.workspace.count]
+            .iter()
+            .any(|row| row.home == home)
+    }
+
+    fn check_extent(&mut self, plan: RedoTransaction) -> Result<(), Error> {
+        same_superblocks(self.io, self.workspace)?;
+        let w = &mut self.workspace;
+        let scratch: &mut [u8; BLOCK] = (&mut w.raw[..BLOCK]).try_into().unwrap();
+        let end = plan.first_log_block + plan.log_blocks;
+        if end < END && w.obsolete[(end - FIRST) as usize] == OLD_CONTINUATION {
+            self.io.read(end, scratch)?;
+            if scratch.iter().any(|&byte| byte != 0) {
+                return Err(Error::Busy);
+            }
+        }
+        for block in plan.first_log_block..end {
+            self.io.read(block, scratch)?;
+            if w.obsolete[(block - FIRST) as usize] == 0 && scratch.iter().any(|&byte| byte != 0) {
+                return Err(Error::Busy);
+            }
+        }
+        Ok(())
     }
 
     /// Append into a reserved span of blank blocks and verified obsolete
@@ -580,22 +679,7 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
         }
         let digest = digest.finalize().into();
         reserve(&plan)?;
-        same_superblocks(self.io, self.workspace)?;
-        let w = &mut self.workspace;
-        let scratch: &mut [u8; BLOCK] = (&mut w.raw[..BLOCK]).try_into().unwrap();
-        let end = plan.first_log_block + plan.log_blocks;
-        if end < END && w.obsolete[(end - FIRST) as usize] == OLD_CONTINUATION {
-            self.io.read(end, scratch)?;
-            if scratch.iter().any(|&byte| byte != 0) {
-                return Err(Error::Busy);
-            }
-        }
-        for block in plan.first_log_block..end {
-            self.io.read(block, scratch)?;
-            if w.obsolete[(block - FIRST) as usize] == 0 && scratch.iter().any(|&byte| byte != 0) {
-                return Err(Error::Busy);
-            }
-        }
+        self.check_extent(plan)?;
         if self.write_and_verify(plan, images, digest).is_err()
             || self
                 .workspace
@@ -606,13 +690,7 @@ impl<'a, I: EpochBlockIo> RedoWriter<'a, I> {
             self.workspace.checkpoint_required = true;
             return Err(Error::Unknown);
         }
-        let w = &mut self.workspace;
-        w.next_log_block += plan.log_blocks;
-        w.last_txid = plan.txid;
-        let e = w.evidence.as_mut().unwrap();
-        e.last_commit_lsn = plan.commit_lsn;
-        e.transactions += 1;
-        e.distinct_home_blocks = w.count as u32;
+        self.workspace.advance(plan);
         Ok(CommittedRedo {
             transaction: plan,
             ordered_digest: digest,

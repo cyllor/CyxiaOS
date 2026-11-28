@@ -117,11 +117,22 @@ pub struct ServiceRestartAppend {
     ticket: PreparedEpoch,
     placement: RedoPlacement,
     phase: u8,
+    verified: Option<VerifiedRestartRedo>,
+}
+
+/// One security-state REDO whose two FLUSHes and readback have completed.
+pub struct VerifiedRestartRedo {
+    pub(super) placement: RedoPlacement,
+    pub(super) record_digest: [u8; 32],
 }
 
 impl ServiceRestartAppend {
     pub fn matches_stop(&self, stop: StopEvidence) -> bool {
         self.ticket.change == Change::Restart(stop)
+    }
+
+    pub fn verified_redo(&self) -> Option<&VerifiedRestartRedo> {
+        self.verified.as_ref()
     }
 }
 
@@ -209,6 +220,7 @@ impl OneStateRedo {
             ticket,
             placement,
             phase: 0,
+            verified: None,
         })
     }
 
@@ -258,20 +270,23 @@ impl OneStateRedo {
                 // The serialized phase cursor reaches this only after both
                 // device FLUSHes and byte-exact independent readback.
                 work.phase = u8::MAX;
-                return gate
-                    .confirm_from_redo(
-                        work.ticket,
-                        receipt,
-                        self.image(),
-                        superblock_raw,
-                        place.first,
-                        u64::from(place.state_home),
-                        &self.begin,
-                        &[&self.redo],
-                        &self.commit,
-                        |_, _| Ok(()),
-                    )
-                    .map(Some);
+                let outcome = gate.confirm_from_redo(
+                    work.ticket,
+                    receipt,
+                    self.image(),
+                    superblock_raw,
+                    place.first,
+                    u64::from(place.state_home),
+                    &self.begin,
+                    &[&self.redo],
+                    &self.commit,
+                    |_, _| Ok(()),
+                )?;
+                work.verified = Some(VerifiedRestartRedo {
+                    placement: place,
+                    record_digest: Sha256::digest(self.redo).into(),
+                });
+                return Ok(Some(outcome));
             }
             _ => return Err(Error::Unknown),
         };

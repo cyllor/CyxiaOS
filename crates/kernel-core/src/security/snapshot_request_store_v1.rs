@@ -13,8 +13,8 @@ use crate::security::{
     file_service_v4::Reply,
     snapshot_service_v4::{
         BOUND, CANCELLED, DONE, FILE_REQ_KEY_BYTES, FileReqKey, Operation, PARTIAL, PRINCIPALS,
-        RestoreMode, SNAPSHOT_KEY_BYTES, SnapshotKey, SnapshotRequest, UNKNOWN, request_digest,
-        verify_mutation_result, zero,
+        RECOVERY_SLOT, RestoreMode, SNAPSHOT_KEY_BYTES, SnapshotKey, SnapshotRequest, UNKNOWN,
+        request_digest, verify_mutation_result, zero,
     },
 };
 
@@ -102,7 +102,7 @@ impl RequestRecord {
     ) -> bool {
         self.operation == SNAP_OP_RESTORE
             && self.state == RequestState::Done
-            && self.key.client_slot == 15
+            && self.key.client_slot == RECOVERY_SLOT
             && self.key.fs_uuid == commit.view.fs_uuid
             && self.key.request_seq == commit.key.request_seq
             && self.old_live_view_epoch == prepared.prior.live_epoch
@@ -580,7 +580,7 @@ pub const fn record_partition(client_slot: u32) -> Option<core::ops::Range<usize
     match client_slot {
         0..=13 => Some(0..ORDINARY_RECORDS),
         14 => Some(ORDINARY_RECORDS..ORDINARY_RECORDS + MAINTENANCE_RECORDS),
-        15 => Some(ORDINARY_RECORDS + MAINTENANCE_RECORDS..RECORDS),
+        RECOVERY_SLOT => Some(ORDINARY_RECORDS + MAINTENANCE_RECORDS..RECORDS),
         _ => None,
     }
 }

@@ -821,6 +821,8 @@ pub struct GcVolume<'a> {
 pub struct CheckpointedGc {
     checkpoint: SuperblockV1,
     bitmap_sha256: [u8; 32],
+    catalog_sha256: [u8; 32],
+    protection_sha256: [u8; 32],
     released: u32,
 }
 
@@ -846,6 +848,13 @@ impl CheckpointedGc {
         io.read(1, &mut work.protection)?;
         if unified_superblock_pair(&work.catalog, &work.protection)? != self.checkpoint {
             return Err(Error::Stale);
+        }
+        io.read(SNAPSHOT_CATALOG_BLOCK, &mut work.catalog)?;
+        io.read(SNAPSHOT_PROTECTION_BLOCK, &mut work.protection)?;
+        if hash(&work.catalog) != self.catalog_sha256
+            || hash(&work.protection) != self.protection_sha256
+        {
+            return Err(Error::Conflict);
         }
         for (i, page) in work.bitmap.iter_mut().enumerate() {
             io.read(BITMAP_START + i as u32, page)?;
@@ -942,6 +951,8 @@ pub fn retire_deleted_snapshot<I: EpochBlockIo>(
     catalog.encode(&mut work.catalog)?;
     protection.encode(&mut work.protection)?;
     let bitmap_sha256 = bitmap_hash(&work.bitmap);
+    let catalog_sha256 = hash(&work.catalog);
+    let protection_sha256 = hash(&work.protection);
     let plan = writer.prepare(6)?;
     let images: [RedoImage<'_>; 6] = core::array::from_fn(|at| match at {
         4 => RedoImage {
@@ -987,6 +998,8 @@ pub fn retire_deleted_snapshot<I: EpochBlockIo>(
     Ok(CheckpointedGc {
         checkpoint,
         bitmap_sha256,
+        catalog_sha256,
+        protection_sha256,
         released,
     })
 }

@@ -16,8 +16,9 @@ use cyxia_kernel_core::{
         recovery_v1::{RecoveryWorkspace, RedoImage, RedoWriter, recover_checkpoint},
         snapshot_read_v4::history_prefix_digest,
         snapshot_request_store_v1::{
-            RECORD_BYTES, RequestRecord, RequestState, RequestStoreHeader, Watermark,
-            inspect_request_store, record_location, verify_request_store,
+            MAINTENANCE_RECORDS, ORDINARY_RECORDS, RECORD_BYTES, RECORDS, RECOVERY_RECORDS,
+            RequestRecord, RequestState, RequestStoreHeader, Watermark, inspect_request_store,
+            record_location, record_partition, verify_request_store,
         },
         snapshot_service_v4::{
             CallBinding, RequestError, SnapshotGrant, SnapshotRequest, decode_reply, encode_reply,
@@ -248,6 +249,82 @@ fn all_sixteen_pages_enforce_partitions_watermarks_keys_commit_boundary_and_rese
     assert_eq!(
         verify_request_store(UUID, 1, 107, |block, page| empty.read(block, page)),
         Err(Error::Conflict),
+    );
+}
+
+#[test]
+fn full_request_store_retains_each_partition_and_rejects_cross_class_reuse() {
+    let vectors = vectors();
+    let mut raw_header: [u8; SUPER_BYTES] = named(&vectors, "header").try_into().unwrap();
+    let mut header = RequestStoreHeader::decode(&raw_header).unwrap().unwrap();
+    let classes = [
+        (0, ORDINARY_RECORDS),
+        (14, MAINTENANCE_RECORDS),
+        (15, RECOVERY_RECORDS),
+    ];
+    for (slot, capacity) in classes {
+        header.watermarks[slot as usize] = Watermark {
+            client_generation: 1,
+            highest_accepted_seq: capacity as u64,
+        };
+    }
+    header.encode(&mut raw_header).unwrap();
+    let mut media = Volume::from_header(&raw_header);
+    let mut template = RequestRecord::decode(named(&vectors, "pending")).unwrap();
+    template.state = RequestState::Failed;
+    template.result_code = -5;
+    template.log_epoch = 1;
+    template.replace_payload(&[]).unwrap();
+    let mut outcomes = Vec::new();
+    for (slot, capacity) in classes {
+        let partition = record_partition(slot).unwrap();
+        assert_eq!(partition.len(), capacity);
+        for (sequence, index) in (1u64..).zip(partition.clone()) {
+            let mut terminal = template;
+            terminal.key.client_slot = slot;
+            terminal.key.client_generation = 1;
+            terminal.key.request_seq = sequence;
+            terminal.txid = index as u64 + 1;
+            terminal.commit_lsn = terminal.txid;
+            terminal.seal_result().unwrap();
+            let mut raw = [0; RECORD_BYTES];
+            terminal.encode(&mut raw).unwrap();
+            media.put(index, &raw);
+            outcomes.push(terminal);
+        }
+        let evidence =
+            verify_request_store(UUID, header.generation, RECORDS as u64, |block, page| {
+                media.read(block, page)
+            })
+            .unwrap();
+        assert_eq!(evidence.occupied, partition.end);
+        assert_eq!(evidence.nonterminal, 0);
+    }
+    assert_eq!(outcomes.len(), RECORDS);
+    assert_eq!(record_location(RECORDS), Err(Error::Invalid));
+    let mut found = Vec::new();
+    inspect_request_store(
+        UUID,
+        header.generation,
+        RECORDS as u64,
+        |block, page| media.read(block, page),
+        |record| {
+            found.push(*record);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(found, outcomes);
+
+    let mut raw = [0; RECORD_BYTES];
+    outcomes[0].encode(&mut raw).unwrap();
+    media.put(0, &[0; RECORD_BYTES]);
+    media.put(RECORDS - RECOVERY_RECORDS, &raw);
+    assert_eq!(
+        verify_request_store(UUID, header.generation, RECORDS as u64, |block, page| {
+            media.read(block, page)
+        }),
+        Err(Error::Conflict)
     );
 }
 

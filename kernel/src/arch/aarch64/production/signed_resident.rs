@@ -51,6 +51,9 @@ use cyxia_kernel_core::{
 
 #[path = "signed_budget_trace.rs"]
 mod budget_trace;
+#[cfg(cyxia_startup_catalog)]
+#[path = "signed_resident/snapshots.rs"]
+mod snapshots;
 
 const CLOCK: u16 = 1;
 const YIELD: u16 = 1 << 1;
@@ -95,6 +98,9 @@ const NETWORK_POLICY_REJECTED: &[u8] =
 #[cfg(cyxia_startup_catalog)]
 const ROLE_SERVICES_REJECTED: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=role_services_unqualified command=status\n";
+#[cfg(cyxia_startup_catalog)]
+const SNAPSHOT_AUTHORITY_REJECTED: &[u8] =
+    b"V020_STARTUP state=SECURE_DEGRADED reason=snapshot_authority_unqualified command=status\n";
 #[cfg(cyxia_business_package)]
 const UNQUALIFIED_BUSINESS: &[u8] =
     b"V020_STARTUP state=SECURE_DEGRADED reason=business_package_unqualified command=status\n";
@@ -158,6 +164,8 @@ struct Services {
     next_selector: u32,
     #[cfg(cyxia_startup_catalog)]
     objects: Option<signed_syscalls::Objects>,
+    #[cfg(cyxia_startup_catalog)]
+    snapshots: Option<snapshots::SnapshotEndpoint>,
 }
 
 #[cfg(cyxia_startup_catalog)]
@@ -210,11 +218,26 @@ impl Services {
             next_selector: 0xc000 + ROLE_COUNT as u32,
             #[cfg(cyxia_startup_catalog)]
             objects: None,
+            #[cfg(cyxia_startup_catalog)]
+            snapshots: None,
         })
     }
 
     fn selector(&self, index: usize) -> u64 {
         self.selectors[index]
+    }
+
+    fn snapshot_endpoint(&self, role: Role) -> u64 {
+        #[cfg(cyxia_startup_catalog)]
+        return self
+            .snapshots
+            .as_ref()
+            .map_or(0, |entry| entry.startup_endpoint(role));
+        #[cfg(not(cyxia_startup_catalog))]
+        {
+            let _ = role;
+            0
+        }
     }
 
     #[cfg(cyxia_startup_catalog)]
@@ -323,6 +346,9 @@ impl Services {
 
     #[cfg(cyxia_startup_catalog)]
     fn permits(&self, caller: &SignedCaller, operation: Syscall, selector: u64) -> bool {
+        if operation == Syscall::ServiceCall && snapshots::SnapshotEndpoint::recognizes(selector) {
+            return self.snapshots.is_some() && caller.member.role == Role::Supervisor;
+        }
         let index = caller.index;
         match call_owner(operation) {
             CallOwner::Lifecycle => true,
@@ -344,7 +370,19 @@ impl Services {
     }
 
     #[cfg(cyxia_startup_catalog)]
-    fn dispatch(&mut self, caller: &SignedCaller, call: ValidatedCall) -> i64 {
+    fn dispatch(
+        &mut self,
+        caller: &SignedCaller,
+        call: ValidatedCall,
+        policy: &ConfirmedBootPolicy<'_>,
+    ) -> i64 {
+        if call.operation == Syscall::ServiceCall
+            && snapshots::SnapshotEndpoint::recognizes(call.args[0])
+        {
+            return self.snapshots.as_mut().map_or(E_AUTH, |endpoint| {
+                endpoint.dispatch(caller, call.args, policy)
+            });
+        }
         let index = caller.index;
         match call_owner(call.operation) {
             CallOwner::RosterObjects => self
@@ -867,12 +905,13 @@ impl Task {
         member: NativeRole,
         services: &mut Services,
         captured_ttbr0: u64,
+        policy: &ConfirmedBootPolicy<'_>,
     ) -> Result<TaskAction, Error> {
         if registered_role_abi(index, member, captured_ttbr0) != Some(syscall_abi) {
             return Err(Error::Denied);
         }
         #[cfg(not(cyxia_startup_catalog))]
-        let _ = services;
+        let _ = (services, policy);
         #[cfg(cyxia_startup_catalog)]
         let caller = SignedCaller {
             index,
@@ -921,7 +960,7 @@ impl Task {
             Syscall::Exit => return Ok(TaskAction::Exit(call.args[0] as i32)),
             _ => {
                 #[cfg(cyxia_startup_catalog)]
-                let result = services.dispatch(&caller, call);
+                let result = services.dispatch(&caller, call, policy);
                 #[cfg(not(cyxia_startup_catalog))]
                 let result = E_AUTH;
                 if result == E_AUTH {
@@ -1163,6 +1202,7 @@ fn load_signed_roles(
                 actor.generation,
                 RoleLaunch::Lifecycle {
                     cap_selector: services.selector(index),
+                    snapshot_endpoint: services.snapshot_endpoint(ROLES[index]),
                     object_epoch: services
                         .grants
                         .uses_objects(index)
@@ -1253,6 +1293,7 @@ fn turn(
             &mut returned,
             execution,
             services,
+            policy,
         )
     } else {
         Err(Error::Denied)
@@ -1433,6 +1474,7 @@ fn recover_role_step(
                 generation,
                 RoleLaunch::Lifecycle {
                     cap_selector: selector,
+                    snapshot_endpoint: services.snapshot_endpoint(old.role),
                     object_epoch: services
                         .grants
                         .uses_objects(index)
@@ -1551,6 +1593,7 @@ fn run_quantum(
     returned: &mut u64,
     execution: &Execution,
     services: &mut Services,
+    policy: &ConfirmedBootPolicy<'_>,
 ) -> Result<Option<RoleStop>, Error> {
     // A separate physical timer forces return before the prepaid bound
     // expires. Reserve exit/settlement margin using the native fixture's
@@ -1622,7 +1665,7 @@ fn run_quantum(
             Return::Timer | Return::Yield => break,
             Return::Emulated => {}
             Return::Syscall => {
-                match task.syscall(syscall_abi, index, member, services, captured_ttbr0)? {
+                match task.syscall(syscall_abi, index, member, services, captured_ttbr0, policy)? {
                     TaskAction::Resume => {}
                     TaskAction::EndTurn => break,
                     TaskAction::Exit(status) => return Ok(Some(RoleStop::Exited(status))),
@@ -1702,6 +1745,8 @@ fn run_tasks(
     let mut recovery_cursor = 0;
     #[cfg(cyxia_startup_catalog)]
     let mut prefer_audit = true;
+    #[cfg(cyxia_startup_catalog)]
+    let mut prefer_snapshot = false;
     let mut command = 0;
     let mut next_evidence = EvidenceFrame::Roles;
     // Finish publishing the authenticated cohort before entering any EL0
@@ -1720,9 +1765,48 @@ fn run_tasks(
                 // when both have work so continuous audit input cannot
                 // starve a stopped Supervisor's replacement.
                 let role_pending = tasks.iter().any(|task| task.recovery.pending());
-                if recovery::has_pending_persistence() && (prefer_audit || !role_pending) {
+                let audit_pending = recovery::has_pending_persistence();
+                let snapshot_pending = services.snapshots.as_ref().is_some_and(|s| s.pending());
+                #[cfg(cyxia_file_read_client)]
+                let file_pending = signed_business::file_runtime_pending();
+                #[cfg(not(cyxia_file_read_client))]
+                let file_pending = false;
+                if file_pending && (prefer_snapshot || !role_pending && !audit_pending) {
+                    #[cfg(cyxia_file_read_client)]
+                    {
+                        let mut work = RecoveryBatches::new(budget);
+                        signed_business::file_runtime_turn(boot, &mut || work.checkpoint());
+                        let (batches, used) = work.finish()?;
+                        if batches != 0 {
+                            report_recovery("V020_G1_FILE_RUNTIME_BUDGET", batches, used, RECOVERY_NS);
+                        }
+                    }
+                    prefer_snapshot = false;
+                } else if snapshot_pending && (prefer_snapshot || !role_pending && !audit_pending) {
+                    let mut work = RecoveryBatches::new(budget);
+                    let result = services.snapshots.as_mut().unwrap().advance(
+                        boot,
+                        manifest,
+                        &tasks,
+                        &mut || work.checkpoint(),
+                    );
+                    let (batches, used) = work.finish()?;
+                    if batches != 0 {
+                        report_recovery("V020_G1_SNAPSHOT_RUNTIME_BUDGET", batches, used, RECOVERY_NS);
+                    }
+                    if let Err(error) = result {
+                        report_recovery(
+                            "V020_G1_SNAPSHOT_RUNTIME_REFUSED",
+                            boot_epoch,
+                            error as u64,
+                            0,
+                        );
+                    }
+                    prefer_snapshot = false;
+                } else if audit_pending && (prefer_audit || !role_pending) {
                     persist_recovery(budget, 0, true)?;
                     prefer_audit = false;
+                    prefer_snapshot = snapshot_pending || file_pending;
                 } else if role_pending {
                     recover_one_role(
                         boot,
@@ -1733,6 +1817,7 @@ fn run_tasks(
                         &mut recovery_cursor,
                     )?;
                     prefer_audit = true;
+                    prefer_snapshot = snapshot_pending || file_pending;
                 }
             }
             // Resume interrupted settlement before exposing any plan query
@@ -2154,7 +2239,7 @@ pub(super) fn run(info: &BootInfo) -> ! {
     #[cfg(cyxia_business_package)]
     let control_config = (startup.config.wire(), startup.config.digest());
     #[cfg(cyxia_startup_catalog)]
-    let (deployment, grants, mut staged) = {
+    let (deployment, grants, snapshot_authority, mut staged) = {
         budget
             .continuous
             .as_mut()
@@ -2177,17 +2262,29 @@ pub(super) fn run(info: &BootInfo) -> ! {
                 })?;
             let grants = qualify_role_services(&mut media, &startup.config)
                 .map_err(|error| (ROLE_SERVICES_REJECTED, "V020_SEC_S_CATALOG_REJECTED", error))?;
-            let staged =
-                media_staging::stage_with_policy(info, Some(startup.config), policy, &mut || {
-                    media.checkpoint()
-                });
-            Ok((deployment, grants, staged))
+            let snapshot_authority =
+                startup_catalog::snapshot_authority(&startup.config, &mut || media.checkpoint())
+                    .map_err(|error| {
+                        (
+                            SNAPSHOT_AUTHORITY_REJECTED,
+                            "V020_G1_SNAPSHOT_AUTHORITY_REJECTED",
+                            error,
+                        )
+                    })?;
+            let staged = media_staging::stage_with_policy(
+                info,
+                Some(startup.config),
+                policy,
+                snapshot_authority,
+                &mut || media.checkpoint(),
+            );
+            Ok((deployment, grants, snapshot_authority, staged))
         })();
         let (batches, used) = match media.finish() {
             Ok(debit) => debit,
             Err(fault) => fence(info, budget, OutputQueue::new(), fault),
         };
-        let (deployment, grants, staged) = match staged {
+        let (deployment, grants, snapshot_authority, staged) = match staged {
             Ok(staged) => staged,
             Err((reason, label, error)) => {
                 report(label, error as u64, 0, 0);
@@ -2203,7 +2300,7 @@ pub(super) fn run(info: &BootInfo) -> ! {
                 .finish_media(staged.confirmed_epoch);
             report("V020_SIGNED_MEDIA_BUDGET", batches, used, RECOVERY_NS);
         }
-        (deployment, grants, staged)
+        (deployment, grants, snapshot_authority, staged)
     };
     #[cfg(not(cyxia_startup_catalog))]
     let grants = RoleServices::NONE;
@@ -2230,6 +2327,16 @@ pub(super) fn run(info: &BootInfo) -> ! {
         Ok(services) => services,
         Err(error) => fence(info, budget, OutputQueue::new(), error.into()),
     };
+    #[cfg(cyxia_startup_catalog)]
+    if let Some(grant) = snapshot_authority {
+        services.snapshots = match snapshots::SnapshotEndpoint::bind(grant, &policy) {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                report("V020_G1_SNAPSHOT_AUTHORITY_REJECTED", error as u64, 0, 0);
+                degraded(info, budget, Some(SNAPSHOT_AUTHORITY_REJECTED))
+            }
+        };
+    }
     let (members, execution) = match load_signed_roles(&mut budget, &policy, &actors, &mut services)
     {
         Ok(loaded) => loaded,

@@ -274,6 +274,7 @@ pub(super) enum RoleLaunch {
     #[cfg(cyxia_signed_resident)]
     Lifecycle {
         cap_selector: u64,
+        snapshot_endpoint: u64,
         object_epoch: Option<u64>,
     },
     #[cfg(feature = "v020-production-diagnostic")]
@@ -382,8 +383,9 @@ pub(super) fn load_role_with_identity(
         #[cfg(cyxia_signed_resident)]
         RoleLaunch::Lifecycle {
             cap_selector,
+            snapshot_endpoint,
             object_epoch,
-        } => (cap_selector, 0u64, 0, 0, object_epoch),
+        } => (cap_selector, snapshot_endpoint, 0, 0, object_epoch),
         #[cfg(feature = "v020-production-diagnostic")]
         RoleLaunch::Diagnostic {
             cap_selector,

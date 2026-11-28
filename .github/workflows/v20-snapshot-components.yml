@@ -11,7 +11,10 @@ on:
       - 'crates/kernel-core/src/security/file_*'
       - 'crates/kernel-core/src/security/snapshot_*'
       - 'crates/kernel-core/tests/snapshot_*'
+      - 'crates/kernel-core/tests/g1_shared_resources.rs'
       - 'crates/kernel-core/tests/media_staging.rs'
+      - 'crates/kernel-core/src/control_plane/role_budget_v0199.rs'
+      - 'crates/prototype/src/domains/io.rs'
       - 'kernel/src/arch/aarch64/production/media_staging/authority.rs'
       - 'kernel/src/arch/aarch64/production/media_staging/reopen.rs'
       - 'kernel/src/arch/aarch64/production/media_staging/signed.rs'
@@ -20,6 +23,13 @@ on:
       - 'tests/host/test_v2_filesystem.py'
       - 'tools/check_v2_filesystem.py'
       - 'tools/v020_g1_export_v2.py'
+      - 'tools/v020_g1_migration_authority.py'
+      - 'tools/verify_v020_g1_parameter_use.py'
+      - 'tools/test_v020_g1_parameter_use.py'
+      - 'tools/verify_v020_g1_file_budget.py'
+      - 'tools/test_v020_g1_file_budget.py'
+      - 'docs/design/v0.20-g1-parameter-bindings.json'
+      - 'crates/contracts/src/resource.rs'
       - 'tools/test_snapshot_probe.py'
       - 'tools/run_snapshot_probe.py'
       - 'tools/host_prototype_library.py'
@@ -123,7 +133,12 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B tools/v020_g1_snapshot_wire.py 2>&1 | tee artifacts/snapshot-media/d7-wire.log
+          python3 -B tools/verify_v020_g1_parameter_use.py --list-candidates > artifacts/snapshot-media/g1-parameter-bindings.json
+          python3 -B -m unittest -v tools.test_v020_g1_parameter_use 2>&1 | tee artifacts/snapshot-media/g1-parameter-scanner.log
+          PYTHONPATH=tools python3 -B -m unittest test_v020_g1_file_budget 2>&1 | tee artifacts/snapshot-media/g1-budget-replay.log
           cargo test --locked --offline -p cyxia-kernel-core --test snapshot_g1_parameters --test snapshot_d7_wire 2>&1 | tee artifacts/snapshot-media/g1-parameters.log
+          cargo test --locked --offline -p cyxia-kernel-core --test g1_shared_resources 2>&1 | tee artifacts/snapshot-media/g1-shared-resources.log
+          cargo test --locked --offline -p cyxia-kernel-core --lib g1_control_window_retains_full_recovery_debit 2>&1 | tee artifacts/snapshot-media/g1-control-window-saturation.log
           cargo test --locked --offline -p cyxia-kernel-core d5_workspace_bytes_fit_the_ledger --lib -- --nocapture 2>&1 | tee artifacts/snapshot-media/d5-workspace.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

@@ -62,7 +62,7 @@ use sha2::{Digest, Sha256};
 mod durable;
 #[cfg(cyxia_startup_catalog)]
 pub(super) use durable::{
-    ack_durable, audit_degraded, audit_transport_online, check_durable_ack, close_audit_reader,
+    MeteredDisk, ack_durable, audit_degraded, audit_transport_online, check_durable_ack, close_audit_reader,
     confirm_delivery, durable_available, has_pending_persistence, install_durable, open_durable,
     persist_pending, read_durable, replace_audit_reader, verify_retired_ack, with_epoch_io,
 };

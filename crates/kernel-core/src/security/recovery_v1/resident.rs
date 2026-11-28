@@ -2,8 +2,8 @@
 
 use super::{
     BLOCK, END, EpochBlockIo, Error, FIRST, Header, OLD_CONTINUATION, OLD_RECORD, RecoveryEvidence,
-    RecoveryWorkspace, RedoTransaction, Row, Sha256, SuperblockV1, after_image_home, begin_count,
-    checkpoint_scanned, has_later_log_header, hash, read_exact_image, read_record,
+    RecoveryWorkspace, RedoTransaction, RedoWriter, Row, Sha256, SuperblockV1, after_image_home,
+    begin_count, checkpoint_scanned, has_later_log_header, hash, read_exact_image, read_record,
     read_record_with_preparation, same_superblocks, u16at, u32at, u64at, verify_commit,
 };
 use crate::security::{
@@ -12,6 +12,9 @@ use crate::security::{
     file_receipt_store_v0199::{RECEIPT_STORE_BYTES, home_closure},
 };
 use sha2::Digest;
+
+#[path = "snapshot.rs"]
+pub mod snapshot;
 
 /// Classify the first block before selecting the active or checkpointed
 /// inspection path. The entire extent is independently verified by inspect.
@@ -220,6 +223,28 @@ impl<'a, I: EpochBlockIo> Journal<'a, I> {
 
     pub fn evidence(&self) -> RecoveryEvidence {
         self.work.evidence.expect("verified resident journal")
+    }
+
+    /// Hand the clean, current resident extent to its sole append owner.
+    /// Inspection already verified both superblocks and the entire suffix.
+    pub fn into_writer(self) -> Result<RedoWriter<'a, I>, Error> {
+        if self.retired || self.preparation.is_some() || self.work.checkpoint_required {
+            return Err(Error::Unknown);
+        }
+        let transactions = u64::from(self.evidence().transactions);
+        self.work.last_txid = self
+            .checkpoint
+            .generation
+            .checked_add(transactions)
+            .and_then(|next| next.checked_sub(1))
+            .ok_or(Error::Exhausted)?;
+        self.work.next_log_block = self.extent_end;
+        self.work.retire_after = None;
+        self.work.obsolete.fill(0);
+        Ok(RedoWriter {
+            io: self.io,
+            workspace: self.work,
+        })
     }
 
     pub fn view(&mut self) -> impl EpochBlockIo + '_ {

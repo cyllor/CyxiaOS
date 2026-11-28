@@ -7,6 +7,7 @@ pub(super) fn build(default_catalog: bool) {
     println!("cargo:rustc-check-cfg=cfg(cyxia_business_package)");
     println!("cargo:rustc-check-cfg=cfg(cyxia_business_task_services)");
     println!("cargo:rustc-check-cfg=cfg(cyxia_file_owner_package)");
+    println!("cargo:rustc-check-cfg=cfg(cyxia_file_read_client)");
     if !default_catalog {
         return;
     }
@@ -34,6 +35,14 @@ pub(super) fn build(default_catalog: bool) {
         owner_inputs == 0 || owner_inputs == file_owner.len(),
         "file owner inputs must be supplied together"
     );
+    let has_file_client = match (
+        input.join("file-client.bin").try_exists(),
+        input.join("file-client.sig").try_exists(),
+    ) {
+        (Ok(false), Ok(false)) => false,
+        (Ok(true), Ok(true)) if owner_inputs == file_owner.len() => true,
+        _ => panic!("file client manifest and signature require the signed file-owner package"),
+    };
     // Watch the directory when the optional pair is absent so adding both
     // deployment assets causes Cargo to rebuild the immutable inventory.
     println!("cargo:rerun-if-changed={}", input.display());
@@ -67,6 +76,12 @@ pub(super) fn build(default_catalog: bool) {
             fs::write(out.join(name), load(input, name, min, max)).expect(name);
         }
         println!("cargo:rustc-cfg=cyxia_file_owner_package");
+    }
+    if has_file_client {
+        for (name, len) in [("file-client.bin", 64), ("file-client.sig", 64)] {
+            fs::write(out.join(name), load(input, name, len, len)).expect(name);
+        }
+        println!("cargo:rustc-cfg=cyxia_file_read_client");
     }
     if has_grants {
         assert!(

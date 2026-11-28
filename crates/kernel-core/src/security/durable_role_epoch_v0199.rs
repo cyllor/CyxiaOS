@@ -145,6 +145,11 @@ impl ConfirmedBootPolicy<'_> {
         self.config_digest == digest
     }
 
+    /// Match a protected owner's verified mount to the exact running state.
+    pub(super) fn matches_mounted_security(&self, state: &SecurityStateStoreV2) -> bool {
+        self.epochs.running_boot_epoch() == Ok(self.boot) && self.epochs.committed == *state
+    }
+
     pub fn service_generation(&self, role: Role) -> Result<u64, Error> {
         self.epochs.running_service_generation(role)
     }

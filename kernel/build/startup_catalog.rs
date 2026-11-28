@@ -88,6 +88,7 @@ pub(super) fn copy_policy_inputs(input: &Path, out: &Path) {
     for (data, signature, bytes) in [
         ("recovery-store.bin", "recovery-store.sig", 104),
         ("file-volume.bin", "file-volume.sig", 168),
+        ("snapshot-authority.bin", "snapshot-authority.sig", 56),
     ] {
         let present = input
             .join(data)

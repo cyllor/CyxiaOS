@@ -18,11 +18,13 @@ pub mod file_volume;
 mod lifecycle_packages;
 mod profile;
 pub mod role_services;
+pub mod snapshot_authority;
 
 pub use business_package::TASK_SERVICES_BYTES;
 use business_package::{business_package_message, task_services_message};
 pub use lifecycle_packages::LifecyclePackageDigest;
 use lifecycle_packages::lifecycle_package_message;
+pub use profile::{FILE_ALLOC_GROUP_PER_SECOND, FILE_FSYNC_TASK_PER_SECOND, FILE_RETIRE_GROUP_PER_SECOND};
 
 pub struct PinnedStartupCatalog<'a> {
     pub boot_public_key: &'a [u8; 32],
@@ -336,6 +338,58 @@ mod tests {
         owner_grant[12] = 2;
         assert_eq!(
             FileOwnerGrant::verify(&catalog, &policy, package, &owner_grant, &owner_signature),
+            Err(Error::Invalid)
+        );
+        let client_owner = [26; 32];
+        let mut client_grant = [0; file_owner::CLIENT_BYTES];
+        client_grant[..8].copy_from_slice(b"CYXFCL01");
+        client_grant[8..24].copy_from_slice(&policy.header().fs_uuid);
+        client_grant[24..28].copy_from_slice(&2u32.to_le_bytes());
+        client_grant[28..32].copy_from_slice(&[0, 3, 3, 0]);
+        for (word, value) in client_grant[32..].chunks_exact_mut(8).zip([5u64, 7, 1, 1]) {
+            word.copy_from_slice(&value.to_le_bytes());
+        }
+        let signed = signer
+            .sign(
+                &[
+                    &b"CYX/STARTUP-FILE-CLIENT/v1"[..],
+                    &policy.digest(),
+                    &package,
+                    &client_owner,
+                    &client_grant,
+                ]
+                .concat(),
+            )
+            .to_bytes();
+        use file_owner::FileClientGrant;
+        let verify_client = |business, owner, raw: &[u8; file_owner::CLIENT_BYTES]| {
+            FileClientGrant::verify(&catalog, &policy, business, owner, raw, &signed)
+        };
+        let verified = verify_client(package, client_owner, &client_grant).unwrap();
+        assert_eq!(
+            (
+                verified.inode,
+                verified.inode_generation,
+                verified.acl_generation
+            ),
+            (2, 5, 7)
+        );
+        assert_eq!(
+            verify_client([23; 32], client_owner, &client_grant),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            verify_client(package, [23; 32], &client_grant),
+            Err(Error::Unauthorized)
+        );
+        client_grant[40] ^= 1;
+        assert_eq!(
+            verify_client(package, client_owner, &client_grant),
+            Err(Error::Unauthorized)
+        );
+        client_grant[28] = 1;
+        assert_eq!(
+            verify_client(package, client_owner, &client_grant),
             Err(Error::Invalid)
         );
         let other_authority = PinnedStartupCatalog {

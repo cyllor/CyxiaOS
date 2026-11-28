@@ -102,9 +102,14 @@ mod signed;
 use cyxia_kernel_core::security::offline_config_v1::VerifiedOfflineConfig;
 #[cfg(cyxia_startup_catalog)]
 use cyxia_kernel_core::security::{
-    boot_epoch_v1::{TlsBootPolicy, TlsBootTransition},
+    boot_epoch_v1::{BootEpochStoreV1, TlsBootPolicy, TlsBootTransition},
+    file_index_v0199::SecurityStateStoreV2,
+    file_media_v0199::SuperblockV1,
+    file_mount_v1::MountEvidence,
     network::deployment::KeyManifest,
     recovery_proof_store::RecoveryProofStore,
+    recovery_v1::{RecoveryWorkspace, RedoWriter, resident::Journal},
+    startup_catalog_v0199::snapshot_authority::SnapshotAuthority,
 };
 #[cfg(cyxia_signed_scratch_catalog)]
 #[path = "startup_catalog.rs"]
@@ -177,6 +182,55 @@ pub(super) struct SignedResidentBoot {
     config: VerifiedOfflineConfig<'static>,
     #[cfg(cyxia_startup_catalog)]
     restarts: role_restart::RestartJournal,
+    #[cfg(cyxia_startup_catalog)]
+    runtime: Option<RuntimeJournal>,
+}
+
+#[cfg(cyxia_startup_catalog)]
+struct RuntimeJournal {
+    workspace: &'static mut RecoveryWorkspace,
+    checkpoint: SuperblockV1,
+    mounted: MountEvidence,
+}
+
+#[cfg(cyxia_startup_catalog)]
+impl RuntimeJournal {
+    fn open(
+        disk: &mut Disk<'_>,
+        checkpoint: SuperblockV1,
+        mut mounted: MountEvidence,
+        committed: SecurityStateStoreV2,
+    ) -> Result<Self, SecurityError> {
+        // SAFETY: this is the final use by the one-shot CPU0 staging owner.
+        // Runtime use stays with the same CPU0 owner for the rest of boot.
+        let workspace = unsafe { reopen::workspace() };
+        let mut writer = Journal::inspect(disk, workspace, checkpoint, None, |_| Ok(()))?
+            .into_writer()?;
+        let evidence = writer.evidence().ok_or(SecurityError::Unknown)?;
+        if evidence.transactions != 1
+            || checkpoint.checkpoint_lsn.checked_add(4) != Some(evidence.last_commit_lsn)
+        {
+            return Err(SecurityError::Conflict);
+        }
+        let mut raw = [0; BLOCK_BYTES];
+        writer.read_committed_at(volume::BOOT_HOME, evidence.last_commit_lsn, &mut raw)?;
+        let boot = BootEpochStoreV1::decode(&raw)?;
+        writer.read_committed_at(volume::SECURITY_HOME, evidence.last_commit_lsn, &mut raw)?;
+        if SecurityStateStoreV2::decode(&raw)? != committed
+            || !boot.matches(&committed)
+            || mounted.boot.fs_uuid != boot.fs_uuid
+            || mounted.boot.boot_epoch.checked_add(1) != Some(boot.boot_epoch)
+        {
+            return Err(SecurityError::Conflict);
+        }
+        mounted.boot = boot;
+        mounted.security = committed;
+        Ok(Self {
+            workspace,
+            checkpoint,
+            mounted,
+        })
+    }
 }
 
 /// Boot-verified public policy. No previous private credential is present.
@@ -212,10 +266,41 @@ impl SignedResidentBoot {
         self.restarts.advance(
             &mut self.epochs,
             &self.config,
+            self.runtime.as_mut(),
             stop,
             checkpoint,
             verify_stop,
         )
+    }
+
+    #[cfg(cyxia_startup_catalog)]
+    pub(super) fn with_runtime_writer<T>(
+        &mut self,
+        checkpoint: &mut dyn FnMut() -> Result<(), SecurityError>,
+        operation: impl FnOnce(
+            &mut RedoWriter<'_, super::recovery::MeteredDisk<'_>>,
+            &mut MountEvidence,
+            &VerifiedOfflineConfig<'static>,
+        ) -> Result<T, SecurityError>,
+    ) -> Result<T, SecurityError> {
+        if cyxia_arch_aarch64::cpu::slot() != 0 {
+            return Err(SecurityError::Unauthorized);
+        }
+        if self.restarts.pending() {
+            return Err(SecurityError::Busy);
+        }
+        let epoch = self.policy()?.boot_epoch();
+        let runtime = self.runtime.as_mut().ok_or(SecurityError::Unauthorized)?;
+        if runtime.mounted.boot.boot_epoch != epoch
+            || !runtime.mounted.boot.matches(&runtime.mounted.security)
+        {
+            return Err(SecurityError::Stale);
+        }
+        super::recovery::with_epoch_io(checkpoint, |io| {
+            let mut writer =
+                RedoWriter::resume_exclusive(io, runtime.workspace, runtime.checkpoint)?;
+            operation(&mut writer, &mut runtime.mounted, &self.config)
+        })
     }
 }
 
@@ -410,6 +495,7 @@ fn run_chain(
     out: &mut StagingOutcome,
     #[cfg(cyxia_signed_resident)] verified: Option<VerifiedOfflineConfig<'static>>,
     #[cfg(cyxia_startup_catalog)] network: NetworkPolicy,
+    #[cfg(cyxia_startup_catalog)] snapshot_authority: Option<SnapshotAuthority>,
     #[cfg(all(
         feature = "v020-production-fsync-scratch",
         not(cyxia_signed_resident)
@@ -515,7 +601,13 @@ fn run_chain(
         {
             use reopen::BootLogRecovery;
             let reconciled = reopen::recover_resident_for_layout(
-                disk, sb, current, transition, resident_layout, recovery_locator,
+                disk,
+                sb,
+                current,
+                transition,
+                resident_layout,
+                recovery_locator,
+                snapshot_authority,
             );
             match &reconciled {
                 Ok((_, mounted, outcome)) => {
@@ -645,7 +737,7 @@ fn run_chain(
     #[cfg(not(any(feature = "v020-production-media-signed", cyxia_startup_catalog)))]
     let _ = resident_epochs;
     #[cfg(cyxia_startup_catalog)]
-    {
+    let runtime = {
         use cyxia_kernel_core::control_plane::role_manifest_v0199::ROLE_COUNT;
         let unchanged_roles = mounted.security.service_generations[..ROLE_COUNT]
             .try_into()
@@ -701,6 +793,12 @@ fn run_chain(
                 .ok()?;
             }
         }
+        #[cfg(cyxia_file_read_client)]
+        super::signed_business::stage_file_client(
+            disk, &mounted, &committed, volume::ACL_HOME, recovery_locator.map(|locator| locator.inode_slot()),
+        )
+            .inspect_err(|error| report("V020_SEC_F_READ_GRANT_REFUSED", out.confirmed_epoch, *error as u64, 0))
+            .ok()?;
         disk.checkpoint().ok()?;
         report(
             "V020_W12_MEDIA_EPOCH",
@@ -722,7 +820,26 @@ fn run_chain(
             mounted.receipts.unresolved as u64,
             (mounted.receipts.occupied - mounted.receipts.unresolved) as u64,
         );
-    }
+        let writable_file = {
+            #[cfg(cyxia_file_read_client)]
+            {
+                super::signed_business::file_client_writable()
+            }
+            #[cfg(not(cyxia_file_read_client))]
+            false
+        };
+        if (snapshot_authority.is_some() && mounted.snapshot.is_some()) || writable_file {
+            Some(
+                RuntimeJournal::open(disk, checkpoint, mounted, committed)
+                    .inspect_err(|error| {
+                        report("V020_SEC_F_JOURNAL_REFUSED", out.confirmed_epoch, *error as u64, 0)
+                    })
+                    .ok()?,
+            )
+        } else {
+            None
+        }
+    };
     #[cfg(feature = "v020-production-media-signed")]
     {
         let committed = authority::verified_pair_state(disk, checkpoint, config).ok()?;
@@ -828,6 +945,8 @@ fn run_chain(
             config: verified,
             #[cfg(cyxia_startup_catalog)]
             restarts,
+            #[cfg(cyxia_startup_catalog)]
+            runtime,
         });
     }
     out.mount_requires_recovery = false;
@@ -857,6 +976,7 @@ pub(super) fn stage_with_policy(
     info: &BootInfo,
     #[cfg(cyxia_signed_resident)] verified: Option<VerifiedOfflineConfig<'static>>,
     #[cfg(cyxia_startup_catalog)] network: NetworkPolicy,
+    #[cfg(cyxia_startup_catalog)] snapshot_authority: Option<SnapshotAuthority>,
     #[cfg(cyxia_startup_catalog)] checkpoint: &mut dyn FnMut() -> Result<(), SecurityError>,
     #[cfg(all(
         feature = "v020-production-fsync-scratch",
@@ -920,6 +1040,8 @@ pub(super) fn stage_with_policy(
             verified,
             #[cfg(cyxia_startup_catalog)]
             network,
+            #[cfg(cyxia_startup_catalog)]
+            snapshot_authority,
         )
         .is_some();
     }

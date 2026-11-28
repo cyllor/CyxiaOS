@@ -1,0 +1,347 @@
+{
+  "schema": "cyxia-v020-g1-parameter-bindings/v1",
+  "bindings": {
+    "advice.disposition_bytes": {
+      "owner": "AdviceDisposition.v1", "unit": "bytes", "derivation": "Fixed AdviceDisposition v1 frame",
+      "definitions": [["crates/kernel-core/src/control_plane/advice_disposition_v1.rs", "DISPOSITION_BYTES", "240"]],
+      "uses": [["crates/kernel-core/src/control_plane/advice_disposition_v1.rs", "bytes.len() != DISPOSITION_BYTES"]],
+      "tests": [["crates/kernel-core/src/control_plane/advice_disposition_v1.rs", "no_decision_is_observation_only_and_old_or_malformed_records_fail"]]
+    },
+    "advice.record_bytes": {
+      "owner": "AdviceSchema.v1", "unit": "bytes", "derivation": "Fixed AdviceEnvelope v1 frame",
+      "definitions": [["crates/kernel-core/src/control_plane/advice_envelope_v1.rs", "ADVICE_BYTES", "152"]],
+      "uses": [["crates/kernel-core/src/control_plane/advice_envelope_v1.rs", "bytes.len() != ADVICE_BYTES"]],
+      "tests": [["crates/kernel-core/src/control_plane/advice_envelope_v1.rs", "exact_152_byte_frame_uses_trusted_candidate_value"]]
+    },
+    "audit.recovery_digest_label": {
+      "owner": "RecoveryProof.v2", "unit": "ASCII bytes", "derivation": "Domain of the per-CPU recovery digest chain",
+      "definitions": [["crates/kernel-core/src/security/recovery_proof_v2.rs", "RECOVERY_DOMAIN", "b\"CYX/RECOVERY/v2\""]],
+      "uses": [["crates/kernel-core/src/security/recovery_proof_v2.rs", "h.update(RECOVERY_DOMAIN)"]],
+      "tests": [["crates/kernel-core/src/security/recovery_proof_v2.rs", "chain_steps_match_independent_golden_vectors"]]
+    },
+    "crypto.drbg_personalization": {
+      "owner": "CSPRNG.v1", "unit": "ASCII bytes", "derivation": "Personalization appended to the DRBG seed input",
+      "definitions": [["crates/kernel-core/src/security/network/entropy.rs", "PERSONALIZATION", "b\"CYX/DRBG/v1\""]],
+      "uses": [["crates/kernel-core/src/security/network/entropy.rs", "copy_from_slice(PERSONALIZATION)"]],
+      "tests": [["crates/kernel-core/src/security/network/entropy.rs", "domains_are_independent_and_boot_epoch_bound"]]
+    },
+    "decision.record_bytes": {
+      "owner": "DecisionSchema.v3", "unit": "bytes", "derivation": "Fixed DecisionRecord v3 frame",
+      "definitions": [["crates/kernel-core/src/control_plane/decision_record_v3.rs", "DECISION_BYTES", "256"]],
+      "uses": [["crates/kernel-core/src/control_plane/decision_record_v3.rs", "bytes.len() != DECISION_BYTES"]],
+      "tests": [["crates/kernel-core/src/control_plane/decision_record_v3.rs", "malformed_lengths_retired_disposition_and_rule_bypass_fail_closed"]]
+    },
+    "echo.payload_max_bytes": {
+      "owner": "EchoSchema.v1", "unit": "bytes", "derivation": "Maximum Echo payload excluding its frame header",
+      "definitions": [["crates/net-transport/src/echo.rs", "MAX_PAYLOAD", "4096"]],
+      "uses": [["crates/net-transport/src/echo.rs", "payload_len > MAX_PAYLOAD || input.len() != total"]],
+      "tests": [["crates/net-transport/src/echo.rs", "sec_n05_oversize_and_bad_version"]]
+    },
+    "evidence.verdict_digest_label": {
+      "owner": "Verdict.v4", "unit": "ASCII bytes", "derivation": "Domain of the canonical V4 verdict digest",
+      "definitions": [["crates/kernel-core/src/security/verdict_v4.rs", "LABEL", "b\"CYX/VERDICT/v4\""]],
+      "uses": [["crates/kernel-core/src/security/verdict_v4.rs", "hash.update(LABEL)"]],
+      "tests": [["crates/kernel-core/tests/verdict_v4_vectors.rs", "all_262_g4_records_match_the_reference_corpus"]]
+    },
+    "file.admit_digest_label": {
+      "owner": "FileAuth.v3", "unit": "ASCII bytes", "derivation": "Domain from §9.6.1",
+      "definitions": [["crates/kernel-core/src/security/file_auth_v3.rs", "OPERATION_DOMAIN", "b\"CYX/FILE-ADMIT/v3\""]],
+      "uses": [["crates/kernel-core/src/security/file_auth_v3.rs", "outer.update(OPERATION_DOMAIN)"]],
+      "tests": [["crates/kernel-core/tests/file_auth_wire.rs", "file_auth_digests_match_independent_sha256_and_reject_changed_binding"]]
+    },
+    "file.blocks": {
+      "owner": "FileFormat.v1", "unit": "blocks", "derivation": "512 MiB divided by 4096 bytes",
+      "definitions": [["crates/kernel-core/src/security/file_media_v0199.rs", "BLOCK_COUNT", "131072"]],
+      "uses": [["kernel/src/arch/aarch64/production/media_staging/volume.rs", "file_format_v1::format_unified(disk, BLOCK_COUNT"]],
+      "tests": [["crates/kernel-core/tests/snapshot_g1_parameters.rs", "d1_geometry_matches_file_format_and_system_object_owners"]]
+    },
+    "file.inodes": {
+      "owner": "FileFormat.v1", "unit": "inodes", "derivation": "The v1 table has 16 pages of 16 inode records",
+      "definitions": [["crates/kernel-core/src/security/file_structure_v1.rs", "INODES", "256"]],
+      "uses": [["crates/kernel-core/src/security/file_mount_v1.rs", "const ACL_STORE: usize = INODES * ACL_BYTES"]],
+      "tests": [["crates/kernel-core/tests/snapshot_g1_parameters.rs", "d1_geometry_matches_file_format_and_system_object_owners"]]
+    },
+    "file.io_max_bytes": {
+      "owner": "FileServiceRequest.v4", "unit": "bytes", "derivation": "64 KiB per logical I/O",
+      "definitions": [["crates/kernel-core/src/security/file_service_v4.rs", "MAX_IO_BYTES", "65_536"]],
+      "uses": [["crates/kernel-core/src/security/file_service_v4.rs", "le32(payload, 8)? as usize <= MAX_IO_BYTES"], ["crates/kernel-core/src/security/file_service_v4.rs", "len <= MAX_IO_BYTES && 12usize.checked_add(len)"]],
+      "tests": [["crates/kernel-core/src/security/file_service_v4.rs", "file_read_write_limits_and_wrong_source_rejected"]]
+    },
+    "file.layout_starts": {
+      "owner": "FileFormat.v1", "unit": "block index", "derivation": "Two superblocks, 4096 redo blocks, four bitmap pages and 16 inode pages",
+      "definitions": [["crates/kernel-core/src/security/file_format_v1.rs", "LOG_START", "2"], ["crates/kernel-core/src/security/file_media_v0199.rs", "BITMAP_START", "4098"], ["crates/kernel-core/src/security/file_media_v0199.rs", "INODE_START", "4102"], ["crates/kernel-core/src/security/file_media_v0199.rs", "DATA_START", "4118"]],
+      "uses": [["crates/kernel-core/src/security/file_format_v1.rs", "for block in LOG_START..BITMAP_START"], ["crates/kernel-core/src/security/file_media_v0199.rs", "le32(bytes, 56)? != BITMAP_START"], ["crates/kernel-core/src/security/file_media_v0199.rs", "le32(bytes, 60)? != INODE_START"], ["crates/kernel-core/src/security/file_media_v0199.rs", "le32(bytes, 64)? != DATA_START"]],
+      "tests": [["crates/kernel-core/tests/snapshot_g1_parameters.rs", "d1_geometry_matches_file_format_and_system_object_owners"], ["tools/test_v020_g1_genesis.py", "test_sparse_image_matches_pinned_vector_and_independent_structure_reader"]]
+    },
+    "file.log_blocks": {
+      "owner": "FileFormat.v1", "unit": "blocks", "derivation": "The redo range is [2, 4098) in ordinary file media",
+      "definitions": [["crates/kernel-core/src/security/recovery_v1.rs", "LOG_BLOCKS", "(END - FIRST) as usize"]],
+      "uses": [["crates/kernel-core/src/security/recovery_v1.rs", "obsolete: [u8; LOG_BLOCKS]"]],
+      "tests": [["crates/kernel-core/tests/file_transactions_v1.rs", "ordinary_namespace_and_fsync_across_power_cuts"]]
+    },
+    "file.max_bytes": {
+      "owner": "FileFormat.v1", "unit": "bytes", "derivation": "8 MiB maximum per ordinary file",
+      "definitions": [["crates/kernel-core/src/security/file_structure_v1.rs", "MAX_FILE", "8 * 1024 * 1024"]],
+      "uses": [["crates/kernel-core/src/security/file_structure_v1.rs", "|| size > MAX_FILE"]],
+      "tests": [["crates/kernel-core/tests/file_transactions_v1.rs", "ordinary_namespace_and_fsync_across_power_cuts"]]
+    },
+    "file.name_path_max": {
+      "owner": "FileFormat.v1", "unit": "UTF-8 bytes", "derivation": "63 bytes per name and 512 bytes per absolute path",
+      "definitions": [["crates/kernel-core/src/security/file_service_v4.rs", "MAX_NAME_BYTES", "63"], ["crates/kernel-core/src/security/file.rs", "MAX_PATH", "512"]],
+      "uses": [["crates/kernel-core/src/security/file_service_v4.rs", "name.len() <= MAX_NAME_BYTES"], ["crates/kernel-core/src/security/file.rs", "path.len() > MAX_PATH"]],
+      "tests": [["crates/kernel-core/src/security/file.rs", "native_path_guard_rejects_duplicate_slashes_nul_and_invalid_utf8"], ["crates/kernel-core/src/security/file_service_v4.rs", "all_name_operations_reject_non_utf8_and_ambiguous_components"]]
+    },
+    "file.txn_home_max": {
+      "owner": "FileFormat.v1", "unit": "blocks/transaction", "derivation": "128 complete redo home images",
+      "definitions": [["crates/kernel-core/src/security/recovery_v1.rs", "MAX_REDO", "128"]],
+      "uses": [["crates/kernel-core/src/security/recovery_v1.rs", "if !(1..=MAX_REDO).contains(&images)"]],
+      "tests": [["crates/kernel-core/tests/file_transactions_v1.rs", "ordinary_namespace_and_fsync_across_power_cuts"]]
+    },
+    "offline.signature_label": {
+      "owner": "OfflineConfigEnvelope.v1", "unit": "ASCII bytes", "derivation": "Domain of the canonical offline envelope signature",
+      "definitions": [["crates/kernel-core/src/security/offline_config_v1.rs", "SIGNATURE_LABEL", "b\"CYX/OFFLINE/v1\""]],
+      "uses": [["crates/kernel-core/src/security/offline_config_v1.rs", "SIGNATURE_LABEL,"]],
+      "tests": [["crates/kernel-core/src/security/offline_config_v1.rs", "real_ed25519_signature_binds_exact_config_and_domain_label"]]
+    },
+    "platform.control_cpu": {
+      "owner": "PlatformSchema.v1", "unit": "CPU ID", "derivation": "The pinned CPU0 identifier",
+      "definitions": [["crates/kernel-core/src/control_plane/cpu0_v0199.rs", "CONTROL_CPU", "0"], ["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "CONTROL_CPU", "0"]],
+      "uses": [["crates/kernel-core/src/control_plane/cpu0_v0199.rs", "self.cpu != CONTROL_CPU"], ["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "if cpu != CONTROL_CPU || !actor.valid()"], ["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "if cpu != CONTROL_CPU || !matches!(class, Class::Coordination | Class::Recovery)"]],
+      "tests": [["crates/kernel-core/src/control_plane/cpu0_v0199.rs", "cpu0_is_the_only_control_and_three_others_are_business"]]
+    },
+    "platform.cpu_count": {
+      "owner": "PlatformSchema.v1", "unit": "CPUs", "derivation": "Population count of the four-bit online CPU mask",
+      "definitions": [["crates/kernel-core/src/control_plane/cpu0_v0199.rs", "ONLINE", "0b1111"], ["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "REQUIRED_ONLINE_MASK", "0b1111"]],
+      "uses": [["crates/kernel-core/src/control_plane/cpu0_v0199.rs", "online == ONLINE"]],
+      "tests": [["crates/kernel-core/src/control_plane/cpu0_v0199.rs", "cpu0_is_the_only_control_and_three_others_are_business"]]
+    },
+    "platform.page_bytes": {
+      "owner": "PlatformSchema.v1", "unit": "bytes", "derivation": "4 KiB native translation granule",
+      "definitions": [["crates/kernel-core/src/frame_meta_v0199.rs", "PAGE", "4096"], ["crates/kernel-core/src/control_plane/pie_image_v0199.rs", "PAGE_BYTES", "4096"], ["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "PAGE_SIZE", "4096"]],
+      "uses": [["crates/kernel-core/src/frame_meta_v0199.rs", "COUNT as u64 * PAGE"], ["crates/kernel-core/src/control_plane/pie_image_v0199.rs", "align != PAGE_BYTES"], ["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "entry.ttbr0_root % PAGE_SIZE"]],
+      "tests": [["crates/kernel-core/src/frame_meta_v0199.rs", "exact_layout_and_full_1g_conservation_with_retained_dma"], ["crates/kernel-core/src/control_plane/pie_image_v0199.rs", "phdr_overflow_truncated_file_overlap_and_bad_manifest_rejected"]]
+    },
+    "platform.ram_bytes": {
+      "owner": "PlatformSchema.v1", "unit": "bytes", "derivation": "262144 physical frames × 4096 bytes",
+      "definitions": [["crates/kernel-core/src/frame_meta_v0199.rs", "RAM_BYTES", "COUNT as u64 * PAGE"]],
+      "uses": [["crates/kernel-core/src/frame_meta_v0199.rs", "ram.len != RAM_BYTES"], ["kernel/src/arch/aarch64/production/frames/dense.rs", "ram.len != RAM_BYTES"]],
+      "tests": [["crates/kernel-core/tests/snapshot_g1_parameters.rs", "d5_reserves_fit_the_existing_resource_owner_units"]]
+    },
+    "policy.actions_max": {
+      "owner": "PolicySchema.v2", "unit": "actions/plan", "derivation": "Maximum number of ordered local actions",
+      "definitions": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "MAX_ACTIONS", "16"]],
+      "uses": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "count > MAX_ACTIONS"]],
+      "tests": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "old_v1_and_malformed_or_cross_domain_plan_are_rejected"]]
+    },
+    "policy.candidate_max": {
+      "owner": "PolicySchema.v2", "unit": "candidates", "derivation": "32 local candidates admitted into a decision context",
+      "definitions": [["crates/prototype/src/policy.rs", "MAX_CANDIDATES", "32"], ["crates/prototype/src/model.rs", "MAX_CANDIDATES", "32"]],
+      "uses": [["crates/prototype/src/policy.rs", "choices.len() > MAX_CANDIDATES"], ["crates/prototype/src/model.rs", "candidates.len() > MAX_CANDIDATES"]],
+      "tests": [["crates/prototype/src/policy.rs", "compact_registration_round_trips_every_action_shape"], ["crates/prototype/src/model.rs", "shared_prefix_matches_full_trace_including_changed_prefix"]]
+    },
+    "policy.envelope_header_bytes": {
+      "owner": "PolicySchema.v2", "unit": "bytes", "derivation": "Fixed v2 action envelope header width",
+      "definitions": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "POLICY_ENVELOPE_BYTES", "144"]],
+      "uses": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "usize::from(le16(h, 6)?) != POLICY_ENVELOPE_BYTES"]],
+      "tests": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "old_v1_and_malformed_or_cross_domain_plan_are_rejected"]]
+    },
+    "policy.payload_max": {
+      "owner": "PolicySchema.v2", "unit": "bytes/action", "derivation": "Payload bound checked by both encoding and decoding",
+      "definitions": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "MAX_PAYLOAD_BYTES", "256"]],
+      "uses": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "if !(2..=MAX_PAYLOAD_BYTES).contains(&n)"]],
+      "tests": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "old_v1_and_malformed_or_cross_domain_plan_are_rejected"]]
+    },
+    "policy.plan_header_bytes": {
+      "owner": "PolicySchema.v2", "unit": "bytes", "derivation": "Fixed v2 plan header width",
+      "definitions": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "PLAN_HEADER_BYTES", "64"]],
+      "uses": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "usize::from(le16(frame, 6)?) != PLAN_HEADER_BYTES"]],
+      "tests": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "old_v1_and_malformed_or_cross_domain_plan_are_rejected"]]
+    },
+    "policy.plan_max_bytes": {
+      "owner": "PolicySchema.v2", "unit": "bytes", "derivation": "64 + 16 × (144 + 256) = 6464 bytes",
+      "definitions": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "MAX_PLAN_BYTES", "PLAN_HEADER_BYTES + MAX_ACTIONS * (POLICY_ENVELOPE_BYTES + MAX_PAYLOAD_BYTES)"]],
+      "uses": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "frame.len() > MAX_PLAN_BYTES"]],
+      "tests": [["crates/kernel-core/src/control_plane/plan_wire_v2.rs", "old_v1_and_malformed_or_cross_domain_plan_are_rejected"]]
+    },
+    "resource.advice_slot_bytes": {
+      "owner": "ResourceSchema.v1", "unit": "bytes/slot", "derivation": "Per-entry static allocation upper bound",
+      "definitions": [["crates/kernel-core/src/control_plane/advice_ledger_v0199.rs", "SLOT_LIMIT_BYTES", "512"]],
+      "uses": [["crates/kernel-core/src/control_plane/advice_ledger_v0199.rs", "core::mem::size_of::<Option<Slot>>() <= SLOT_LIMIT_BYTES"]],
+      "tests": [["crates/kernel-core/src/control_plane/advice_ledger_v0199.rs", "bounded_advice_slot_is_never_a_capability_or_replayable_after_ack"]]
+    },
+    "resource.advice_slots": {
+      "owner": "ResourceSchema.v1", "unit": "slots", "derivation": "Bounded live advice ledger rows",
+      "definitions": [["crates/kernel-core/src/control_plane/advice_ledger_v0199.rs", "ADVICE_SLOTS", "64"]],
+      "uses": [["crates/kernel-core/src/control_plane/advice_ledger_v0199.rs", "rows: [Option<Slot>; ADVICE_SLOTS]"]],
+      "tests": [["crates/kernel-core/src/control_plane/advice_ledger_v0199.rs", "bounded_advice_slot_is_never_a_capability_or_replayable_after_ack"]]
+    },
+    "resource.business_cpu_commit_milli": {
+      "owner": "ResourceSchema.v1", "unit": "milli-core/CPU", "derivation": "(window − IRQ and maintenance reserve) × 1000 ÷ window",
+      "definitions": [["crates/prototype/src/domains/tasks/scheduler.rs", "CPU_BUDGET_NS", "WINDOW_NS - IRQ_MAINTENANCE_RESERVE_NS"]],
+      "uses": [["crates/prototype/src/domains/tasks/scheduler.rs", "if c.carry_spent > CPU_BUDGET_NS"], ["kernel/src/arch/aarch64/production/signed_business.rs", "let budget_ns = CPU_BUDGET_NS"]],
+      "tests": [["crates/prototype/src/domains/tasks/scheduler.rs", "window_splits_into_ninety_ms_business_and_ten_ms_reserve"], ["tools/test_v020_g1_file_budget.py", "test_charges_both_windows_when_the_scheduler_carries_completion"]]
+    },
+    "resource.business_maintenance_ms": {
+      "owner": "ResourceSchema.v1", "unit": "ms/window", "derivation": "One tenth of the CPU accounting window",
+      "definitions": [["crates/prototype/src/domains/tasks/scheduler.rs", "IRQ_MAINTENANCE_RESERVE_NS", "WINDOW_NS / 10"]],
+      "uses": [["crates/prototype/src/domains/tasks/scheduler.rs", "WINDOW_NS - IRQ_MAINTENANCE_RESERVE_NS"]],
+      "tests": [["crates/prototype/src/domains/tasks/scheduler.rs", "window_splits_into_ninety_ms_business_and_ten_ms_reserve"]]
+    },
+    "resource.completion_slots_each": {
+      "owner": "ResourceSchema.v1", "unit": "slots/queue", "derivation": "Independent ordinary and recovery completion credit maxima",
+      "definitions": [["crates/prototype/src/domains/io.rs", "COMPLETION_CREDITS", "64"]],
+      "uses": [["crates/prototype/src/domains/io.rs", "self.usage.submit_credits == COMPLETION_CREDITS"]],
+      "tests": [["crates/kernel-core/tests/g1_shared_resources.rs", "ordinary_saturation_preserves_recovery_io_and_terminal_custody"]]
+    },
+    "resource.control_pool_bytes": {
+      "owner": "ResourceSchema.v1", "unit": "bytes", "derivation": "8 MiB total bounded control allocation",
+      "definitions": [["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "CONTROL_POOL_LIMIT", "8 * 1024 * 1024"]],
+      "uses": [["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "pool > CONTROL_POOL_LIMIT"]],
+      "tests": [["crates/kernel-core/tests/snapshot_g1_parameters.rs", "d5_reserves_fit_the_existing_resource_owner_units"]]
+    },
+    "resource.control_roles": {
+      "owner": "ResourceSchema.v1", "unit": "roles", "derivation": "The eight signed CPU0 roles",
+      "definitions": [["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "ROLE_COUNT", "8"]],
+      "uses": [["kernel/src/arch/aarch64/production/signed_resident.rs", "selectors: [u64; ROLE_COUNT]"]],
+      "tests": [["tools/verify_v020_g0_freeze.py", "verify_topology_and_abi"]]
+    },
+    "resource.control_rpc_slots": {
+      "owner": "ResourceSchema.v1", "unit": "slots", "derivation": "Ten ordinary physical slots plus six separately reserved recovery slots",
+      "definitions": [["crates/kernel-core/src/control_plane/control_rpc_v1.rs", "NORMAL_SLOTS", "10"], ["crates/kernel-core/src/control_plane/control_rpc_v1.rs", "RECOVERY_SLOTS", "6"]],
+      "uses": [["crates/kernel-core/src/control_plane/control_rpc_v1.rs", "slots: [Slot; NORMAL_SLOTS + RECOVERY_SLOTS]"], ["crates/kernel-core/src/control_plane/control_rpc_v1.rs", "NORMAL_SLOTS..NORMAL_SLOTS + RECOVERY_SLOTS"]],
+      "tests": [["crates/kernel-core/src/control_plane/control_rpc_v1.rs", "ordinary_role_slots_and_executor_capacity_do_not_borrow_recovery"]]
+    },
+    "resource.control_total_ms": {
+      "owner": "ResourceSchema.v1", "unit": "ms/window", "derivation": "70 ms × 1000000 ns/ms",
+      "definitions": [["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "LIMIT_NS", "70_000_000"], ["crates/kernel-core/src/control_plane/cpu0_v0199.rs", "CONTROL_BUDGET_NS", "70_000_000"], ["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "CONTROL_NS_PER_100MS", "70_000_000"]],
+      "uses": [["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "requested > LIMIT_NS.saturating_sub(total)"], ["crates/kernel-core/src/control_plane/cpu0_v0199.rs", "self.actual_ns > CONTROL_BUDGET_NS"], ["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "charge_ns > CONTROL_NS_PER_100MS"]],
+      "tests": [["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "g1_control_window_retains_full_recovery_debit"], ["crates/kernel-core/src/control_plane/cpu0_v0199.rs", "disabled_dynamic_handoff_and_cpu0_budget_does_not_reallocate"]]
+    },
+    "resource.cpu_window_ms": {
+      "owner": "ResourceSchema.v1", "unit": "ms", "derivation": "100 ms × 1,000,000 ns/ms",
+      "definitions": [["crates/contracts/src/resource.rs", "CPU_ACCOUNTING_WINDOW_NS", "100_000_000"]],
+      "uses": [["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "pub use cyxia_contracts::CPU_ACCOUNTING_WINDOW_NS as WINDOW_NS"], ["crates/prototype/src/domains/types.rs", "pub use cyxia_contracts::CPU_ACCOUNTING_WINDOW_NS as WINDOW_NS"], ["crates/prototype/src/domains/tasks/scheduler.rs", "let window = finished_ns / WINDOW_NS"]],
+      "tests": [["tools/test_v020_g1_file_budget.py", "test_charges_both_windows_when_the_scheduler_carries_completion"], ["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "measured_boundary_split_conserves_debit_and_never_invents_credit"]]
+    },
+    "resource.d09_normal_window_bytes": {
+      "owner": "ResourceSchema.v1", "unit": "bytes/100ms", "derivation": "4 MiB ordinary D09 share before class division",
+      "definitions": [["crates/prototype/src/domains/io.rs", "ORDINARY_BYTES", "4 * 1024 * 1024"]],
+      "uses": [["crates/prototype/src/domains/io.rs", "let bg = ORDINARY_BYTES * u64::from(share) / 1000"]],
+      "tests": [["crates/prototype/tests/a10_cache_admission.rs", "required_writeback_does_not_bypass_exhausted_real_completion_credits"], ["crates/kernel-core/tests/g1_shared_resources.rs", "ordinary_saturation_preserves_recovery_io_and_terminal_custody"]]
+    },
+    "resource.decision_slot_us": {
+      "owner": "ResourceSchema.v1", "unit": "us/domain/window", "derivation": "500 us × 1000 ns/us",
+      "definitions": [["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "DECISION_DOMAIN_LIMIT_NS", "500_000"]],
+      "uses": [["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "DECISION_DOMAIN_LIMIT_NS.saturating_sub(spent)"], ["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "overrun |= *d > DECISION_DOMAIN_LIMIT_NS"]],
+      "tests": [["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "g1_control_window_retains_full_recovery_debit"]]
+    },
+    "resource.finding_review_slots": {
+      "owner": "ResourceSchema.v1", "unit": "slots", "derivation": "Bounded finding ledger rows",
+      "definitions": [["crates/kernel-core/src/control_plane/security_finding.rs", "FINDING_SLOTS", "16"]],
+      "uses": [["crates/kernel-core/src/control_plane/security_finding.rs", "rows: [Option<FindingRow>; FINDING_SLOTS]"]],
+      "tests": [["crates/kernel-core/src/control_plane/security_finding.rs", "fixed_evaluation_window_and_slots_cannot_be_refilled_by_retries"]]
+    },
+    "resource.frame_meta_count": {
+      "owner": "ResourceSchema.v1", "unit": "frames", "derivation": "1 GiB divided by 4096 bytes",
+      "definitions": [["crates/kernel-core/src/frame_meta_v0199.rs", "COUNT", "262144"]],
+      "uses": [["crates/kernel-core/src/frame_meta_v0199.rs", "RAM_BYTES: u64 = COUNT as u64 * PAGE"]],
+      "tests": [["crates/kernel-core/tests/snapshot_g1_parameters.rs", "d5_reserves_fit_the_existing_resource_owner_units"]]
+    },
+    "resource.frame_meta_reserved_bytes": {
+      "owner": "ResourceSchema.v1", "unit": "bytes", "derivation": "Frame count × 40 bytes per row",
+      "definitions": [["crates/kernel-core/src/frame_meta_v0199.rs", "TABLE_BYTES", "COUNT * 40"]],
+      "uses": [["kernel/src/arch/aarch64/production/frames/dense.rs", "reserve_user_pool(info, TABLE_BYTES as u64)"]],
+      "tests": [["crates/kernel-core/tests/snapshot_g1_parameters.rs", "d5_reserves_fit_the_existing_resource_owner_units"]]
+    },
+    "resource.io_queue_max": {
+      "owner": "ResourceSchema.v1", "unit": "requests", "derivation": "Physical scheduler entries",
+      "definitions": [["crates/prototype/src/domains/io.rs", "QUEUE_CAPACITY", "256"]],
+      "uses": [["crates/prototype/src/domains/io.rs", "slots: [Option<Slot>; QUEUE_CAPACITY]"]],
+      "tests": [["crates/kernel-core/tests/g1_shared_resources.rs", "ordinary_saturation_preserves_recovery_io_and_terminal_custody"]]
+    },
+    "resource.ipc_endpoint_physical_capacity": {
+      "owner": "ResourceSchema.v1", "unit": "entries/endpoint", "derivation": "128 physical cells for each local IPC endpoint",
+      "definitions": [["crates/prototype/src/domains/tasks.rs", "MAX_MESSAGES", "128"]],
+      "uses": [["crates/prototype/src/domains/tasks/ipc.rs", "messages: [[Message<BYTES>; MAX_MESSAGES]; ENDPOINTS]"], ["crates/prototype/src/domains/tasks/ipc.rs", "if self.len >= MAX_MESSAGES || !self.owns(cell)"]],
+      "tests": [["crates/prototype/tests/domain_tasks.rs", "ipc_shrink_preserves_128_messages_and_batch_changes_real_delivery"]]
+    },
+    "resource.lock_max_held": {
+      "owner": "ResourceSchema.v1", "unit": "locks/IRQ-off span", "derivation": "Nested acquisition cap for the single continuous IRQ-off span",
+      "definitions": [["crates/kernel-core/src/control_plane/policy_lock_v0199.rs", "MAX_LOCKS_PER_IRQ_OFF", "8"]],
+      "uses": [["crates/kernel-core/src/control_plane/policy_lock_v0199.rs", "held.len() >= MAX_LOCKS_PER_IRQ_OFF"]],
+      "tests": [["crates/kernel-core/src/control_plane/policy_lock_v0199.rs", "lock_count_cap_is_eight_actual_locks"]]
+    },
+    "resource.ordinary_ipc_payload_bytes": {
+      "owner": "ResourceSchema.v1", "unit": "bytes", "derivation": "512-byte copied ordinary receive payload bound",
+      "definitions": [["crates/kernel-core/src/security/ipc_receive_v3.rs", "PAYLOAD_BYTES", "512"]],
+      "uses": [["crates/kernel-core/src/security/ipc_receive_v3.rs", "payload.len() > PAYLOAD_BYTES"]],
+      "tests": [["crates/kernel-core/src/security/ipc_receive_v3.rs", "fault_retry_done_recopy_ack_and_recovery_preserve_exact_queue"]]
+    },
+    "resource.pending_plans": {
+      "owner": "ResourceSchema.v1", "unit": "plans", "derivation": "Published plan limit excludes the single unpublished slot",
+      "definitions": [["crates/kernel-core/src/control_plane/registered_gate_v3.rs", "MAX_PUBLISHED_PLANS", "64"]],
+      "uses": [["crates/kernel-core/src/control_plane/registered_gate_v3.rs", "self.published_count() >= MAX_PUBLISHED_PLANS"]],
+      "tests": [["crates/kernel-core/src/control_plane/registered_gate_v3.rs", "sixty_four_inflight_plus_one_frozen_preserve_unknown_and_release_by_exact_key"]]
+    },
+    "resource.recovery_ms": {
+      "owner": "ResourceSchema.v1", "unit": "ms/window", "derivation": "Recovery class entry in CLASS_LIMITS ÷ 1000000 ns/ms",
+      "definitions": [["kernel/src/arch/aarch64/production/signed_resident.rs", "RECOVERY_NS", "CLASS_LIMITS[Class::Recovery as usize]"]],
+      "uses": [["kernel/src/arch/aarch64/production/signed_resident.rs", "used >= RECOVERY_NS - STARTUP_OPERATION_MARGIN_NS"], ["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "requested > CLASS_LIMITS[class.index()].saturating_sub(self.spent[class.index()])"]],
+      "tests": [["crates/kernel-core/src/control_plane/role_budget_v0199.rs", "g1_control_window_retains_full_recovery_debit"]]
+    },
+    "resource.security_brain_ms": {
+      "owner": "ResourceSchema.v1", "unit": "ms/window", "derivation": "8 ms × 1000000 ns/ms",
+      "definitions": [["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "SECURITY_MAX_NS", "8_000_000"]],
+      "uses": [["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "entry.control_ns_per_100ms > SECURITY_MAX_NS"]],
+      "tests": [["crates/kernel-core/src/control_plane/role_manifest_v0199.rs", "single_control_ledger_and_pool_fail_closed_on_overcommit"]]
+    },
+    "resource.terminal_plan_summaries": {
+      "owner": "ResourceSchema.v1", "unit": "summaries", "derivation": "Circular terminal-summary history length",
+      "definitions": [["crates/kernel-core/src/control_plane/registered_gate_v3.rs", "TERMINAL_HISTORY", "256"]],
+      "uses": [["crates/kernel-core/src/control_plane/registered_gate_v3.rs", "self.history_next = (self.history_next + 1) % TERMINAL_HISTORY"]],
+      "tests": [["crates/kernel-core/src/control_plane/registered_gate_v3.rs", "bounded_terminal_summary_history_retains_only_latest_256_distinct_plan_keys"]]
+    },
+    "rules.d01_protected_wait_ms": {
+      "owner": "RuleProfile.v2", "unit": "ms", "derivation": "One 100 ms accounting window",
+      "definitions": [["crates/prototype/src/domains/tasks/scheduler.rs", "FAIR_WAIT_NS", "WINDOW_NS"]],
+      "uses": [["crates/prototype/src/domains/tasks/scheduler.rs", "now.saturating_sub(t.ready_since) >= FAIR_WAIT_NS"]],
+      "tests": [["crates/prototype/tests/domain_tasks.rs", "scheduler_executes_minima_before_weighted_surplus"]]
+    },
+    "rules.lease_ms": {
+      "owner": "RuleProfile.v2", "unit": "ms", "derivation": "10000 ms × 1000000 ns/ms from the authenticated snapshot",
+      "definitions": [["crates/prototype/src/domains/types.rs", "POLICY_NS", "10_000_000_000"]],
+      "uses": [["crates/prototype/src/domains/types.rs", "snapshot_ns.checked_add(POLICY_NS)"]],
+      "tests": [["crates/kernel-core/src/control_plane/registered_gate_v3.rs", "continuous_plan_requires_exact_lease_and_distinct_live_role_ids"], ["crates/prototype/tests/domain_tasks.rs", "scheduler_installs_already_published_weight_after_snapshot_admission_expires"]]
+    },
+    "rules.storage_max_bytes": {
+      "owner": "RuleProfile.v2", "unit": "bytes", "derivation": "64 KiB maximum stored RuleProfile v2",
+      "definitions": [["crates/kernel-core/src/control_plane/rule_profile_v2.rs", "MAX_BYTES", "64 * 1024"]],
+      "uses": [["crates/kernel-core/src/control_plane/rule_profile_v2.rs", "bytes.len() > MAX_BYTES"]],
+      "tests": [["crates/kernel-core/src/control_plane/rule_profile_v2.rs", "reject_old_version_wrong_length_unsafe_mode_and_reserved_bytes"]]
+    },
+    "tcp.mss_values": {
+      "owner": "TcpSchema.v1", "unit": "bytes", "derivation": "Ordered indices for eight SYN cookie MSS tiers",
+      "definitions": [["crates/kernel-core/src/security/network.rs", "MSS_TIERS", "[536, 576, 960, 1200, 1280, 1360, 1440, 1460]"]],
+      "uses": [["crates/kernel-core/src/security/network.rs", "MSS_TIERS[self.mss_index as usize]"]],
+      "tests": [["crates/kernel-core/src/security/network.rs", "sec_n09_cookie_roundtrip_all_mss_tiers"]]
+    },
+    "tcp.syn_bucket_label": {
+      "owner": "TcpSchema.v1", "unit": "ASCII bytes", "derivation": "Domain for per-prefix SYN bucket selection",
+      "definitions": [["crates/kernel-core/src/security/network.rs", "SYN_BUCKET_LABEL", "b\"CYX/SYN-BUCKET/v1\""]],
+      "uses": [["crates/kernel-core/src/security/network.rs", "msg[..17].copy_from_slice(SYN_BUCKET_LABEL)"]],
+      "tests": [["crates/kernel-core/src/security/network.rs", "sec_n13_frozen_bucket_mapping_keyed_and_24_granular"]]
+    },
+    "tcp.syn_cookie_label": {
+      "owner": "TcpSchema.v1", "unit": "ASCII bytes", "derivation": "Domain for the SYN cookie child key",
+      "definitions": [["crates/kernel-core/src/security/network.rs", "SYN_COOKIE_LABEL", "b\"CYX/SYN-COOKIE/v1\""]],
+      "uses": [["crates/kernel-core/src/security/network.rs", "hkdf_subkey(&syn_domain_key, SYN_COOKIE_LABEL)"]],
+      "tests": [["crates/kernel-core/src/security/network.rs", "sec_n09_cookie_mac_binds_every_field"]]
+    },
+    "tls.leaf_der_max_bytes": {
+      "owner": "TlsSchema.v1", "unit": "bytes", "derivation": "Maximum encoded leaf certificate passed to the peer verifier",
+      "definitions": [["crates/net-transport/src/tls.rs", "MAX_CERTIFICATE", "4096"]],
+      "uses": [["crates/net-transport/src/tls.rs", "certificate.as_ref().len() > MAX_CERTIFICATE"]],
+      "tests": [["crates/net-transport/src/tls.rs", "entropy_failure_prevents_pairing_construction"]]
+    }
+  }
+}

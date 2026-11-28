@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import struct
 
+from check_v13_disk import crc32c
 import v020_g1_snapshot_wire as snapshot_wire
 from v020_g1_genesis import ACL, BOOT, INDEX, ROOT, SECURITY, _genesis_blocks
 from v020_snapshot_catalog_vectors import Catalog, Entry, encode as encode_catalog
@@ -165,7 +166,8 @@ def restored_pages(config):
         raw[block // 8] &= ~(1 << (block % 8))
     blocks[BITMAP_START] = bytes(raw)
 
-    key = struct.pack("<16sIQQ", uuid, 15, 1, 1)
+    client_generation, = struct.unpack_from("<Q", config, 256 + 15 * 16 + 8)
+    key = struct.pack("<16sIQQ", uuid, 15, client_generation, 1)
     source = struct.pack("<16sQIIQ", uuid, 1, 0, 0, 1)
     body = source + struct.pack("<II", 2, 0)
     result = source + struct.pack("<QQ16sQQII", 1, 2, uuid, 1, 1, 1, 0)
@@ -174,7 +176,7 @@ def restored_pages(config):
                                   log=1, txid=1, payload=result, lsn=4)
     _, state, _, _, _, lsn, view, digest = snapshot_wire.read_record(record)
     require((state, lsn, view) == (2, 4, 2), "independent RESTORE record differs")
-    blocks[4252] = snapshot_wire.header({15: (1, 1)}, uuid=uuid, generation=2)
+    blocks[4252] = snapshot_wire.header({15: (client_generation, 1)}, uuid=uuid, generation=2)
     blocks[4260] = record.ljust(BLOCK_BYTES, b"\0")
     raw = bytearray(blocks[4268])
     struct.pack_into("<Q", raw, 56, 2)
@@ -211,6 +213,119 @@ def verify_retained_restore(args, config):
     refused = rejected(args, args.unified_elf, name, image)
     return {"boot_epoch": 2, "live_view_epoch": 2, "restore_lsn": 4,
             "writes_open": False, "missing_receipt": refused}
+
+
+def append_redo(blocks, first, lsn, txid, images, committed=True, *, epoch=2):
+    """Independent v1 encoding for consecutive transactions in the selected epoch."""
+    count = len(images)
+
+    def put(block, kind, number, payload, target=0, index=0, total=0):
+        header = bytearray(64)
+        struct.pack_into("<IHHIIQQQQII", header, 0, 0x43594C47, 1, kind, 64 + len(payload),
+                         crc32c(payload), txid, number, epoch, target, index, total)
+        raw = seal(header, 56) + payload
+        for offset in range(0, len(raw), BLOCK_BYTES):
+            blocks[block + offset // BLOCK_BYTES] = raw[offset:offset + BLOCK_BYTES].ljust(BLOCK_BYTES, b"\0")
+
+    put(first, 1, lsn, struct.pack("<IIQ", count, 0, count * BLOCK_BYTES))
+    ordered = sha256()
+    for index, (home, page) in enumerate(images):
+        put(first + 1 + 2 * index, 2, lsn + index + 1, page, home, index, count)
+        ordered.update(struct.pack("<Q", home) + page)
+    if committed:
+        put(first + 1 + 2 * count, 3, lsn + count + 1,
+            struct.pack("<QQQII", txid, lsn, lsn + count, count, 0) + ordered.digest())
+
+
+def opening_pages(config, commit=True, materialized=False):
+    blocks = restored_pages(config)
+    uuid = config[16:32]
+    # Preserve short and long periodic coverage using a shared retained root.
+    history = b"".join(blocks[number] for number in range(4133, 4147))
+    second = slot.Identity(uuid, 2, 3, 1, 1, 0, 10)
+    descriptor = slot.encode(second, None, sha256(history).digest())
+    blocks[4177] = descriptor
+    for i in range(14):
+        blocks[4178 + i] = history[i * BLOCK_BYTES:(i + 1) * BLOCK_BYTES]
+    first = slot.Identity(uuid, 1, 0, 1, 1, 0, 10)
+    blocks[4131] = encode_catalog(Catalog(uuid, 3, 3, (
+        Entry(1, first, sha256(blocks[4132]).digest()), Entry(), Entry(),
+        Entry(1, second, sha256(descriptor).digest()), *(Entry(),) * 4,
+    )))
+    frozen = bytearray(blocks[4268])
+    struct.pack_into("<Q", frozen, 72 + 3 * 8, 21_600_000_000_000)
+    blocks[4268] = seal(frozen, 32)
+
+    security, boot_page = bytearray(blocks[SECURITY]), bytearray(blocks[BOOT])
+    struct.pack_into("<Q", security, 24, 3)
+    struct.pack_into("<Q", security, 64, 2)
+    struct.pack_into("<Q", boot_page, 24, 2)
+    append_redo(blocks, 2, 5, 2, ((SECURITY, seal(security, 72)), (BOOT, seal(boot_page, 32))))
+
+    client_generation, = struct.unpack_from("<Q", config, 256 + 15 * 16 + 8)
+    key = struct.pack("<16sIQQ", uuid, 15, client_generation, 2)
+    prior = blocks[4260]
+    body = struct.pack("<Q", 1) + prior[16:52] + bytes(4)
+    request = snapshot_wire.read_request(snapshot_wire.frame(0x29, 2, body, key, 2), 9)
+    pending = (prior[:512] + snapshot_wire.record(request, state=1)).ljust(BLOCK_BYTES, b"\0")
+    header = snapshot_wire.header({15: (client_generation, 2)}, uuid=uuid, generation=3)
+    append_redo(blocks, 8, 9, 3, ((4252, header), (4260, pending)))
+
+    terminal = snapshot_wire.record(request, state=2, new_view=2, log=2, txid=4, lsn=16,
+                                    payload=struct.pack("<QII", 2, 1, 0))
+    settled = (prior[:512] + terminal).ljust(BLOCK_BYTES, b"\0")
+    opened = bytearray(seal(frozen, 32))
+    struct.pack_into("<Q", opened, 24, 3)
+    struct.pack_into("<Q", opened, 48, 2)
+    opened[136:138] = bytes((1, 0))
+    opened[144:176] = terminal[184:216]
+    opened[176:208] = bytes(32)
+    opened = seal(opened, 32)
+    append_redo(blocks, 14, 13, 4, ((4260, settled), (4268, opened)), commit)
+    if materialized:
+        blocks[4268] = opened
+    return blocks, header, (settled, opened) if commit else (pending, blocks[4268])
+
+
+def verify_open_redo_case(args, config, name, commit, materialized):
+    pages, header, expected = opening_pages(config, commit, materialized)
+    image = args.output / f"{name}.raw"
+    with create_raw(image) as disk:
+        write_pages(disk, pages)
+    result = boot(str(args.qemu), args.unified_elf, args.output / name, args.timeout,
+                  image, 3, expected_policy_envelope=config)
+    require(result["status"] == "PASS", f"{name}: {result.get('error')}")
+    lines = (args.output / name / "serial.txt").read_text().splitlines()
+    require(rows(lines, "V020_SEC_F_SNAPSHOT_OPEN_REPLAY") == ([(2, 16, 3)] if commit else [])
+            and rows(lines, "V020_SEC_F_SNAPSHOT_MOUNT") == [(2, 0, 0)]
+            and rows(lines, "V020_SEC_F_SNAPSHOT_RESTORE_RETAINED") == [(2, 2, 4)],
+            f"{name}: the cold gate or replay boundary differs")
+    with image.open("rb") as disk:
+        generation, lsn, epoch = max(struct.unpack_from("<3Q", at(disk, index), 32) for index in (0, 1))
+        require((generation, lsn, epoch) == (3, 16 if commit else 12, 3),
+                f"{name}: the verified checkpoint does not cover the exact durable prefix")
+        require((at(disk, 4252), at(disk, 4260), at(disk, 4268)) == (header, *expected)
+                and at(disk, 4131) == pages[4131] and at(disk, BITMAP_START) == pages[BITMAP_START]
+                and at(disk, ROOT + 3) == pages[ROOT + 3], f"{name}: checkpoint changed unrelated custody")
+    return {"boot_epoch": 3, "checkpoint_lsn": lsn, "open_committed": commit, "writes_open": False}
+
+
+def verify_open_redo(args, config):
+    evidence = {
+        name: verify_open_redo_case(args, config, name, commit, materialized)
+        for name, commit, materialized in (
+            ("open-writes-committed", True, False),
+            ("open-writes-prepared", False, False),
+            ("open-writes-checkpoint-cut", True, True),
+        )
+    }
+    name = "open-writes-prepared-with-changed-home"
+    pages, _, _ = opening_pages(config, commit=False, materialized=True)
+    image = args.output / f"{name}.raw"
+    with create_raw(image) as disk:
+        write_pages(disk, pages)
+    evidence[name] = rejected(args, args.unified_elf, name, image)
+    return evidence
 
 
 def independent_file_readback(image, completed):
@@ -317,6 +432,14 @@ def run(args):
         else:
             evidence["cases"][name] = rejected(args, elf, name, image)
     evidence["cases"]["retained-restore"] = verify_retained_restore(args, config)
+    authority = [
+        (args.catalog / name).is_file() for name in ("snapshot-authority.bin", "snapshot-authority.sig")
+    ]
+    require(all(authority) or not any(authority), "snapshot replay requires the complete detached authority")
+    if all(authority):
+        evidence["cases"].update(verify_open_redo(args, config))
+    else:
+        evidence["signed_open_replay"] = {"status": "NOT_RUN", "reason": "detached authority absent"}
     evidence["status"] = "PASS"
     (args.output / "verification.json").write_text(json.dumps(evidence, indent=2) + "\n")
 

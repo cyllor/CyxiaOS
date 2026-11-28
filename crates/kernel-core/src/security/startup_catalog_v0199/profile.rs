@@ -7,6 +7,9 @@ use crate::security::network::tls_deadline::{
 
 pub(super) const BYTES: usize = 256;
 const FIXED: [u8; BYTES] = fixed_profile();
+pub const FILE_FSYNC_TASK_PER_SECOND: u8 = 8;
+pub const FILE_ALLOC_GROUP_PER_SECOND: u8 = 8;
+pub const FILE_RETIRE_GROUP_PER_SECOND: u8 = 8;
 
 const fn field<const N: usize>(wire: &mut [u8; BYTES], offset: usize, value: [u8; N]) {
     let mut at = 0;
@@ -37,7 +40,19 @@ const fn fixed_profile() -> [u8; BYTES] {
     field(&mut wire, 78, 4096u16.to_le_bytes());
     field(&mut wire, 80, [32, 16]);
     field(&mut wire, 82, 256u16.to_le_bytes());
-    field(&mut wire, 84, [8, 32, 8, 8, 8, 1, 8]);
+    field(
+        &mut wire,
+        84,
+        [
+            FILE_FSYNC_TASK_PER_SECOND,
+            32,
+            FILE_ALLOC_GROUP_PER_SECOND,
+            FILE_RETIRE_GROUP_PER_SECOND,
+            8,
+            1,
+            8,
+        ],
+    );
 
     // Connection limits, ARP, MTU and TCP deadlines.
     field(&mut wire, 91, [16, 4, 4, 32, 8]);
