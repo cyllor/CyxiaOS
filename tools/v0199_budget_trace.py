@@ -8,6 +8,7 @@ HEADER = struct.Struct("<6Q")
 ROW = struct.Struct("<6Q")
 TRACE_BYTES = ((HEADER.size + CAPACITY * ROW.size + 4095) // 4096) * 4096
 MAGIC = 0x4359584255444731
+FAILURE_MAGIC = 0x435958424641494C
 WINDOW = 100_000_000
 TOTAL_LIMIT = 70_000_000
 CLASS_LIMITS = (30_000_000, 8_000_000, 7_500_000, 8_000_000, 8_000_000, 8_500_000)
@@ -40,6 +41,30 @@ DECISION_DOMAIN_QUOTA = 500_000
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def inspect_failure_trace(raw):
+    """Describe only a terminal diagnostic prefix, never an acceptance result."""
+    require(len(raw) == TRACE_BYTES, "wrong failure trace size")
+    magic, version, count, wall, counter, before = HEADER.unpack_from(raw)
+    require(magic == FAILURE_MAGIC and version == 4 and 0 < count <= CAPACITY,
+            "unsealed or non-failure CPU0 trace")
+    require(before < wall and before // WINDOW == wall // WINDOW,
+            "failure trace origin straddles a window")
+    end_offset = HEADER.size + count * ROW.size
+    require(not any(raw[end_offset:]), "unexpected unused failure trace bytes")
+    origin_wall, origin_counter = wall, counter
+    last_debit = 0
+    for end, tick, quota, deadline, scope, lower in ROW.iter_unpack(raw[HEADER.size:end_offset]):
+        require(end >= wall and tick >= counter and before <= lower < end
+                and lower // WINDOW == end // WINDOW,
+                "regressed or unbounded failure trace sample")
+        last_debit = tick - counter
+        require(last_debit <= end - before, "failure CPU0 execution exceeds wall bounds")
+        wall, counter, before = end, tick, lower
+    return dict(scope="terminal_failure_prefix_only", intervals=count,
+                start_wall_ns=origin_wall, end_wall_ns=wall,
+                sampled_cpu_ns=counter-origin_counter, last_debit_ns=last_debit)
 
 
 def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, boot_accounting=None):

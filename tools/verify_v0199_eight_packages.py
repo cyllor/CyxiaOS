@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import struct
 import verify_smp
-from v0199_budget_trace import TRACE_BYTES, verify_sustained, verify_trace
+from v0199_budget_trace import TRACE_BYTES, inspect_failure_trace, verify_sustained, verify_trace
 
 ROLES=(6,7,2,8,9,3,10,11)
 MAGIC=0x43595838424f4f54
@@ -67,6 +67,14 @@ class Bringup:
                            "invalid CPU0 accounting evidence extent")
         self.trace = trace
         return evidence
+
+    def capture_overrun(self, qmp, output):
+        # The caller has stopped every vCPU. Keep failed bytes separately;
+        # neither the successful page nor its validator may consume them.
+        path = output / "cpu0-budget-failure-prefix.bin"
+        qmp.execute("pmemsave", {"val": self.trace["pa"], "size": TRACE_BYTES,
+                                "filename": str(path)})
+        return inspect_failure_trace(path.read_bytes())
 
     def capture_extra(self, qmp, output, page):
         path = output / "cpu0-budget-trace.bin"

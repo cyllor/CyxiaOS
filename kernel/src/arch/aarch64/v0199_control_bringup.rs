@@ -296,6 +296,7 @@ impl BudgetMeter {
             self.crossed_gaps += 1;
         }
         if receipt.overrun {
+            self.trace.seal_failure();
             report(
                 "V0199_BOOTSTRAP_OVERRUN",
                 0,
@@ -387,6 +388,7 @@ impl BudgetMeter {
     fn settle_coordination(&mut self, token: Turn, began: u64) -> u64 {
         let receipt = self.settle(token, began);
         if receipt.overrun || receipt.crossed_window {
+            self.trace.seal_failure();
             report(
                 "V0199_BOOTSTRAP_OVERRUN",
                 0,
@@ -466,6 +468,7 @@ impl BudgetMeter {
     ) -> u64 {
         let receipt = self.settle(t, began);
         if receipt.overrun || receipt.crossed_window {
+            self.trace.seal_failure();
             report(
                 "V0199_RECOVERY_OVERRUN_PHASE",
                 phase,
@@ -1160,6 +1163,7 @@ fn turn(
     r.charges = r.charges.checked_add(receipt.actual_ns).unwrap();
     r.turns += 1;
     if receipt.overrun || receipt.crossed_window {
+        budget.trace.seal_failure();
         if class == Class::Decision {
             report(
                 "V0199_DECISION_OVERRUN_PHASES",

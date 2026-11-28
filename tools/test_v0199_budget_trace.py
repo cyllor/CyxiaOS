@@ -1,9 +1,15 @@
 """Independent checker regressions for measured diagnostic CPU0 evidence."""
 
 import struct
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import Mock
 
-from v0199_budget_trace import HEADER, MAGIC, ROW, TRACE_BYTES, WINDOW, verify_sustained, verify_trace
+from verify_v0199_eight_packages import Bringup
+
+from v0199_budget_trace import (FAILURE_MAGIC, HEADER, MAGIC, ROW, TRACE_BYTES, WINDOW,
+                                inspect_failure_trace, verify_sustained, verify_trace)
 
 
 class BudgetTraceTests(unittest.TestCase):
@@ -24,6 +30,49 @@ class BudgetTraceTests(unittest.TestCase):
         for index, row in enumerate(self.rows):
             ROW.pack_into(raw, HEADER.size + index * ROW.size, *row)
         return raw
+
+    def failure_evidence(self):
+        raw = self.evidence(version=4)
+        struct.pack_into("<Q", raw, 0, FAILURE_MAGIC)
+        return raw
+
+    def test_failed_prefix_is_not_a_successful_trace(self):
+        raw = self.failure_evidence()
+        detail = inspect_failure_trace(raw)
+        self.assertEqual(detail["scope"], "terminal_failure_prefix_only")
+        self.assertEqual(detail["intervals"], 4)
+        self.assertEqual(detail["sampled_cpu_ns"], 1_200)
+        self.assertEqual(detail["last_debit_ns"], 100)
+        with self.assertRaisesRegex(ValueError, "unsealed CPU0 trace"):
+            verify_trace(raw, self.summary, boot_accounting=(1, self.rows[0][0], 100))
+
+    def test_failed_prefix_rejects_incomplete_and_wrong_identity(self):
+        for raw in (self.evidence(version=4), self.failure_evidence()[:-1], bytes(TRACE_BYTES)):
+            with self.subTest(size=len(raw)), self.assertRaises(ValueError):
+                inspect_failure_trace(raw)
+        for offset, value in ((16, 0), (16, 4097), (HEADER.size + 8, 999), (TRACE_BYTES - 8, 1)):
+            raw = self.failure_evidence()
+            struct.pack_into("<Q", raw, offset, value)
+            with self.subTest(offset=offset, value=value), self.assertRaises(ValueError):
+                inspect_failure_trace(raw)
+
+    def test_failed_capture_retains_raw_bytes_even_if_validation_fails(self):
+        bringup = Bringup.__new__(Bringup)
+        bringup.trace = {"pa": 0x42000000}
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root)
+            path = output / "cpu0-budget-failure-prefix.bin"
+            qmp = Mock()
+            for raw in (self.failure_evidence(), self.evidence(version=4)):
+                qmp.execute.side_effect = lambda cmd, args: Path(args["filename"]).write_bytes(raw)
+                if struct.unpack_from("<Q", raw)[0] == FAILURE_MAGIC:
+                    self.assertEqual(bringup.capture_overrun(qmp, output)["intervals"], 4)
+                else:
+                    with self.assertRaises(ValueError):
+                        bringup.capture_overrun(qmp, output)
+                qmp.execute.assert_called_with("pmemsave", {"val": 0x42000000,
+                    "size": TRACE_BYTES, "filename": str(path)})
+                self.assertEqual(path.read_bytes(), raw)
 
     def test_boundary_stop_and_gap_crossing_debit_once(self):
         result = verify_trace(self.evidence(), self.summary, recovery_slices=(1, 100))
