@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import struct
 import verify_smp
-from v0199_budget_trace import TRACE_BYTES, verify_sustained, verify_trace
+from v0199_budget_trace import TRACE_BYTES, inspect_failure_trace, verify_sustained, verify_trace
 
 ROLES=(6,7,2,8,9,3,10,11)
 MAGIC=0x43595838424f4f54
@@ -66,7 +66,45 @@ class Bringup:
                                 or evidence["pa"] + evidence["size"] <= trace["pa"]),
                            "invalid CPU0 accounting evidence extent")
         self.trace = trace
+        if self.sustained_load:
+            panic = verify_smp.symbol(elf, "PANIC_EVIDENCE")
+            verify_smp.require(panic["size"] == 64 and panic["pa"] % 64 == 0
+                               and all(panic["pa"] + panic["size"] <= span["pa"]
+                                       or span["pa"] + span["size"] <= panic["pa"]
+                                       for span in (trace, evidence)),
+                               "invalid panic evidence extent")
+            self.panic_extent = panic
+            self.native_extent = evidence
         return evidence
+
+    def capture_panic(self, qmp, output):
+        # Failure-only capture. Do not interpret an unsealed budget/page as
+        # a successful replay, and preserve raw bytes before parsing.
+        if not self.sustained_load:
+            return None
+        for location, name in ((self.panic_extent, "panic-location.bin"),
+                               (self.trace, "cpu0-budget-panic-raw.bin"),
+                               (self.native_extent, "native-panic-page.bin")):
+            qmp.execute("pmemsave", {"val": location["pa"], "size": location["size"],
+                                    "filename": str(output / name)})
+        raw = (output / "panic-location.bin").read_bytes()
+        verify_smp.require(len(raw) == 64, "incomplete panic location")
+        magic, slot, line, column, file_hash, elr, esr, far = struct.unpack("<8Q", raw)
+        verify_smp.require(magic == 0x435950414e490001 and slot < 4,
+                           "unsealed or invalid panic location")
+        verify_smp.require((line == column == file_hash == 0) or
+                           (0 < line < 2**32 and 0 < column < 2**32 and file_hash != 0),
+                           "invalid panic source location")
+        return dict(scope="terminal_panic_only", cpu_slot=slot, line=line, column=column,
+                    file_fnv1a64=f"{file_hash:016x}", elr_el1=elr, esr_el1=esr, far_el1=far)
+
+    def capture_overrun(self, qmp, output):
+        # The caller has stopped every vCPU. Keep failed bytes separately;
+        # neither the successful page nor its validator may consume them.
+        path = output / "cpu0-budget-failure-prefix.bin"
+        qmp.execute("pmemsave", {"val": self.trace["pa"], "size": TRACE_BYTES,
+                                "filename": str(path)})
+        return inspect_failure_trace(path.read_bytes())
 
     def capture_extra(self, qmp, output, page):
         path = output / "cpu0-budget-trace.bin"

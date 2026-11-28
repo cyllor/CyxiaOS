@@ -8,6 +8,7 @@ use cyxia_kernel_core::control_plane::role_budget_v0199::Turn;
 
 const CAPACITY: usize = 4096;
 const MAGIC: u64 = 0x4359_5842_5544_4731;
+const FAILURE_MAGIC: u64 = 0x4359_5842_4641_494c;
 
 #[repr(C, align(4096))]
 struct Evidence {
@@ -77,8 +78,17 @@ impl Trace {
         self.next += 1;
     }
 
+    // Terminal failure prefixes are deliberately not valid successful traces.
+    pub(super) fn seal_failure(&self) {
+        self.publish(FAILURE_MAGIC);
+    }
+
     pub(super) fn seal(self) {
-        V0199_BUDGET_TRACE.header[0].store(MAGIC, Ordering::Relaxed);
+        self.publish(MAGIC);
+    }
+
+    fn publish(&self, magic: u64) {
+        V0199_BUDGET_TRACE.header[0].store(magic, Ordering::Relaxed);
         V0199_BUDGET_TRACE.header[1].store(4, Ordering::Relaxed);
         V0199_BUDGET_TRACE.header[2].store(self.next as u64, Ordering::Release);
     }

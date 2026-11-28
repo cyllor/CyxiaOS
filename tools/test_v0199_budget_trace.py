@@ -1,9 +1,15 @@
 """Independent checker regressions for measured diagnostic CPU0 evidence."""
 
 import struct
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import Mock
 
-from v0199_budget_trace import HEADER, MAGIC, ROW, TRACE_BYTES, WINDOW, verify_sustained, verify_trace
+from verify_v0199_eight_packages import Bringup
+
+from v0199_budget_trace import (FAILURE_MAGIC, HEADER, MAGIC, ROW, TRACE_BYTES, WINDOW,
+                                inspect_failure_trace, verify_sustained, verify_trace)
 
 
 class BudgetTraceTests(unittest.TestCase):
@@ -24,6 +30,82 @@ class BudgetTraceTests(unittest.TestCase):
         for index, row in enumerate(self.rows):
             ROW.pack_into(raw, HEADER.size + index * ROW.size, *row)
         return raw
+
+    def failure_evidence(self):
+        raw = self.evidence(version=4)
+        struct.pack_into("<Q", raw, 0, FAILURE_MAGIC)
+        return raw
+
+    def test_failed_prefix_is_not_a_successful_trace(self):
+        raw = self.failure_evidence()
+        detail = inspect_failure_trace(raw)
+        self.assertEqual(detail["scope"], "terminal_failure_prefix_only")
+        self.assertEqual(detail["intervals"], 4)
+        self.assertEqual(detail["sampled_cpu_ns"], 1_200)
+        self.assertEqual(detail["last_debit_ns"], 100)
+        with self.assertRaisesRegex(ValueError, "unsealed CPU0 trace"):
+            verify_trace(raw, self.summary, boot_accounting=(1, self.rows[0][0], 100))
+
+    def test_failed_prefix_rejects_incomplete_and_wrong_identity(self):
+        for raw in (self.evidence(version=4), self.failure_evidence()[:-1], bytes(TRACE_BYTES)):
+            with self.subTest(size=len(raw)), self.assertRaises(ValueError):
+                inspect_failure_trace(raw)
+        for offset, value in ((16, 0), (16, 4097), (HEADER.size + 8, 999), (TRACE_BYTES - 8, 1)):
+            raw = self.failure_evidence()
+            struct.pack_into("<Q", raw, offset, value)
+            with self.subTest(offset=offset, value=value), self.assertRaises(ValueError):
+                inspect_failure_trace(raw)
+
+    def test_failed_capture_retains_raw_bytes_even_if_validation_fails(self):
+        bringup = Bringup.__new__(Bringup)
+        bringup.trace = {"pa": 0x42000000}
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root)
+            path = output / "cpu0-budget-failure-prefix.bin"
+            qmp = Mock()
+            for raw in (self.failure_evidence(), self.evidence(version=4)):
+                qmp.execute.side_effect = lambda cmd, args: Path(args["filename"]).write_bytes(raw)
+                if struct.unpack_from("<Q", raw)[0] == FAILURE_MAGIC:
+                    self.assertEqual(bringup.capture_overrun(qmp, output)["intervals"], 4)
+                else:
+                    with self.assertRaises(ValueError):
+                        bringup.capture_overrun(qmp, output)
+                qmp.execute.assert_called_with("pmemsave", {"val": 0x42000000,
+                    "size": TRACE_BYTES, "filename": str(path)})
+                self.assertEqual(path.read_bytes(), raw)
+
+    def test_panic_capture_preserves_raw_bytes_and_rejects_unsealed_location(self):
+        bringup = Bringup.__new__(Bringup)
+        bringup.sustained_load = True
+        bringup.panic_extent = {"pa": 0x41000000, "size": 64}
+        bringup.trace = {"pa": 0x42000000, "size": TRACE_BYTES}
+        bringup.native_extent = {"pa": 0x43000000, "size": 4096}
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root)
+            qmp = Mock()
+            for values in ((0x435950414e490001, 0, 123, 45, 67, 8, 9, 10),
+                           (0, 0, 123, 45, 67, 8, 9, 10),
+                           (0x435950414e490001, 4, 123, 45, 67, 8, 9, 10),
+                           (0x435950414e490001, 0, 0, 45, 67, 8, 9, 10)):
+                raw = struct.pack("<8Q", *values)
+                def save(cmd, args):
+                    Path(args["filename"]).write_bytes(raw if args["size"] == 64
+                                                       else bytes(args["size"]))
+                qmp.execute.side_effect = save
+                if values[0] and values[1] == 0 and values[2] == 123:
+                    detail = bringup.capture_panic(qmp, output)
+                    self.assertEqual((detail["scope"], detail["line"], detail["column"]),
+                                     ("terminal_panic_only", 123, 45))
+                else:
+                    with self.assertRaises(ValueError):
+                        bringup.capture_panic(qmp, output)
+                self.assertEqual((output / "panic-location.bin").read_bytes(), raw)
+                self.assertEqual((output / "cpu0-budget-panic-raw.bin").stat().st_size, TRACE_BYTES)
+                self.assertEqual((output / "native-panic-page.bin").stat().st_size, 4096)
+            bringup.sustained_load = False
+            qmp.reset_mock()
+            self.assertIsNone(bringup.capture_panic(qmp, output))
+            qmp.execute.assert_not_called()
 
     def test_boundary_stop_and_gap_crossing_debit_once(self):
         result = verify_trace(self.evidence(), self.summary, recovery_slices=(1, 100))
@@ -46,6 +128,68 @@ class BudgetTraceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "role grant during early boot"):
             verify_trace(self.evidence(version=4), self.summary,
                          boot_accounting=(2, self.rows[1][0], 600))
+
+    def test_early_boot_replenishment_keeps_both_window_bounds_and_full_debit(self):
+        self.start = 10_000_000
+        self.rows = [
+            (12_000_000, 1_201_000, 0, 0, 0, 11_999_984),
+            (WINDOW + 10_000, 1_251_000, 0, 0, 0, WINDOW + 9_984),
+            (WINDOW + 2_000_000, 2_451_000, 0, 0, 0, WINDOW + 1_999_984),
+            (WINDOW + 2_200_000, 2_551_000, 0, 0, 0, WINDOW + 2_199_984),
+        ]
+        self.summary = [2_550_000, 2_550_000, 1_350_000, 1, self.start,
+                        self.rows[-1][0], 0, 0, 0, 2_550_000, 0, 0]
+        boundary = (3, self.rows[2][0], 2_450_000)
+        result = verify_trace(self.evidence(version=4), self.summary, boot_accounting=boundary)
+        self.assertEqual(result["early_boot_coordination_cpu_ns"], 2_450_000)
+        self.assertEqual(result["budget_max_window_upper_ns"], 1_350_000)
+        # A mere extra sample without an actual window crossing cannot reset
+        # the 2ms coordination credit. Keep the same measured execution.
+        self.rows = [(end - (WINDOW - 20_000_000) if i else end, tick,
+                      quota, deadline, scope, lower - (WINDOW - 20_000_000) if i else lower)
+                     for i, (end, tick, quota, deadline, scope, lower) in enumerate(self.rows)]
+        with self.assertRaisesRegex(ValueError, "EL1 coordination sublimit"):
+            verify_trace(self.evidence(version=4), self.summary,
+                         boot_accounting=(3, self.rows[2][0], 2_450_000))
+
+    def test_256m_early_boot_overrun_cannot_be_accepted_as_success(self):
+        # Reproduce both measured debit shapes from 46130235312, not an
+        # attestation of a new QEMU run. Extra rows alone cannot replenish
+        # coordination credit; the second capture exceeds it in one gap.
+        for debits in ((1_880_699, 220_990), (2_351_746,)):
+            with self.subTest(debits=debits):
+                self.start = 10_000_000
+                wall, counter = self.start, 1_000
+                self.rows = []
+                for debit in (*debits, 100):
+                    wall += 10_000_000
+                    counter += debit
+                    self.rows.append((wall, counter, 0, 0, 0, wall - 16))
+                total = sum(debits) + 100
+                self.summary = [total, total, total, 0, self.start, wall,
+                                0, 0, 0, total, 0, 0]
+                with self.assertRaisesRegex(ValueError, "EL1 coordination sublimit"):
+                    verify_trace(self.evidence(version=4), self.summary,
+                                 boot_accounting=(len(debits), self.rows[-2][0], sum(debits)))
+
+    def test_boot_reports_follow_timer_readiness_in_diagnostic_source(self):
+        # Supplemental wiring guard, never a native timing or G4 proof.
+        root = Path(__file__).resolve().parents[1] / "kernel/src/arch/aarch64"
+        boot = (root / "boot.rs").read_text()
+        smp = (root / "smp.rs").read_text()
+        self.assertEqual(boot.count('budget.observe_boot_phase();'), 1)
+        before = boot.split('budget.observe_boot_phase();', 1)[0]
+        self.assertIn('assert_eq!(vbar, core::ptr::addr_of!(exception_vectors) as u64);', before)
+        for block in ('log(b"BOOT_ENTRY', 'log(b"HIGH_VA_OK'):
+            self.assertIn('#[cfg(not(feature = "v0199-control-bringup"))]\n    {\n        ' + block, before)
+        run = smp.split('pub fn run(', 1)[1]
+        early = run.split('gic().enable(irq).unwrap();', 1)[1].split('init_memory();', 1)[0]
+        markers = ['super::log(b"BOOT_ENTRY', 'super::log(b"PLATFORM_OK',
+                   'super::log(b"HIGH_VA_OK', 'super::clock::init(info);']
+        for marker in markers:
+            before_marker, early = early.split(marker, 1)
+            self.assertIn('budget.boot_checkpoint();', before_marker)
+        self.assertIn('budget.boot_checkpoint();', early)
 
     def test_grant_must_precede_deadline_and_have_enough_credit(self):
         end, counter, _, deadline, scope, lower = self.rows[1]

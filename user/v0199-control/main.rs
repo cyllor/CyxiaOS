@@ -120,12 +120,13 @@ fn put16(b:&mut[u8],at:usize,v:u16){b[at..at+2].copy_from_slice(&v.to_le_bytes()
 fn put32(b:&mut[u8],at:usize,v:u32){b[at..at+4].copy_from_slice(&v.to_le_bytes());}
 fn put64(b:&mut[u8],at:usize,v:u64){b[at..at+8].copy_from_slice(&v.to_le_bytes());}
 fn snapshot(cap:u64,target:u64,domain:u64)->i64{
-    let mut reply=[0u8;264];
+    // ABI3 0x40 is copy-out only. The bootstrap does not interpret its reply
+    // or start inference. Do not clear or read this private stack buffer:
+    // a refusal or interrupted copy-out may leave bytes uninitialized.
+    // The real consumer must validate a complete successful reply before use.
+    let mut reply=core::mem::MaybeUninit::<[u8;264]>::uninit();
     let result=call(0x40,[cap,domain,target,reply.as_mut_ptr() as u64,264,0]);
-    // No model inference is started until a production snapshot, immutable
-    // model/config and a frozen candidate/evidence context are all available.
-    // This bootstrap deliberately does not accept a partially filled reply.
-    core::hint::black_box((result,reply[0])).0
+    core::hint::black_box(result)
 }
 #[cfg(control_role="6")]
 fn role_step(cap:u64,target:u64,_generation:u64,_now:u64){snapshot(cap,target,1);}

@@ -350,8 +350,25 @@ def run(elf: Path, output: Path, timeout: float = 20, cpus: int = 4, *, acceptan
                 for frame in decoder.feed(data): decoded.extend(frame)
                 if b'V0199_BOOTSTRAP_OVERRUN' in decoded:
                     report['cpu0_overrun'] = overrun_diagnostic(bytes(decoded))
+                    capture = getattr(acceptance, 'capture_overrun', None)
+                    if capture is not None:
+                        try:
+                            qmp.execute('stop')
+                            report['cpu0_overrun_capture'] = capture(qmp, output)
+                        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                            report['cpu0_overrun_capture_error'] = type(error).__name__ + ': ' + str(error)
                     raise ValueError('native CPU0 execution overrun (see framed UART)')
-                if b'FAIL' in decoded or b'SMP_ERROR' in decoded: raise ValueError('guest failure')
+                if b'FAIL' in decoded or b'SMP_ERROR' in decoded:
+                    capture = getattr(acceptance, 'capture_panic', None)
+                    if capture is not None and b'FAIL panic\n' in decoded:
+                        try:
+                            qmp.execute('stop')
+                            detail = capture(qmp, output)
+                            if detail is not None:
+                                report['guest_panic'] = detail
+                        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+                            report['guest_panic_capture_error'] = type(error).__name__ + ': ' + str(error)
+                    raise ValueError('guest failure')
                 completion = b'SMP_SELFTEST_PASS cpus=4\n' if acceptance is None else acceptance.completion
                 if completion in decoded:
                     qmp.execute('stop')
