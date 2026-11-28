@@ -338,6 +338,8 @@ pub(super) fn prepare(
             image,
             stack_top,
             child: None,
+            #[cfg(cyxia_file_owner_package)]
+            file_owner: None,
         },
         asid: CHILD_ASID,
     };

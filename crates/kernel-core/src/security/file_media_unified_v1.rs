@@ -6,40 +6,33 @@
 //! objects; legacy v2 volumes join only through offline read-only export ->
 //! all-zero new image rebuild -> import with a continuity proof.
 //!
-//! Freeze honesty (see the freeze doc status header):
-//! - Baseline bytes (superblock v1, region map, the four baseline object block
-//!   counts 1/7/4/1, v4/Reply v3 headers) are implemented exactly as frozen in
-//!   V0.19.9 §9.2/§9.2.1/§9.6/§9.6.1 and the existing frozen decoders.
-//! - Strategy-A additions (8-object map, inode segment 224..231, fixed new
-//!   object block ranges, new object envelopes, op/capability tables, budget
-//!   carve-out) are RATIFIED direction. Their new bytes are
-//!   golden-vector-pending until the D7 deliverables land; G1 overall remains
-//!   NOT_READY. New object payloads must stay all-zero until field layouts are
-//!   frozen (fail-closed placeholder, not an invented field layout).
-//!
-//! Contract layer only: no mount, no native boot wiring, no writes to any
-//! device. The existing `file_mount_v1` `[SystemObject; 4]` validator is NOT
-//! modified; [`unified_map_from_baseline`] bridges it toward the ratified
-//! N=8 map, and [`validate_unified_system_map`] is the new unified validator.
-//! Host test vectors are fixture-derived and are NOT golden vectors.
+//! The baseline v1 layout, four baseline system objects and v4/Reply v3
+//! headers keep their V0.19.9 encodings. D7 supplies independent byte
+//! vectors for the four additional objects and the snapshot endpoints.
+//! An authenticated unified mount verifies populated snapshots and reserves
+//! their blocks before publishing a read view. G1 also requires the online
+//! ownership, allocation and migration evidence recorded in the freeze doc.
 use super::Error;
+use super::boot_epoch_v1::BootEpochStoreV1;
+use super::file_index_v0199::SecurityStateStoreV2;
 use super::file_media_v0199::{SnapshotMediaKind, crc32c_zeroed, probe_snapshot_media_pair};
 use super::file_structure_v1::{INODE_BYTES, INODES, SystemKind, SystemObject};
+use super::snapshot_service_v4::PRINCIPALS;
 
 // Populated media is read only through the authenticated unified mount.
 #[path = "snapshot_catalog_candidate.rs"]
 pub mod catalog_candidate;
+#[cfg(feature = "snapshot-history-candidate")]
+#[path = "snapshot_history_candidate.rs"]
+pub mod history_candidate;
+#[path = "snapshot_mount_v1.rs"]
+pub(super) mod mount;
 #[path = "snapshot_protection_candidate.rs"]
 pub mod protection_candidate;
 #[path = "snapshot_request_store_v1.rs"]
 pub mod request_store;
 #[path = "snapshot_slot_candidate.rs"]
 pub mod slot_candidate;
-#[path = "snapshot_mount_v1.rs"]
-pub(super) mod mount;
-#[cfg(feature = "snapshot-history-candidate")]
-#[path = "snapshot_history_candidate.rs"]
-pub mod history_candidate;
 
 // Baseline-frozen layout constants, re-exported as the unified contract's
 // single source (never re-derived here).
@@ -83,8 +76,8 @@ pub const SLOT_MIRROR_BLOCKS: u32 = 14;
 /// 224 business inodes x 256 B = the first 14 inode-table pages.
 pub const SLOT_MIRROR_BYTES: usize = 57344;
 
-// Fixed block ranges of the four NEW objects (ratified; golden-vector-pending
-// bytes). Baseline four keep manifest-supplied positions (block counts frozen).
+// D7 fixes the four snapshot object ranges. The signed manifest supplies
+// the four baseline object positions and their frozen block counts.
 pub const SNAPSHOT_CATALOG_BLOCK: u32 = 4131;
 pub const SNAPSHOT_SLOT_START: u32 = 4132;
 pub const SNAPSHOT_REQUEST_START: u32 = 4252;
@@ -315,7 +308,7 @@ pub fn unified_superblock_pair(first: &[u8], second: &[u8]) -> Result<Superblock
 }
 
 // ---------------------------------------------------------------------------
-// D1.5: new-object envelope (golden-vector-pending fields)
+// D1.5: snapshot object envelope
 // ---------------------------------------------------------------------------
 
 pub const ENVELOPE_BYTES: usize = 40;
@@ -328,8 +321,8 @@ pub const SNAP_SLOT_MAGIC: u32 = 0x4359_4c53;
 pub const SNAP_REQUEST_MAGIC: u32 = 0x4359_5152;
 pub const SNAP_PROTECTION_MAGIC: u32 = 0x4359_4450;
 
-/// Envelope of a new snapshot object's first block. Field-level payloads are
-/// golden-vector-pending; until frozen, bytes 40..4096 MUST be all zero.
+/// Common header of a snapshot object's first block. The owning object
+/// codec verifies its payload after this header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ObjectEnvelope {
     pub kind: UnifiedSystemKind,
@@ -622,24 +615,32 @@ pub struct RetainedSnapshot {
 /// retained root requires an authenticated retention-discharge proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MigrationWitness {
-    pub fs_uuid: [u8; 16],
-    pub boot_epoch: u64,
+    pub boot: BootEpochStoreV1,
+    pub security: SecurityStateStoreV2,
     pub protection_generation: u64,
     pub live_view_epoch: u64,
-    pub state_generation: u64,
-    pub rule_min_generation: u64,
-    pub security_min_generation: u64,
-    pub key_generation: u64,
-    pub service_generations: [u64; 16],
-    pub request_watermark: u64,
+    pub online_age_ns: u64,
+    pub live_tree_digest: [u8; 32],
+    pub request_watermarks: [request_store::Watermark; PRINCIPALS as usize],
     pub snapshot_id_hi: u64,
     pub slots: [SlotContinuity; SNAPSHOT_SLOTS as usize],
 }
 
 impl MigrationWitness {
     fn validate(&self) -> Result<(), Error> {
-        if self.fs_uuid == [0; 16] {
+        self.security.encode()?;
+        if self.protection_generation == 0
+            || self.live_view_epoch == 0
+            || self.live_tree_digest == [0; 32]
+            || self
+                .request_watermarks
+                .iter()
+                .any(|mark| mark.client_generation == 0 && mark.highest_accepted_seq != 0)
+        {
             return Err(Error::Invalid);
+        }
+        if !self.boot.matches(&self.security) {
+            return Err(Error::Conflict);
         }
         for (index, slot) in self.slots.iter().enumerate() {
             if let Some(retained) = slot.retained {
@@ -667,23 +668,22 @@ pub fn check_migration_continuity(
 ) -> Result<(), Error> {
     old.validate()?;
     new.validate()?;
-    if old.fs_uuid != new.fs_uuid {
+    if old.live_tree_digest != new.live_tree_digest || !new.security.no_rollback_from(&old.security)
+    {
         return Err(Error::Conflict);
     }
-    if new.boot_epoch < old.boot_epoch
-        || new.protection_generation < old.protection_generation
+    if new.protection_generation < old.protection_generation
         || new.live_view_epoch < old.live_view_epoch
-        || new.state_generation < old.state_generation
-        || new.rule_min_generation < old.rule_min_generation
-        || new.security_min_generation < old.security_min_generation
-        || new.key_generation < old.key_generation
-        || new.request_watermark < old.request_watermark
-        || new.snapshot_id_hi < old.snapshot_id_hi
+        || new.online_age_ns < old.online_age_ns
         || old
-            .service_generations
+            .request_watermarks
             .iter()
-            .zip(new.service_generations)
-            .any(|(before, after)| after < *before)
+            .zip(new.request_watermarks)
+            .any(|(before, after)| {
+                after.client_generation < before.client_generation
+                    || after.highest_accepted_seq < before.highest_accepted_seq
+            })
+        || new.snapshot_id_hi < old.snapshot_id_hi
     {
         return Err(Error::Conflict);
     }
@@ -696,7 +696,13 @@ pub fn check_migration_continuity(
                 if after.slot_generation == before.slot_generation
                     && retained.snapshot_id == previous.snapshot_id
                     && retained.logical_tree_digest == previous.logical_tree_digest
-                    && retained.retention_deadline >= previous.retention_deadline => {}
+                    && retained.retention_deadline >= previous.retention_deadline
+                    && retained
+                        .retention_deadline
+                        .saturating_sub(new.online_age_ns)
+                        >= previous
+                            .retention_deadline
+                            .saturating_sub(old.online_age_ns) => {}
             (None, Some(retained))
                 if after.slot_generation > before.slot_generation
                     && retained.snapshot_id > old.snapshot_id_hi => {}
@@ -740,7 +746,24 @@ const _: () = assert!(SNAP_MGMT_CONTROL_KIB + SNAP_SHARED_BITMAP_KIB == SNAP_LEG
 const _: () = assert!(1335 - SNAP_MGMT_CONTROL_KIB == CONTROL_UNCOMMITTED_MARGIN_KIB);
 const _: () = assert!(SNAP_GC_WORKSPACE_KIB <= FILE_TRANSACTION_WORKSPACE_KIB);
 const _: () = assert!(CONTROL_POOL_KIB == 8 * 1024 && PROGRESS_POOL_KIB == 8 * 1024);
-const _: () = assert!(FRAME_META_KIB == 10 * 1024);
+const _: () = assert!(SNAP_SHARED_BITMAP_KIB * 1024 == BLOCK_COUNT / 8);
+const _: () = assert!(
+    core::mem::size_of::<crate::frame_meta_v0199::FrameMeta>() * crate::frame_meta_v0199::COUNT
+        == FRAME_META_KIB as usize * 1024
+);
+#[cfg(not(target_os = "none"))]
+const _: () = {
+    use super::recovery_v1::RecoveryWorkspace;
+    use catalog_candidate::lifecycle::{CaptureWorkspace, GcWorkspace};
+    use core::mem::size_of;
+
+    assert!(size_of::<CaptureWorkspace>() == STAGING_SLOT_BYTES);
+    assert!(size_of::<GcWorkspace>() <= SNAP_GC_WORKSPACE_KIB as usize * 1024);
+    assert!(
+        size_of::<RecoveryWorkspace>() + size_of::<GcWorkspace>()
+            <= FILE_TRANSACTION_WORKSPACE_KIB as usize * 1024
+    );
+};
 
 // Parameter-registry candidate carry-over (direction ratified; exact lock
 // pending the byte-exact freeze together with layout/ledger/test windows).
@@ -774,7 +797,35 @@ const _: () = assert!(SHORT_RETENTION_S > SHORT_PERIOD_S && LONG_RETENTION_S > L
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+
+    #[test]
+    fn d5_workspace_bytes_fit_the_ledger() {
+        use crate::security::{
+            file_fsync_v1::FsyncWorkspace, file_mount_v1::Workspace as MountWorkspace,
+            file_service_v4::transactions::Workspace as FileWorkspace,
+            recovery_v1::RecoveryWorkspace,
+        };
+        use catalog_candidate::lifecycle::{CaptureWorkspace, GcWorkspace};
+        use core::mem::size_of;
+
+        let redo = size_of::<RecoveryWorkspace>();
+        for (name, size) in [
+            ("file transaction", size_of::<FileWorkspace>()),
+            ("file fsync", size_of::<FsyncWorkspace>()),
+            ("snapshot GC", size_of::<GcWorkspace>()),
+        ] {
+            assert!(redo + size <= FILE_TRANSACTION_WORKSPACE_KIB as usize * 1024);
+            std::println!("{name}: {size} + {redo} redo bytes");
+        }
+        std::println!(
+            "snapshot capture: {} staging bytes, mount: {} bytes",
+            size_of::<CaptureWorkspace>(),
+            size_of::<MountWorkspace>(),
+        );
+    }
 
     fn canonical_map() -> [UnifiedSystemObject; UNIFIED_SYSTEM_OBJECTS] {
         let obj = |kind: UnifiedSystemKind, first_block: u32| UnifiedSystemObject {
@@ -1219,16 +1270,30 @@ mod tests {
 
     fn witness() -> MigrationWitness {
         MigrationWitness {
-            fs_uuid: [1; 16],
-            boot_epoch: 2,
+            boot: BootEpochStoreV1 {
+                fs_uuid: [1; 16],
+                boot_epoch: 2,
+            },
+            security: SecurityStateStoreV2 {
+                fs_uuid: [1; 16],
+                state_generation: 5,
+                rule_min_generation: 1,
+                security_min_generation: 1,
+                key_generation: 2,
+                isolated_service_bitmap: 1,
+                last_boot_epoch: 2,
+                offline_config_generation: 1,
+                offline_config_hash: [9; 32],
+                service_generations: core::array::from_fn(|index| index as u64 + 1),
+            },
             protection_generation: 3,
             live_view_epoch: 4,
-            state_generation: 5,
-            rule_min_generation: 1,
-            security_min_generation: 1,
-            key_generation: 2,
-            service_generations: core::array::from_fn(|index| index as u64 + 1),
-            request_watermark: 100,
+            online_age_ns: 20,
+            live_tree_digest: [12; 32],
+            request_watermarks: core::array::from_fn(|i| request_store::Watermark {
+                client_generation: 2,
+                highest_accepted_seq: 100 + i as u64,
+            }),
             snapshot_id_hi: 9,
             slots: core::array::from_fn(|index| SlotContinuity {
                 slot_generation: 1,
@@ -1246,22 +1311,27 @@ mod tests {
         let old = witness();
         assert_eq!(check_migration_continuity(&old, &old), Ok(()));
         let mut new = witness();
-        new.boot_epoch += 1;
+        new.boot.boot_epoch += 1;
+        new.security.last_boot_epoch = new.boot.boot_epoch;
+        new.security.state_generation += 1;
         new.protection_generation += 1;
-        new.request_watermark += 10;
-        new.service_generations[0] += 1;
+        new.request_watermarks[0].highest_accepted_seq += 10;
+        new.security.service_generations[0] += 1;
         new.slots[0].retained.as_mut().unwrap().retention_deadline += 60;
         assert_eq!(check_migration_continuity(&old, &new), Ok(()));
         // Every scalar field is individually monotonic.
         let regressions: [fn(&mut MigrationWitness); 9] = [
-            |w| w.boot_epoch -= 1,
+            |w| {
+                w.boot.boot_epoch -= 1;
+                w.security.last_boot_epoch = w.boot.boot_epoch;
+            },
             |w| w.protection_generation -= 1,
             |w| w.live_view_epoch -= 1,
-            |w| w.state_generation -= 1,
-            |w| w.rule_min_generation -= 1,
-            |w| w.security_min_generation -= 1,
-            |w| w.key_generation -= 1,
-            |w| w.request_watermark -= 1,
+            |w| w.online_age_ns -= 1,
+            |w| w.security.state_generation -= 1,
+            |w| w.security.rule_min_generation -= 1,
+            |w| w.security.security_min_generation -= 1,
+            |w| w.security.key_generation -= 1,
             |w| w.snapshot_id_hi -= 1,
         ];
         for f in regressions {
@@ -1269,17 +1339,74 @@ mod tests {
             f(&mut bad);
             assert_eq!(check_migration_continuity(&old, &bad), Err(Error::Conflict));
         }
-        for index in 0..old.service_generations.len() {
+        for index in 0..old.security.service_generations.len() {
             let mut bad = witness();
-            bad.service_generations[index] -= 1;
+            bad.security.state_generation += 1;
+            bad.security.service_generations[index] -= 1;
             assert_eq!(check_migration_continuity(&old, &bad), Err(Error::Conflict));
         }
         let mut bad = witness();
-        bad.fs_uuid = [2; 16];
+        bad.boot.fs_uuid = [2; 16];
+        bad.security.fs_uuid = bad.boot.fs_uuid;
         assert_eq!(check_migration_continuity(&old, &bad), Err(Error::Conflict));
         let mut bad = witness();
-        bad.fs_uuid = [0; 16];
+        bad.boot.fs_uuid = [0; 16];
+        bad.security.fs_uuid = bad.boot.fs_uuid;
         assert_eq!(check_migration_continuity(&old, &bad), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn migration_rejects_unbound_boot_policy_and_security_clearance() {
+        let old = witness();
+        let mut changed = old;
+        changed.boot.boot_epoch += 1;
+        assert_eq!(
+            check_migration_continuity(&old, &changed),
+            Err(Error::Conflict)
+        );
+
+        let mut changed = old;
+        changed.security.state_generation += 1;
+        changed.security.offline_config_hash[0] ^= 1;
+        assert_eq!(
+            check_migration_continuity(&old, &changed),
+            Err(Error::Conflict)
+        );
+
+        let mut changed = old;
+        changed.security.state_generation += 1;
+        changed.security.isolated_service_bitmap = 0;
+        assert_eq!(
+            check_migration_continuity(&old, &changed),
+            Err(Error::Conflict)
+        );
+    }
+
+    #[test]
+    fn migration_binds_live_content_and_every_request_watermark() {
+        let old = witness();
+        let mut changed = old;
+        changed.live_tree_digest[0] ^= 1;
+        assert_eq!(
+            check_migration_continuity(&old, &changed),
+            Err(Error::Conflict)
+        );
+
+        let mut changed = old;
+        changed.request_watermarks[0].highest_accepted_seq -= 1;
+        changed.request_watermarks[15].highest_accepted_seq += 1;
+        assert_eq!(
+            check_migration_continuity(&old, &changed),
+            Err(Error::Conflict)
+        );
+
+        let mut changed = old;
+        changed.request_watermarks[3].client_generation -= 1;
+        changed.request_watermarks[3].highest_accepted_seq += 1;
+        assert_eq!(
+            check_migration_continuity(&old, &changed),
+            Err(Error::Conflict)
+        );
     }
 
     #[test]
@@ -1302,6 +1429,18 @@ mod tests {
         new.slots[3].slot_generation += 1;
         new.slots[3].retained.as_mut().unwrap().retention_deadline += 1;
         assert_eq!(check_migration_continuity(&old, &new), Err(Error::Conflict));
+    }
+
+    #[test]
+    fn migration_preserves_remaining_retention_when_age_advances() {
+        let old = witness();
+        let mut new = old;
+        new.online_age_ns += 1;
+        assert_eq!(check_migration_continuity(&old, &new), Err(Error::Conflict));
+        for slot in &mut new.slots {
+            slot.retained.as_mut().unwrap().retention_deadline += 1;
+        }
+        assert_eq!(check_migration_continuity(&old, &new), Ok(()));
     }
 
     #[test]

@@ -217,8 +217,14 @@ pub(super) fn file_volume(
         let previous = UnifiedFileVolume::verify(
             config,
             PREDECESSOR.boot_public_key,
-            include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/predecessor/file-volume.bin")),
-            include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/predecessor/file-volume.sig")),
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/startup-catalog/predecessor/file-volume.bin"
+            )),
+            include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/startup-catalog/predecessor/file-volume.sig"
+            )),
         )?;
         if previous != current {
             return Err(Error::Conflict);
@@ -278,6 +284,22 @@ pub(super) fn qualify_business_package(
     signature: &[u8; 64],
 ) -> Result<(), Error> {
     CATALOG.qualify_business_package(config, package_digest, signature)
+}
+
+#[cfg(cyxia_file_owner_package)]
+pub(super) fn qualify_file_owner(
+    config: &VerifiedOfflineConfig<'_>,
+    package_digest: [u8; 32],
+    grant: &[u8; cyxia_kernel_core::security::startup_catalog_v0199::file_owner::BYTES],
+    signature: &[u8; 64],
+) -> Result<cyxia_kernel_core::security::startup_catalog_v0199::file_owner::FileOwnerGrant, Error> {
+    cyxia_kernel_core::security::startup_catalog_v0199::file_owner::FileOwnerGrant::verify(
+        &CATALOG,
+        config,
+        package_digest,
+        grant,
+        signature,
+    )
 }
 
 #[cfg(cyxia_business_package)]

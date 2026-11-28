@@ -47,6 +47,8 @@ pub const FILE_AUTH_COMPLETE: u16 = 2;
 /// role12 FILE_SERVICE is the only ADMIT caller; COMPLETE additionally
 /// allows a protected recovery successor verified by EL1 takeover records.
 pub const FILE_SERVICE_ROLE: u64 = 12;
+/// The separately reserved FILE_SERVICE slot in SecurityStateStore v2.
+pub const FILE_SERVICE_SLOT: usize = (FILE_SERVICE_ROLE - 1) as usize;
 
 /// Domain separator of the ADMIT binding digest (ASCII, exact bytes).
 pub const OPERATION_DOMAIN: &[u8] = b"CYX/FILE-ADMIT/v3";

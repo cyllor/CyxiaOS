@@ -17,11 +17,15 @@ on:
       - 'kernel/src/arch/aarch64/production/media_staging/signed.rs'
       - 'kernel/src/arch/aarch64/production/media_staging/volume.rs'
       - 'tests/host/test_snapshot*'
+      - 'tests/host/test_v2_filesystem.py'
+      - 'tools/check_v2_filesystem.py'
+      - 'tools/v020_g1_export_v2.py'
       - 'tools/test_snapshot_probe.py'
       - 'tools/run_snapshot_probe.py'
       - 'tools/host_prototype_library.py'
       - 'tools/test_v020_g1_genesis.py'
       - 'tools/v020_g1_genesis.py'
+      - 'tools/v020_g1_snapshot_wire.py'
       - 'tools/v020_snapshot_catalog_vectors.py'
       - 'tools/v020_snapshot_slot_vectors.py'
       - 'tools/fixtures/v020-g1-*'
@@ -115,6 +119,12 @@ jobs:
           python3 -B tools/v020_snapshot_slot_vectors.py check 2>&1 | tee artifacts/snapshot-media/slot.log
           python3 -B tools/v020_snapshot_catalog_vectors.py check 2>&1 | tee artifacts/snapshot-media/catalog.log
           cargo test --locked --offline -p cyxia-kernel-core --test media_staging --test snapshot_slot_candidate --test snapshot_protection_candidate --test snapshot_catalog_candidate 2>&1 | tee artifacts/snapshot-media/g1-rust.log
+      - name: Verify G1 quota and endpoint contracts
+        run: |
+          set -euo pipefail
+          python3 -B tools/v020_g1_snapshot_wire.py 2>&1 | tee artifacts/snapshot-media/d7-wire.log
+          cargo test --locked --offline -p cyxia-kernel-core --test snapshot_g1_parameters --test snapshot_d7_wire 2>&1 | tee artifacts/snapshot-media/g1-parameters.log
+          cargo test --locked --offline -p cyxia-kernel-core d5_workspace_bytes_fit_the_ledger --lib -- --nocapture 2>&1 | tee artifacts/snapshot-media/d5-workspace.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

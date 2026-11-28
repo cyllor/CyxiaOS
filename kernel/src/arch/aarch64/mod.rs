@@ -43,13 +43,16 @@ pub(crate) use exceptions::ExceptionFrame;
 pub(crate) use exceptions::hex;
 
 pub(crate) const HIGH: u64 = cyxia_platform_virt::HIGH_BASE;
-pub(crate) const SOFTWARE_PAN: u8 =
-    cfg!(any(feature = "v020-production", feature = "unified-runtime")) as u8;
+pub(crate) const SOFTWARE_PAN: u8 = cfg!(any(
+    feature = "v020-production",
+    feature = "unified-runtime"
+)) as u8;
 // Every executing secondary with pointer-bearing syscalls has a private
 // TTBR1 copy descriptor and performs its own window invalidation.
 pub(crate) const SECONDARY_COPY_WINDOWS: usize = if cfg!(any(
     feature = "unified-runtime",
-    cyxia_business_task_services
+    cyxia_business_task_services,
+    cyxia_file_owner_package,
 )) {
     cyxia_contracts::BOOT_CPUS - 1
 } else {

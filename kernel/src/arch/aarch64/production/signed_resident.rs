@@ -1020,6 +1020,10 @@ fn activate_business(
     startup_work(budget, (3 + ROLE_COUNT + 3) as u64, || {
         signed_business::prepare_group_child(policy, package)
     })??;
+    #[cfg(cyxia_file_owner_package)]
+    startup_work(budget, (3 + ROLE_COUNT + 5) as u64, || {
+        signed_business::prepare_file_owner(policy, package, layouts)
+    })??;
     let mask = signed_business::open(policy)?;
     report("V020_SIGNED_BUSINESS_READY", policy.boot_epoch(), mask, 0);
     Ok(())
@@ -1337,7 +1341,11 @@ fn turn(
             }
         }
         #[cfg(cyxia_startup_catalog)]
-        persist_recovery(budget, if LOAD_EVIDENCE { retirement_cpu } else { 0 }, false)?;
+        persist_recovery(
+            budget,
+            if LOAD_EVIDENCE { retirement_cpu } else { 0 },
+            false,
+        )?;
         #[cfg(not(cyxia_startup_catalog))]
         let _ = retirement_cpu;
         if LOAD_EVIDENCE {

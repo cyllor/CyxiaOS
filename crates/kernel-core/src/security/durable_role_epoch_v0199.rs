@@ -149,6 +149,22 @@ impl ConfirmedBootPolicy<'_> {
         self.epochs.running_service_generation(role)
     }
 
+    /// The business file owner has its own reserved security-state slot,
+    /// independent of the eight CPU0 lifecycle roles.
+    pub fn file_service_generation(&self) -> Result<u64, Error> {
+        use super::file_auth_v3::FILE_SERVICE_SLOT;
+        if self.epochs.running_boot_epoch()? != self.boot
+            || self
+                .epochs
+                .slots
+                .iter()
+                .any(|role| usize::from(role.slot) == FILE_SERVICE_SLOT)
+        {
+            return Err(Error::Conflict);
+        }
+        self.epochs.committed_generation_at(FILE_SERVICE_SLOT)
+    }
+
     pub(super) fn verify_tls_installation(
         &self,
         installation: &super::network::TlsInstallation,
@@ -355,7 +371,10 @@ impl DurableEpochGate {
     }
 
     fn committed_service_generation(&self, role: Role) -> Result<u64, Error> {
-        let at = self.slot(role)?;
+        self.committed_generation_at(self.slot(role)?)
+    }
+
+    fn committed_generation_at(&self, at: usize) -> Result<u64, Error> {
         if self.committed.isolated_service_bitmap & (1u64 << at) != 0 {
             return Err(Error::Unauthorized);
         }

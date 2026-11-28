@@ -562,6 +562,14 @@ fn run_chain(
             u64::from(snapshot.historical_only_blocks),
             u64::from(mounted.writes_open()),
         );
+        if let Some(restore) = snapshot.completed_restore() {
+            report(
+                "V020_SEC_F_SNAPSHOT_RESTORE_RETAINED",
+                mounted.boot.boot_epoch,
+                restore.new_live_view_epoch,
+                restore.commit_lsn,
+            );
+        }
         Ok(mounted.system_blocks)
     } else {
         volume::unified_map(disk, checkpoint, LAYOUT)

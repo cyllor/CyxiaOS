@@ -249,14 +249,16 @@ fn attributed_far(esr: u64, far: u64) -> u64 {
     }
 }
 
-/// Only a classified abort from the current pinned business context supplies
-/// this actor. The caller retires the writer before CPU0 may read its slot.
+/// Only a classified fault from the current pinned business context supplies
+/// this actor. CPU0 reads its slot after the core's writer stops.
 #[cfg(cyxia_business_package)]
 pub(super) fn record_business_failure(actor: Identity, esr: u64, far: u64) -> Result<(), Error> {
     let i = cyxia_arch_aarch64::cpu::slot();
     let owned = actor.id == BUSINESS_THREAD_ID_BASE + i as u64;
     #[cfg(cyxia_business_task_services)]
     let owned = owned || super::signed_business::is_group_child_identity(i, actor);
+    #[cfg(cyxia_file_owner_package)]
+    let owned = owned || super::signed_business::is_file_owner_identity(i, actor);
     if i == 0 || i >= ACCUMULATOR_COUNT || !actor.valid() || !owned {
         return Err(Error::Unauthorized);
     }

@@ -247,6 +247,27 @@ impl RestoreGate {
             && epoch == self.view.live_epoch
             && protection == self.view.protection_generation
     }
+
+    pub(crate) fn reopened_restore(&self) -> Option<(Prepared, Commit)> {
+        if self.phase != Phase::Open {
+            return None;
+        }
+        self.last
+    }
+
+    pub(crate) fn restore_for_reopen(
+        &self,
+        actor: Identity,
+        expected: View,
+    ) -> Result<(Prepared, Commit), Error> {
+        if actor != self.reopen {
+            return Err(Error::Unauthorized);
+        }
+        if self.phase != Phase::RestoredFrozen || expected != self.view || self.pending.is_some() {
+            return Err(Error::Busy);
+        }
+        self.last.ok_or(Error::Unknown)
+    }
     /// The native protected owner attests exact persisted preparation,
     /// valid historical root, explicit handling of accepted writes, live
     /// view revocation, actual capacity and current independent policy.
@@ -448,13 +469,7 @@ impl RestoreGate {
         generation: u64,
         verify_open: impl FnOnce(View, Commit) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        if actor != self.reopen {
-            return Err(Error::Unauthorized);
-        }
-        if self.phase != Phase::RestoredFrozen || expected != self.view || self.pending.is_some() {
-            return Err(Error::Busy);
-        }
-        let (_, c) = self.last.ok_or(Error::Unknown)?;
+        let (_, c) = self.restore_for_reopen(actor, expected)?;
         // A durable open transition may have completed despite a lost
         // response. Keep the software write gate closed; never repeat the
         // side-effecting writer until an independent read-only proof.

@@ -1,0 +1,23 @@
+{
+  "schema": "cyxia-v020-g0-baseline-lock/v1",
+  "source_commit": "3260c3de0d6e7bad87f144a65b789f1d2324a2f8",
+  "sources": {
+    "docs/design/baselines/v0.19.9-implementation-spec.txt": "16a53c5c4f89df55425ce6c3898e00175c05c9c1185e8926a9abd6c737782843",
+    "docs/design/v0.20-native-local-system.md#design": "4a3607d73536ec89f7068983112c9c168272c702a4b9b3e904bb0c0bdc5b0ca4",
+    "docs/design/v0.20-native-local-system.md#acceptance": "1b5e5b7dca0d7a2f76dbbea63b650f1fc6ce1e57478a396a2bba751c8eec0c76",
+    "docs/design/v0.20-g1-media-freeze.md#approval": "84560f51fdcbf71f895c5b729e9913c0269f282671d2296427e923058ca1732b",
+    "docs/implementation/v020-sim-acceptance-scope.md#approved-scope": "4f21bcbf554c1b79c06a90f23b341d59a4f81bc3449f2171fb0ab8cdb7acda8e",
+    "docs/implementation/v020-sim-proof-scope.json": "a168384fa6c21e13c36a81340fd08d6b6656fc78769342dc27a3f2bd5d39f0e8",
+    "tools/v0199-required-proof-inventory.json": "2fec97c1575c5d3ea4098c32642c605a5151920522ed03d11803a51fd27264df",
+    "tools/qemu/README.md": "eed48b787a91050067f1dc711bf2658e38c6304ef12465dafb767d880ce7d641"
+  },
+  "baseline_sha256": "895d464908bced980bae31af30c36866d1f3812f94939db15ad9ca8193749302",
+  "security_tracks": {
+    "SEC-P": "895d464908bced980bae31af30c36866d1f3812f94939db15ad9ca8193749302",
+    "SEC-F": "895d464908bced980bae31af30c36866d1f3812f94939db15ad9ca8193749302",
+    "SEC-M": "895d464908bced980bae31af30c36866d1f3812f94939db15ad9ca8193749302",
+    "SEC-N": "895d464908bced980bae31af30c36866d1f3812f94939db15ad9ca8193749302",
+    "SEC-D": "895d464908bced980bae31af30c36866d1f3812f94939db15ad9ca8193749302",
+    "SEC-S": "895d464908bced980bae31af30c36866d1f3812f94939db15ad9ca8193749302"
+  }
+}

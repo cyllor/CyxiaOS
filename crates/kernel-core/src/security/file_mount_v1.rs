@@ -1212,38 +1212,237 @@ mod tests {
 
     #[test]
     fn deleting_snapshot_gc_hands_off_only_checkpointed_exact_bitmap() {
-        use crate::security::{
-            file_media_unified_v1::{
-                catalog_candidate::{
-                    CatalogEntry,
-                    lifecycle::{GcVolume, GcWorkspace, retire_deleted_snapshot},
+        use crate::{
+            control_plane::Identity,
+            security::{
+                file_media_unified_v1::{
+                    SNAP_CAP_DELETE_EXPIRED, SNAP_OP_DELETE_EXPIRED, SNAPSHOT_STRIDE,
+                    SnapshotEnrollment,
+                    catalog_candidate::{
+                        CatalogContext, CatalogEntry,
+                        lifecycle::{
+                            CaptureWorkspace, ExpectedState, GcVolume, GcWorkspace,
+                            SnapshotMutationCall, admit_expiration, mark_expired,
+                            retire_deleted_snapshot,
+                        },
+                    },
+                    request_store::{RequestState, RequestStoreHeader, Watermark},
+                    slot_candidate::SlotDescriptor,
                 },
-                slot_candidate::SlotDescriptor,
+                recovery_v1::{
+                    RecoveryWorkspace, RedoWriter, recover_checkpoint_with_evidence, scan,
+                },
+                snapshot_service_v4::{
+                    CallBinding, FileReqKey, SnapshotGrant, SnapshotKey, SnapshotRequest,
+                    encode_request,
+                },
             },
-            recovery_v1::{RecoveryWorkspace, RedoWriter, recover_checkpoint_with_evidence, scan},
         };
-        for cut_at in 0..=5 {
+        const SLOT: u32 = 6;
+        let p = principals();
+        let cuts = (0..=6)
+            .map(|gc_cut| (gc_cut, 0))
+            .chain((1..=3).map(|delete_cut| (0, delete_cut)));
+        for (cut_at, delete_cut) in cuts {
             let (mut disk, baseline, snapshot) = unified_fixture();
             // This version shares its regular file block with the live root.
             // Only the independently owned history directory block is freed.
-            add_snapshot(&mut disk, 0, true, DATA_START);
+            let missing_receipt = cut_at == 6;
+            add_snapshot(&mut disk, SLOT, missing_receipt, DATA_START);
             disk.set_allocated(HISTORY_FILE, false);
             superblocks(&mut disk);
-            let target = SlotDescriptor::decode(SNAPSHOT_SLOT_START, &disk.0[&SNAPSHOT_SLOT_START])
+            let home = SNAPSHOT_SLOT_START + SLOT * SNAPSHOT_STRIDE;
+            let target = SlotDescriptor::decode(home, &disk.0[&home])
                 .unwrap()
                 .identity;
+            let mut mount = Workspace::new();
+            let mut redo = RecoveryWorkspace::new();
             let mut disk = PowerDisk {
                 durable: disk,
                 pending: BTreeMap::new(),
                 flushes: 0,
-                cut_at,
+                cut_at: 0,
                 cut_after_flush: false,
             };
+            let (checkpoint, deletion_lsn) = if missing_receipt {
+                (CHECKPOINT, CHECKPOINT.checkpoint_lsn)
+            } else {
+                let mut verify = |io: &mut PowerDisk, sb| {
+                    validate_unified_resident(
+                        io,
+                        sb,
+                        &baseline,
+                        &snapshot,
+                        &p,
+                        &mut mount,
+                        |_, _, _| Ok(()),
+                    )
+                };
+                let key = FileReqKey {
+                    fs_uuid: target.fs_uuid,
+                    client_slot: 14,
+                    client_generation: 1,
+                    request_seq: 1,
+                };
+                let snapshot_key = SnapshotKey {
+                    fs_uuid: target.fs_uuid,
+                    snapshot_id: target.snapshot_id,
+                    slot: target.slot,
+                    slot_generation: target.slot_generation,
+                }
+                .encode()
+                .unwrap();
+                let mut frame = [0; 128];
+                let used = encode_request(
+                    SNAP_OP_DELETE_EXPIRED,
+                    1,
+                    Some(key),
+                    0,
+                    &snapshot_key,
+                    9,
+                    &mut frame,
+                )
+                .unwrap();
+                let request = SnapshotRequest::decode(&frame[..used], 9).unwrap();
+                let mut watermarks = [Watermark::EMPTY; 16];
+                watermarks[14] = Watermark {
+                    client_generation: 1,
+                    highest_accepted_seq: 0,
+                };
+                RequestStoreHeader {
+                    fs_uuid: target.fs_uuid,
+                    generation: 1,
+                    watermarks,
+                }
+                .encode(disk.durable.0.get_mut(&SNAPSHOT_REQUEST_START).unwrap())
+                .unwrap();
+                let mounted = verify(&mut disk, CHECKPOINT).unwrap();
+                let staged = mounted.snapshot.unwrap();
+                let protection = staged.protection.unwrap();
+                let binding = CallBinding {
+                    holder: Identity {
+                        id: 14,
+                        generation: 1,
+                    },
+                    boot_epoch: mounted.boot.boot_epoch,
+                    service_generation: 1,
+                    endpoint: 1,
+                    selector: 9,
+                    fs_uuid: target.fs_uuid,
+                };
+                let call = SnapshotMutationCall {
+                    mount: &mounted,
+                    binding,
+                    grant: SnapshotGrant {
+                        binding,
+                        enrollment: SnapshotEnrollment::InternalMaintenance,
+                        capability_word: SNAP_CAP_DELETE_EXPIRED,
+                        principal: Some((key.client_slot, key.client_generation)),
+                        history_prefix_sha256: None,
+                    },
+                    request: &request,
+                };
+                let mut writer = RedoWriter::open(&mut disk, &mut redo, CHECKPOINT).unwrap();
+                let mut work = CaptureWorkspace::new();
+                let admitted = admit_expiration(&mut writer, call, &mut work, |_| Ok(())).unwrap();
+                assert_eq!(admitted.record.state, RequestState::Pending);
+                let retry = admit_expiration(&mut writer, call, &mut work, |_| {
+                    panic!("DELETE admission repeated")
+                })
+                .unwrap();
+                assert_eq!(retry.record, admitted.record);
+                assert!(retry.reserved.is_none());
+                let expected = ExpectedState {
+                    catalog: CatalogContext {
+                        fs_uuid: target.fs_uuid,
+                        catalog_generation: staged.catalog.unwrap().generation,
+                        slot_store_generation: 1,
+                        live_view_epoch: protection.live_view_epoch,
+                        committed_lsn: admitted.reserved.unwrap().transaction().commit_lsn,
+                        online_age_ns: protection.online_age_ns,
+                    },
+                    catalog_sha256: staged.catalog_sha256,
+                    protection_sha256: staged.protection_sha256,
+                };
+                let planned = writer.prepare(2).unwrap();
+                if delete_cut > 0 {
+                    drop(writer);
+                    disk.flushes = 0;
+                    disk.cut_at = delete_cut.min(2);
+                    disk.cut_after_flush = delete_cut == 3;
+                    writer = RedoWriter::open(&mut disk, &mut redo, CHECKPOINT).unwrap();
+                }
+                let done = mark_expired(&mut writer, expected, call, &mut work, |plan, seen| {
+                    assert_eq!(seen, target);
+                    assert_eq!(*plan, planned);
+                    Ok(())
+                });
+                if delete_cut > 0 {
+                    assert!(matches!(done, Err(Error::Unknown)));
+                    drop(writer);
+                    assert!(disk.pending.is_empty());
+                    disk.cut_at = 0;
+                    let mut reopened = RecoveryWorkspace::new();
+                    let evidence = scan(&mut disk, &mut reopened).unwrap();
+                    let committed = delete_cut == 3;
+                    let lsn = if committed {
+                        planned.commit_lsn
+                    } else {
+                        expected.catalog.committed_lsn
+                    };
+                    assert_eq!(evidence.last_commit_lsn, lsn);
+                    recover_checkpoint_with_evidence(&mut disk, &mut reopened, |io, old| {
+                        let effective = SuperblockV1 {
+                            checkpoint_lsn: lsn,
+                            ..old
+                        };
+                        let staged = verify(io, effective)?.snapshot.unwrap();
+                        assert_eq!(staged.has_committed_deletion(SLOT as usize), committed);
+                        assert_eq!(staged.requests.nonterminal, usize::from(!committed));
+                        assert_eq!(staged.historical_only_blocks, 1);
+                        let entry = staged.catalog.unwrap().entries[SLOT as usize];
+                        if committed {
+                            assert!(matches!(
+                                entry,
+                                CatalogEntry::Deleting { binding, root_drop_commit_lsn }
+                                    if binding.identity == target && root_drop_commit_lsn == lsn
+                            ));
+                        } else {
+                            assert!(matches!(entry, CatalogEntry::Active(binding) if binding.identity == target));
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                    continue;
+                }
+                let done = done.unwrap().transaction();
+                let retry = admit_expiration(&mut writer, call, &mut work, |_| {
+                    panic!("terminal DELETE repeated")
+                })
+                .unwrap();
+                assert_eq!(retry.record.state, RequestState::Done);
+                assert_eq!(retry.record.commit_lsn, done.commit_lsn);
+                assert_eq!(retry.record.txid, done.txid);
+                assert_eq!(retry.record.request_digest, admitted.record.request_digest);
+                assert!(retry.reserved.is_none());
+                let (_, checkpoint) = writer
+                    .checkpoint_verified(|io, old| {
+                        let effective = SuperblockV1 {
+                            checkpoint_lsn: done.commit_lsn,
+                            ..old
+                        };
+                        let staged = verify(io, effective)?.snapshot.unwrap();
+                        assert!(staged.has_committed_deletion(SLOT as usize));
+                        assert_eq!(staged.historical_only_blocks, 1);
+                        Ok(())
+                    })
+                    .unwrap();
+                (checkpoint, done.commit_lsn)
+            };
+            disk.flushes = 0;
+            disk.cut_at = cut_at;
             let mut gc = GcWorkspace::new();
-            let mut mount = Workspace::new();
-            let mut redo = RecoveryWorkspace::new();
-            let p = principals();
-            let writer = RedoWriter::open(&mut disk, &mut redo, CHECKPOINT).unwrap();
+            let writer = RedoWriter::open(&mut disk, &mut redo, checkpoint).unwrap();
             let result = retire_deleted_snapshot(
                 writer,
                 GcVolume {
@@ -1256,12 +1455,18 @@ mod tests {
                 &mut gc,
                 |_, _, _| Ok(()),
                 |seen, lsn| {
+                    assert!(!missing_receipt, "no prior DELETE receipt");
                     assert_eq!(seen, target);
-                    assert_eq!(lsn, 4);
+                    assert_eq!(lsn, deletion_lsn);
                     Ok(())
                 },
                 |_| Ok(()),
             );
+            if missing_receipt {
+                assert!(matches!(result, Err(Error::Conflict)));
+                assert_eq!(disk.flushes, 0);
+                continue;
+            }
             if matches!(cut_at, 0 | 5) {
                 let proof = result.unwrap();
                 assert_eq!(proof.released(), 1);
@@ -1274,10 +1479,10 @@ mod tests {
                     continue;
                 }
                 proof
-                    .handoff(&mut disk, &mut gc, |checkpoint, bits| {
+                    .handoff(&mut disk, &mut gc, |published, bits| {
                         let has =
                             |block: u32| bits[0][block as usize / 8] & (1 << (block % 8)) != 0;
-                        assert_eq!(checkpoint.generation, 3);
+                        assert_eq!(published.generation, checkpoint.generation + 1);
                         assert!(has(DATA_START));
                         assert!(has(ROOT));
                         assert!(has(SNAPSHOT_PROTECTION_BLOCK));
@@ -1292,7 +1497,7 @@ mod tests {
             // and all allocator state. A prior incomplete log cannot free.
             let mut reread = RecoveryWorkspace::new();
             let e = scan(&mut disk, &mut reread).unwrap();
-            assert_eq!(e.superblock, CHECKPOINT);
+            assert_eq!(e.superblock, checkpoint);
             let mut verify = |disk: &mut PowerDisk, effective: SuperblockV1| {
                 validate_unified_resident(
                     disk,
@@ -1305,15 +1510,15 @@ mod tests {
                 )
             };
             if cut_at <= 2 {
-                let entry = verify(&mut disk, CHECKPOINT)
+                let entry = verify(&mut disk, checkpoint)
                     .unwrap()
                     .snapshot
                     .unwrap()
                     .catalog
                     .unwrap()
-                    .entries[0];
+                    .entries[SLOT as usize];
                 assert!(matches!(entry, CatalogEntry::Deleting { .. }));
-                assert_eq!(e.last_commit_lsn, CHECKPOINT.checkpoint_lsn);
+                assert_eq!(e.last_commit_lsn, deletion_lsn);
                 continue;
             }
             recover_checkpoint_with_evidence(&mut disk, &mut reread, |disk, old| {
@@ -1323,7 +1528,7 @@ mod tests {
                 };
                 let snap = verify(disk, effective)?.snapshot.unwrap();
                 assert!(matches!(
-                    snap.catalog.unwrap().entries[0],
+                    snap.catalog.unwrap().entries[SLOT as usize],
                     CatalogEntry::Free { slot_generation: 1 }
                 ));
                 assert_eq!(snap.historical_only_blocks, 0);
@@ -1339,11 +1544,12 @@ mod tests {
             control_plane::Identity,
             security::{
                 file_media_unified_v1::{
-                    SNAP_CAP_PROTECTION, SNAP_OP_OPEN_WRITES, SNAP_OP_RESTORE,
+                    SNAP_CAP_PROTECTION, SNAP_OP_OPEN_WRITES, SNAP_OP_RESTORE, SnapshotEnrollment,
                     catalog_candidate::{
                         CatalogContext,
                         lifecycle::{
-                            CaptureWorkspace, ExpectedState, OpenWritesRequest, commit_open_writes,
+                            CaptureWorkspace, ExpectedState, SnapshotMutationCall,
+                            admit_open_writes, commit_open_writes,
                         },
                     },
                     protection_candidate::RestorePhase,
@@ -1359,7 +1565,8 @@ mod tests {
                     Commit, Phase, Prepared, Recovered, RestoreGate, RestoreKey, SnapshotKey, View,
                 },
                 snapshot_service_v4::{
-                    FileReqKey, SnapshotKey as WireKey, SnapshotRequest, encode_request,
+                    CallBinding, FileReqKey, SnapshotGrant, SnapshotKey as WireKey,
+                    SnapshotRequest, encode_request,
                 },
             },
         };
@@ -1417,11 +1624,22 @@ mod tests {
             body.fill(0);
             p64(&mut body, 0, 1);
             body[8..44].copy_from_slice(&key.encode().unwrap());
-            let open = decode(SNAP_OP_OPEN_WRITES, open_key, 2, &body);
+            let mut open_raw = [0; 256];
+            let open_len = encode_request(
+                SNAP_OP_OPEN_WRITES,
+                open_key.request_seq,
+                Some(open_key),
+                2,
+                &body,
+                9,
+                &mut open_raw,
+            )
+            .unwrap();
+            let open = SnapshotRequest::decode(&open_raw[..open_len], 9).unwrap();
             let mut watermark = [Watermark::EMPTY; 16];
             watermark[15] = Watermark {
                 client_generation: 1,
-                highest_accepted_seq: 2,
+                highest_accepted_seq: 1,
             };
             RequestStoreHeader {
                 fs_uuid: key.fs_uuid,
@@ -1431,13 +1649,11 @@ mod tests {
             .encode(disk.0.get_mut(&SNAPSHOT_REQUEST_START).unwrap())
             .unwrap();
             let mut page = Box::new([0; BLOCK]);
-            for (index, record) in [(56, restored), (57, open)] {
-                let (_, range) = record_location(index).unwrap();
-                record
-                    .encode((&mut page[range]).try_into().unwrap())
-                    .unwrap();
-            }
-            disk.0.insert(record_location(56).unwrap().0, page);
+            let (home, range) = record_location(56).unwrap();
+            restored
+                .encode((&mut page[range]).try_into().unwrap())
+                .unwrap();
+            disk.0.insert(home, page);
             let raw = disk.0.get_mut(&SNAPSHOT_PROTECTION_BLOCK).unwrap();
             let mut p = ProtectionRecord::decode(&raw[..]).unwrap();
             p.live_view_epoch = 2;
@@ -1445,7 +1661,7 @@ mod tests {
             p.cleanup_frozen = true;
             p.restore_obligation_digest = restored.result_digest;
             p.encode(raw).unwrap();
-            let expected = ExpectedState {
+            let mut expected = ExpectedState {
                 catalog: CatalogContext {
                     fs_uuid: key.fs_uuid,
                     catalog_generation: 2,
@@ -1516,40 +1732,179 @@ mod tests {
                 |_, _| Ok(()),
             )
             .unwrap();
+            let mut other_gate = RestoreGate::recover_frozen(
+                view,
+                recovery,
+                supervisor,
+                Recovered::RestoredFrozen(
+                    prepared,
+                    Commit {
+                        txid: commit.txid + 1,
+                        ..commit
+                    },
+                ),
+                index,
+                security,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            other_gate
+                .reopen_next_protection(supervisor, view, |_, _| Ok(()))
+                .unwrap();
             let mut disk = PowerDisk {
                 durable: disk,
                 pending: BTreeMap::new(),
                 flushes: 0,
-                cut_at: cut_at.min(2),
-                cut_after_flush: cut_at == 3,
+                cut_at: 0,
+                cut_after_flush: false,
             };
             let mut redo = RecoveryWorkspace::new();
-            let mut writer = RedoWriter::open(&mut disk, &mut redo, CHECKPOINT).unwrap();
             let mut work = CaptureWorkspace::new();
-            let request = OpenWritesRequest {
-                actor: supervisor,
-                rights: SNAP_CAP_PROTECTION,
-                key: open_key,
+            let (mount, binding, grant);
+            {
+                let mut writer = RedoWriter::open(&mut disk, &mut redo, CHECKPOINT).unwrap();
+                mount = validate_unified_resident(
+                    &mut writer.committed_view(),
+                    CHECKPOINT,
+                    &baseline,
+                    &snapshot,
+                    &principals(),
+                    &mut Workspace::new(),
+                    |_, _, _| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(mount.snapshot.unwrap().completed_restore(), Some(&restored));
+                binding = CallBinding {
+                    holder: supervisor,
+                    boot_epoch: mount.boot.boot_epoch,
+                    service_generation: 1,
+                    endpoint: 1,
+                    selector: 9,
+                    fs_uuid: key.fs_uuid,
+                };
+                grant = SnapshotGrant {
+                    binding,
+                    enrollment: SnapshotEnrollment::RecoverySupervisor,
+                    capability_word: SNAP_CAP_PROTECTION,
+                    principal: Some((open_key.client_slot, open_key.client_generation)),
+                    history_prefix_sha256: None,
+                };
+                let call = SnapshotMutationCall {
+                    mount: &mount,
+                    binding,
+                    grant,
+                    request: &open,
+                };
+                let wrong = CallBinding {
+                    holder: recovery,
+                    ..binding
+                };
+                assert!(matches!(
+                    admit_open_writes(
+                        &mut writer,
+                        &gate,
+                        SnapshotMutationCall {
+                            binding: wrong,
+                            grant: SnapshotGrant {
+                                binding: wrong,
+                                ..grant
+                            },
+                            ..call
+                        },
+                        &mut work,
+                        |_| panic!("independent protection actor required"),
+                    ),
+                    Err(Error::Unauthorized)
+                ));
+                let stale = CallBinding {
+                    boot_epoch: binding.boot_epoch + 1,
+                    ..binding
+                };
+                assert!(matches!(
+                    admit_open_writes(
+                        &mut writer,
+                        &gate,
+                        SnapshotMutationCall {
+                            binding: stale,
+                            grant: SnapshotGrant {
+                                binding: stale,
+                                ..grant
+                            },
+                            ..call
+                        },
+                        &mut work,
+                        |_| panic!("stale boot"),
+                    ),
+                    Err(Error::Stale)
+                ));
+                let admitted =
+                    admit_open_writes(&mut writer, &gate, call, &mut work, |_| Ok(())).unwrap();
+                assert_eq!(admitted.record.state, RequestState::Pending);
+                expected.catalog.committed_lsn =
+                    admitted.reserved.unwrap().transaction().commit_lsn;
+                let retry = admit_open_writes(&mut writer, &gate, call, &mut work, |_| {
+                    panic!("same-key retry executed twice")
+                })
+                .unwrap();
+                assert_eq!(retry.record, admitted.record);
+                assert!(retry.reserved.is_none());
+                assert!(!gate.may_write(2, 1));
+            }
+            disk.flushes = 0;
+            disk.cut_at = cut_at.min(2);
+            disk.cut_after_flush = cut_at == 3;
+            let mut writer = RedoWriter::open(&mut disk, &mut redo, CHECKPOINT).unwrap();
+            let call = SnapshotMutationCall {
+                mount: &mount,
+                binding,
+                grant,
+                request: &open,
             };
-            assert!(matches!(
-                commit_open_writes(
-                    &mut writer,
-                    expected,
-                    &mut gate,
-                    OpenWritesRequest {
-                        actor: recovery,
-                        ..request
+            for (wrong, error) in [
+                (
+                    CallBinding {
+                        holder: recovery,
+                        ..binding
                     },
-                    &mut work,
-                    |_| panic!()
+                    Error::Unauthorized,
                 ),
-                Err(Error::Unauthorized)
-            ));
+                (
+                    CallBinding {
+                        boot_epoch: binding.boot_epoch + 1,
+                        ..binding
+                    },
+                    Error::Stale,
+                ),
+            ] {
+                assert_eq!(
+                    commit_open_writes(
+                        &mut writer,
+                        expected,
+                        &mut gate,
+                        SnapshotMutationCall {
+                            binding: wrong,
+                            grant: SnapshotGrant {
+                                binding: wrong,
+                                ..grant
+                            },
+                            ..call
+                        },
+                        &mut work,
+                        |_| panic!("unauthorized OPEN_WRITES effect"),
+                    )
+                    .err(),
+                    Some(error),
+                );
+            }
             assert_eq!(gate.phase(), Phase::RestoredFrozen);
-            let opened =
-                commit_open_writes(&mut writer, expected, &mut gate, request, &mut work, |_| {
-                    Ok(())
-                });
+            let opened = commit_open_writes(
+                &mut writer,
+                expected,
+                &mut gate,
+                call,
+                &mut work,
+                |_| Ok(()),
+            );
             if cut_at == 0 {
                 let tx = opened.unwrap().transaction();
                 assert!(gate.may_write(2, 2));
@@ -1574,6 +1929,12 @@ mod tests {
                 assert!(mounted.permits_replay_of_file_writes());
                 assert!(!mounted.writes_open());
                 assert_eq!(
+                    mounted.authorize_snapshot_writes(&other_gate, |_| panic!(
+                        "different RESTORE transaction"
+                    )),
+                    Err(Error::Stale)
+                );
+                assert_eq!(
                     mounted.authorize_snapshot_writes(&gate, |_| Err(Error::Unauthorized)),
                     Err(Error::Unauthorized)
                 );
@@ -1587,6 +1948,24 @@ mod tests {
                     .unwrap();
                 assert!(mounted.writes_open());
                 assert!(!mounted.may_overwrite_in_place());
+                assert_eq!(
+                    mounted.authorize_snapshot_writes(&gate, |_| Err(Error::Stale)),
+                    Err(Error::Stale)
+                );
+                assert!(
+                    !mounted.writes_open(),
+                    "failed BootEpoch recheck closes writes"
+                );
+                mounted
+                    .authorize_snapshot_writes(&gate, |_| Ok(()))
+                    .unwrap();
+                assert_eq!(
+                    mounted.authorize_snapshot_writes(&other_gate, |_| panic!(
+                        "different RESTORE transaction"
+                    )),
+                    Err(Error::Stale)
+                );
+                assert!(!mounted.writes_open(), "stale restore gate closes writes");
             } else {
                 assert!(matches!(opened, Err(Error::Unknown)));
                 assert_eq!(gate.phase(), Phase::ReopeningUnknown);
