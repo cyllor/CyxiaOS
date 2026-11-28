@@ -201,6 +201,12 @@ extern "C" fn _start(arg_va:u64,args_len:u64)->!{
     file_receipt::run();
     #[cfg(not(all(file_receipt_query_probe, control_role = "11")))]
     loop{
+        if cfg!(audit_full_idle) {
+            // The full audit fixture only drives the Supervisor. Keep the
+            // other signed roles resident without unrelated RPC traffic.
+            let _ = call(3, [u64::MAX, 0, 0, 0, 0, 0]);
+            continue;
+        }
         let now=clock();
         if now>=0 {role_step(cap,target,generation,now as u64);}
         yield_now();

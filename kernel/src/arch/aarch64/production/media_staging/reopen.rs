@@ -1,12 +1,13 @@
-//! Reopen the boot-only journal under exclusive CPU0 ownership. This handles
-//! interruption in preparation, home replay, checkpointing and retirement of
-//! the six-block BootEpoch append. Every other redo block must be zero.
+//! Reopen the signed volume under exclusive CPU0 ownership. BootEpoch and
+//! runtime appends share one ordered journal and advance one checkpoint.
 use super::{Disk, authority, volume};
 use core::mem::MaybeUninit;
 #[cfg(any(test, cyxia_startup_catalog))]
 use cyxia_kernel_core::security::boot_epoch_v1::{TlsBootPolicy, TlsBootTransition};
 #[cfg(test)]
 use cyxia_kernel_core::security::offline_config_v1::VerifiedOfflineConfig;
+#[cfg(any(test, cyxia_startup_catalog))]
+use cyxia_kernel_core::security::recovery_proof_store::RecoveryLocator;
 use cyxia_kernel_core::security::{
     Error,
     boot_epoch_v1::BootEpochStoreV1,
@@ -16,6 +17,10 @@ use cyxia_kernel_core::security::{
     file_mount_v1::MountEvidence,
     recovery_v1::{self, RecoveryWorkspace},
 };
+
+#[cfg(any(test, cyxia_startup_catalog))]
+#[path = "reopen_resident.rs"]
+mod resident;
 
 #[cfg_attr(target_os = "none", unsafe(link_section = ".bss.sec_n"))]
 static mut RECOVERY: MaybeUninit<RecoveryWorkspace> = MaybeUninit::uninit();
@@ -76,7 +81,7 @@ pub(super) fn recover_resident(
     recover_resident_with_tls(disk, sb, TlsBootPolicy::new(config, None)?, None)
 }
 
-#[cfg(any(test, cyxia_startup_catalog))]
+#[cfg(test)]
 pub(super) fn recover_resident_with_tls(
     disk: &mut Disk,
     sb: SuperblockV1,
@@ -100,28 +105,51 @@ pub(super) enum BootLogRecovery {
 
 /// Report the prior transaction's disposition only after recovery I/O and
 /// readback. The authorized caller first owns the reset-complete block device.
-#[cfg(any(test, cyxia_startup_catalog))]
+#[cfg(test)]
 pub(super) fn recover_resident_with_reconciliation(
     disk: &mut Disk,
     sb: SuperblockV1,
     current: TlsBootPolicy<'_>,
     transition: Option<TlsBootTransition<'_>>,
 ) -> Result<(SuperblockV1, MountEvidence, BootLogRecovery), Error> {
+    recover_resident_for_layout(
+        disk,
+        sb,
+        current,
+        transition,
+        volume::SnapshotLayout::LegacyZero,
+        None,
+    )
+}
+
+#[cfg(any(test, cyxia_startup_catalog))]
+pub(super) fn recover_resident_for_layout(
+    disk: &mut Disk,
+    sb: SuperblockV1,
+    current: TlsBootPolicy<'_>,
+    transition: Option<TlsBootTransition<'_>>,
+    snapshots: volume::SnapshotLayout,
+    carrier: Option<RecoveryLocator>,
+) -> Result<(SuperblockV1, MountEvidence, BootLogRecovery), Error> {
     if transition.is_some_and(|t| t.current().config().digest() != current.config().digest()) {
         return Err(Error::Conflict);
+    }
+    let policies = Policies {
+        current: BootPolicy::Resident(current),
+        predecessor: transition.map(|t| BootPolicy::Resident(t.previous())),
+    };
+    if let Some(recovered) = resident::reconcile(disk, sb, &policies, snapshots, carrier)? {
+        return Ok(recovered);
     }
     recover_boot_pair_for(
         disk,
         sb,
-        Policies {
-            current: BootPolicy::Resident(current),
-            predecessor: transition.map(|t| BootPolicy::Resident(t.previous())),
-        },
-        volume::SnapshotLayout::LegacyZero,
+        policies,
+        snapshots,
         volume::Checkpoints::Resident,
         |disk, epoch, policy| match policy {
             BootPolicy::Resident(policy) => {
-                volume::validate_resident_homes_for(disk, sb, epoch, policy)
+                volume::validate_resident_homes_for_layout(disk, sb, epoch, policy, snapshots)
             }
             #[cfg(not(cyxia_startup_catalog))]
             BootPolicy::Staging(_) => Err(Error::Conflict),
@@ -147,12 +175,22 @@ impl<'a> BootPolicy<'a> {
         }
     }
 
-    fn state(self, epoch: u64) -> Result<SecurityStateStoreV2, Error> {
+    fn state(
+        self,
+        epoch: u64,
+        _roles_from: &SecurityStateStoreV2,
+    ) -> Result<SecurityStateStoreV2, Error> {
         match self {
             #[cfg(not(cyxia_startup_catalog))]
             Self::Staging(config) => volume::expected_state(epoch, config),
             #[cfg(any(test, cyxia_startup_catalog))]
-            Self::Resident(policy) => policy.resident_state(epoch),
+            Self::Resident(policy) => {
+                use cyxia_kernel_core::control_plane::role_manifest_v0199::ROLE_COUNT;
+                let roles = _roles_from.service_generations[..ROLE_COUNT]
+                    .try_into()
+                    .unwrap();
+                policy.resident_state_with_roles(epoch, roles)
+            }
         }
     }
 }
@@ -168,11 +206,11 @@ impl<'a> Policies<'a> {
         actual: &SecurityStateStoreV2,
         epoch: u64,
     ) -> Result<BootPolicy<'a>, Error> {
-        if *actual == self.current.state(epoch)? {
+        if *actual == self.current.state(epoch, actual)? {
             return Ok(self.current);
         }
         if let Some(previous) = self.predecessor
-            && *actual == previous.state(epoch)?
+            && *actual == previous.state(epoch, actual)?
         {
             return Ok(previous);
         }
@@ -228,6 +266,66 @@ fn verify_replay_homes(
         return Err(Error::Conflict);
     }
     Ok(())
+}
+
+/// A rotated deployment must materialize the newly authorized public
+/// policy before dropping its predecessor. This boot retains the already
+/// durable paired redo as the anchor for runtime restart transactions.
+#[cfg(test)]
+pub(super) fn materialize_verified_boot(
+    disk: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    policy: TlsBootPolicy<'_>,
+    committed: &SecurityStateStoreV2,
+) -> Result<MountEvidence, Error> {
+    materialize_verified_boot_for_layout(
+        disk,
+        sb,
+        policy,
+        committed,
+        volume::SnapshotLayout::LegacyZero,
+    )
+}
+
+#[cfg(any(test, cyxia_startup_catalog))]
+pub(super) fn materialize_verified_boot_for_layout(
+    disk: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    policy: TlsBootPolicy<'_>,
+    committed: &SecurityStateStoreV2,
+    snapshots: volume::SnapshotLayout,
+) -> Result<MountEvidence, Error> {
+    policy.verify_resident_state(committed, sb.generation)?;
+    authority::verified_pair_state_for(
+        disk,
+        sb,
+        |_| Ok(()),
+        |state| {
+            if state != committed {
+                return Err(Error::Conflict);
+            }
+            Ok(())
+        },
+    )?;
+    // SAFETY: the single staging owner has released its earlier workspace.
+    let work = unsafe { workspace() };
+    let evidence = recovery_v1::scan(disk, work)?;
+    if evidence.superblock != sb
+        || evidence.transactions != 1
+        || evidence.distinct_home_blocks != 2
+        || evidence.incomplete_tail
+        || sb.checkpoint_lsn.checked_add(4) != Some(evidence.last_commit_lsn)
+    {
+        return Err(Error::Conflict);
+    }
+    disk.flush().map_err(|_| Error::Unknown)?;
+    recovery_v1::replay_home(disk, work)?;
+    let mounted =
+        volume::validate_resident_homes_for_layout(disk, sb, sb.generation, policy, snapshots)?;
+    if &mounted.security != committed {
+        return Err(Error::Conflict);
+    }
+    Ok(mounted)
 }
 
 fn retire(disk: &mut impl EpochBlockIo) -> Result<(), Error> {
@@ -299,7 +397,13 @@ fn recover_boot_pair_for<D: EpochBlockIo>(
     if volume::read_checkpoint_for(disk, &mut raw, config, checkpoints)? != sb {
         return Err(Error::Conflict);
     }
-    volume::unified_map(disk, sb, snapshots)?;
+    match checkpoints {
+        volume::Checkpoints::Staging => {
+            volume::unified_map(disk, sb, snapshots)?;
+        }
+        #[cfg(any(test, cyxia_startup_catalog))]
+        volume::Checkpoints::Resident => volume::verify_resident_layout(disk, sb, snapshots)?,
+    }
     let log = authority::recovery_log_for(disk, sb, |epoch, state| {
         policies.policy_for(state, epoch).map(|_| ())
     });
@@ -314,8 +418,8 @@ fn recover_boot_pair_for<D: EpochBlockIo>(
         disk.read(volume::SECURITY_HOME, &mut raw)?;
         let previous = SecurityStateStoreV2::decode(&raw)?;
         let before = policies.policy_for(&previous, previous_epoch)?;
-        let next_same_policy = before.state(sb.generation)?;
-        let next_current_policy = policies.current.state(sb.generation)?;
+        let next_same_policy = before.state(sb.generation, &previous)?;
+        let next_current_policy = policies.current.state(sb.generation, &previous)?;
         // A prior boot could have armed the old policy's ordinary epoch
         // append before a newer signed configuration was deployed.
         match authority::uncommitted_log_for(disk, sb, next_same_policy) {
@@ -328,6 +432,11 @@ fn recover_boot_pair_for<D: EpochBlockIo>(
     let log = log?;
     let (mounted_policy, replay) = match log {
         authority::BootLog::Committed(committed) => {
+            #[cfg(any(test, cyxia_startup_catalog))]
+            if matches!(checkpoints, volume::Checkpoints::Resident) {
+                // Active resident logs go through the strict extent owner.
+                return Err(Error::Conflict);
+            }
             let after = policies.policy_for(&committed, sb.generation)?;
             disk.read(volume::SECURITY_HOME, &mut raw)?;
             let home = SecurityStateStoreV2::decode(&raw)?;
@@ -339,12 +448,12 @@ fn recover_boot_pair_for<D: EpochBlockIo>(
             } else {
                 policies.policy_for(&home, previous_epoch)?
             };
-            let old = before.state(previous_epoch)?;
-            if !committed.no_rollback_from(&old) {
+            let old = before.state(previous_epoch, &committed)?;
+            if !committed.no_rollback_from(&old) || (home != committed && home != old) {
                 return Err(Error::Stale);
             }
             verify_replay_homes(disk, &old, &committed)?;
-            (before, Some((old, after)))
+            (before, Some((old, after, committed)))
         }
         _ if policies.predecessor.is_some() => {
             disk.read(volume::SECURITY_HOME, &mut raw)?;
@@ -358,7 +467,7 @@ fn recover_boot_pair_for<D: EpochBlockIo>(
     let preflight = validate(
         &mut BootHomeView {
             disk,
-            previous: replay.map(|(old, _)| old),
+            previous: replay.map(|(old, _, _)| old),
         },
         previous_epoch,
         mounted_policy,
@@ -387,14 +496,7 @@ fn recover_boot_pair_for<D: EpochBlockIo>(
         }
         authority::BootLog::Committed(_) => {}
     }
-    let (_, after) = replay.ok_or(Error::Conflict)?;
-
-    #[cfg(any(test, cyxia_startup_catalog))]
-    if matches!(checkpoints, volume::Checkpoints::Resident) {
-        // The prior owner may have lost its COMMIT FLUSH response. Make the
-        // verified log durable before replay is allowed to touch either home.
-        disk.flush().map_err(|_| Error::Unknown)?;
-    }
+    let (_, after, committed) = replay.ok_or(Error::Conflict)?;
 
     // SAFETY: CPU0 borrows the workspace only inside the synchronous, one-shot
     // staging run; initialization precedes every use, including in host tests.
@@ -405,14 +507,18 @@ fn recover_boot_pair_for<D: EpochBlockIo>(
             if current != sb {
                 return Err(Error::Conflict);
             }
-            mounted = Some(validate(
+            let verified = validate(
                 &mut BootHomeView {
                     disk,
                     previous: None,
                 },
                 sb.generation,
                 after,
-            )?);
+            )?;
+            if verified.security != committed {
+                return Err(Error::Conflict);
+            }
+            mounted = Some(verified);
             Ok(())
         })?;
     if chain.superblock != sb

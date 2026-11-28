@@ -2,6 +2,8 @@
 //! CPU0 is the only writer of role backing and page tables. The published
 //! RX mappings have their writable aliases removed before first entry.
 use super::{Page, mmu, phys, ram_l3, timer, user};
+#[cfg(cyxia_startup_catalog)]
+use core::sync::atomic::AtomicU8;
 #[cfg(cyxia_signed_resident)]
 use core::sync::atomic::AtomicU16;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +28,7 @@ pub(super) const COPY: usize = 128 * 1024;
 const BASE: u64 = 0x10000;
 const STACK_BASE: u64 = 0x30000;
 const STACK_END: u64 = STACK_BASE + ROLE_STACK_BYTES as u64;
+const DIRECT_RW: u64 = 0x0060_0000_0000_0703;
 
 pub(super) static PIE_CAP: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
 
@@ -86,7 +89,10 @@ impl Tables {
 }
 #[repr(align(4096))]
 pub(super) struct CopyBuffer(pub(super) [u8; COPY]);
-#[cfg_attr(cyxia_startup_catalog, unsafe(export_name = "V020_SIGNED_ROLE_BACKING"))]
+#[cfg_attr(
+    cyxia_startup_catalog,
+    unsafe(export_name = "V020_SIGNED_ROLE_BACKING")
+)]
 pub(super) static mut BACKING: [Backing; ROLE_COUNT] = [const { Backing::ZERO }; ROLE_COUNT];
 #[cfg_attr(cyxia_startup_catalog, unsafe(export_name = "V020_SIGNED_ROLE_TABLES"))]
 pub(super) static mut TABLES: [Tables; ROLE_COUNT] = [const { Tables::ZERO }; ROLE_COUNT];
@@ -124,6 +130,13 @@ pub(super) fn root_pa(index: usize) -> u64 {
     phys(tables(index) as u64)
 }
 pub(super) fn role_asid(index: usize) -> u8 {
+    #[cfg(cyxia_startup_catalog)]
+    {
+        let current = PIE_ASID[index].load(Ordering::Acquire);
+        if current != 0 {
+            return current;
+        }
+    }
     (0xA0 + index) as u8
 }
 pub(super) fn high_leaf(pa: u64) -> *mut u64 {
@@ -162,7 +175,7 @@ pub(super) fn tlbi() {
 fn seal_page(pa: u64) {
     let leaf = high_leaf(pa);
     let old = unsafe { core::ptr::read_volatile(leaf) };
-    assert_eq!(old, pa | 0x0060_0000_0000_0703);
+    assert_eq!(old, pa | DIRECT_RW);
     unsafe {
         core::ptr::write_volatile(leaf, 0);
     }
@@ -180,7 +193,7 @@ fn remove_writable_alias(pa: u64) {
     // writable backing after staging. The final broadcast TLBI completes
     // every removal before its TTBR0 can be used.
     unsafe {
-        assert_eq!(leaf.read_volatile(), pa | 0x0060_0000_0000_0703);
+        assert_eq!(leaf.read_volatile(), pa | DIRECT_RW);
         leaf.write_volatile(0);
     }
 }
@@ -339,16 +352,28 @@ pub(super) fn load_role_with_identity(
     #[cfg(cyxia_signed_resident)]
     let lifecycle = matches!(launch, RoleLaunch::Lifecycle { .. });
     #[cfg(cyxia_signed_resident)]
-    if lifecycle {
+    let asid = if lifecycle {
         if super::cpu::registered_slot() != Some(profile::CONTROL_CPU) {
             return Err(Error::Denied);
         }
-        // SAFETY: CPU0 exclusively owns the registry, and staging never
-        // reuses a live or retired slot during the same boot.
-        if !matches!(unsafe { registration(index).read() }, Registration::Vacant) {
-            return Err(Error::Denied);
+        // SAFETY: CPU0 exclusively owns the mapping and its registration.
+        match unsafe { registration(index).read() } {
+            Registration::Vacant => role_asid(index),
+            #[cfg(cyxia_startup_catalog)]
+            Registration::Retired(old) if old.generation.checked_add(1) == Some(generation) => {
+                let asid = NEXT_RESTART_ASID
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |asid| {
+                        (asid < 0x80).then_some(asid + 1)
+                    })
+                    .map_err(|_| Error::Exhausted)?;
+                recover_backing(index, old)?;
+                asid
+            }
+            _ => return Err(Error::Denied),
         }
-    }
+    } else {
+        role_asid(index)
+    };
     let actor = Identity {
         id: u64::from(role.id()),
         generation,
@@ -392,8 +417,9 @@ pub(super) fn load_role_with_identity(
     } else {
         &args[..24]
     };
-    let startup = cyxia_kernel_core::security::syscall_v3::stage_spawn_args(stack, STACK_BASE, args)
-        .map_err(|_| Error::Denied)?;
+    let startup =
+        cyxia_kernel_core::security::syscall_v3::stage_spawn_args(stack, STACK_BASE, args)
+            .map_err(|_| Error::Denied)?;
     assert_eq!(startup.sp, STACK_END - 32);
     let image_base = b as u64;
     for (i, flags) in map.iter().copied().enumerate() {
@@ -476,10 +502,12 @@ pub(super) fn load_role_with_identity(
     };
     #[cfg(cyxia_signed_resident)]
     if lifecycle {
-        let binding = LifecycleBinding::new(member, role_asid(index), syscall_abi)?;
+        let binding = LifecycleBinding::new(member, asid, syscall_abi)?;
         // SAFETY: verified mappings and the fresh context are committed by
         // the sole CPU0 owner. No exception hook reads this registry.
         unsafe { registration(index).write(Registration::Live(binding)) };
+        #[cfg(cyxia_startup_catalog)]
+        PIE_ASID[index].store(asid, Ordering::Release);
         PIE_SYSCALL_ABI[index].store(syscall_abi, Ordering::Release);
     }
     Ok(member)
@@ -488,6 +516,11 @@ static PIE_ENTRY: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_C
 static PIE_SP: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
 static PIE_X0: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
 static PIE_X1: [AtomicU64; ROLE_COUNT] = [const { AtomicU64::new(0) }; ROLE_COUNT];
+#[cfg(cyxia_startup_catalog)]
+static PIE_ASID: [AtomicU8; ROLE_COUNT] = [const { AtomicU8::new(0) }; ROLE_COUNT];
+// Independent from the TLS, initial control, business and dynamic ASIDs.
+#[cfg(cyxia_startup_catalog)]
+static NEXT_RESTART_ASID: AtomicU8 = AtomicU8::new(0x50);
 #[cfg(cyxia_signed_resident)]
 #[unsafe(export_name = "V020_SIGNED_ROLE_SYSCALL_ABI")]
 static PIE_SYSCALL_ABI: [AtomicU16; ROLE_COUNT] = [const { AtomicU16::new(0) }; ROLE_COUNT];
@@ -497,6 +530,9 @@ static PIE_SYSCALL_ABI: [AtomicU16; ROLE_COUNT] = [const { AtomicU16::new(0) }; 
 enum Registration {
     Vacant,
     Live(LifecycleBinding),
+    #[cfg(cyxia_startup_catalog)]
+    Retired(Identity),
+    #[cfg(not(cyxia_startup_catalog))]
     Retired,
 }
 
@@ -527,12 +563,12 @@ pub(super) fn registered_role_abi(
     // SAFETY: CPU0 is the only accessor, including for task retirement.
     match unsafe { registration(index).read() } {
         Registration::Live(binding) => binding.authenticate(member, captured_ttbr0, cpu),
-        Registration::Vacant | Registration::Retired => None,
+        _ => None,
     }
 }
 
-/// Disconnect a stopped CPU0 role's verified root. Its ASID and all
-/// private pages stay reserved for the rest of the boot.
+/// Disconnect a stopped CPU0 role's root before permitting in-slot restaging.
+/// The stopped ASID is never allocated again during this boot.
 #[cfg(cyxia_signed_resident)]
 pub(super) fn retire_stopped_role(index: usize, member: NativeRole) -> Result<(), Error> {
     let ttbr0 = member.ttbr0_root | (u64::from(role_asid(index)) << 48);
@@ -547,11 +583,68 @@ pub(super) fn retire_stopped_role(index: usize, member: NativeRole) -> Result<()
         let child = PhysAddr(phys(core::ptr::addr_of!((*tables).mid) as u64));
         mmu::checked_single_child_table(child, |slot| root.add(slot).read_volatile())
             .map_err(|_| Error::Denied)?;
+        #[cfg(cyxia_startup_catalog)]
+        registration(index).write(Registration::Retired(member.actor));
+        #[cfg(not(cyxia_startup_catalog))]
         registration(index).write(Registration::Retired);
         root.write_volatile(0);
     }
     tlbi();
     PIE_SYSCALL_ABI[index].store(0, Ordering::Release);
+    PIE_CAP[index].store(0, Ordering::Release);
+    Ok(())
+}
+
+#[cfg(cyxia_startup_catalog)]
+pub(super) fn role_stop_verified(index: usize, old: Identity) -> bool {
+    if super::cpu::registered_slot() != Some(profile::CONTROL_CPU)
+        || ROLES.get(index).map(|role| u64::from(role.id())) != Some(old.id)
+        || PIE_SYSCALL_ABI[index].load(Ordering::Acquire) != 0
+        || PIE_CAP[index].load(Ordering::Acquire) != 0
+    {
+        return false;
+    }
+    // SAFETY: CPU0 owns registration and no dispatch uses a retired root.
+    unsafe {
+        matches!(registration(index).read(), Registration::Retired(actor) if actor == old)
+            && (*tables(index)).root.0.iter().all(|&entry| entry == 0)
+    }
+}
+
+#[cfg(cyxia_startup_catalog)]
+fn recover_backing(index: usize, old: Identity) -> Result<(), Error> {
+    if !role_stop_verified(index, old) {
+        return Err(Error::Denied);
+    }
+    let b = backing(index);
+    let t = tables(index);
+    let start = phys(b as u64);
+    let pages = (start..start + core::mem::size_of::<Backing>() as u64).step_by(PAGE);
+    // Validate all descriptors before changing any. Only the pinned pages
+    // of this stopped CPU0 role can regain the kernel-only RW/NX alias.
+    for pa in pages.clone() {
+        let alias = unsafe { high_leaf(pa).read_volatile() };
+        let rw = pa | DIRECT_RW;
+        if alias != 0 && alias != rw && alias != rw | (1 << 7) {
+            return Err(Error::Denied);
+        }
+    }
+    for pa in pages.clone() {
+        unsafe { high_leaf(pa).write_volatile(0) };
+    }
+    tlbi();
+    for pa in pages {
+        unsafe { high_leaf(pa).write_volatile(pa | DIRECT_RW) };
+    }
+    tlbi();
+    // SAFETY: the old root and its aliases have been invalidated. The
+    // hardware sees no EL0 mappings during this wipe and restaging.
+    unsafe {
+        (*b).image.fill(0);
+        (*b).stack.fill(0);
+        core::ptr::addr_of_mut!((*t).mid).write(Page::ZERO);
+        core::ptr::addr_of_mut!((*t).leaf).write(Page::ZERO);
+    }
     Ok(())
 }
 

@@ -13,11 +13,13 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 mod business_package;
+pub mod file_volume;
 mod lifecycle_packages;
 mod profile;
 pub mod role_services;
 
-use business_package::business_package_message;
+pub use business_package::TASK_SERVICES_BYTES;
+use business_package::{business_package_message, task_services_message};
 pub use lifecycle_packages::LifecyclePackageDigest;
 use lifecycle_packages::lifecycle_package_message;
 
@@ -94,6 +96,24 @@ impl<'a> PinnedStartupCatalog<'a> {
             return Err(Error::Invalid);
         }
         let message = business_package_message(policy.digest(), package_digest);
+        verify_startup_signature(self.boot_public_key, signature, &message)
+    }
+
+    /// Authorize task group provisioning for a separately qualified PIE.
+    pub fn qualify_business_task_services(
+        &self,
+        policy: &VerifiedOfflineConfig<'_>,
+        package_digest: [u8; 32],
+        grants: &[u8; TASK_SERVICES_BYTES],
+        signature: &[u8; 64],
+    ) -> Result<(), Error> {
+        if policy.wire() != self.offline_config {
+            return Err(Error::Conflict);
+        }
+        if package_digest == [0; 32] {
+            return Err(Error::Invalid);
+        }
+        let message = task_services_message(policy.digest(), package_digest, grants);
         verify_startup_signature(self.boot_public_key, signature, &message)
     }
 
@@ -255,6 +275,33 @@ mod tests {
             catalog.qualify_business_package(&policy, [22; 32], &signature),
             Err(Error::Unauthorized)
         );
+        let grant = [13; TASK_SERVICES_BYTES];
+        let task_message = [
+            &b"CYX/STARTUP-BUSINESS-TASK-SERVICES/v1"[..],
+            &policy.digest(),
+            &package,
+            &grant,
+        ]
+        .concat();
+        let task_signature = signer.sign(&task_message).to_bytes();
+        assert_eq!(
+            catalog.qualify_business_task_services(&policy, package, &grant, &task_signature),
+            Ok(())
+        );
+        assert_eq!(
+            catalog.qualify_business_task_services(&policy, package, &grant, &signature),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            catalog.qualify_business_task_services(&policy, [22; 32], &grant, &task_signature),
+            Err(Error::Unauthorized)
+        );
+        let mut expanded = grant;
+        expanded[28] ^= 1;
+        assert_eq!(
+            catalog.qualify_business_task_services(&policy, package, &expanded, &task_signature),
+            Err(Error::Unauthorized)
+        );
         let other_authority = PinnedStartupCatalog {
             boot_public_key: &SigningKey::from_bytes(&[0x39; 32])
                 .verifying_key()
@@ -282,6 +329,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             refreshed_authority.qualify_business_package(&refreshed_policy, package, &signature),
+            Err(Error::Unauthorized)
+        );
+        assert_eq!(
+            refreshed_authority.qualify_business_task_services(
+                &refreshed_policy,
+                package,
+                &grant,
+                &task_signature,
+            ),
             Err(Error::Unauthorized)
         );
 

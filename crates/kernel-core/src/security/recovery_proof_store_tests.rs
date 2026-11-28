@@ -36,6 +36,7 @@ struct Disk {
     trace: [Option<Io>; 24],
     operations: usize,
     fail: Option<Io>,
+    persist_failed_flush: bool,
 }
 
 impl Disk {
@@ -46,6 +47,7 @@ impl Disk {
             trace: [None; 24],
             operations: 0,
             fail: None,
+            persist_failed_flush: false,
         }
     }
 
@@ -53,6 +55,7 @@ impl Disk {
         self.pending = self.durable;
         self.clear_trace();
         self.fail = None;
+        self.persist_failed_flush = false;
     }
 
     fn clear_trace(&mut self) {
@@ -85,9 +88,11 @@ impl EpochBlockIo for Disk {
     }
 
     fn flush(&mut self) -> Result<(), Error> {
-        self.observe(Io::Flush)?;
-        self.durable = self.pending;
-        Ok(())
+        let result = self.observe(Io::Flush);
+        if result.is_ok() || self.persist_failed_flush {
+            self.durable = self.pending;
+        }
+        result
     }
 }
 
@@ -177,6 +182,81 @@ fn delivery_ack_and_boot_takeover_keep_exact_identity() {
 }
 
 #[test]
+fn same_boot_takeover_keeps_accepted_ack_and_requires_fresh_delivery() {
+    let (mut disk, mut work) = (Disk::new(), Workspace::new());
+    let mut store = bound(&mut disk, &mut work, 1, READER);
+    let mut acc = RecoveryAccumulator::new(1, 0, 1).unwrap();
+    for seq in 1..=2 {
+        store
+            .append(record(&mut acc, seq), &mut disk, &mut work)
+            .unwrap();
+    }
+    let (first, first_digest) = decode_read(store.read(READER, 0).unwrap());
+    let unread_ack = store.read(READER, first).unwrap();
+    let (second, second_digest) = decode_read(unread_ack);
+    store.confirm_delivery(READER, first, first_digest).unwrap();
+    store
+        .confirm_delivery(READER, second, second_digest)
+        .unwrap();
+    assert_eq!(store.ack(READER, first, first_digest), Err(Error::Busy));
+
+    let next = Identity {
+        generation: 5,
+        ..READER
+    };
+    assert_eq!(
+        store.replace_reader_confirmed(READER, next.generation),
+        Err(Error::Busy)
+    );
+    store.close_reader(READER).unwrap();
+    assert_eq!(store.read(READER, 0), Err(Error::Unauthorized));
+    assert_eq!(
+        store.confirm_delivery(READER, second, second_digest),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(
+        store.ack(READER, first, first_digest),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(store.read(next, 0), Err(Error::Unauthorized));
+    assert_eq!(
+        store.retired_ack_confirmed(READER, first, first_digest),
+        Err(Error::Busy)
+    );
+    assert_eq!(
+        store.replace_reader_confirmed(READER, next.generation),
+        Err(Error::Busy)
+    );
+
+    assert_eq!(store.persist_ack(&mut disk, &mut work), Ok(Some(first)));
+    assert_eq!(
+        store.retired_ack_confirmed(READER, first, first_digest),
+        Ok(())
+    );
+    assert_eq!(
+        store.retired_ack_confirmed(READER, first, second_digest),
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        store.replace_reader_confirmed(READER, next.generation + 1),
+        Err(Error::Stale)
+    );
+    store
+        .replace_reader_confirmed(READER, next.generation)
+        .unwrap();
+    assert_eq!(store.inventory(), (1, first));
+    assert_eq!(store.read(READER, first), Err(Error::Unauthorized));
+    assert_eq!(store.read(next, 0), Ok(unread_ack));
+    assert_eq!(
+        store.ack(next, second, second_digest),
+        Err(Error::Unauthorized)
+    );
+    store.confirm_delivery(next, second, second_digest).unwrap();
+    assert_eq!(store.ack(next, second, second_digest), Err(Error::Busy));
+    assert_eq!(store.persist_ack(&mut disk, &mut work), Ok(Some(second)));
+}
+
+#[test]
 fn crash_before_ack_flush_retains_last_confirmed_record_and_requires_delivery() {
     let (mut disk, mut work) = (Disk::new(), Workspace::new());
     let mut owner = bound(&mut disk, &mut work, 1, READER);
@@ -189,6 +269,16 @@ fn crash_before_ack_flush_retains_last_confirmed_record_and_requires_delivery() 
     assert_eq!(owner.persist_ack(&mut disk, &mut work), Err(Error::Unknown));
     assert_eq!(owner.ack(READER, seq, digest), Err(Error::Unknown));
     assert_eq!(owner.read(READER, 0), Err(Error::Unknown));
+    owner.close_reader(READER).unwrap();
+    assert_eq!(owner.read(READER, 0), Err(Error::Unauthorized));
+    assert_eq!(
+        owner.retired_ack_confirmed(READER, seq, digest),
+        Err(Error::Unknown)
+    );
+    assert_eq!(
+        owner.replace_reader_confirmed(READER, READER.generation + 1),
+        Err(Error::Unknown)
+    );
     disk.crash();
     let owner = bound(&mut disk, &mut work, 2, READER);
     assert_eq!(
@@ -246,6 +336,316 @@ fn full_custody_refuses_overwrite_and_traces_a_new_chain_after_ack() {
     assert_eq!(owner.inventory(), (RECORDS as u64, seq));
     assert_eq!(owner.ack(READER, seq2, digest2), Err(Error::Busy));
     assert_eq!(owner.persist_ack(&mut disk, &mut work), Ok(Some(seq2)));
+}
+
+fn full_store(disk: &mut Disk, work: &mut Workspace) -> (RecoveryProofStore, RecoveryAccumulator) {
+    let mut store = bound(disk, work, 1, READER);
+    let mut acc = RecoveryAccumulator::new(1, 0, 1).unwrap();
+    for count in 1..=RECORDS as u64 {
+        disk.clear_trace();
+        store.append(record(&mut acc, count), disk, work).unwrap();
+    }
+    disk.clear_trace();
+    (store, acc)
+}
+
+fn record_stopped_cpu(boot: u64, cpu: u32) -> RecoveryProofV2 {
+    let mut acc = RecoveryAccumulator::new(boot, cpu, 1).unwrap();
+    acc.record(&DegradedEvent {
+        kind: DegradedEventKind::OtherCritical,
+        event_id: 1,
+        event_digest: hash(&[&boot.to_le_bytes(), &cpu.to_le_bytes()]),
+        object_id: BUSINESS_THREAD_ID_BASE + u64::from(cpu),
+        object_generation: boot,
+        failure_code: 0x24,
+    })
+    .unwrap();
+    acc.takeover_stopped_writer(boot, cpu, 1, 1).unwrap();
+    *acc.proof()
+}
+
+fn assert_fifo_saved(
+    owner: &RecoveryProofStore,
+    reader: Identity,
+    expected: &[[u8; AUDIT_PAYLOAD]; RECORDS],
+) {
+    for (index, frame) in expected.iter().enumerate() {
+        assert_eq!(owner.read(reader, index as u64), Ok(*frame));
+    }
+    assert_eq!(owner.read(reader, RECORDS as u64), Ok([0; AUDIT_PAYLOAD]));
+}
+
+fn ack_next(
+    owner: &mut RecoveryProofStore,
+    reader: Identity,
+    disk: &mut Disk,
+    work: &mut Workspace,
+) -> u64 {
+    let (seq, digest) = decode_read(owner.read(reader, 0).unwrap());
+    owner.confirm_delivery(reader, seq, digest).unwrap();
+    assert_eq!(owner.ack(reader, seq, digest), Err(Error::Busy));
+    assert_eq!(owner.persist_ack(disk, work), Ok(Some(seq)));
+    seq
+}
+
+#[test]
+fn full_spill_survives_consumer_takeover_and_cold_reopen_in_order() {
+    let (mut disk, mut work) = (Disk::new(), Workspace::new());
+    let (mut owner, mut acc) = full_store(&mut disk, &mut work);
+    let original: [[u8; AUDIT_PAYLOAD]; RECORDS] =
+        core::array::from_fn(|index| owner.read(READER, index as u64).unwrap());
+    let (seq, digest) = decode_read(original[0]);
+    owner.confirm_delivery(READER, seq, digest).unwrap();
+    owner.close_reader(READER).unwrap();
+    assert!(!owner.audit_status().reader_available);
+    assert!(!owner.can_append());
+    assert!(owner.can_persist_proof());
+
+    let first = record(&mut acc, 9);
+    assert_eq!(
+        owner.persist_proof(first, &mut disk, &mut work),
+        Ok(ProofPersistence::Deferred)
+    );
+    assert_eq!(&disk.durable[0][..8], SPILL_PAGE_MAGIC);
+    assert_eq!(u64at(&disk.durable[0], WRITER_END), 1);
+    assert_eq!(u64at(&disk.durable[0], SPILL_START), 9);
+    let business = record_stopped_cpu(1, 2);
+    assert_eq!(
+        owner.persist_proof(business, &mut disk, &mut work),
+        Ok(ProofPersistence::Deferred)
+    );
+    let newest = record(&mut acc, 10);
+    let invalid = RecoveryProofV2 {
+        recovery_count: 2,
+        ..newest
+    };
+    assert_eq!(
+        owner.persist_proof(invalid, &mut disk, &mut work),
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        owner.persist_proof(newest, &mut disk, &mut work),
+        Ok(ProofPersistence::Deferred)
+    );
+    assert_eq!(owner.audit_status().deferred, 2);
+    assert_eq!(owner.audit_status().saturated, 0);
+    assert_eq!(owner.promote(&mut disk, &mut work), Ok(None));
+    assert_eq!(owner.read(READER, 0), Err(Error::Unauthorized));
+    assert_eq!(owner.ack(READER, seq, digest), Err(Error::Unauthorized));
+
+    let next = Identity {
+        generation: 5,
+        ..READER
+    };
+    owner
+        .replace_reader_confirmed(READER, next.generation)
+        .unwrap();
+    assert_fifo_saved(&owner, next, &original);
+    assert_eq!(owner.ack(next, seq, digest), Err(Error::Unauthorized));
+
+    disk.crash();
+    let cold = Identity {
+        generation: 6,
+        ..READER
+    };
+    let mut owner = bound(&mut disk, &mut work, 2, cold);
+    assert_fifo_saved(&owner, cold, &original);
+    assert_eq!(owner.audit_status().deferred, 2);
+    assert_eq!(owner.ack(next, seq, digest), Err(Error::Unauthorized));
+    assert_eq!(owner.ack(cold, seq, digest), Err(Error::Unauthorized));
+    assert_eq!(ack_next(&mut owner, cold, &mut disk, &mut work), seq);
+    assert!(owner.can_promote());
+    assert!(!owner.can_persist_proof());
+    let current = record(&mut RecoveryAccumulator::new(2, 0, 1).unwrap(), 1);
+    assert_eq!(
+        owner.persist_proof(current, &mut disk, &mut work),
+        Err(Error::Busy)
+    );
+    assert_eq!(owner.promote(&mut disk, &mut work), Ok(Some(9)));
+    assert_eq!(owner.read(cold, 8), Ok(audit_payload(9, &newest)));
+    assert_eq!(owner.read(cold, 9), Ok([0; AUDIT_PAYLOAD]));
+    for index in 1..RECORDS {
+        assert_eq!(owner.read(cold, index as u64), Ok(original[index]));
+    }
+    assert_eq!(ack_next(&mut owner, cold, &mut disk, &mut work), 2);
+    assert_eq!(owner.promote(&mut disk, &mut work), Ok(Some(10)));
+    assert_eq!(owner.read(cold, 9), Ok(audit_payload(10, &business)));
+    assert_eq!(owner.audit_status().deferred, 0);
+}
+
+#[test]
+fn repeated_boot_saturation_is_sticky_without_replacing_evidence() {
+    let (mut disk, mut work) = (Disk::new(), Workspace::new());
+    let (mut owner, mut acc) = full_store(&mut disk, &mut work);
+    let boot1 = record(&mut acc, 9);
+    assert_eq!(
+        owner.persist_proof(boot1, &mut disk, &mut work),
+        Ok(ProofPersistence::Deferred)
+    );
+    disk.crash();
+    let mut owner = bound(&mut disk, &mut work, 2, READER);
+    let boot2 = record(&mut RecoveryAccumulator::new(2, 0, 1).unwrap(), 1);
+    assert_eq!(
+        owner.persist_proof(boot2, &mut disk, &mut work),
+        Ok(ProofPersistence::Deferred)
+    );
+    disk.crash();
+    let mut owner = bound(&mut disk, &mut work, 3, READER);
+    let mut acc3 = RecoveryAccumulator::new(3, 0, 1).unwrap();
+    let proof = record(&mut acc3, 1);
+    assert_eq!(
+        owner.persist_proof(proof, &mut disk, &mut work),
+        Ok(ProofPersistence::Saturated)
+    );
+    assert_eq!(
+        owner.persist_proof(proof, &mut disk, &mut work),
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        owner.persist_proof(record(&mut acc3, 2), &mut disk, &mut work),
+        Ok(ProofPersistence::Saturated)
+    );
+    let business = record_stopped_cpu(3, 3);
+    assert_eq!(
+        owner.persist_proof(business, &mut disk, &mut work),
+        Ok(ProofPersistence::Deferred)
+    );
+    assert_eq!(
+        owner.audit_status(),
+        AuditStatus {
+            pending: 8,
+            retired: 0,
+            deferred: 3,
+            saturated: 2,
+            first_saturated_boot: 3,
+            last_saturated_boot: 3,
+            saturated_cpu_mask: 1,
+            reader_available: true,
+            uncertain: false,
+        }
+    );
+    disk.crash();
+    let mut owner = bound(&mut disk, &mut work, 4, READER);
+    let mut acc4 = RecoveryAccumulator::new(4, 0, 1).unwrap();
+    assert_eq!(
+        owner.persist_proof(record(&mut acc4, 1), &mut disk, &mut work),
+        Ok(ProofPersistence::Saturated)
+    );
+    assert_eq!(owner.audit_status().first_saturated_boot, 3);
+    assert_eq!(owner.audit_status().last_saturated_boot, 4);
+    assert_eq!(owner.audit_status().saturated, 3);
+    let newest = record(&mut acc4, 2);
+    for (sequence, proof) in [(9, boot1), (10, boot2), (11, business), (12, newest)] {
+        disk.clear_trace();
+        ack_next(&mut owner, READER, &mut disk, &mut work);
+        assert_eq!(owner.promote(&mut disk, &mut work), Ok(Some(sequence)));
+        assert_eq!(
+            owner.read(READER, sequence - 1),
+            Ok(audit_payload(sequence, &proof))
+        );
+        if sequence == 9 {
+            assert_eq!(
+                owner.persist_proof(newest, &mut disk, &mut work),
+                Ok(ProofPersistence::Deferred)
+            );
+        }
+    }
+    disk.crash();
+    let owner = bound(&mut disk, &mut work, 5, READER);
+    assert_eq!(owner.audit_status().deferred, 0);
+    assert_eq!(owner.audit_status().saturated, 3);
+    assert_eq!(owner.audit_status().first_saturated_boot, 3);
+    assert_eq!(owner.audit_status().last_saturated_boot, 4);
+}
+
+#[test]
+fn spill_write_flush_and_readback_reopen_without_overwriting_the_fifo() {
+    for (cut, persist_failed_flush, committed) in SPILL_CUTS {
+        let (mut disk, mut work) = (Disk::new(), Workspace::new());
+        let (mut owner, mut acc) = full_store(&mut disk, &mut work);
+        let original: [[u8; AUDIT_PAYLOAD]; RECORDS] =
+            core::array::from_fn(|index| owner.read(READER, index as u64).unwrap());
+        disk.fail = Some(cut);
+        disk.persist_failed_flush = persist_failed_flush;
+        assert_eq!(
+            owner.persist_proof(record(&mut acc, 9), &mut disk, &mut work),
+            Err(Error::Unknown)
+        );
+        assert!(owner.audit_status().uncertain);
+        assert!(!owner.can_persist_proof());
+        assert!(!owner.can_promote());
+        assert_eq!(owner.read(READER, 0), Err(Error::Unknown));
+        disk.crash();
+        let owner = bound(&mut disk, &mut work, 2, READER);
+        assert_fifo_saved(&owner, READER, &original);
+        assert_eq!(owner.audit_status().deferred, u64::from(committed));
+    }
+}
+
+const SPILL_CUTS: [(Io, bool, bool); 4] = [
+    (Io::Write(HOME), false, false),
+    (Io::Flush, false, false),
+    (Io::Flush, true, true),
+    (Io::Read(HOME), false, true),
+];
+
+#[test]
+fn promotion_reopen_assigns_at_most_one_sequence() {
+    // Generation 9 defers the proof, 10 ACKs an original and 11 promotes.
+    for (cut, persist_failed_flush, committed) in SPILL_CUTS {
+        let (mut disk, mut work) = (Disk::new(), Workspace::new());
+        let (mut owner, mut acc) = full_store(&mut disk, &mut work);
+        let proof = record(&mut acc, 9);
+        owner.persist_proof(proof, &mut disk, &mut work).unwrap();
+        let original_second = owner.read(READER, 1).unwrap();
+        assert_eq!(ack_next(&mut owner, READER, &mut disk, &mut work), 1);
+        disk.fail = Some(cut);
+        disk.persist_failed_flush = persist_failed_flush;
+        assert_eq!(owner.promote(&mut disk, &mut work), Err(Error::Unknown));
+        disk.crash();
+        let mut owner = bound(&mut disk, &mut work, 2, READER);
+        assert_eq!(owner.audit_status().retired, 1);
+        assert_eq!(owner.read(READER, 0), Ok(original_second));
+        if committed {
+            assert_eq!(owner.audit_status().deferred, 0);
+            assert_eq!(owner.promote(&mut disk, &mut work), Ok(None));
+        } else {
+            assert_eq!(owner.audit_status().deferred, 1);
+            assert_eq!(owner.read(READER, 8), Ok([0; AUDIT_PAYLOAD]));
+            assert_eq!(owner.promote(&mut disk, &mut work), Ok(Some(9)));
+        }
+        assert_eq!(owner.read(READER, 8), Ok(audit_payload(9, &proof)));
+        assert_eq!(owner.read(READER, 9), Ok([0; AUDIT_PAYLOAD]));
+    }
+}
+
+#[test]
+fn a_sealed_page_cannot_mount_with_a_reordered_promotion() {
+    let (mut disk, mut work) = (Disk::new(), Workspace::new());
+    let (mut owner, mut acc) = full_store(&mut disk, &mut work);
+    let first = record(&mut acc, 9);
+    let second = record_stopped_cpu(1, 2);
+    owner.persist_proof(first, &mut disk, &mut work).unwrap();
+    owner.persist_proof(second, &mut disk, &mut work).unwrap();
+    ack_next(&mut owner, READER, &mut disk, &mut work);
+    assert_eq!(owner.promote(&mut disk, &mut work), Ok(Some(9)));
+    disk.crash();
+
+    // Each proof and the sealed page can decode independently. The paired
+    // transition must still enforce the oldest unseen receipt's custody.
+    let prior = Page::decode(&disk.durable[0], locator().carrier, 0, 1).unwrap();
+    let mut wrong = prior;
+    wrong.generation += 1;
+    wrong.prior_digest = prior.seal;
+    wrong.proofs[wrong.count] = Some(second);
+    wrong.count += 1;
+    wrong.spill.deferred[2 * SPILL_PER_CPU] = None;
+    wrong.encode(locator().carrier, &mut disk.pending[1]);
+    assert!(Page::decode(&disk.pending[1], locator().carrier, 1, 1).is_ok());
+    assert!(matches!(
+        RecoveryProofStore::open_pages(locator(), 1, &mut disk, &mut work),
+        Err(Error::Conflict)
+    ));
 }
 
 #[test]

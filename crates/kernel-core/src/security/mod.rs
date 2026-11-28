@@ -53,6 +53,8 @@ pub mod snapshot_gc_gate;
 pub mod snapshot_list_v4;
 pub mod snapshot_read_v4;
 pub mod snapshot_restore_gate;
+pub mod snapshot_service_v4;
+pub use file_media_unified_v1::request_store as snapshot_request_store_v1;
 
 pub mod ipc_receive_v3;
 

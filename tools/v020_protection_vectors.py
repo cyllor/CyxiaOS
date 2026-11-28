@@ -13,7 +13,7 @@ else:
 
 VECTORS = Path(__file__).parent / "fixtures" / "v020-g1-protection.tsv"
 ENVELOPE = struct.Struct("<IHH16sQII")
-PAYLOAD = struct.Struct("<HHIQQQ8QBB6s32s32s")
+PAYLOAD = struct.Struct("<HHIQQQ8QBBB5s32s32s")
 MAGIC = 0x43594450
 USED = ENVELOPE.size + PAYLOAD.size
 ZERO_DIGEST = bytes(32)
@@ -31,12 +31,14 @@ class Protection:
     phase: int
     reopen: bytes
     obligation: bytes
+    cleanup_frozen: int = 0
 
     def validate(self):
         if (len(self.uuid) != 16 or not any(self.uuid)
                 or min(self.generation, self.protection_generation, self.live_epoch) <= 0
                 or len(self.deadlines) != 8 or self.gate not in (0, 1)
                 or self.phase not in (0, 1, 2)
+                or self.cleanup_frozen not in (0, 1)
                 or len(self.reopen) != 32 or len(self.obligation) != 32
                 or (self.phase == 0) != (self.obligation == ZERO_DIGEST)
                 or (self.gate == 1) != (self.reopen != ZERO_DIGEST)
@@ -56,7 +58,7 @@ def encode(record):
                        record.generation, 0, 0)
     PAYLOAD.pack_into(raw, ENVELOPE.size, 1, PAYLOAD.size, 0,
                       record.protection_generation, record.live_epoch, record.online_age_ns,
-                      *record.deadlines, record.gate, record.phase, bytes(6),
+                      *record.deadlines, record.gate, record.phase, record.cleanup_frozen, bytes(5),
                       record.reopen, record.obligation)
     return seal(raw)
 
@@ -71,12 +73,12 @@ def decode(raw):
     (version, length, reserved, protection, live, age, *rest) = PAYLOAD.unpack_from(
         raw, ENVELOPE.size
     )
-    *deadlines, gate, phase, reserved2, reopen, obligation = rest
-    if ((version, length, reserved, reserved2) != (1, PAYLOAD.size, 0, bytes(6))
+    *deadlines, gate, phase, cleanup_frozen, reserved2, reopen, obligation = rest
+    if ((version, length, reserved, reserved2) != (1, PAYLOAD.size, 0, bytes(5))
             or any(raw[USED:])):
         raise ValueError("invalid ProtectionStore candidate payload")
     record = Protection(uuid, generation, protection, live, age, tuple(deadlines),
-                        gate, phase, reopen, obligation)
+                        gate, phase, reopen, obligation, cleanup_frozen)
     record.validate()
     return record
 
@@ -90,7 +92,9 @@ def examples():
                      phase=0, reopen=sha256(b"independent admission").digest(),
                      obligation=ZERO_DIGEST)
     for name, record in (("closed", frozen), ("prepared", prepared),
-                         ("restored", restored), ("opened", opened)):
+                         ("restored", restored), ("opened", opened),
+                         ("cleanup-frozen", replace(frozen, cleanup_frozen=1)),
+                         ("open-and-cleanup-frozen", replace(opened, cleanup_frozen=1))):
         yield name, "accept", encode(record)
 
     def changed(record, offset, data):
@@ -103,7 +107,8 @@ def examples():
     overlapping = bytearray(changed(opened, 137, b"\x02"))
     overlapping[176:208] = restored.obligation
     yield "open-while-restored", "reject", seal(overlapping)
-    yield "reserved", "reject", changed(frozen, 138, b"\x01")
+    yield "invalid-cleanup-freeze", "reject", changed(frozen, 138, b"\x02")
+    yield "reserved", "reject", changed(frozen, 139, b"\x01")
     yield "nonzero-tail", "reject", changed(frozen, USED, b"\x01")
     unsealed = bytearray(encode(frozen))
     unsealed[32] ^= 1

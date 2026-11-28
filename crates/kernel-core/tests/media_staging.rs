@@ -13,10 +13,14 @@ use cyxia_kernel_core::security::{
 mod authority;
 #[path = "../../../kernel/src/arch/aarch64/production/media_staging/reopen.rs"]
 mod reopen;
+#[path = "../../../kernel/src/arch/aarch64/production/media_staging/role_restart.rs"]
+mod role_restart;
 #[path = "../../../kernel/src/arch/aarch64/production/media_staging/signed.rs"]
 mod signed;
 #[path = "../../../kernel/src/arch/aarch64/production/media_staging/volume.rs"]
 mod volume;
+#[path = "media_staging/resident_file_redo.rs"]
+mod resident_file_redo;
 use volume::SnapshotLayout::{
     AllocatedEnvelopes, AllocatedEnvelopesWithFile, AllocatedEnvelopesWithWritableFile,
     EmptyEnvelopes, LegacyZero,
@@ -31,6 +35,7 @@ struct Disk {
     first_flush_writes: Option<u64>,
     fail_before_write: Option<u64>,
     fail_before_flush: Option<u64>,
+    durable: Option<BTreeMap<u32, [u8; BLOCK_BYTES]>>,
 }
 
 impl EpochBlockIo for Disk {
@@ -58,12 +63,225 @@ impl EpochBlockIo for Disk {
         }
         self.first_flush_writes.get_or_insert(self.writes);
         self.flushes += 1;
+        if let Some(durable) = &mut self.durable {
+            durable.clone_from(&self.blocks);
+        }
         Ok(())
     }
 }
 
 // These native static workspaces belong to one CPU0 at a time.
 static STAGING_OWNER: Mutex<()> = Mutex::new(());
+
+#[test]
+fn running_role_redo_preserves_peers_and_cold_mount_reconciles_exactly_once() {
+    use cyxia_kernel_core::{
+        control_plane::role_manifest_v0199::{ROLES, Role},
+        security::{
+            boot_epoch_v1::TlsBootPolicy,
+            durable_role_epoch_v0199::{Outcome, RedoPlacement, StopEvidence},
+            epoch_redo_v0199::OneStateRedo,
+        },
+    };
+
+    let _owner = STAGING_OWNER.lock().unwrap();
+    let verified = signed::verify(signed::WIRE, &mut [0; 1024]).unwrap();
+    let policy = TlsBootPolicy::new(&verified, None).unwrap();
+    let mut staged = Disk::default();
+    let checkpoint = volume::format(&mut staged, Some(&verified), LegacyZero).unwrap();
+    let former = policy.resident_state(0).unwrap();
+    authority::allocate_boot(
+        &mut staged,
+        checkpoint,
+        &former,
+        authority::BootUpdate::Tls(policy),
+        volume::Checkpoints::Resident,
+    )
+    .unwrap();
+    let allocate = |disk: &mut Disk| {
+        authority::allocate_boot(
+            disk,
+            checkpoint,
+            &former,
+            authority::BootUpdate::Tls(policy),
+            volume::Checkpoints::Resident,
+        )
+        .unwrap()
+        .1
+    };
+    let replica = |blocks: &BTreeMap<u32, [u8; BLOCK_BYTES]>| Disk {
+        blocks: blocks.clone(),
+        ..Disk::default()
+    };
+    let first = volume::FIRST_LOG_BLOCK + authority::BOOT_LOG_BLOCKS;
+    let raw = staged.blocks[&0];
+    let run_restart = |disk: &mut Disk, fail_write, fail_flush| {
+        let mut blank = replica(&staged.blocks);
+        for block in volume::FIRST_LOG_BLOCK..first {
+            blank.blocks.remove(&block);
+        }
+        let mut epochs = allocate(&mut blank);
+        disk.fail_before_write = fail_write;
+        disk.fail_before_flush = fail_flush;
+        let stop = StopEvidence {
+            role: Role::Supervisor,
+            generation: 1,
+            digest: [0x52; 32],
+        };
+        let placement = RedoPlacement {
+            fs_uuid: checkpoint.fs_uuid,
+            log_epoch: checkpoint.log_epoch,
+            first,
+            state_home: volume::SECURITY_HOME,
+            boot_home: None,
+            txid: 2,
+            commit_lsn: 7,
+        };
+        let mut log = OneStateRedo::zeroed();
+        let mut scratch = [0; BLOCK_BYTES];
+        let mut pending = epochs
+            .prepare_role_restart(&mut log, checkpoint, placement, &verified, stop, |seen| {
+                assert_eq!(seen, stop);
+                Ok(())
+            })
+            .unwrap();
+        let result = loop {
+            let running = epochs.confirmed_running_policy(&verified).unwrap();
+            assert_eq!(running.boot_epoch(), 1);
+            assert_eq!(
+                running.service_generation(Role::Supervisor),
+                Err(Error::Busy)
+            );
+            assert_eq!(
+                running.service_generation(Role::DeterministicController),
+                Ok(1)
+            );
+            match epochs.step_role_restart(disk, &log, &mut pending, &raw, &mut scratch) {
+                Ok(None) => {}
+                finish => break finish,
+            }
+        };
+        let running = epochs.confirmed_running_policy(&verified).unwrap();
+        match result {
+            Ok(Some(Outcome::Service {
+                role: Role::Supervisor,
+                generation: 2,
+                isolated: false,
+            })) => {
+                assert_eq!(running.service_generation(Role::Supervisor), Ok(2));
+                assert_eq!(disk.first_flush_writes, Some(3));
+                assert_eq!((disk.writes, disk.flushes), (4, 2));
+            }
+            Err(Error::Unknown) => {
+                assert_eq!(
+                    running.service_generation(Role::Supervisor),
+                    Err(Error::Busy)
+                );
+                let writes = disk.writes;
+                assert_eq!(
+                    epochs.step_role_restart(disk, &log, &mut pending, &raw, &mut scratch),
+                    Err(Error::Unknown)
+                );
+                assert_eq!(disk.writes, writes);
+            }
+            other => panic!("unexpected restart result {other:?}"),
+        }
+        result
+    };
+    let supervisor = ROLES
+        .iter()
+        .position(|&role| role == Role::Supervisor)
+        .unwrap();
+    for (write_failure, flush_failure, generation) in [
+        (None, None, 2),
+        (Some(2), None, 1),
+        (Some(3), None, 1),
+        (None, Some(1), 2),
+    ] {
+        let mut disk = replica(&staged.blocks);
+        run_restart(&mut disk, write_failure, flush_failure).ok();
+        disk.fail_before_write = None;
+        disk.fail_before_flush = None;
+        let (checkpoint, mounted) =
+            reopen::recover_resident(&mut disk, checkpoint, &verified).unwrap();
+        assert_eq!(mounted.boot.boot_epoch, 1);
+        assert_eq!(mounted.security.service_generations[supervisor], generation);
+        assert_eq!(
+            checkpoint.checkpoint_lsn,
+            if generation == 2 { 7 } else { 4 }
+        );
+        assert_eq!(checkpoint.generation, 2);
+    }
+    // A well-formed transaction still cannot advance two role slots.
+    let mut dirty = replica(&staged.blocks);
+    let mut role_versions = [1; ROLES.len()];
+    role_versions[0] = 2;
+    role_versions[1] = 2;
+    let image = policy
+        .resident_state_with_roles(1, role_versions)
+        .unwrap()
+        .encode()
+        .unwrap();
+    {
+        use cyxia_kernel_core::security::recovery_v1::{RecoveryWorkspace, RedoImage, RedoWriter};
+        let mut work = RecoveryWorkspace::new();
+        let mut writer = RedoWriter::open(&mut dirty, &mut work, checkpoint).unwrap();
+        let tx = writer.prepare(1).unwrap();
+        writer
+            .append(
+                tx,
+                &[RedoImage {
+                    home: volume::SECURITY_HOME,
+                    contents: &image,
+                }],
+                |_| Ok(()),
+            )
+            .unwrap();
+    }
+    let before = (dirty.writes, dirty.flushes);
+    assert_eq!(
+        reopen::recover_resident(&mut dirty, checkpoint, &verified).err(),
+        Some(Error::Conflict)
+    );
+    assert_eq!((dirty.writes, dirty.flushes), before);
+
+    // Interrupt retirement after selecting the new checkpoint. The
+    // successor retains the exact state and never replays obsolete records.
+    let mut disk = replica(&staged.blocks);
+    run_restart(&mut disk, None, None).unwrap();
+    disk.fail_before_write = Some(disk.writes + 5);
+    assert_eq!(
+        reopen::recover_resident(&mut disk, checkpoint, &verified).err(),
+        Some(Error::Unknown)
+    );
+    disk.fail_before_write = None;
+    let checkpoint = volume::read_checkpoint_for(
+        &mut disk,
+        &mut [0; BLOCK_BYTES],
+        Some(&verified),
+        volume::Checkpoints::Resident,
+    )
+    .unwrap();
+    let (confirmed, mounted) = reopen::recover_resident(&mut disk, checkpoint, &verified).unwrap();
+    assert_eq!(confirmed, checkpoint);
+    assert_eq!(confirmed.checkpoint_lsn, 7);
+    assert_eq!(mounted.security.service_generations[supervisor], 2);
+    let (epoch, next) = authority::allocate_boot(
+        &mut disk,
+        checkpoint,
+        &mounted.security,
+        authority::BootUpdate::Tls(policy),
+        volume::Checkpoints::Resident,
+    )
+    .unwrap();
+    assert_eq!(epoch, 2);
+    assert_eq!(
+        next.confirmed_running_policy(&verified)
+            .unwrap()
+            .service_generation(Role::Supervisor),
+        Ok(2)
+    );
+}
 
 #[test]
 fn resident_startup_reclaims_genesis_preparations_in_durable_tail_first_order() {
@@ -617,7 +835,7 @@ fn signed_tls_boot_pair_rotates_replays_and_revokes_without_changing_file_homes(
         assert!(incomplete.blocks == disk.blocks);
     }
 
-    let (epoch, authority) = boot(
+    let (epoch, mut authority) = boot(
         &mut disk,
         checkpoint,
         &mounted.security,
@@ -628,12 +846,17 @@ fn signed_tls_boot_pair_rotates_replays_and_revokes_without_changing_file_homes(
     let policy = authority.confirmed_boot_policy(&active_config).unwrap();
     assert!(active_manifest.installation().authorize(policy).is_ok());
     assert!(old_manifest.installation().authorize(policy).is_err());
-    let after = authority::verified_pair_state_for(&mut disk, checkpoint, |state| {
-        assert_eq!(*state, active.resident_state(2)?);
-        Ok(())
-    })
+    let after = authority::verified_pair_state_for(
+        &mut disk,
+        checkpoint,
+        |_| Ok(()),
+        |state| {
+            assert_eq!(*state, active.resident_state(2)?);
+            Ok(())
+        },
+    )
     .unwrap();
-    volume::confirm_tls_receipts(&mounted, &after, rotate).unwrap();
+    volume::confirm_tls_receipts(&mounted, &after, rotate, &mut || Ok(())).unwrap();
     let io = (disk.writes, disk.flushes);
     assert!(reopen::recover_resident_with_tls(&mut disk, checkpoint, old, None).is_err());
     assert_eq!((disk.writes, disk.flushes), io);
@@ -660,10 +883,77 @@ fn signed_tls_boot_pair_rotates_replays_and_revokes_without_changing_file_homes(
         assert_eq!(mounted.security, after);
     }
 
-    // The native owner retires the key-changing redo before service
-    // publication; the next deployment needs only its public predecessor.
-    let (checkpoint, _) =
-        reopen::recover_resident_with_tls(&mut disk, checkpoint, active, Some(rotate)).unwrap();
+    // The native owner materializes the rotated policy while preserving
+    // its live boot pair. A role restart can append in that same boot,
+    // and the successor needs only its immediate public predecessor.
+    use cyxia_kernel_core::{
+        control_plane::role_manifest_v0199::{ROLE_COUNT, Role},
+        security::{
+            durable_role_epoch_v0199::{Outcome, RedoPlacement, StopEvidence},
+            epoch_redo_v0199::OneStateRedo,
+        },
+    };
+    reopen::materialize_verified_boot(&mut disk, checkpoint, active, &after).unwrap();
+    let mut raw = [0; BLOCK_BYTES];
+    assert_eq!(
+        volume::read_checkpoint_for(
+            &mut disk,
+            &mut raw,
+            Some(&active_config),
+            volume::Checkpoints::Resident,
+        )
+        .unwrap(),
+        checkpoint
+    );
+    let stop = StopEvidence {
+        role: Role::Operations,
+        generation: 1,
+        digest: [0x53; 32],
+    };
+    let mut log = OneStateRedo::zeroed();
+    let mut work = authority
+        .prepare_role_restart(
+            &mut log,
+            checkpoint,
+            RedoPlacement {
+                first: volume::FIRST_LOG_BLOCK + authority::BOOT_LOG_BLOCKS,
+                fs_uuid: checkpoint.fs_uuid,
+                log_epoch: checkpoint.log_epoch,
+                state_home: volume::SECURITY_HOME,
+                boot_home: None,
+                txid: epoch + 1,
+                commit_lsn: checkpoint.checkpoint_lsn + 7,
+            },
+            &active_config,
+            stop,
+            |actual| {
+                if actual == stop {
+                    Ok(())
+                } else {
+                    Err(Error::Unauthorized)
+                }
+            },
+        )
+        .unwrap();
+    let mut scratch = [0; BLOCK_BYTES];
+    let completed = loop {
+        let policy = authority.confirmed_running_policy(&active_config).unwrap();
+        assert!(active_manifest.installation().authorize(policy).is_ok());
+        if let Some(completed) = authority
+            .step_role_restart(&mut disk, &log, &mut work, &raw, &mut scratch)
+            .unwrap()
+        {
+            break completed;
+        }
+    };
+    assert_eq!(
+        completed,
+        Outcome::Service {
+            role: Role::Operations,
+            generation: 2,
+            isolated: false
+        }
+    );
     let (checkpoint, mounted) =
         reopen::recover_resident_with_tls(&mut disk, checkpoint, revoked, Some(revoke)).unwrap();
     let (epoch, authority) = boot(
@@ -681,12 +971,17 @@ fn signed_tls_boot_pair_rotates_replays_and_revokes_without_changing_file_homes(
     );
     assert_eq!(
         policy.service_generation(cyxia_kernel_core::control_plane::role_manifest_v0199::ROLES[0]),
-        Ok(1)
+        Ok(2)
     );
     assert!(reopen::recover_resident_with_tls(&mut disk, checkpoint, active, None).is_err());
     let (checkpoint, mounted) =
         reopen::recover_resident_with_tls(&mut disk, checkpoint, revoked, Some(revoke)).unwrap();
-    assert_eq!(mounted.security, revoked.resident_state(3).unwrap());
+    let mut roles = [1; ROLE_COUNT];
+    roles[0] = 2;
+    assert_eq!(
+        mounted.security,
+        revoked.resident_state_with_roles(3, roles).unwrap()
+    );
     assert_eq!(disk.blocks[&CANONICAL_BUSINESS_START], immutable);
     let (epoch, authority) = boot(
         &mut disk,

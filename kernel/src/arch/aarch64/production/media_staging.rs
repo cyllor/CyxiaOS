@@ -92,6 +92,9 @@ mod authority;
 mod fsync;
 #[path = "media_staging/reopen.rs"]
 mod reopen;
+#[cfg(any(test, cyxia_startup_catalog))]
+#[path = "media_staging/role_restart.rs"]
+mod role_restart;
 #[cfg(any(feature = "v020-production-media-signed", cyxia_startup_catalog))]
 #[path = "media_staging/signed.rs"]
 mod signed;
@@ -172,6 +175,8 @@ pub(super) struct StagedReceiptQuery {
 pub(super) struct SignedResidentBoot {
     epochs: cyxia_kernel_core::security::boot_epoch_v1::BootEpochAuthority,
     config: VerifiedOfflineConfig<'static>,
+    #[cfg(cyxia_startup_catalog)]
+    restarts: role_restart::RestartJournal,
 }
 
 /// Boot-verified public policy. No previous private credential is present.
@@ -189,7 +194,28 @@ impl SignedResidentBoot {
         cyxia_kernel_core::security::durable_role_epoch_v0199::ConfirmedBootPolicy<'_>,
         SecurityError,
     > {
+        #[cfg(cyxia_startup_catalog)]
+        return self.epochs.confirmed_running_policy(&self.config);
+        #[cfg(not(cyxia_startup_catalog))]
         self.epochs.confirmed_boot_policy(&self.config)
+    }
+
+    #[cfg(cyxia_startup_catalog)]
+    pub(super) fn restart_role(
+        &mut self,
+        stop: cyxia_kernel_core::security::durable_role_epoch_v0199::StopEvidence,
+        checkpoint: &mut dyn FnMut() -> Result<(), SecurityError>,
+        verify_stop: impl FnOnce(
+            cyxia_kernel_core::security::durable_role_epoch_v0199::StopEvidence,
+        ) -> Result<(), SecurityError>,
+    ) -> Result<Option<u64>, SecurityError> {
+        self.restarts.advance(
+            &mut self.epochs,
+            &self.config,
+            stop,
+            checkpoint,
+            verify_stop,
+        )
     }
 }
 
@@ -440,6 +466,20 @@ fn run_chain(
             }
         }
     };
+    #[cfg(cyxia_startup_catalog)]
+    let resident_layout = {
+        let predecessor = network.predecessor.as_ref().map(|(config, _)| config);
+        match startup_catalog::file_volume(&verified, predecessor, &mut || disk.checkpoint()) {
+            Ok(Some(layout)) => volume::SnapshotLayout::SignedUnified {
+                root_owner: layout.root_owner(),
+            },
+            Ok(None) => volume::SnapshotLayout::LegacyZero,
+            Err(error) => {
+                report("V020_SEC_F_VOLUME_MANIFEST_REFUSED", 0, error as u64, 0);
+                return None;
+            }
+        }
+    };
     #[cfg(any(feature = "v020-production-media-signed", cyxia_startup_catalog))]
     let config = Some(&verified);
     #[cfg(not(any(feature = "v020-production-media-signed", cyxia_startup_catalog)))]
@@ -474,8 +514,9 @@ fn run_chain(
         #[cfg(cyxia_startup_catalog)]
         {
             use reopen::BootLogRecovery;
-            let reconciled =
-                reopen::recover_resident_with_reconciliation(disk, sb, current, transition);
+            let reconciled = reopen::recover_resident_for_layout(
+                disk, sb, current, transition, resident_layout, recovery_locator,
+            );
             match &reconciled {
                 Ok((_, mounted, outcome)) => {
                     let (kind, cleared) = match outcome {
@@ -513,10 +554,21 @@ fn run_chain(
     let (checkpoint, mounted) = mounted.ok()?;
     out.reopened = REOPEN;
     out.mount_validated = true;
-    step(
-        3,
-        volume::unified_map(disk, checkpoint, LAYOUT).map(u64::from),
-    )?;
+    #[cfg(cyxia_startup_catalog)]
+    let map = if let Some(snapshot) = mounted.snapshot {
+        report(
+            "V020_SEC_F_SNAPSHOT_MOUNT",
+            mounted.boot.boot_epoch,
+            u64::from(snapshot.historical_only_blocks),
+            u64::from(mounted.writes_open()),
+        );
+        Ok(mounted.system_blocks)
+    } else {
+        volume::unified_map(disk, checkpoint, LAYOUT)
+    };
+    #[cfg(not(cyxia_startup_catalog))]
+    let map = volume::unified_map(disk, checkpoint, LAYOUT);
+    step(3, map.map(u64::from))?;
     out.unified_map_validated = true;
     #[cfg(feature = "v020-production-media-unified")]
     {
@@ -535,11 +587,21 @@ fn run_chain(
             Ok(store) => {
                 disk.checkpoint().ok()?;
                 let (pending, retired) = store.inventory();
-                report("V020_SEC_S_RECOVERY_STORE", out.prior_epoch, pending, retired);
+                report(
+                    "V020_SEC_S_RECOVERY_STORE",
+                    out.prior_epoch,
+                    pending,
+                    retired,
+                );
                 out.recovery_proof = Some(store);
             }
             Err(error) => {
-                report("V020_SEC_S_RECOVERY_STORE_REFUSED", out.prior_epoch, error as u64, 0);
+                report(
+                    "V020_SEC_S_RECOVERY_STORE_REFUSED",
+                    out.prior_epoch,
+                    error as u64,
+                    0,
+                );
                 return None;
             }
         }
@@ -565,6 +627,8 @@ fn run_chain(
         allocated.as_ref().map(|(epoch, _)| *epoch).map_err(|e| *e),
     )?;
     let (_, resident_epochs) = allocated.ok()?;
+    #[cfg(cyxia_startup_catalog)]
+    disk.checkpoint().ok()?;
     #[cfg(any(feature = "v020-production-media-signed", cyxia_startup_catalog))]
     {
         let policy = resident_epochs.confirmed_boot_policy(&verified).ok()?;
@@ -574,29 +638,41 @@ fn run_chain(
     let _ = resident_epochs;
     #[cfg(cyxia_startup_catalog)]
     {
-        let expected = current.resident_state(out.confirmed_epoch).ok()?;
-        let committed = authority::verified_pair_state_for(disk, checkpoint, |state| {
-            if *state != expected {
-                return Err(SecurityError::Conflict);
-            }
-            Ok(())
-        })
-        .ok()?;
+        use cyxia_kernel_core::control_plane::role_manifest_v0199::ROLE_COUNT;
+        let unchanged_roles = mounted.security.service_generations[..ROLE_COUNT]
+            .try_into()
+            .ok()?;
+        let expected = current
+            .resident_state_with_roles(out.confirmed_epoch, unchanged_roles)
+            .ok()?;
+        let committed =
+            authority::verified_pair_state_for(disk, checkpoint, Disk::checkpoint, |state| {
+                if *state != expected {
+                    return Err(SecurityError::Conflict);
+                }
+                Ok(())
+            })
+            .ok()?;
         if committed.last_boot_epoch != out.confirmed_epoch {
             return None;
         }
+        disk.checkpoint().ok()?;
         // The paired boot transaction changed only the two boot homes.
         // Independently rebind the retained receipt/index view to the new
         // epoch before publishing the authorized mount outcome.
         match install {
             Some(transition) => {
-                volume::confirm_tls_receipts(&mounted, &committed, transition).ok()?;
-                // Finish this transition's checkpoint before any new role
-                // starts. A later successor only needs this deployment's
-                // public policy, even if its ordinary boots keep redo live.
-                let (_, replayed) =
-                    reopen::recover_resident_with_tls(disk, checkpoint, current, Some(transition))
-                        .ok()?;
+                volume::confirm_tls_receipts(&mounted, &committed, transition, &mut || {
+                    disk.checkpoint()
+                })
+                .ok()?;
+                // Confirm the rotated policy on its physical homes before
+                // launch. Keep the durable pair as the prefix for role
+                // restart appends until the next cold checkpoint.
+                let replayed = reopen::materialize_verified_boot_for_layout(
+                    disk, checkpoint, current, &committed, resident_layout,
+                )
+                .ok()?;
                 if replayed.security != committed || replayed.receipts != mounted.receipts {
                     return None;
                 }
@@ -608,7 +684,13 @@ fn run_chain(
                 );
             }
             None => {
-                volume::confirmed_receipt_query_digest(&mounted, &committed, &verified).ok()?;
+                volume::confirmed_receipt_query_digest(
+                    &mounted,
+                    &committed,
+                    &verified,
+                    &mut || disk.checkpoint(),
+                )
+                .ok()?;
             }
         }
         disk.checkpoint().ok()?;
@@ -639,8 +721,10 @@ fn run_chain(
         if committed.last_boot_epoch != out.confirmed_epoch {
             return None;
         }
-        out.receipt_query_digest =
-            Some(volume::confirmed_receipt_query_digest(&mounted, &committed, &verified).ok()?);
+        out.receipt_query_digest = Some(
+            volume::confirmed_receipt_query_digest(&mounted, &committed, &verified, &mut || Ok(()))
+                .ok()?,
+        );
         #[cfg(all(feature = "v020-production-fsync-scratch", not(cyxia_signed_resident)))]
         {
             if REOPEN {
@@ -729,9 +813,13 @@ fn run_chain(
     }
     #[cfg(any(cyxia_signed_resident, feature = "v020-production-media-signed"))]
     {
+        #[cfg(cyxia_startup_catalog)]
+        let restarts = role_restart::RestartJournal::open(disk, checkpoint, &verified).ok()?;
         out.resident_boot = Some(SignedResidentBoot {
             epochs: resident_epochs,
             config: verified,
+            #[cfg(cyxia_startup_catalog)]
+            restarts,
         });
     }
     out.mount_requires_recovery = false;
@@ -886,11 +974,8 @@ pub(super) fn stage_with_policy(
         report("V020_W11_MEDIA_IO_ERROR", code, sector, site);
     }
     #[cfg(cyxia_startup_catalog)]
-    if out.chain_complete
-        && out.resident_boot.is_some()
-        && let Some(store) = out.recovery_proof.take()
-    {
-        super::recovery::install_durable(store, disk.device);
+    if out.chain_complete && out.resident_boot.is_some() {
+        super::recovery::install_durable(out.recovery_proof.take(), disk.device);
     }
     out
 }

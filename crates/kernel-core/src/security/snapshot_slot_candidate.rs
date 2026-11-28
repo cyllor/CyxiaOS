@@ -1,5 +1,5 @@
-//! D7 candidate for the 15-block populated slot. The production mount still
-//! accepts only the empty D1.5 envelope and zero continuation blocks.
+//! D7 encoding for a 15-block snapshot slot. The signed mount separately
+//! checks the capture's inode tree, system-object isolation and allocation.
 
 use sha2::{Digest, Sha256};
 
@@ -27,7 +27,7 @@ pub struct SlotIdentity {
 }
 
 impl SlotIdentity {
-    pub(super) fn descriptor_block(self) -> Result<u32, Error> {
+    pub(crate) fn descriptor_block(self) -> Result<u32, Error> {
         if self.fs_uuid == [0; 16]
             || self.snapshot_id == 0
             || self.slot >= SNAPSHOT_SLOTS

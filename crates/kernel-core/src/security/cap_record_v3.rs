@@ -92,6 +92,71 @@ impl CapRecordV3 {
         };
         self.rights & !mask == 0
     }
+
+    /// Match a protected snapshot record to the exact authenticated caller,
+    /// generation and live native target. Deployment handle resolution is a
+    /// separate step performed by the architecture capability table.
+    pub fn check_snapshot_view(
+        self,
+        holder: Identity,
+        target: Identity,
+        generation: u64,
+        role: Role,
+    ) -> Result<(), Error> {
+        if !self.valid()
+            || self.object_kind != 12
+            || self.rights != SNAPSHOT_READ
+            || role.allowed_caps() & rm::SNAPSHOT == 0
+            || !target.valid()
+            || self.source_role != u32::from(role.id())
+            || self.owner_group != u32::MAX
+            || self.depth != 0
+            || self.holder.id != holder.id
+            || self.target.id != target.id
+        {
+            return Err(Error::Unauthorized);
+        }
+        if self.state != 1
+            || self.holder != holder
+            || self.target != target
+            || self.record_generation != generation
+        {
+            return Err(Error::Stale);
+        }
+        Ok(())
+    }
+
+    /// Check the record returned by the native EXECUTOR_RPC lookup. The
+    /// selector identifies the table slot and record generation. Reports
+    /// retain the protected cap ID so that a different slot cannot take
+    /// custody of accepted work.
+    pub(crate) fn executor_cap_id(
+        self,
+        holder: Identity,
+        target: Identity,
+        selector: u64,
+    ) -> Result<u64, Error> {
+        if !self.valid()
+            || self.object_kind != 8
+            || self.rights != IPC_SEND
+            || self.source_role as u64 != super::file_auth_v3::FILE_SERVICE_ROLE
+            || self.owner_group != u32::MAX
+            || self.depth != 0
+            || self.holder.id != holder.id
+            || self.target.id != target.id
+        {
+            return Err(Error::Unauthorized);
+        }
+        if self.state != 1
+            || self.record_generation != selector >> 32
+            || self.holder != holder
+            || self.target != target
+        {
+            return Err(Error::Stale);
+        }
+        Ok(self.cap_id)
+    }
+
     pub fn decode(b: &[u8]) -> Result<Self, Error> {
         if b.len() != 128
             || u32at(b, 0) != 0x43594350

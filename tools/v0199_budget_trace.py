@@ -32,6 +32,9 @@ SEC_S_ROLE_LIMITS = CLASS_LIMITS[:2] + (SIGNED_ROLE_LIMIT,) * (len(SIGNED_ROLES)
 SEC_S_ROLE_TURNS = (15, 4, 1, 1, 1, 1, 1, 1)
 SIGNED_CONSOLE_QUOTA = 1_000_000
 SIGNED_RECOVERY_QUOTA = CLASS_LIMITS[RECOVERY]
+NATIVE_CONTROL_QUOTA = 250_000
+NATIVE_DECISION_TURN = 400_000
+DECISION_DOMAIN_QUOTA = 500_000
 
 
 def require(condition, message):
@@ -65,7 +68,7 @@ def verify_trace(raw, summary, replacement_roles=None, recovery_slices=None, *, 
 
 def _replay_intervals(intervals, origin, summary, replacement_roles=None, recovery_slices=None,
                       *, boot_accounting=None, signed_roles=None, opening_recovery=None,
-                      sec_s_load=False):
+                      sec_s_load=False, native_d01=False):
     wall, counter, before = origin
     boot_intervals, boot_end, boot_cpu_ns = boot_accounting or (0, 0, 0)
     signed = signed_roles is not None
@@ -196,13 +199,18 @@ def _replay_intervals(intervals, origin, summary, replacement_roles=None, recove
                             KERNEL_COORDINATION_LIMIT - kernel_coordination - 200_000)
                 if signed:
                     expected = SIGNED_RECOVERY_QUOTA if category == RECOVERY else SIGNED_CONSOLE_QUOTA
-                require(quota == expected, "incorrect EL1 prepayment")
+                native_control = native_d01 and category == COORDINATION and quota == NATIVE_CONTROL_QUOTA
+                require(quota == expected or native_control, "incorrect EL1 prepayment")
                 if category == RECOVERY:
                     recovery_count += 1
                     largest_recovery = max(largest_recovery, actual)
             else:
                 role = actor - 1
                 expected_class, expected_domain, expected_quota = ROLE_GRANTS[role]
+                native_decision = native_d01 and expected_class == 2
+                if native_decision:
+                    expected_quota = min(NATIVE_DECISION_TURN,
+                                         DECISION_DOMAIN_QUOTA - decision_spending[expected_domain])
                 require((category, quota) == (expected_class, expected_quota)
                         and (domain == expected_domain or (sec_s_load and role == 0)),
                         "incorrect role grant class, domain, or quota")
@@ -212,7 +220,8 @@ def _replay_intervals(intervals, origin, summary, replacement_roles=None, recove
                 if signed:
                     require((role, actor_id, generation) == signed_roles[role],
                             "signed role identity differs from the durable role table")
-                    return_limit = (1 if category == 2 else 32 if sec_s_load and role < 2 else 8)
+                    return_limit = 4 if native_decision else (
+                        1 if category == 2 else 32 if sec_s_load and role < 2 else 8)
                     require(returned <= return_limit
                             and (returned == 0 or actual > 0),
                             "invalid native EL0 return count")
@@ -237,7 +246,7 @@ def _replay_intervals(intervals, origin, summary, replacement_roles=None, recove
                 require(quota <= 2_000_000 and security_count < 4, "excess security reviews")
                 security_count += 1
             elif category == 2:
-                require(decision_spending[domain] + quota <= 500_000,
+                require(decision_spending[domain] + quota <= DECISION_DOMAIN_QUOTA,
                         "shared decision domain limit exceeded")
                 decision_spending[domain] += actual
             grants += 1
@@ -287,7 +296,8 @@ def _replay_intervals(intervals, origin, summary, replacement_roles=None, recove
 
 def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
                         media_budget=None, frame_budget=None, business_entropy_budget=None,
-                        runtime_recovery=(), sec_s_load=False, trace_final=None):
+                        runtime_recovery=(), sec_s_load=False, trace_final=None,
+                        native_d01=False, business_task_services=False):
     """Bind sealed CPU accounting to the durable role inventory and native UART."""
     trace_sizes = {1: (SIGNED_TRACE_BYTES, SIGNED_CAPACITY),
                    2: (SIGNED_EARLY_TRACE_BYTES, SIGNED_EARLY_CAPACITY),
@@ -341,8 +351,11 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
                                  recovery_slices=(len(debits), max(debits)), signed_roles=roles,
                                  opening_recovery=(phase_start, phase_end))
 
+    if native_d01 or business_task_services:
+        require(business_entropy_budget is not None, "native backends require admitted business CPUs")
     expected_recovery_counts = ((3, 2 + split_startup) if business_entropy_budget is None
-                                else (2 + split_startup + 3,))
+                                else (2 + split_startup + 3 + int(native_d01)
+                                      + int(business_task_services),))
     require(media_budget is not None and len(recovery) in expected_recovery_counts
             and 0 < phase_start < phase_end < count,
             "missing signed media accounting span")
@@ -400,6 +413,7 @@ def verify_signed_trace(raw, boot_epoch, roles, recovery, uart_budget, *,
     result = _replay_intervals(
         intervals, (wall, tick, before), replay, signed_roles=roles,
         recovery_slices=(len(all_recovery), max(all_recovery)), sec_s_load=sec_s_load,
+        native_d01=native_d01,
     )
     if frame_budget is not None:
         result.update(boot_frame_meta_recovery_batches=len(frame_recovery),

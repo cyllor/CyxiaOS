@@ -26,16 +26,17 @@ use super::Error;
 use super::file_media_v0199::{SnapshotMediaKind, crc32c_zeroed, probe_snapshot_media_pair};
 use super::file_structure_v1::{INODE_BYTES, INODES, SystemKind, SystemObject};
 
-// Nonempty readers are available for host tests and explicitly selected
-// candidate builds. The production mount always uses the empty decoder.
-#[cfg(any(not(target_os = "none"), feature = "snapshot-history-candidate"))]
+// Populated media is read only through the authenticated unified mount.
 #[path = "snapshot_catalog_candidate.rs"]
 pub mod catalog_candidate;
 #[path = "snapshot_protection_candidate.rs"]
 pub mod protection_candidate;
-#[cfg(any(not(target_os = "none"), feature = "snapshot-history-candidate"))]
+#[path = "snapshot_request_store_v1.rs"]
+pub mod request_store;
 #[path = "snapshot_slot_candidate.rs"]
 pub mod slot_candidate;
+#[path = "snapshot_mount_v1.rs"]
+pub(super) mod mount;
 #[cfg(feature = "snapshot-history-candidate")]
 #[path = "snapshot_history_candidate.rs"]
 pub mod history_candidate;

@@ -875,11 +875,14 @@ class NativeSecurityWiring(unittest.TestCase):
     def test_signed_lifecycle_exit_retires_the_root_with_prepaid_recovery(self):
         arm = ROOT / "kernel/src/arch/aarch64/production"
         signed = source(arm / "signed_resident.rs")
-        turn = signed.split("fn turn(", 1)[1].split("fn run_quantum(", 1)[0]
+        turn = signed.split("fn turn(", 1)[1].split("fn stopped_evidence(", 1)[0]
+        settled = turn.index("budget.settle(grant, start, returned)?")
+        stopped = turn.index("if let Some(stop) = result?")
+        self.assertLess(settled, stopped)
+        local, terminal = turn[stopped:].split("budget.ledger.close_ordinary()", 1)
+        self.assertLess(local.index(".retire(index, member)"),
+                        local.index("task.recovery = RoleRecovery::Stopped"))
         ordered = [
-            "budget.settle(grant, start, returned)?",
-            "if let Some(stop) = result?",
-            "budget.ledger.close_ordinary()",
             "budget.reserve_recovery()?",
             "retire_stopped_role(index, member)?",
             "task.context = user::Context::empty()",
@@ -887,13 +890,16 @@ class NativeSecurityWiring(unittest.TestCase):
             "retirement?;",
             "return Err(Fault::RoleStopped",
         ]
-        for step in ordered:
-            self.assertIn(step, turn)
-        positions = [turn.index(step) for step in ordered]
+        positions = [terminal.index(step) for step in ordered]
         self.assertEqual(positions, sorted(positions))
+        recovery = signed.split("fn recover_one_role(", 1)[1].split("fn run_quantum(", 1)[0]
+        self.assertLess(recovery.index("Class::Recovery"), recovery.index("recover_role_step("))
+        self.assertLess(recovery.index("recover_role_step("), recovery.index("budget.settle(grant"))
+        step = signed.split("fn recover_role_step(", 1)[1].split("fn recover_one_role(", 1)[0]
+        self.assertLess(step.index("ACTIVE_ROLE_TTBR0.load"), step.index("retire_stopped_role("))
         loader = source(arm / "role_loader.rs")
         retire = loader.split("pub(super) fn retire_stopped_role(", 1)[1].split("\n}\n", 1)[0]
-        self.assertLess(retire.index("registration(index).write(Registration::Retired)"),
+        self.assertLess(retire.index("registration(index).write(Registration::Retired"),
                         retire.index("root.write_volatile(0)"))
         self.assertLess(retire.index("root.write_volatile(0)"), retire.index("tlbi();"))
         self.assertLess(retire.index("tlbi();"), retire.index("PIE_SYSCALL_ABI[index].store(0"))
@@ -945,7 +951,11 @@ class NativeSecurityWiring(unittest.TestCase):
         staging = source(arm / "production/media_staging.rs")
         self.assertIn("out.chain_complete = run_chain(&mut disk, &mut out).is_some()", staging)
         self.assertIn("authority::verified_pair_state(disk, checkpoint, config)", staging)
-        self.assertIn("volume::confirmed_receipt_query_digest(&mounted, &committed, &verified)", staging)
+        self.assertRegex(
+            staging,
+            r"volume::confirmed_receipt_query_digest\(\s*&mounted,\s*&committed,\s*&verified,"
+            r"\s*&mut \|\| disk\.checkpoint\(\)",
+        )
 
     def test_ai_proposals_are_not_capabilities(self):
         src = source(CORE / "process.rs")

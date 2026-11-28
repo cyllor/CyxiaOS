@@ -80,6 +80,63 @@ pub struct PlanV2<'a> {
     pub core_generation: u64,
 }
 
+/// Encode a single canonical plan action from independently selected values.
+/// The wire encoder adds no registration or publication authority.
+pub fn encode_single_action(
+    header: PlanHeaderV2,
+    action: PolicyActionV2<'_>,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    let payload_len = 2 + action.action_payload.len();
+    if header.action_count != 1 || payload_len > MAX_PAYLOAD_BYTES {
+        return Err(Error::Invalid);
+    }
+    let n = PLAN_HEADER_BYTES + POLICY_ENVELOPE_BYTES + payload_len;
+    let frame = out.get_mut(..n).ok_or(Error::Invalid)?;
+    frame.fill(0);
+    frame[0..4].copy_from_slice(&PLAN_MAGIC.to_le_bytes());
+    frame[4..6].copy_from_slice(&PLAN_VERSION.to_le_bytes());
+    frame[6..8].copy_from_slice(&(PLAN_HEADER_BYTES as u16).to_le_bytes());
+    frame[8..12].copy_from_slice(&(n as u32).to_le_bytes());
+    frame[12..14].copy_from_slice(&header.action_count.to_le_bytes());
+    frame[14..16].copy_from_slice(&header.flags.to_le_bytes());
+    for (at, v) in [
+        (16, header.plan_seq),
+        (24, header.base_plan_version),
+        (32, header.active_model_generation),
+        (40, header.controller_epoch),
+        (48, header.snapshot_seq),
+        (56, header.active_until_local_ns),
+    ] {
+        frame[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let a = &mut frame[PLAN_HEADER_BYTES..];
+    a[0..4].copy_from_slice(&POLICY_MAGIC.to_le_bytes());
+    a[4..6].copy_from_slice(&POLICY_VERSION.to_le_bytes());
+    a[6..8].copy_from_slice(&(POLICY_ENVELOPE_BYTES as u16).to_le_bytes());
+    a[8..10].copy_from_slice(&action.domain_id.to_le_bytes());
+    a[10..12].copy_from_slice(&action.action_kind.to_le_bytes());
+    a[12..16].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    for (at, v) in [
+        (16, action.controller_epoch),
+        (24, action.decision_seq),
+        (32, action.snapshot_seq),
+        (40, action.target_id),
+        (48, action.target_generation),
+        (56, action.ledger_generation),
+        (64, action.core_generation),
+        (72, action.expires_local_ns),
+    ] {
+        a[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    a[80..112].copy_from_slice(&action.model_hash);
+    a[112..144].copy_from_slice(&action.candidate_set_hash);
+    a[144..146].copy_from_slice(&action.candidate_index.to_le_bytes());
+    a[146..].copy_from_slice(action.action_payload);
+    PlanV2::decode(frame)?;
+    Ok(n)
+}
+
 fn action_at(frame: &[u8], at: usize) -> Result<(PolicyActionV2<'_>, usize), Error> {
     let h = frame
         .get(

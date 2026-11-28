@@ -1,15 +1,16 @@
-//! V0.19.9 SVC 0x50/0x41 *trusted copyin transport* to a frozen v3 gate.
+//! V0.19.9 native SVC transport to a frozen v3 gate.
 //!
-//! This is the no_std dispatch core for an EL1 AArch64 trap adapter, not a
-//! claim that the legacy native trap has been cut over. The platform must
-//! authenticate x8, the verified package ABI, the real caller and its cap,
-//! perform stable checked copyin/out, and execute the actual native APPLY
-//! adapter. A model cannot supply a trusted capability or call this Rust
-//! function directly from EL0.
+//! The platform authenticates the call number, package ABI, caller and
+//! endpoint cap, checks the whole user span and owns the actual apply effects.
 use super::{
     Error, Identity,
     advice_disposition_v1::DISPOSITION_BYTES,
     advice_ledger_v0199::EvidenceLedger,
+    apply_report_v1::{
+        ApplyReportV1, BoundReport, ExecutorBindingV1, MAX_APPLY_REPORT_BYTES, ReportOrigin,
+        TrustedApplyScope,
+    },
+    control_rpc_v1::{Caller, Error as RpcError, RpcTable},
     decision_record_v3::DECISION_BYTES,
     plan_wire_v2::{MAX_PLAN_BYTES, PlanV2},
     registered_gate_v3::{
@@ -18,7 +19,7 @@ use super::{
     },
     rule_profile_v2::Profile,
 };
-use crate::security::syscall_v3::decode_v3;
+use crate::security::{cap_record_v3::CapRecordV3, syscall_v3::decode_v3};
 
 /// Trust anchor created exclusively from actual EL1 cap table and
 /// authenticated EL0 Task identity. User payload bytes are NOT trusted to
@@ -145,54 +146,115 @@ pub fn read_registered_decision_rpc(
     }
 }
 
+fn file_executor_origin(
+    table: &RpcTable,
+    caller: Caller,
+    native: VerifiedNativeCaller,
+    selector: u64,
+    cap: CapRecordV3,
+    binding: ExecutorBindingV1,
+    boot_epoch: u64,
+) -> Result<ReportOrigin, RpcError> {
+    if !(1..=3).contains(&native.cpu)
+        || caller.role != 12
+        || caller.holder.id != native.identity.id
+        || caller.cap != native.endpoint_cap
+        || selector != caller.cap
+        || binding.domain != 4
+        || binding.holder.id != native.identity.id
+    {
+        return Err(RpcError::Auth);
+    }
+    if caller.boot_epoch != boot_epoch
+        || caller.holder != native.identity
+        || binding.holder != native.identity
+        || !binding.active
+    {
+        return Err(RpcError::Stale);
+    }
+    let cap_id = cap
+        .executor_cap_id(native.identity, binding.target, selector)
+        .map_err(|error| match error {
+            crate::security::Error::Stale => RpcError::Stale,
+            _ => RpcError::Auth,
+        })?;
+    let origin = ReportOrigin::User {
+        holder: native.identity,
+        cap_id,
+    };
+    if !binding.permits(origin) {
+        return Err(RpcError::Auth);
+    }
+    table.check_live(caller)?;
+    Ok(origin)
+}
+
+fn executor_error(error: Error) -> RpcError {
+    match error {
+        Error::Denied => RpcError::Auth,
+        Error::Stale => RpcError::Stale,
+        Error::Busy => RpcError::Busy,
+        Error::NotReady => RpcError::Again,
+        Error::Expired => RpcError::Expired,
+        Error::Exhausted => RpcError::Capacity,
+        _ => RpcError::Format,
+    }
+}
+
 /// D04 FILE_SERVICE fetch uses the same per-holder RPC sequence flow.
 /// The real EL1 file/plan owners supply binding and installed version,
-/// plus an atomic native admission check; successful fetch retains work
-/// before copyout. This is not the actual filesystem executor.
+/// a native-verified EXECUTOR_RPC CapRecord and atomic admission check.
+/// Successful fetch retains work before copyout.
 // Stable wide native ABI adapter; regrouping arguments would change the public contract.
 #[allow(clippy::too_many_arguments)]
 pub fn executor_fetch_rpc(
     gate: &mut RegisteredDecisionGate,
-    table: &mut super::control_rpc_v1::RpcTable,
-    caller: super::control_rpc_v1::Caller,
+    table: &mut RpcTable,
+    caller: Caller,
     native: VerifiedNativeCaller,
     args: [u64; 6],
+    cap: CapRecordV3,
     copied: &[u8],
     plan_wire: &[u8],
     index: usize,
-    binding: super::apply_report_v1::ExecutorBindingV1,
-    scope: super::apply_report_v1::TrustedApplyScope,
+    binding: ExecutorBindingV1,
+    scope: TrustedApplyScope,
     parent_deadline: u64,
     verify_and_accept: impl FnOnce(&super::apply_work_v1::ApplyWorkV1<'_>) -> Result<(), Error>,
-) -> Result<super::control_rpc_v1::Frame, super::control_rpc_v1::Error> {
-    use super::apply_report_v1::ReportOrigin;
-    use super::control_rpc_v1::{Admission, Error as RpcError, Op, Request, State};
+) -> Result<super::control_rpc_v1::Frame, RpcError> {
+    use super::control_rpc_v1::{Admission, Op, Request, State};
     decode_v3(native.package_abi, 0x50, args).map_err(|_| RpcError::Format)?;
-    // File service may run on a business core: unlike the eight control
-    // EL0 roles it is not forced to CPU0. The protected owner authenticates
-    // its actual scheduling/affinity before this serialized adapter.
-    let origin = ReportOrigin::User {
-        holder: native.identity,
-        cap_id: native.endpoint_cap,
-    };
-    if !(1..=3).contains(&native.cpu)
-        || caller.role != 12
-        || caller.boot_epoch != scope.boot_epoch
-        || caller.holder != native.identity
-        || caller.cap != native.endpoint_cap
-        || args[0] != caller.cap
-        || args[3] != 0
-        || binding.domain != 4
-        || !binding.permits(origin)
-    {
+    let origin = file_executor_origin(
+        table,
+        caller,
+        native,
+        args[0],
+        cap,
+        binding,
+        scope.boot_epoch,
+    )?;
+    if args[3] != 0 {
         return Err(RpcError::Auth);
     }
     if args[2] != copied.len() as u64 {
         return Err(RpcError::Format);
     }
     let r = Request::decode(copied)?;
-    if !matches!(r.op, Op::ExecutorFetch | Op::Ack) {
-        return Err(RpcError::Auth);
+    match r.op {
+        Op::ExecutorFetch => {
+            let target = u64::from_le_bytes(r.payload[8..16].try_into().unwrap());
+            let generation = u64::from_le_bytes(r.payload[16..24].try_into().unwrap());
+            if target != binding.target.id {
+                return Err(RpcError::Auth);
+            }
+            if generation != binding.target.generation
+                || r.expected_generation != binding.executor_generation
+            {
+                return Err(RpcError::Stale);
+            }
+        }
+        Op::Ack => (),
+        _ => return Err(RpcError::Auth),
     }
     let out_cap = usize::try_from(args[5]).map_err(|_| RpcError::Format)?;
     match table.admit(
@@ -202,13 +264,7 @@ pub fn executor_fetch_rpc(
         scope.now_ns,
         parent_deadline,
         binding.executor_generation,
-        |r| {
-            let at = |i: usize| u64::from_le_bytes(r.payload[i..i + 8].try_into().unwrap());
-            if at(8) != binding.target.id || at(16) != binding.target.generation {
-                return Err(RpcError::Auth);
-            }
-            Ok(())
-        },
+        |_| Ok(()),
     )? {
         Admission::Replay(reply) | Admission::Acknowledged(reply) => Ok(reply),
         Admission::Execute(ticket) => {
@@ -223,28 +279,74 @@ pub fn executor_fetch_rpc(
                     frame.bytes(),
                     || Ok(()),
                 ),
-                Err(e) => {
-                    let code = match e {
-                        Error::Denied => RpcError::Auth,
-                        Error::Stale => RpcError::Stale,
-                        Error::Busy => RpcError::Busy,
-                        Error::NotReady => RpcError::Again,
-                        Error::Expired => RpcError::Expired,
-                        Error::Exhausted => RpcError::Capacity,
-                        _ => RpcError::Format,
-                    };
-                    table.complete(
-                        ticket,
-                        State::Done,
-                        code as i32,
-                        binding.executor_generation,
-                        &[],
-                        || Ok(()),
-                    )
-                }
+                Err(error) => table.complete(
+                    ticket,
+                    State::Done,
+                    executor_error(error) as i32,
+                    binding.executor_generation,
+                    &[],
+                    || Ok(()),
+                ),
             }
         }
     }
+}
+
+/// Stable bytes from the authenticated 0x43 entry for the terminal owner.
+pub struct ExecutorReport {
+    bytes: [u8; MAX_APPLY_REPORT_BYTES],
+    len: usize,
+    origin: ReportOrigin,
+}
+impl ExecutorReport {
+    pub fn as_bound(&self) -> BoundReport<'_> {
+        BoundReport {
+            bytes: &self.bytes[..self.len],
+            origin: self.origin,
+        }
+    }
+}
+
+/// Admit D04 0x43 using the live cap record for the same native EXECUTOR_RPC
+/// endpoint as fetch. The native owner resolves the static label and cap
+/// before calling this function and pins the input during checked copyin.
+/// `verify_effect` independently reads that exact accepted work's native
+/// effect or terminal no-effect evidence. The terminal owner rechecks the
+/// whole plan and retains feedback before releasing any obligation.
+#[allow(clippy::too_many_arguments)]
+pub fn executor_report(
+    gate: &RegisteredDecisionGate<'_>,
+    table: &RpcTable,
+    caller: Caller,
+    native: VerifiedNativeCaller,
+    args: [u64; 6],
+    cap: CapRecordV3,
+    binding: ExecutorBindingV1,
+    scope: TrustedApplyScope,
+    copyin: impl FnOnce(u64, &mut [u8]) -> Result<(), RpcError>,
+    verify_effect: impl FnOnce(&ApplyReportV1<'_>) -> Result<(), Error>,
+) -> Result<ExecutorReport, RpcError> {
+    let origin = file_executor_origin(
+        table,
+        caller,
+        native,
+        args[0],
+        cap,
+        binding,
+        scope.boot_epoch,
+    )?;
+    decode_v3(native.package_abi, 0x43, args).map_err(|_| RpcError::Format)?;
+    let mut frame = ExecutorReport {
+        bytes: [0; MAX_APPLY_REPORT_BYTES],
+        len: args[2] as usize,
+        origin,
+    };
+    copyin(args[1], &mut frame.bytes[..frame.len])?;
+    let report = gate
+        .verify_executor_report(frame.as_bound(), binding, scope)
+        .map_err(executor_error)?;
+    verify_effect(&report).map_err(executor_error)?;
+    Ok(frame)
 }
 
 impl SvcV3Bridge<'_, '_> {
@@ -905,12 +1007,15 @@ mod tests {
         assert_eq!(invoked, 1);
     }
     #[test]
-    fn file_executor_fetch_registers_actual_work_once_before_lost_reply() {
+    fn file_executor_requires_accepted_work_and_independent_effect() {
         use super::super::{
-            apply_report_v1::{ExecutorBindingV1, TrustedApplyScope},
+            apply_report_v1::{
+                ActionStatus, ApplyReportV1, ExecutorBindingV1, PlanKey, TrustedApplyScope,
+            },
             apply_work_v1::ApplyWorkV1,
             control_rpc_v1::{Caller, Error as RpcError, RpcTable, State},
         };
+        use crate::security::cap_record_v3::{CapRecordV3, IPC_SEND};
         let mut rules_bytes = profile_bytes();
         rules_bytes[36..38].copy_from_slice(&4u16.to_le_bytes());
         let rules = Profile::parse(&rules_bytes).unwrap();
@@ -957,7 +1062,13 @@ mod tests {
             id: 8,
             generation: 1,
         };
-        let mut gate = RegisteredDecisionGate::new(ctl, publisher, 1, 2).unwrap();
+        let supervisor = Identity {
+            id: 11,
+            generation: 1,
+        };
+        let mut gate =
+            RegisteredDecisionGate::new_with_terminal_owner(ctl, publisher, supervisor, 1, 2)
+                .unwrap();
         gate.register_rule_only(ctl, &plan, &records, &rules, &actions, context)
             .unwrap();
         gate.publish_once(
@@ -974,17 +1085,18 @@ mod tests {
             id: 12,
             generation: 5,
         };
+        let selector = (1 << 32) | 8;
         let caller = Caller {
             boot_epoch: 1,
             holder,
             role: 12,
             endpoint: 8,
-            cap: 99,
+            cap: selector,
         };
         let native = VerifiedNativeCaller {
             identity: holder,
             package_abi: 3,
-            endpoint_cap: 99,
+            endpoint_cap: selector,
             cpu: 1,
         };
         let mut table = RpcTable::new();
@@ -997,6 +1109,21 @@ mod tests {
             executor_generation: 9,
             holder,
             endpoint_cap_id: 99,
+        };
+        let cap = CapRecordV3 {
+            cap_id: binding.endpoint_cap_id,
+            holder,
+            target: binding.target,
+            parent_cap_id: 0,
+            parent_generation: 0,
+            deny_generation: 0,
+            rights: IPC_SEND,
+            object_kind: 8,
+            state: 1,
+            depth: 0,
+            source_role: 12,
+            owner_group: u32::MAX,
+            record_generation: 1,
         };
         let scope = TrustedApplyScope {
             boot_epoch: 1,
@@ -1013,7 +1140,116 @@ mod tests {
             request[at..at + 8].copy_from_slice(&v.to_le_bytes());
         }
         request[48..50].copy_from_slice(&4u16.to_le_bytes());
-        let args = [99, 4096, 72, 0, 8192, 384];
+        let args = [selector, 4096, 72, 0, 8192, 384];
+        let report = ApplyReportV1 {
+            key: PlanKey {
+                boot_epoch: 1,
+                controller_epoch: 2,
+                plan_seq: 1,
+            },
+            action_index: 0,
+            domain_id: 4,
+            state: ActionStatus::Applied,
+            target: binding.target,
+            executor_generation: binding.executor_generation,
+            plan_version: scope.plan_version,
+            result: 0,
+            completed_ns: 175,
+            action: &payload,
+        };
+        let report_scope = TrustedApplyScope {
+            now_ns: 180,
+            ..scope
+        };
+        let report_args = [selector, 4096, 100, 0, 0, 0];
+        let copy_report = |r: ApplyReportV1<'_>, dest: &mut [u8]| {
+            let mut raw = [0; 352];
+            let n = r.encode(&mut raw).unwrap();
+            dest.copy_from_slice(&raw[..n]);
+            Ok(())
+        };
+        for role in [2, 8, 11, 13] {
+            assert_eq!(
+                executor_report(
+                    &gate,
+                    &table,
+                    Caller { role, ..caller },
+                    native,
+                    report_args,
+                    cap,
+                    binding,
+                    report_scope,
+                    |_, _| panic!("unqualified role cannot copy"),
+                    |_| panic!(),
+                )
+                .err(),
+                Some(RpcError::Auth),
+            );
+        }
+        for (wrong, expected) in [
+            (
+                CapRecordV3 {
+                    object_kind: 4,
+                    ..cap
+                },
+                RpcError::Auth,
+            ),
+            (
+                CapRecordV3 {
+                    rights: 1 << 17,
+                    ..cap
+                },
+                RpcError::Auth,
+            ),
+            (
+                CapRecordV3 {
+                    cap_id: selector,
+                    ..cap
+                },
+                RpcError::Auth,
+            ),
+            (
+                CapRecordV3 {
+                    record_generation: 2,
+                    ..cap
+                },
+                RpcError::Stale,
+            ),
+            (CapRecordV3 { state: 2, ..cap }, RpcError::Stale),
+        ] {
+            assert_eq!(
+                executor_report(
+                    &gate,
+                    &table,
+                    caller,
+                    native,
+                    report_args,
+                    wrong,
+                    binding,
+                    report_scope,
+                    |_, _| panic!("wrong capability cannot copy"),
+                    |_| panic!(),
+                )
+                .err(),
+                Some(expected),
+            );
+        }
+        assert_eq!(
+            executor_report(
+                &gate,
+                &table,
+                caller,
+                native,
+                report_args,
+                cap,
+                binding,
+                report_scope,
+                |_, dest| copy_report(report, dest),
+                |_| panic!("no accepted work"),
+            )
+            .err(),
+            Some(RpcError::Again),
+        );
         for cpu in [0, 4] {
             let wrong = VerifiedNativeCaller { cpu, ..native };
             assert_eq!(
@@ -1023,6 +1259,7 @@ mod tests {
                     caller,
                     wrong,
                     args,
+                    cap,
                     &request,
                     &plan,
                     0,
@@ -1045,6 +1282,7 @@ mod tests {
                 caller,
                 wrong,
                 args,
+                cap,
                 &request,
                 &plan,
                 0,
@@ -1061,6 +1299,7 @@ mod tests {
             caller,
             native,
             args,
+            cap,
             &request,
             &plan,
             0,
@@ -1084,6 +1323,7 @@ mod tests {
                 caller,
                 native,
                 args,
+                cap,
                 &request,
                 &plan,
                 0,
@@ -1096,6 +1336,187 @@ mod tests {
                 |_| panic!("replay cannot execute")
             ),
             Ok(reply)
+        );
+        assert_eq!(
+            executor_fetch_rpc(
+                &mut gate,
+                &mut table,
+                caller,
+                native,
+                args,
+                cap,
+                &request,
+                &plan,
+                0,
+                ExecutorBindingV1 {
+                    executor_generation: 10,
+                    ..binding
+                },
+                scope,
+                200,
+                |_| panic!("stale executor cannot retrieve old work"),
+            ),
+            Err(RpcError::Stale)
+        );
+        for (wrong, expected) in [
+            (
+                ApplyReportV1 {
+                    domain_id: 1,
+                    ..report
+                },
+                RpcError::Auth,
+            ),
+            (
+                ApplyReportV1 {
+                    target: Identity {
+                        generation: 2,
+                        ..report.target
+                    },
+                    ..report
+                },
+                RpcError::Stale,
+            ),
+            (
+                ApplyReportV1 {
+                    executor_generation: 8,
+                    ..report
+                },
+                RpcError::Stale,
+            ),
+            (
+                ApplyReportV1 {
+                    plan_version: 6,
+                    ..report
+                },
+                RpcError::Stale,
+            ),
+            (
+                ApplyReportV1 {
+                    completed_ns: 169,
+                    ..report
+                },
+                RpcError::Auth,
+            ),
+            (
+                ApplyReportV1 {
+                    action: &[0, 0, 4, 0],
+                    ..report
+                },
+                RpcError::Auth,
+            ),
+            (
+                ApplyReportV1 {
+                    state: ActionStatus::Unknown,
+                    ..report
+                },
+                RpcError::Again,
+            ),
+        ] {
+            assert_eq!(
+                executor_report(
+                    &gate,
+                    &table,
+                    caller,
+                    native,
+                    report_args,
+                    cap,
+                    binding,
+                    report_scope,
+                    |_, dest| copy_report(wrong, dest),
+                    |_| panic!("ineligible report"),
+                )
+                .err(),
+                Some(expected),
+            );
+        }
+        assert_eq!(
+            executor_report(
+                &gate,
+                &table,
+                caller,
+                native,
+                report_args,
+                cap,
+                binding,
+                report_scope,
+                |_, _| Err(RpcError::Fault),
+                |_| panic!("copy fault cannot verify an effect"),
+            )
+            .err(),
+            Some(RpcError::Fault),
+        );
+        assert_eq!(
+            executor_report(
+                &gate,
+                &table,
+                caller,
+                native,
+                report_args,
+                cap,
+                binding,
+                report_scope,
+                |_, dest| copy_report(report, dest),
+                |_| Err(Error::NotReady),
+            )
+            .err(),
+            Some(RpcError::Again),
+        );
+        let retained = executor_report(
+            &gate,
+            &table,
+            caller,
+            native,
+            report_args,
+            cap,
+            binding,
+            report_scope,
+            |ptr, dest| {
+                assert_eq!(ptr, report_args[1]);
+                copy_report(report, dest)
+            },
+            |candidate| {
+                assert_eq!(*candidate, report);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            retained.as_bound().origin,
+            super::super::apply_report_v1::ReportOrigin::User {
+                holder,
+                cap_id: cap.cap_id,
+            }
+        );
+        gate.settle_verified_apply_reports_with_feedback(
+            supervisor,
+            &plan,
+            &[retained.as_bound()],
+            &[binding],
+            report_scope,
+            None,
+            |_, candidate| {
+                assert_eq!(*candidate, report);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        table.close(caller).unwrap();
+        assert_eq!(
+            executor_report(
+                &gate,
+                &table,
+                caller,
+                native,
+                report_args,
+                cap,
+                binding,
+                report_scope,
+                |_, _| panic!("fenced caller cannot copy"),
+                |_| panic!(),
+            )
+            .err(),
+            Some(RpcError::Stale),
         );
     }
 

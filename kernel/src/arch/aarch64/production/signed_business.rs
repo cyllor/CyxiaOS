@@ -3,7 +3,7 @@
 //! CPU0 stages and seals the operator's signed immutable package once per
 //! core. Publication hands each private context to exactly one secondary.
 //! Closing the shared epoch denies new turns without discarding live grants.
-//! No task can spawn, transfer rights or make an external request here.
+//! Only a separately signed task group may create a child or map owned pages.
 use super::super::{GATES, ONLINE, Page, fatal, signed_exec_trap};
 use super::role_loader::{COPY_BUFFER, high_leaf, now_ns, sync_code, tlbi};
 #[cfg(cyxia_resident_net)]
@@ -41,6 +41,11 @@ use cyxia_prototype::domains::{
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+#[cfg(cyxia_business_task_services)]
+mod task_services;
+#[cfg(cyxia_business_task_services)]
+pub(super) use task_services::GROUP_CPU;
+
 const BUSINESS_CORES: usize = 3;
 const PAGE: usize = 4096;
 const IMAGE_BYTES: usize = 64 * 1024;
@@ -51,6 +56,10 @@ const SLOT_MASK: u64 = (1 << 13) - 1;
 const CLOSED: u64 = u64::MAX;
 const MAX_SLICE_NS: u64 = 2_000_000;
 const EXIT_MARGIN_NS: u64 = 100_000;
+// Signed task services reserve extra time within the same D01 charge for
+// checked copies, synchronous page-table changes and dispatch settlement.
+#[cfg(cyxia_business_task_services)]
+const TASK_SERVICE_EXIT_MARGIN_NS: u64 = 500_000;
 const HEADROOM_NS: u64 = 5_000_000;
 const POLL_NS: u64 = 2_000_000;
 const STARTUP_POLL_NS: u64 = 100_000_000;
@@ -67,12 +76,16 @@ const SIGNATURE: &[u8; 64] = include_bytes!(concat!(
 pub(super) struct ApprovedPackage {
     config: [u8; 32],
     digest: [u8; 32],
+    #[cfg(cyxia_business_task_services)]
+    grant: task_services::Grant,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct Layout {
     image: u64,
     stack_top: u64,
+    #[cfg(cyxia_business_task_services)]
+    child: Option<(u64, u64)>,
 }
 
 #[repr(C, align(4096))]
@@ -118,6 +131,17 @@ static TURNS: [AtomicU64; BUSINESS_CORES] = [const { AtomicU64::new(0) }; BUSINE
 static SCHEDULER_HELD: AtomicBool = AtomicBool::new(false);
 static mut SCHEDULER: Scheduler = Scheduler::new();
 
+pub(super) fn is_live_epoch(epoch: u64) -> bool {
+    epoch != 0 && epoch != CLOSED && EPOCH.load(Ordering::Acquire) == epoch
+}
+
+#[cfg(cyxia_business_task_services)]
+pub(super) fn is_group_child_identity(slot: usize, actor: Identity) -> bool {
+    slot == GROUP_CPU
+        && PUBLISHED.load(Ordering::Acquire) == actor.generation
+        && task_services::is_child(actor)
+}
+
 pub(super) fn authorize(config: &VerifiedOfflineConfig<'_>) -> Result<ApprovedPackage, Error> {
     let digest = Sha256::digest(PACKAGE).into();
     startup_catalog::qualify_business_package(config, digest, SIGNATURE)
@@ -125,6 +149,8 @@ pub(super) fn authorize(config: &VerifiedOfflineConfig<'_>) -> Result<ApprovedPa
     Ok(ApprovedPackage {
         config: config.digest(),
         digest,
+        #[cfg(cyxia_business_task_services)]
+        grant: task_services::qualify(config, digest)?,
     })
 }
 
@@ -134,7 +160,8 @@ pub(super) fn addresses(
     #[cfg(cyxia_resident_net)] network_entropy: Option<&mut Entropy>,
     checkpoint: &mut impl FnMut() -> Result<(), SvcError>,
 ) -> Result<[Layout; BUSINESS_CORES], Error> {
-    let mut randomness = Zeroizing::new([0u8; BUSINESS_CORES * 16]);
+    const LAYOUTS: usize = BUSINESS_CORES + cfg!(cyxia_business_task_services) as usize;
+    let mut randomness = Zeroizing::new([0u8; LAYOUTS * 16]);
     let mut standalone = || {
         super::net_entropy::startup_aslr(info, policy.boot_epoch(), &mut randomness[..], || {
             checkpoint().map_err(|_| cyxia_driver_virtio::Error::Busy)
@@ -151,19 +178,28 @@ pub(super) fn addresses(
     }
     #[cfg(not(cyxia_resident_net))]
     standalone().map_err(|_| Error::NotReady)?;
-    Ok(core::array::from_fn(|index| {
+    let limits = |index| {
         let offset = index * 16;
         let image = u64::from_le_bytes(randomness[offset..offset + 8].try_into().unwrap());
         let stack = u64::from_le_bytes(randomness[offset + 8..offset + 16].try_into().unwrap());
         // Nominating 8192 distinct 2 MiB bases keeps the entire PIE in the
         // architectural range. Separate entropy selects a disjoint stack table
         // and offset with room for its private guard page in the same table.
-        Layout {
-            image: IMAGE_MIN + (image & SLOT_MASK) * SLOT_BYTES,
-            stack_top: STACK_MIN
+        (
+            IMAGE_MIN + (image & SLOT_MASK) * SLOT_BYTES,
+            STACK_MIN
                 + (stack & SLOT_MASK) * SLOT_BYTES
                 + ((stack >> 13 & 0xff) + 1) * PAGE as u64
                 + ROLE_STACK_BYTES as u64,
+        )
+    };
+    Ok(core::array::from_fn(|index| {
+        let (image, stack_top) = limits(index);
+        Layout {
+            image,
+            stack_top,
+            #[cfg(cyxia_business_task_services)]
+            child: (index + 1 == GROUP_CPU).then(|| limits(BUSINESS_CORES)),
         }
     }))
 }
@@ -265,6 +301,7 @@ fn stage_package(
     storage: *mut Backing,
     package: &ApprovedPackage,
     layout: Layout,
+    args: &[u8],
 ) -> Result<user::Context, Error> {
     // SAFETY: boot's serial CPU0 loader owns this registered scratch buffer.
     let scratch = unsafe { &mut *addr_of_mut!(COPY_BUFFER.0) };
@@ -294,7 +331,7 @@ fn stage_package(
             flags[(start / PAGE as u64) as usize..end].fill(4);
         }
         let stack = unsafe { &mut *addr_of_mut!((*storage).stack) };
-        let stack = stage_spawn_args(stack, layout.stack_top - ROLE_STACK_BYTES as u64, &[])
+        let stack = stage_spawn_args(stack, layout.stack_top - ROLE_STACK_BYTES as u64, args)
             .map_err(|_| Error::Invalid)?;
         let mut context = user::Context::empty();
         context.pc = layout.image + pie.entry;
@@ -367,10 +404,29 @@ pub(super) fn prepare(
     if PREPARED.load(Ordering::Acquire) & bit != 0 {
         return Err(Error::Stale);
     }
-    let context = stage_package(backing(slot - 1), package, addresses)?;
-    let group = ObjectKey {
+    let storage = backing(slot - 1);
+    let args = &[][..];
+    #[cfg(cyxia_business_task_services)]
+    let bootstrap;
+    #[cfg(cyxia_business_task_services)]
+    let args = if slot == GROUP_CPU {
+        bootstrap = package.grant.bootstrap(epoch)?;
+        &bootstrap[..]
+    } else {
+        args
+    };
+    let context = stage_package(storage, package, addresses, args)?;
+    let ordinary_group = ObjectKey {
         id: BUSINESS_THREAD_ID_BASE,
         generation: epoch,
+    };
+    let group = ordinary_group;
+    #[cfg(cyxia_business_task_services)]
+    let group = if slot == GROUP_CPU {
+        task_services::prepare(policy, package.grant, addresses, storage)?;
+        package.grant.group(epoch)
+    } else {
+        group
     };
     let budget_ns = CPU_BUDGET_NS;
     #[cfg(cyxia_resident_net)]
@@ -379,8 +435,17 @@ pub(super) fn prepare(
     } else {
         budget_ns
     };
+    #[cfg(cyxia_business_task_services)]
+    let budget_ns = if slot == GROUP_CPU {
+        budget_ns - package.grant.child_budget_ns
+    } else {
+        budget_ns
+    };
     try_scheduler(|scheduler| {
         if PREPARED.load(Ordering::Relaxed) == 0 {
+            scheduler.register_group(ordinary_group)?;
+        }
+        if group != ordinary_group {
             scheduler.register_group(group)?;
         }
         scheduler.admit(
@@ -409,6 +474,14 @@ pub(super) fn prepare(
     Ok(())
 }
 
+#[cfg(cyxia_business_task_services)]
+pub(super) fn prepare_group_child(
+    policy: &ConfirmedBootPolicy<'_>,
+    package: &ApprovedPackage,
+) -> Result<(), Error> {
+    task_services::prepare_child(policy, package)
+}
+
 pub(super) fn open(policy: &ConfirmedBootPolicy<'_>) -> Result<u64, Error> {
     let epoch = policy.boot_epoch();
     if cpu::slot() != 0
@@ -418,6 +491,10 @@ pub(super) fn open(policy: &ConfirmedBootPolicy<'_>) -> Result<u64, Error> {
         || PREPARED.load(Ordering::Acquire) != BUSINESS_MASK
         || EPOCH.load(Ordering::Acquire) != 0
     {
+        return Err(Error::Denied);
+    }
+    #[cfg(cyxia_business_task_services)]
+    if !task_services::prepared(epoch) {
         return Err(Error::Denied);
     }
     let token = Token {
@@ -524,12 +601,34 @@ fn poll_later() {
     sleep_until(now_ns().saturating_add(POLL_NS));
 }
 
-fn retire(slot: usize, task: ObjectKey, storage: *mut Backing, context: &mut user::Context) -> ! {
+fn invalidate_user_asid(asid: u8) {
+    let operand = u64::from(asid) << 48;
+    // SAFETY: these ASIDs were uniquely reserved for the pinned business
+    // contexts. The completion barriers cover all PEs before backing reuse.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst", "tlbi aside1is, {}", "dsb ish", "isb",
+            in(reg) operand, options(nostack, preserves_flags),
+        );
+    }
+}
+
+fn retire(
+    slot: usize,
+    task: ObjectKey,
+    storage: *mut Backing,
+    context: &mut user::Context,
+    #[cfg(cyxia_business_task_services)] group: &mut Option<&mut task_services::Group>,
+) -> ! {
+    #[cfg(cyxia_business_task_services)]
+    if let Some(group) = group {
+        group.retire();
+    }
     // SAFETY: the sole owner has returned to EL1. This root and ASID are
     // never used again; there are no protected async calls. The scheduler
     // still owns any unanswered receipt independently from this root.
     unsafe { addr_of_mut!((*storage).root).write_volatile(Page::ZERO) };
-    tlbi();
+    invalidate_user_asid(0xB0 + slot as u8);
     *context = user::Context::empty();
     loop {
         if let Some(result) = try_scheduler(|scheduler| scheduler.remove(task)) {
@@ -546,6 +645,29 @@ fn retire(slot: usize, task: ObjectKey, storage: *mut Backing, context: &mut use
         network_worker::after_business_exit();
     }
     park()
+}
+
+fn enter(
+    index: usize,
+    context: &mut user::Context,
+    root: u64,
+    asid: u8,
+    exec: signed_exec_trap::Execution,
+    deadline: u64,
+) -> signed_exec_trap::Return {
+    context.kind = 0;
+    ACTIVE[index].store(root | u64::from(asid) << 48, Ordering::Release);
+    // SAFETY: this is the pinned, uniquely assigned address space and
+    // ASID. The interrupt bounds the outstanding dispatch grant.
+    unsafe {
+        timer::arm(deadline);
+        user::enter_pinned_until_retired(context, root, asid);
+        cpu::disable_timer();
+    }
+    if ACTIVE[index].swap(0, Ordering::AcqRel) != 0 || context.kind == 0 {
+        fatal(BUSINESS_FAULT);
+    }
+    exec.handle_return(context)
 }
 
 pub(crate) fn worker(slot: usize) -> ! {
@@ -579,14 +701,41 @@ pub(crate) fn worker(slot: usize) -> ! {
         plane: Plane::Business,
     };
     let thread = thread(slot, epoch);
+    #[cfg(cyxia_business_task_services)]
+    let mut group = task_services::take(slot, epoch);
+    let exit_margin = EXIT_MARGIN_NS;
+    #[cfg(cyxia_business_task_services)]
+    let exit_margin = if group.is_some() {
+        TASK_SERVICE_EXIT_MARGIN_NS
+    } else {
+        exit_margin
+    };
     if EPOCH.load(Ordering::Acquire) != epoch {
-        retire(slot, thread, storage, context);
+        retire(
+            slot,
+            thread,
+            storage,
+            context,
+            #[cfg(cyxia_business_task_services)]
+            &mut group,
+        );
     }
     let exec = signed_exec_trap::Execution::configure().unwrap_or_else(|| fatal(BUSINESS_FAULT));
     let mut sleeping_until = None;
     loop {
         if EPOCH.load(Ordering::Acquire) != epoch {
-            retire(slot, thread, storage, context);
+            retire(
+                slot,
+                thread,
+                storage,
+                context,
+                #[cfg(cyxia_business_task_services)]
+                &mut group,
+            );
+        }
+        #[cfg(cyxia_business_task_services)]
+        if let Some(group) = group.as_mut() {
+            group.wake();
         }
         let start_ns = now_ns();
         if let Some(wake_ns) = sleeping_until {
@@ -595,7 +744,11 @@ pub(crate) fn worker(slot: usize) -> ! {
                 let network_ready = network_worker::running_on(slot, epoch);
                 #[cfg(not(cyxia_resident_net))]
                 let network_ready = false;
-                if !network_ready {
+                let other_ready = network_ready;
+                #[cfg(cyxia_business_task_services)]
+                let other_ready =
+                    other_ready || group.as_ref().is_some_and(|group| group.has_child());
+                if !other_ready {
                     sleep_until(wake_ns.min(start_ns.saturating_add(POLL_NS)));
                     continue;
                 }
@@ -616,7 +769,14 @@ pub(crate) fn worker(slot: usize) -> ! {
         };
         if EPOCH.load(Ordering::Acquire) != epoch {
             drop(permit);
-            retire(slot, thread, storage, context);
+            retire(
+                slot,
+                thread,
+                storage,
+                context,
+                #[cfg(cyxia_business_task_services)]
+                &mut group,
+            );
         }
         let placement = layout(epoch);
         let started = timer::cpu_ticks();
@@ -641,7 +801,7 @@ pub(crate) fn worker(slot: usize) -> ! {
                 }
             });
             if let Some(grant) = dispatch
-                && grant.reserved_ns <= EXIT_MARGIN_NS
+                && grant.reserved_ns <= exit_margin
             {
                 scheduler.cancel_unstarted(grant, now_ns())?;
                 return Ok::<_, cyxia_prototype::domains::Error>(None);
@@ -651,7 +811,14 @@ pub(crate) fn worker(slot: usize) -> ! {
         let Some(Ok(Some(dispatch))) = dispatched else {
             drop(permit);
             if matches!(dispatched, Some(Err(_))) {
-                retire(slot, thread, storage, context);
+                retire(
+                    slot,
+                    thread,
+                    storage,
+                    context,
+                    #[cfg(cyxia_business_task_services)]
+                    &mut group,
+                );
             }
             poll_later();
             continue;
@@ -670,44 +837,66 @@ pub(crate) fn worker(slot: usize) -> ! {
             drop(permit);
             if settled.is_err() {
                 network_worker::close();
-                retire(slot, thread, storage, context);
+                retire(
+                    slot,
+                    thread,
+                    storage,
+                    context,
+                    #[cfg(cyxia_business_task_services)]
+                    &mut group,
+                );
             }
             if state == RunState::Exited {
                 network_worker::retire_owned();
             }
             continue;
         }
+        #[cfg(cyxia_business_task_services)]
+        if dispatch.thread == thread
+            && EPOCH.load(Ordering::Acquire) == epoch
+            && let Some(group) = group.as_mut()
+        {
+            group.finish_join(context);
+        }
         let remaining = dispatch
             .reserved_ns
-            .saturating_sub(EXIT_MARGIN_NS)
+            .saturating_sub(exit_margin)
             .saturating_sub(timer::cpu_elapsed_ns(started));
         let now = now_ns();
         let latest = (dispatch.started_ns - dispatch.started_ns % WINDOW_NS)
             .saturating_add(WINDOW_NS)
-            .saturating_sub(EXIT_MARGIN_NS);
+            .saturating_sub(exit_margin);
         let wall = remaining.min(latest.saturating_sub(now));
         let deadline =
             (u128::from(now.saturating_add(wall)) * u128::from(timer::frequency())) / 1_000_000_000;
         let entered = wall != 0 && EPOCH.load(Ordering::Acquire) == epoch;
         let mut failed = false;
-        let next = if entered {
-            context.kind = 0;
-            ACTIVE[index].store(root | u64::from(asid) << 48, Ordering::Release);
-            // SAFETY: this is the pinned, uniquely assigned address space and
-            // ASID. The interrupt bounds the outstanding dispatch grant.
-            unsafe {
-                timer::arm(u64::try_from(deadline).unwrap_or_else(|_| fatal(BUSINESS_FAULT)));
-                user::enter_pinned_until_retired(context, root, asid);
-                cpu::disable_timer();
+        #[cfg(cyxia_business_task_services)]
+        let mut child_exit = 0;
+        let next = 'turn: {
+            if !entered {
+                break 'turn RunState::Runnable;
             }
-            if ACTIVE[index].swap(0, Ordering::AcqRel) != 0 || context.kind == 0 {
-                fatal(BUSINESS_FAULT);
+            let deadline = u64::try_from(deadline).unwrap_or_else(|_| fatal(BUSINESS_FAULT));
+            #[cfg(cyxia_business_task_services)]
+            if dispatch.thread != thread {
+                let group = group
+                    .as_mut()
+                    .filter(|group| group.child_key() == dispatch.thread)
+                    .unwrap_or_else(|| fatal(BUSINESS_FAULT));
+                let (state, code) = group.drive_child(exec, deadline);
+                child_exit = code;
+                break 'turn state;
             }
-            match exec.handle_return(context) {
+            match enter(index, context, root, asid, exec, deadline) {
                 signed_exec_trap::Return::Timer
                 | signed_exec_trap::Return::Yield
                 | signed_exec_trap::Return::Emulated => RunState::Runnable,
                 signed_exec_trap::Return::TerminateTask => {
+                    #[cfg(cyxia_business_task_services)]
+                    if group.as_mut().is_some_and(|group| group.fault(context)) {
+                        break 'turn RunState::Runnable;
+                    }
                     let actor = Identity {
                         id: thread.id,
                         generation: thread.generation,
@@ -719,11 +908,13 @@ pub(crate) fn worker(slot: usize) -> ! {
                 }
                 signed_exec_trap::Return::FailStop => fatal(BUSINESS_FAULT),
                 signed_exec_trap::Return::Syscall => {
+                    #[cfg(cyxia_business_task_services)]
+                    if let Some(group) = group.as_mut() {
+                        break 'turn group.syscall(context, &mut sleeping_until);
+                    }
                     lifecycle_syscall(context, &mut sleeping_until)
                 }
             }
-        } else {
-            RunState::Runnable
         };
         let settled = loop {
             if let Some(settled) = try_scheduler(|scheduler| {
@@ -736,15 +927,37 @@ pub(crate) fn worker(slot: usize) -> ! {
         };
         drop(permit);
         if settled.is_err() {
-            retire(slot, thread, storage, context);
+            retire(
+                slot,
+                thread,
+                storage,
+                context,
+                #[cfg(cyxia_business_task_services)]
+                &mut group,
+            );
         }
-        if entered && !failed {
+        if entered && !failed && dispatch.thread == thread {
             let _ = TURNS[index].fetch_update(Ordering::Release, Ordering::Relaxed, |turns| {
                 turns.checked_add(1)
             });
         }
         if next == RunState::Exited {
-            retire(slot, thread, storage, context);
+            #[cfg(cyxia_business_task_services)]
+            if dispatch.thread != thread {
+                group
+                    .as_mut()
+                    .unwrap_or_else(|| fatal(BUSINESS_FAULT))
+                    .retire_child(child_exit);
+                continue;
+            }
+            retire(
+                slot,
+                thread,
+                storage,
+                context,
+                #[cfg(cyxia_business_task_services)]
+                &mut group,
+            );
         }
     }
 }
@@ -757,6 +970,14 @@ fn lifecycle_syscall(context: &mut user::Context, sleeping_until: &mut Option<u6
             return RunState::Runnable;
         }
     };
+    lifecycle_call(context, sleeping_until, call)
+}
+
+fn lifecycle_call(
+    context: &mut user::Context,
+    sleeping_until: &mut Option<u64>,
+    call: cyxia_kernel_core::security::syscall_v3::ValidatedCall,
+) -> RunState {
     context.regs[0] = 0;
     match call.operation {
         Syscall::Exit => return RunState::Exited,

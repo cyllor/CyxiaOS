@@ -62,8 +62,9 @@ use sha2::{Digest, Sha256};
 mod durable;
 #[cfg(cyxia_startup_catalog)]
 pub(super) use durable::{
-    ack_durable, check_durable_ack, confirm_delivery, durable_available, has_pending_persistence,
-    install_durable, open_durable, persist_pending, read_durable,
+    ack_durable, audit_degraded, audit_transport_online, check_durable_ack, close_audit_reader,
+    confirm_delivery, durable_available, has_pending_persistence, install_durable, open_durable,
+    persist_pending, read_durable, replace_audit_reader, verify_retired_ack, with_epoch_io,
 };
 
 /// Protection generation of the staged boot (first generation).
@@ -253,11 +254,10 @@ fn attributed_far(esr: u64, far: u64) -> u64 {
 #[cfg(cyxia_business_package)]
 pub(super) fn record_business_failure(actor: Identity, esr: u64, far: u64) -> Result<(), Error> {
     let i = cyxia_arch_aarch64::cpu::slot();
-    if i == 0
-        || i >= ACCUMULATOR_COUNT
-        || !actor.valid()
-        || actor.id != BUSINESS_THREAD_ID_BASE + i as u64
-    {
+    let owned = actor.id == BUSINESS_THREAD_ID_BASE + i as u64;
+    #[cfg(cyxia_business_task_services)]
+    let owned = owned || super::signed_business::is_group_child_identity(i, actor);
+    if i == 0 || i >= ACCUMULATOR_COUNT || !actor.valid() || !owned {
         return Err(Error::Unauthorized);
     }
     record_event(i, Some(actor), esr, attributed_far(esr, far))

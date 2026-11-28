@@ -11,9 +11,11 @@ use cyxia_kernel_core::security::offline_config_v1::MAX_SIGNED_BYTES;
 use cyxia_kernel_core::security::offline_config_v1::{
     ConfigHeader, Principal, VerifiedOfflineConfig,
 };
-use cyxia_kernel_core::security::{Error, startup_catalog_v0199::PinnedStartupCatalog};
 #[cfg(cyxia_startup_catalog)]
 use cyxia_kernel_core::security::recovery_proof_store::RecoveryLocator;
+#[cfg(cyxia_startup_catalog)]
+use cyxia_kernel_core::security::startup_catalog_v0199::file_volume::UnifiedFileVolume;
+use cyxia_kernel_core::security::{Error, startup_catalog_v0199::PinnedStartupCatalog};
 
 const CATALOG: PinnedStartupCatalog<'static> = PinnedStartupCatalog {
     boot_public_key: include_bytes!(concat!(
@@ -162,8 +164,14 @@ pub(super) fn recovery_store(
     let current = RecoveryLocator::verify(
         config,
         CATALOG.boot_public_key,
-        include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/recovery-store.bin")),
-        include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/recovery-store.sig")),
+        include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/startup-catalog/recovery-store.bin"
+        )),
+        include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/startup-catalog/recovery-store.sig"
+        )),
     )?;
     #[cfg(cyxia_network_predecessor)]
     if let Some(predecessor) = predecessor {
@@ -181,6 +189,38 @@ pub(super) fn recovery_store(
             )),
         )?;
         if previous.is_some_and(|prior| !current.is_some_and(|now| now.same_carrier(prior))) {
+            return Err(Error::Conflict);
+        }
+    }
+    #[cfg(not(cyxia_network_predecessor))]
+    let _ = predecessor;
+    checkpoint()?;
+    Ok(current)
+}
+
+#[cfg(cyxia_startup_catalog)]
+pub(super) fn file_volume(
+    config: &VerifiedOfflineConfig<'_>,
+    predecessor: Option<&VerifiedOfflineConfig<'_>>,
+    checkpoint: &mut impl FnMut() -> Result<(), Error>,
+) -> Result<Option<UnifiedFileVolume>, Error> {
+    checkpoint()?;
+    let current = UnifiedFileVolume::verify(
+        config,
+        CATALOG.boot_public_key,
+        include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/file-volume.bin")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/file-volume.sig")),
+    )?;
+    #[cfg(cyxia_network_predecessor)]
+    if let Some(config) = predecessor {
+        checkpoint()?;
+        let previous = UnifiedFileVolume::verify(
+            config,
+            PREDECESSOR.boot_public_key,
+            include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/predecessor/file-volume.bin")),
+            include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/predecessor/file-volume.sig")),
+        )?;
+        if previous != current {
             return Err(Error::Conflict);
         }
     }
@@ -238,4 +278,27 @@ pub(super) fn qualify_business_package(
     signature: &[u8; 64],
 ) -> Result<(), Error> {
     CATALOG.qualify_business_package(config, package_digest, signature)
+}
+
+#[cfg(cyxia_business_package)]
+pub(super) fn control_rules(
+    verified_config_wire: &[u8],
+) -> Result<cyxia_kernel_core::control_plane::rule_profile_v2::Profile<'static>, Error> {
+    if verified_config_wire != CATALOG.offline_config {
+        return Err(Error::Conflict);
+    }
+    // The VerifiedOfflineConfig was authenticated against these exact
+    // catalog bytes, including the SecurityProfile's RuleProfile binding.
+    cyxia_kernel_core::control_plane::rule_profile_v2::Profile::parse(CATALOG.rules)
+        .map_err(|_| Error::Invalid)
+}
+
+#[cfg(cyxia_business_task_services)]
+pub(super) fn qualify_business_task_services(
+    config: &VerifiedOfflineConfig<'_>,
+    package_digest: [u8; 32],
+    grants: &[u8; cyxia_kernel_core::security::startup_catalog_v0199::TASK_SERVICES_BYTES],
+    signature: &[u8; 64],
+) -> Result<(), Error> {
+    CATALOG.qualify_business_task_services(config, package_digest, grants, signature)
 }

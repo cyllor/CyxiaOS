@@ -84,28 +84,28 @@ pub(super) fn copy_policy_inputs(input: &Path, out: &Path) {
     assert_ne!(generation, 0, "startup key generation must be nonzero");
     fs::write(out.join("key-generation.rs"), generation.to_string())
         .expect("write startup catalog key generation");
-    let locator = "recovery-store.bin";
-    let signature = "recovery-store.sig";
     println!("cargo:rerun-if-changed={}", input.display());
-    let has_locator = input
-        .join(locator)
-        .try_exists()
-        .expect("recovery locator metadata");
-    let has_signature = input
-        .join(signature)
-        .try_exists()
-        .expect("recovery signature metadata");
-    assert_eq!(
-        has_locator, has_signature,
-        "incomplete startup recovery locator"
-    );
-    for (name, bytes) in [(locator, 104), (signature, 64)] {
-        let contents = if has_locator {
-            load(input, name, bytes, bytes)
-        } else {
-            Vec::new()
-        };
-        fs::write(out.join(name), contents).expect("copy startup recovery locator");
+    for (data, signature, bytes) in [
+        ("recovery-store.bin", "recovery-store.sig", 104),
+        ("file-volume.bin", "file-volume.sig", 168),
+    ] {
+        let present = input
+            .join(data)
+            .try_exists()
+            .expect("catalog data metadata");
+        let signed = input
+            .join(signature)
+            .try_exists()
+            .expect("catalog signature metadata");
+        assert_eq!(present, signed, "incomplete startup catalog pair {data}");
+        for (name, bytes) in [(data, bytes), (signature, 64)] {
+            let contents = if present {
+                load(input, name, bytes, bytes)
+            } else {
+                Vec::new()
+            };
+            fs::write(out.join(name), contents).expect("copy detached startup catalog input");
+        }
     }
 }
 

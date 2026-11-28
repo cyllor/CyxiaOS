@@ -333,6 +333,59 @@ fn scheduler_policy_receipt_binds_completed_credit_to_its_dispatch_version() {
         .complete(executed, 1, RunState::Runnable, 4)
         .unwrap();
     assert_eq!(scheduler.policy_receipt(key(1)), Ok(2));
+    assert_eq!(
+        scheduler.verify_weight_effect(key(1), 1, 2, 4),
+        Err(Error::Stale)
+    );
+    assert_eq!(
+        scheduler.verify_weight_effect(key(1), 2, 2, 4),
+        Err(Error::Stale)
+    );
+    assert_eq!(scheduler.verify_weight_effect(key(1), 2, 4, 4), Ok(4));
+    assert_eq!(
+        scheduler.verify_weight_effect(key(1), 2, 4, POLICY_NS),
+        Err(Error::Expired)
+    );
+}
+
+#[test]
+fn scheduler_installs_already_published_weight_after_snapshot_admission_expires() {
+    let mut scheduler = Scheduler::new();
+    scheduler.register_group(key(1)).unwrap();
+    scheduler
+        .admit(spec(10, 1, 0, 0, 20_000_000), layout(1), 0)
+        .unwrap();
+    let (sampled, published, applying) = (1, WINDOW_NS, WINDOW_NS + 20_000_000);
+    let weight = stamp(1, sampled, published);
+    assert_eq!(
+        scheduler.install_weight(key(1), 2, weight, applying),
+        Err(Error::Expired)
+    );
+    assert_eq!(
+        scheduler.install_published_weight(key(1), 2, weight, applying, applying),
+        Err(Error::Expired)
+    );
+    assert_eq!(scheduler.weight_version(key(1)), Ok(0));
+    scheduler
+        .install_published_weight(key(1), 2, weight, published, applying)
+        .unwrap();
+    assert_eq!(
+        scheduler.verify_weight_effect(key(1), 1, 2, applying),
+        Err(Error::NotReady)
+    );
+    let dispatch = scheduler
+        .dispatch(0, layout(1), applying, 1_000_000)
+        .unwrap()
+        .unwrap();
+    let finished = applying + 5;
+    scheduler
+        .complete(dispatch, 5, RunState::Runnable, finished)
+        .unwrap();
+    assert_eq!(
+        scheduler.verify_weight_effect(key(1), 1, 2, finished + 20_000_000),
+        Ok(finished)
+    );
+    assert_eq!(scheduler.weight(key(1), sampled + POLICY_NS), Ok(1));
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! An offline TLS policy changes the existing boot pair, not the media layout.
 use super::{Error, SecurityStateStoreV2};
+use crate::control_plane::role_manifest_v0199::ROLE_COUNT;
 use crate::security::{network::deployment::KeyManifest, offline_config_v1::VerifiedOfflineConfig};
 
 pub(in crate::security) const TLS_VERIFIER_SLOT: usize = 12;
@@ -59,17 +60,35 @@ impl<'a> TlsBootPolicy<'a> {
         Ok(())
     }
 
-    /// Compute the exact protected homes accepted by the native baseline
-    /// resident, whose unrelated service slots start at generation one.
     pub fn resident_state(self, epoch: u64) -> Result<SecurityStateStoreV2, Error> {
+        self.resident_state_with_roles(epoch, [1; ROLE_COUNT])
+    }
+
+    /// Native roster slots are fixed by the signed launch owner. Their
+    /// generation advances contribute exactly one state transition per
+    /// restart and leave the boot counter, TLS slots and config independent.
+    pub fn resident_state_with_roles(
+        self,
+        epoch: u64,
+        roles: [u64; ROLE_COUNT],
+    ) -> Result<SecurityStateStoreV2, Error> {
         let header = self.config.header();
+        let state_generation = roles.iter().try_fold(
+            epoch.checked_add(1).ok_or(Error::Exhausted)?,
+            |total, &generation| {
+                total
+                    .checked_add(generation.checked_sub(1).ok_or(Error::Stale)?)
+                    .ok_or(Error::Exhausted)
+            },
+        )?;
         let mut service_generations = [1; 16];
+        service_generations[..ROLE_COUNT].copy_from_slice(&roles);
         let [verifier, signer] = self.tls_generations();
         service_generations[TLS_VERIFIER_SLOT] = verifier;
         service_generations[TLS_SIGNER_SLOT] = signer;
         Ok(SecurityStateStoreV2 {
             fs_uuid: header.fs_uuid,
-            state_generation: epoch.checked_add(1).ok_or(Error::Exhausted)?,
+            state_generation,
             rule_min_generation: header.rule_generation,
             security_min_generation: header.security_generation,
             key_generation: header.key_generation,
@@ -79,6 +98,19 @@ impl<'a> TlsBootPolicy<'a> {
             offline_config_hash: self.config.digest(),
             service_generations,
         })
+    }
+
+    pub fn verify_resident_state(
+        self,
+        state: &SecurityStateStoreV2,
+        epoch: u64,
+    ) -> Result<(), Error> {
+        self.verify_committed(state)?;
+        let roles = state.service_generations[..ROLE_COUNT].try_into().unwrap();
+        if *state != self.resident_state_with_roles(epoch, roles)? {
+            return Err(Error::Conflict);
+        }
+        Ok(())
     }
 }
 

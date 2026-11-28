@@ -6,7 +6,10 @@
 //! ACL/system payloads and actual durable checkpoint must also be verified.
 use super::{
     Error,
-    file_media_unified_v1::{RESERVED_INODE_START, UNIFIED_SYSTEM_OBJECTS, UnifiedSystemObject},
+    file_media_unified_v1::{
+        BUSINESS_INODES, RESERVED_INODE_START, SLOT_MIRROR_BLOCKS, UNIFIED_SYSTEM_OBJECTS,
+        UnifiedSystemObject, catalog_candidate::CatalogRecord,
+    },
     file_media_v0199::{
         BITMAP_START, BLOCK_COUNT, DATA_START, INODE_START, SuperblockV1, crc32c_zeroed,
     },
@@ -179,7 +182,8 @@ const EMPTY_NAME: Name = Name {
 };
 pub struct Workspace {
     inodes: [Inode; INODES],
-    bitmap: [u8; BITMAP_BYTES],
+    history: [u8; BITMAP_BYTES],
+    history_generations: [u64; BUSINESS_INODES as usize],
     owned: [u8; BITMAP_BYTES],
     references: [u8; INODES],
     names: [Name; INODES],
@@ -189,7 +193,8 @@ impl Workspace {
     pub const fn new() -> Self {
         Self {
             inodes: [EMPTY; INODES],
-            bitmap: [0; BITMAP_BYTES],
+            history: [0; BITMAP_BYTES],
+            history_generations: [0; BUSINESS_INODES as usize],
             owned: [0; BITMAP_BYTES],
             references: [0; INODES],
             names: [EMPTY_NAME; INODES],
@@ -199,6 +204,10 @@ impl Workspace {
 
     pub(super) fn inodes(&self) -> &[Inode; INODES] {
         &self.inodes
+    }
+
+    pub(super) fn history_owns(&self, block: u32) -> bool {
+        block < BLOCK_COUNT && self.history[(block / 8) as usize] & (1 << (block % 8)) != 0
     }
 }
 impl Default for Workspace {
@@ -288,7 +297,7 @@ pub(super) fn scan_baseline(
     validate_system_layout(system)?;
     let extents =
         system.map(|s| SystemExtent::new(s.inode, s.generation, s.first_block, s.kind.blocks()));
-    scan_homes(sb, &extents, INODES, w, read)
+    scan_homes(sb, &extents, INODES, w, read, None, None).map(|(live, _, _)| live)
 }
 /// Scan the committed homes with the validated unified manifest map.
 pub(super) fn scan_unified(
@@ -297,36 +306,178 @@ pub(super) fn scan_unified(
     w: &mut Workspace,
     read: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
 ) -> Result<StructureEvidence, Error> {
+    scan_unified_history(sb, system, w, read, None).map(|(live, _)| live)
+}
+
+/// The allocation bitmap contains the union of the live and retained slot
+/// roots. Every root has its own inode tree. Aliases within a tree and across
+/// the system boundary are rejected, while CoW sharing across roots is legal.
+pub(super) fn scan_unified_history(
+    sb: SuperblockV1,
+    system: &[UnifiedSystemObject; UNIFIED_SYSTEM_OBJECTS],
+    w: &mut Workspace,
+    read: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
+    catalog: Option<&CatalogRecord>,
+) -> Result<(StructureEvidence, u32), Error> {
     let extents =
         system.map(|s| SystemExtent::new(s.inode, s.generation, s.first_block, s.kind.blocks()));
-    scan_homes(sb, &extents, usize::from(RESERVED_INODE_START), w, read)
+    scan_homes(
+        sb,
+        &extents,
+        usize::from(RESERVED_INODE_START),
+        w,
+        read,
+        catalog,
+        None,
+    )
+    .map(|(live, history, _)| (live, history))
 }
+
+/// Recompute allocations after excluding the retiring root. The caller must
+/// have validated the same frozen view including that root and fenced pins.
+#[cfg(not(target_os = "none"))]
+pub(super) fn scan_gc_reclaim(
+    sb: SuperblockV1,
+    system: &[UnifiedSystemObject; UNIFIED_SYSTEM_OBJECTS],
+    w: &mut Workspace,
+    read: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
+    roots: &CatalogRecord,
+    bitmap_after: &mut [[u8; BLOCK]; 4],
+) -> Result<u32, Error> {
+    let extents =
+        system.map(|s| SystemExtent::new(s.inode, s.generation, s.first_block, s.kind.blocks()));
+    scan_homes(
+        sb,
+        &extents,
+        usize::from(RESERVED_INODE_START),
+        w,
+        read,
+        Some(roots),
+        Some(bitmap_after),
+    )
+    .map(|(_, _, released)| released)
+}
+
 fn scan_homes(
     sb: SuperblockV1,
     system: &[SystemExtent],
     reserved_start: usize,
     w: &mut Workspace,
     mut read: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
-) -> Result<StructureEvidence, Error> {
+    catalog: Option<&CatalogRecord>,
+    mut bitmap_after: Option<&mut [[u8; BLOCK]; 4]>,
+) -> Result<(StructureEvidence, u32, u32), Error> {
     if sb.fs_uuid == [0; 16] || sb.generation == 0 || sb.log_epoch == 0 {
         return Err(Error::Invalid);
     }
-    w.owned.fill(0);
-    w.references.fill(0);
-    for i in 0..4 {
-        read(BITMAP_START + i, &mut w.block)?;
-        w.bitmap[i as usize * BLOCK..(i as usize + 1) * BLOCK].copy_from_slice(&w.block);
+    w.history.fill(0);
+    w.history_generations.fill(0);
+    if let Some(catalog) = catalog {
+        for (binding, _) in catalog.entries.iter().filter_map(|entry| entry.binding()) {
+            let block = binding.identity.descriptor_block()?;
+            w.owned.fill(0);
+            // Mark exact protected extents before reading the historical root.
+            // Attempting to share one with a business inode fails as an alias.
+            for s in system {
+                for b in s.run.physical..s.run.physical + s.run.count {
+                    mark(&mut w.owned, b)?;
+                }
+            }
+            w.inodes.fill(EMPTY);
+            read_inode_pages(block + 1, SLOT_MIRROR_BLOCKS, INODES, w, &mut read)?;
+            check_root(w.inodes[0])?;
+            scan_directories(&[], w, &mut read)?;
+            for (prior, inode) in w.history_generations.iter_mut().zip(&w.inodes) {
+                *prior = (*prior).max(inode.generation);
+            }
+            for (history, &owned) in w.history.iter_mut().zip(&w.owned) {
+                *history |= owned;
+            }
+        }
     }
+    w.owned.fill(0);
     for block in 0..DATA_START {
         mark(&mut w.owned, block)?;
     }
+    let (live, data) = read_inode_pages(INODE_START, 16, reserved_start, w, &mut read)?;
+    check_root(w.inodes[0])?;
+    if w.history_generations
+        .iter()
+        .zip(&w.inodes)
+        .any(|(&prior, live)| prior > live.generation)
+    {
+        return Err(Error::Conflict);
+    }
+    for s in system {
+        let inode = w.inodes[usize::from(s.inode)];
+        if inode.kind != 1
+            || inode.generation != s.generation
+            || inode.size != u64::from(s.run.count) * BLOCK as u64
+            || inode.extents != 1
+            || inode.runs[0] != s.run
+        {
+            return Err(Error::Conflict);
+        }
+    }
+    let mut historical_only = 0;
+    let mut released = 0;
+    for i in 0..4 {
+        read(BITMAP_START + i, &mut w.block)?;
+        let range = i as usize * BLOCK..(i as usize + 1) * BLOCK;
+        for (offset, ((&disk, &live), &history)) in w
+            .block
+            .iter()
+            .zip(&w.owned[range.clone()])
+            .zip(&w.history[range])
+            .enumerate()
+        {
+            let roots = live | history;
+            if let Some(after) = bitmap_after.as_deref_mut() {
+                if roots & !disk != 0 {
+                    return Err(Error::Conflict);
+                }
+                after[i as usize][offset] = roots;
+                released += (disk & !roots).count_ones();
+            } else if disk != roots {
+                return Err(Error::Conflict);
+            }
+            historical_only += (history & !live).count_ones();
+        }
+    }
+
+    Ok((
+        StructureEvidence {
+            live_inodes: live,
+            data_blocks: data,
+            directory_entries: scan_directories(system, w, &mut read)?,
+        },
+        historical_only,
+        released,
+    ))
+}
+
+fn check_root(root: Inode) -> Result<(), Error> {
+    if root.kind == 2 && root.generation == 1 && root.parent == 0 && root.parent_generation == 1 {
+        Ok(())
+    } else {
+        Err(Error::Invalid)
+    }
+}
+
+fn read_inode_pages(
+    first: u32,
+    pages: u32,
+    reserved_start: usize,
+    w: &mut Workspace,
+    mut read: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
+) -> Result<(u16, u32), Error> {
     let mut live = 0u16;
     let mut data = 0u32;
-    for page in 0..16u32 {
-        read(INODE_START + page, &mut w.block)?;
-        for i in 0..16usize {
-            let id = page as usize * 16 + i;
-            let inode = Inode::decode(&w.block[i * INODE_BYTES..(i + 1) * INODE_BYTES])?;
+    for page in 0..pages {
+        read(first + page, &mut w.block)?;
+        for (i, row) in w.block.chunks_exact(INODE_BYTES).enumerate() {
+            let id = page as usize * (BLOCK / INODE_BYTES) + i;
+            let inode = Inode::decode(row)?;
             if id >= reserved_start && inode != EMPTY {
                 return Err(Error::Conflict);
             }
@@ -342,24 +493,15 @@ fn scan_homes(
             }
         }
     }
-    let root = w.inodes[0];
-    if root.kind != 2 || root.generation != 1 || root.parent != 0 || root.parent_generation != 1 {
-        return Err(Error::Invalid);
-    }
-    for s in system {
-        let inode = w.inodes[usize::from(s.inode)];
-        if inode.kind != 1
-            || inode.generation != s.generation
-            || inode.size != u64::from(s.run.count) * BLOCK as u64
-            || inode.extents != 1
-            || inode.runs[0] != s.run
-        {
-            return Err(Error::Conflict);
-        }
-    }
-    if w.bitmap != w.owned {
-        return Err(Error::Conflict);
-    }
+    Ok((live, data))
+}
+
+fn scan_directories(
+    system: &[SystemExtent],
+    w: &mut Workspace,
+    mut read: impl FnMut(u32, &mut [u8; BLOCK]) -> Result<(), Error>,
+) -> Result<u32, Error> {
+    w.references.fill(0);
     let mut entries = 0u32;
     for dir in 0..INODES {
         let inode = w.inodes[dir];
@@ -471,11 +613,7 @@ fn scan_homes(
             cur = w.inodes[cur].parent as usize;
         }
     }
-    Ok(StructureEvidence {
-        live_inodes: live,
-        data_blocks: data,
-        directory_entries: entries,
-    })
+    Ok(entries)
 }
 
 #[cfg(test)]

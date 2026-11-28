@@ -45,9 +45,12 @@ pub(crate) use exceptions::hex;
 pub(crate) const HIGH: u64 = cyxia_platform_virt::HIGH_BASE;
 pub(crate) const SOFTWARE_PAN: u8 =
     cfg!(any(feature = "v020-production", feature = "unified-runtime")) as u8;
-// The legacy unified runtime may copy on any executing CPU. V0.20's
-// pointer-bearing endpoints currently dispatch on the control CPU only.
-pub(crate) const SECONDARY_COPY_WINDOWS: usize = if cfg!(feature = "unified-runtime") {
+// Every executing secondary with pointer-bearing syscalls has a private
+// TTBR1 copy descriptor and performs its own window invalidation.
+pub(crate) const SECONDARY_COPY_WINDOWS: usize = if cfg!(any(
+    feature = "unified-runtime",
+    cyxia_business_task_services
+)) {
     cyxia_contracts::BOOT_CPUS - 1
 } else {
     0

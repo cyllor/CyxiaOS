@@ -1,6 +1,12 @@
 //! Control calls for authenticated CPU0 roles in the authorized boot profile.
-//! The detached grant selects a real holder. It cannot install an observation
-//! producer, a decision scope, a plan owner or an executor.
+
+#[cfg(cyxia_business_package)]
+mod native;
+#[cfg(cyxia_business_package)]
+pub(super) use native::{
+    install_native, native_active, native_pending, publications_fenced, refresh_snapshot,
+    snapshot_due, tick_native,
+};
 
 use super::{copy_window::VerifiedSpan, now_ns, recovery, signed_resident::SignedCaller};
 use core::ptr::addr_of_mut;
@@ -15,11 +21,14 @@ use cyxia_kernel_core::{
         decision_record_v3::{DECISION_BYTES, DecisionRecordV3},
         role_manifest_v0199::{
             AUDIT_ACK, AUDIT_READ, CANDIDATE_SUBMIT, CONTROL_MASK, DECISION_REGISTER, EPOCH_ALLOC,
-            MODEL_MANAGE, NativeRole, PUBLISH_PLAN, READ_DECISIONS, Role, SNAPSHOT, TRIAL_D15,
-            VALIDATION_REGISTER,
+            MODEL_MANAGE, NativeRole, PUBLISH_PLAN, READ_DECISIONS, ROLES, Role, SNAPSHOT,
+            TRIAL_D15, VALIDATION_REGISTER,
         },
     },
-    security::{Error, syscall::Syscall, syscall_v3::ValidatedCall},
+    security::{
+        Error, durable_role_epoch_v0199::ConfirmedBootPolicy, syscall::Syscall,
+        syscall_v3::ValidatedCall,
+    },
 };
 
 const AUDIT_RIGHTS: u64 = AUDIT_READ | AUDIT_ACK;
@@ -56,14 +65,25 @@ pub(super) fn authorized(
     {
         return false;
     }
+    #[cfg(cyxia_business_package)]
+    if publications_fenced()
+        && matches!(member.role, Role::DeterministicController | Role::Publisher)
+        && matches!(operation, Syscall::ServiceCall | Syscall::SubmitPlan)
+    {
+        return false;
+    }
     match operation {
         Syscall::ReadSnapshot => first_arg == selector && capabilities & SNAPSHOT != 0,
         Syscall::SubmitPlan => member.role == Role::Publisher && capabilities & PUBLISH_PLAN != 0,
         Syscall::ServiceCall => {
             first_arg == selector && capabilities & service_rights(member.role) != 0
         }
-        // A plan-owner view or a role-12 D04 executor requires its own live
-        // binding. The eight CPU0 lifecycle roles do not hold those endpoints.
+        Syscall::QueryPlan if cfg!(cyxia_business_package) => match member.role {
+            Role::DeterministicController => capabilities & DECISION_REGISTER != 0,
+            Role::Publisher => capabilities & PUBLISH_PLAN != 0,
+            Role::Supervisor => capabilities & AUDIT_READ != 0,
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -71,7 +91,15 @@ pub(super) fn authorized(
 struct AuditTransport {
     caller: Option<Caller>,
     table: RpcTable,
-    pending_ack: Option<Ticket>,
+    closed: bool,
+    pending_ack: Option<PendingAck>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingAck {
+    ticket: Ticket,
+    seq: u64,
+    digest: [u8; 32],
 }
 
 impl AuditTransport {
@@ -79,16 +107,25 @@ impl AuditTransport {
         Self {
             caller: None,
             table: RpcTable::new(),
+            closed: false,
             pending_ack: None,
         }
     }
 }
 
-pub(super) const PROTECTED_BYTES: usize = core::mem::size_of::<AuditTransport>();
+pub(super) const PROTECTED_BYTES: usize = core::mem::size_of::<AuditTransport>() + {
+    #[cfg(cyxia_business_package)]
+    {
+        native::PROTECTED_BYTES
+    }
+    #[cfg(not(cyxia_business_package))]
+    {
+        0
+    }
+};
 
-// CPU0 binds the sole actual Supervisor once before EL0 entry. Only the
-// serialized signed CPU0 syscall adapter uses it thereafter. IRQs, other
-// CPUs, and recovery foreground I/O do not access the transport directly.
+// CPU0 alone binds, serves, retires and replaces the Supervisor transport.
+// Its disk owner settles admitted ACKs separately. IRQs never use either.
 #[unsafe(link_section = ".bss.sec_n")]
 static mut AUDIT_TRANSPORT: AuditTransport = AuditTransport::new();
 
@@ -99,6 +136,9 @@ pub(super) fn bind_audit(
     boot_epoch: u64,
 ) -> Result<(), Error> {
     if capabilities & AUDIT_RIGHTS == 0 {
+        if member.role == Role::Supervisor {
+            return recovery::audit_transport_online(member, false);
+        }
         return Ok(());
     }
     if cpu::slot() != 0
@@ -127,7 +167,140 @@ pub(super) fn bind_audit(
         .bind(caller, false)
         .map_err(|_| Error::Unauthorized)?;
     transport.caller = Some(caller);
+    recovery::audit_transport_online(member, capabilities & AUDIT_RIGHTS == AUDIT_RIGHTS)
+}
+
+pub(super) fn retire_role(index: usize, member: NativeRole, selector: u64) -> Result<(), Error> {
+    if cpu::slot() != 0 || ROLES.get(index) != Some(&member.role) {
+        return Err(Error::Unauthorized);
+    }
+    if member.role == Role::Supervisor {
+        // SAFETY: the root has stopped this exact TTBR0 and CPU0 serializes
+        // retirement with the synchronous transport and audit owner.
+        let transport = unsafe { &mut *addr_of_mut!(AUDIT_TRANSPORT) };
+        if let Some(caller) = transport.caller {
+            if caller.holder != member.actor || caller.cap != selector {
+                return Err(Error::Unauthorized);
+            }
+            transport.table.close(caller).map_err(transport_error)?;
+            transport.closed = true;
+        }
+        recovery::close_audit_reader(member)?;
+    }
+    #[cfg(cyxia_business_package)]
+    native::retire_role(index, member, selector)?;
     Ok(())
+}
+
+pub(super) fn restore_role(
+    index: usize,
+    old: NativeRole,
+    next: NativeRole,
+    capabilities: u64,
+    selector: u64,
+    policy: &ConfirmedBootPolicy<'_>,
+) -> Result<(), Error> {
+    if cpu::slot() != 0
+        || ROLES.get(index) != Some(&old.role)
+        || old.role != next.role
+        || old.actor.id != next.actor.id
+        || old.actor.generation.checked_add(1) != Some(next.actor.generation)
+        || policy.service_generation(next.role)? != next.actor.generation
+    {
+        return Err(Error::Unauthorized);
+    }
+    if next.role == Role::Supervisor {
+        restore_audit(old, next, capabilities, selector, policy)?;
+    }
+    #[cfg(cyxia_business_package)]
+    native::restore_role(index, old, next, capabilities, selector)?;
+    Ok(())
+}
+
+fn restore_audit(
+    old_member: NativeRole,
+    next: NativeRole,
+    capabilities: u64,
+    selector: u64,
+    policy: &ConfirmedBootPolicy<'_>,
+) -> Result<(), Error> {
+    // An optional carrier can exist without an EL0 transport grant.
+    if capabilities & AUDIT_RIGHTS == 0 {
+        recovery::replace_audit_reader(old_member, policy)?;
+        return recovery::audit_transport_online(next, false);
+    }
+    if !authorized(next, capabilities, selector, Syscall::ServiceCall, selector) {
+        return Err(Error::Unauthorized);
+    }
+    let replacement = Caller {
+        boot_epoch: policy.boot_epoch(),
+        holder: next.actor,
+        role: next.role.id(),
+        endpoint: selector,
+        cap: selector,
+    };
+    // SAFETY: the new root has not entered EL0. Only CPU0 runs these
+    // serialized callbacks and the audit disk borrow is non-reentrant.
+    let transport = unsafe { &mut *addr_of_mut!(AUDIT_TRANSPORT) };
+    let old = transport.caller.ok_or(Error::Unauthorized)?;
+    if old == replacement && !transport.closed {
+        return recovery::audit_transport_online(next, capabilities & AUDIT_RIGHTS == AUDIT_RIGHTS);
+    }
+    if old.holder != old_member.actor || !transport.closed {
+        return Err(Error::Unauthorized);
+    }
+    if let Some(pending) = transport.pending_ack {
+        transport
+            .table
+            .reconcile(
+                pending.ticket,
+                0,
+                old.holder.generation,
+                &[],
+                |caller, wire, _, _| {
+                    let request = Request::decode(wire)?;
+                    if caller != old
+                        || request.op != Op::AuditAck
+                        || u64_at(request.payload, 8) != pending.seq
+                        || request.payload[16..48] != pending.digest
+                    {
+                        return Err(RpcError::Auth);
+                    }
+                    recovery::verify_retired_ack(old_member, pending.seq, pending.digest)
+                        .map_err(security_error)
+                },
+            )
+            .map_err(transport_error)?;
+        transport.pending_ack = None;
+    }
+    transport
+        .table
+        .retire_closed(old, |_| {
+            // All terminal ACKs were established by independent durable
+            // read-back. Read caches are mere copies of retained audit records.
+            Ok(())
+        })
+        .map_err(transport_error)?;
+    transport
+        .table
+        .replace_closed(old, replacement, || {
+            recovery::replace_audit_reader(old_member, policy).map_err(security_error)
+        })
+        .map_err(transport_error)?;
+    transport.caller = Some(replacement);
+    transport.closed = false;
+    recovery::audit_transport_online(next, capabilities & AUDIT_RIGHTS == AUDIT_RIGHTS)
+}
+
+fn transport_error(error: RpcError) -> Error {
+    match error {
+        RpcError::Busy | RpcError::Again => Error::Busy,
+        RpcError::Stale => Error::Stale,
+        RpcError::Conflict => Error::Conflict,
+        RpcError::Capacity => Error::Capacity,
+        RpcError::Io => Error::Unknown,
+        _ => Error::Unauthorized,
+    }
 }
 
 fn fixed_rpc_rights(role: Role, operation: Op) -> u64 {
@@ -166,17 +339,19 @@ pub(super) fn dispatch(
     {
         return RpcError::Auth as i64;
     }
-    match call.operation {
-        // The signed startup catalog does not provision a SnapshotStore view
-        // or frozen registered decision/plan scope. Stop before copying data
-        // that cannot be matched to a protected target or registered receipt.
-        Syscall::ReadSnapshot | Syscall::SubmitPlan => RpcError::Again as i64,
-        Syscall::ServiceCall => match service_call(caller, capabilities, call.args) {
-            Ok(()) => 0,
-            Err(error) => error as i64,
-        },
-        _ => RpcError::Auth as i64,
-    }
+    let result = match call.operation {
+        #[cfg(cyxia_business_package)]
+        Syscall::ReadSnapshot => native::read_snapshot(caller, selector, call.args),
+        #[cfg(cyxia_business_package)]
+        Syscall::SubmitPlan => native::publish(caller, selector, call.args),
+        #[cfg(cyxia_business_package)]
+        Syscall::QueryPlan => native::query(caller, selector, call.args),
+        #[cfg(not(cyxia_business_package))]
+        Syscall::ReadSnapshot | Syscall::SubmitPlan => Err(RpcError::Again),
+        Syscall::ServiceCall => service_call(caller, capabilities, call.args),
+        _ => Err(RpcError::Auth),
+    };
+    result.map_or_else(|error| error as i64, |()| 0)
 }
 
 fn service_call(caller: &SignedCaller, capabilities: u64, args: [u64; 6]) -> Result<(), RpcError> {
@@ -203,25 +378,40 @@ fn service_call(caller: &SignedCaller, capabilities: u64, args: [u64; 6]) -> Res
     let wire = &mut storage[..len];
     source.copy_in(wire).map_err(|_| RpcError::Fault)?;
     if member.role == Role::DeterministicController {
-        DecisionRecordV3::decode(&wire[..DECISION_BYTES]).map_err(|_| RpcError::Format)?;
+        let decision =
+            DecisionRecordV3::decode(&wire[..DECISION_BYTES]).map_err(|_| RpcError::Format)?;
         if len == ASSISTED_BYTES {
             AdviceDispositionV1::decode(&wire[DECISION_BYTES..]).map_err(|_| RpcError::Format)?;
         }
         if cap < 8 {
             return Err(RpcError::Fault);
         }
-        VerifiedSpan::verify_signed(caller, args[4], cap, true).map_err(|_| RpcError::Fault)?;
+        let output =
+            VerifiedSpan::verify_signed(caller, args[4], cap, true).map_err(|_| RpcError::Fault)?;
+        #[cfg(cyxia_business_package)]
+        if len == DECISION_BYTES {
+            return native::register(caller, args, (&*wire).try_into().unwrap(), decision, output);
+        }
+        let _ = decision;
+        let _ = output;
         return Err(RpcError::Again);
     }
     let request = Request::decode(wire)?;
     if capabilities & fixed_rpc_rights(member.role, request.op) == 0 {
         return Err(RpcError::Auth);
     }
+    if recovery::audit_degraded() && matches!(request.op, Op::Promote | Op::TrialInstantiate) {
+        return Err(RpcError::Again);
+    }
     if cap < request.op.max_reply_len() {
         return Err(RpcError::Fault);
     }
     let output =
         VerifiedSpan::verify_signed(caller, args[4], cap, true).map_err(|_| RpcError::Fault)?;
+    #[cfg(cyxia_business_package)]
+    if member.role == Role::Publisher && matches!(request.op, Op::DecisionRead | Op::Ack) {
+        return native::read_decision(caller, args, wire, output);
+    }
     if member.role != Role::Supervisor
         || !matches!(request.op, Op::AuditRead | Op::AuditAck | Op::Ack)
     {
@@ -250,18 +440,18 @@ fn audit(
     cap: usize,
     output: VerifiedSpan<'_>,
 ) -> Result<(), RpcError> {
-    if !recovery::durable_available(member) {
-        return Err(RpcError::Again);
-    }
     // SAFETY: The signed task is stopped and CPU0 is serialized. No callback
     // below can enter EL0 or invoke this module again.
     let transport = unsafe { &mut *addr_of_mut!(AUDIT_TRANSPORT) };
     let caller = transport.caller.ok_or(RpcError::Auth)?;
-    if caller.holder != member.actor || caller.cap != selector {
+    if transport.closed || caller.holder != member.actor || caller.cap != selector {
         return Err(RpcError::Auth);
     }
     if request.expected_generation != caller.holder.generation {
         return Err(RpcError::Stale);
+    }
+    if !recovery::durable_available(member) {
+        return Err(RpcError::Again);
     }
     let generation = caller.holder.generation;
     let now = now_ns();
@@ -305,14 +495,21 @@ fn audit(
             }
         }
         Admission::Execute(ticket) => {
-            transport.pending_ack = Some(ticket);
             let (seq, digest) = audit_ack.ok_or(RpcError::Auth)?;
-            complete_ack(transport, member, ticket, seq, digest)?
+            let pending = PendingAck {
+                ticket,
+                seq,
+                digest,
+            };
+            transport.pending_ack = Some(pending);
+            complete_ack(transport, member, pending)?
         }
         Admission::Replay(reply) if reply.state() == State::Pending => {
-            let ticket = transport.pending_ack.ok_or(RpcError::Stale)?;
-            let (seq, digest) = audit_ack.ok_or(RpcError::Auth)?;
-            complete_ack(transport, member, ticket, seq, digest)?
+            let pending = transport.pending_ack.ok_or(RpcError::Stale)?;
+            if audit_ack != Some((pending.seq, pending.digest)) {
+                return Err(RpcError::Conflict);
+            }
+            complete_ack(transport, member, pending)?
         }
         Admission::Replay(reply) | Admission::Acknowledged(reply) => reply,
     };
@@ -338,11 +535,9 @@ fn audit(
 fn complete_ack(
     transport: &mut AuditTransport,
     member: NativeRole,
-    ticket: Ticket,
-    seq: u64,
-    digest: [u8; 32],
+    pending: PendingAck,
 ) -> Result<Frame, RpcError> {
-    let (status, code) = match recovery::ack_durable(member, seq, digest) {
+    let (status, code) = match recovery::ack_durable(member, pending.seq, pending.digest) {
         Ok(()) => (State::Done, 0),
         // The 0x50 caller retries its original bytes. The admitted ticket
         // keeps the request and completion credit while foreground flush runs.
@@ -351,14 +546,16 @@ fn complete_ack(
         Err(error) => (State::Done, security_error(error) as i32),
     };
     let frame = transport.table.complete(
-        ticket,
+        pending.ticket,
         status,
         code,
         member.actor.generation,
         &[],
         || Ok(()),
     )?;
-    transport.pending_ack = None;
+    if status == State::Done {
+        transport.pending_ack = None;
+    }
     Ok(frame)
 }
 

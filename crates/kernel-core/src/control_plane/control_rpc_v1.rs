@@ -395,11 +395,23 @@ impl RpcTable {
         self.slots[i].caller = Some(caller);
         Ok(())
     }
-    fn slot(&mut self, caller: Caller) -> Result<&mut Slot, Error> {
+    fn slot_index(&self, caller: Caller) -> Result<usize, Error> {
         self.slots
-            .iter_mut()
-            .find(|s| s.caller == Some(caller))
+            .iter()
+            .position(|s| s.caller == Some(caller))
             .ok_or(Error::Auth)
+    }
+    fn slot(&mut self, caller: Caller) -> Result<&mut Slot, Error> {
+        let i = self.slot_index(caller)?;
+        Ok(&mut self.slots[i])
+    }
+    /// A report must come from the same live endpoint as the fetch RPC.
+    /// Checking the stream does not execute or acknowledge a request.
+    pub(super) fn check_live(&self, caller: Caller) -> Result<(), Error> {
+        if self.slots[self.slot_index(caller)?].closed {
+            return Err(Error::Stale);
+        }
+        Ok(())
     }
     /// Native admission additionally authenticates the current endpoint
     /// and task for *every* call, including ACK and read-only replay.

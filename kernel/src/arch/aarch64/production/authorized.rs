@@ -29,6 +29,8 @@ mod role_loader;
 #[cfg(cyxia_business_package)]
 pub(super) mod signed_business;
 mod signed_control;
+#[cfg(cyxia_business_package)]
+mod signed_d01;
 #[path = "signed_resident.rs"]
 mod signed_resident;
 mod signed_syscalls;

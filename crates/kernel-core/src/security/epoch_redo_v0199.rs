@@ -5,7 +5,10 @@
 //! at a different location or release the pending durable identity.
 use super::{
     Error,
-    durable_role_epoch_v0199::{CommitEvidence, DurableEpochGate, PreparedEpoch, RedoPlacement},
+    durable_role_epoch_v0199::{
+        Change, CommitEvidence, DurableEpochGate, Outcome, PreparedEpoch, RedoPlacement,
+        StopEvidence,
+    },
     file_index_v0199::{BLOCK_BYTES, SecurityStateStoreV2},
     file_media_v0199::{
         BLOCK_COUNT, DATA_START, SuperblockV1, crc32c_payload, crc32c_zeroed, verify_state_redo_v1,
@@ -107,6 +110,21 @@ pub struct OneStateRedo {
     pub redo: [u8; 2 * BLOCK_BYTES],
     pub commit: [u8; BLOCK_BYTES],
 }
+
+/// Progress of the single CPU0-owned runtime append. An uncertain I/O
+/// completion freezes this exact ticket and extent until a cold reconcile.
+pub struct ServiceRestartAppend {
+    ticket: PreparedEpoch,
+    placement: RedoPlacement,
+    phase: u8,
+}
+
+impl ServiceRestartAppend {
+    pub fn matches_stop(&self, stop: StopEvidence) -> bool {
+        self.ticket.change == Change::Restart(stop)
+    }
+}
+
 impl OneStateRedo {
     pub const fn zeroed() -> Self {
         Self {
@@ -137,6 +155,134 @@ impl OneStateRedo {
             .chain(self.commit.iter())
             .all(|v| *v == 0)
     }
+
+    fn record(&self, offset: u32) -> &[u8; BLOCK_BYTES] {
+        match offset {
+            0 => &self.begin,
+            1 => self.redo.first_chunk().unwrap(),
+            2 => self.redo.last_chunk().unwrap(),
+            3 => &self.commit,
+            _ => unreachable!("bounded single-state redo offset"),
+        }
+    }
+
+    pub(super) fn prepare_restart(
+        &mut self,
+        gate: &mut DurableEpochGate,
+        sb: SuperblockV1,
+        placement: RedoPlacement,
+        stop: StopEvidence,
+        verify_stop: impl FnOnce(StopEvidence) -> Result<(), Error>,
+    ) -> Result<ServiceRestartAppend, Error> {
+        Self::extent(placement.first)?;
+        if gate.boot_epoch() != Some(sb.generation)
+            || placement.fs_uuid != sb.fs_uuid
+            || placement.log_epoch != sb.log_epoch
+            || placement.boot_home.is_some()
+            || placement.txid == 0
+            || !(DATA_START..BLOCK_COUNT).contains(&placement.state_home)
+            || placement
+                .commit_lsn
+                .checked_sub(2)
+                .is_none_or(|lsn| lsn <= sb.checkpoint_lsn)
+        {
+            return Err(Error::Conflict);
+        }
+        let ticket = gate.prepare(Change::Restart(stop), verify_stop)?;
+        let image = gate.after_image(ticket)?;
+        self.encode(
+            sb,
+            placement.state_home,
+            placement.txid,
+            placement.commit_lsn,
+            &image,
+        )?;
+        self.verify(
+            sb,
+            placement.first,
+            placement.state_home,
+            placement.txid,
+            placement.commit_lsn,
+        )?;
+        gate.claim_redo_once(ticket, placement, |_| Ok(()))?;
+        Ok(ServiceRestartAppend {
+            ticket,
+            placement,
+            phase: 0,
+        })
+    }
+
+    pub(super) fn step_restart(
+        &self,
+        io: &mut impl EpochBlockIo,
+        gate: &mut DurableEpochGate,
+        work: &mut ServiceRestartAppend,
+        superblock_raw: &[u8; BLOCK_BYTES],
+        scratch: &mut [u8; BLOCK_BYTES],
+    ) -> Result<Option<Outcome>, Error> {
+        let place = work.placement;
+        let step = match work.phase {
+            0..=3 => {
+                let block = place.first + u32::from(work.phase);
+                io.read(block, scratch).and_then(|()| {
+                    if scratch.iter().all(|&byte| byte == 0) {
+                        Ok(())
+                    } else {
+                        Err(Error::Conflict)
+                    }
+                })
+            }
+            4..=6 | 8 => {
+                let offset = u32::from(if work.phase == 8 { 3 } else { work.phase - 4 });
+                io.write(place.first + offset, self.record(offset))
+            }
+            7 | 9 => io.flush(),
+            10..=13 => {
+                let offset = u32::from(work.phase - 10);
+                io.read(place.first + offset, scratch).and_then(|()| {
+                    if scratch == self.record(offset) {
+                        Ok(())
+                    } else {
+                        Err(Error::Unknown)
+                    }
+                })
+            }
+            14 => {
+                let receipt = CommitEvidence {
+                    fs_uuid: place.fs_uuid,
+                    log_epoch: place.log_epoch,
+                    txid: place.txid,
+                    commit_lsn: place.commit_lsn,
+                    after_digest: work.ticket.after_digest,
+                };
+                // The serialized phase cursor reaches this only after both
+                // device FLUSHes and byte-exact independent readback.
+                work.phase = u8::MAX;
+                return gate
+                    .confirm_from_redo(
+                        work.ticket,
+                        receipt,
+                        self.image(),
+                        superblock_raw,
+                        place.first,
+                        u64::from(place.state_home),
+                        &self.begin,
+                        &[&self.redo],
+                        &self.commit,
+                        |_, _| Ok(()),
+                    )
+                    .map(Some);
+            }
+            _ => return Err(Error::Unknown),
+        };
+        if let Err(error) = step {
+            let wrote = work.phase >= 4;
+            work.phase = u8::MAX;
+            return Err(if wrote { Error::Unknown } else { error });
+        }
+        work.phase += 1;
+        Ok(None)
+    }
     pub fn image(&self) -> &[u8; BLOCK_BYTES] {
         self.redo[64..64 + BLOCK_BYTES].try_into().unwrap()
     }
@@ -164,6 +310,47 @@ impl OneStateRedo {
             return Err(Error::Conflict);
         }
         Ok(state)
+    }
+
+    /// Check surviving bytes against the exact native encoder. A preparation
+    /// has a zero COMMIT and an ordered materialized prefix. After the
+    /// successor checkpoint, matching blocks may already have been retired.
+    pub fn verify_materialized(
+        &self,
+        expected: &mut Self,
+        sb: SuperblockV1,
+        placement: RedoPlacement,
+        state: &SecurityStateStoreV2,
+        checkpointed: bool,
+    ) -> Result<u8, Error> {
+        Self::extent(placement.first)?;
+        if placement.fs_uuid != sb.fs_uuid || placement.log_epoch != sb.log_epoch {
+            return Err(Error::Conflict);
+        }
+        expected.encode(
+            sb,
+            placement.state_home,
+            placement.txid,
+            placement.commit_lsn,
+            &state.encode()?,
+        )?;
+        if !checkpointed && self.commit.iter().any(|&b| b != 0) {
+            return Err(Error::Conflict);
+        }
+        let mut present = 0;
+        let mut missing = false;
+        for offset in 0..4 {
+            let actual = self.record(offset);
+            let expected = expected.record(offset);
+            if actual.iter().all(|&b| b == 0) {
+                missing |= expected.iter().any(|&b| b != 0);
+            } else if !checkpointed && missing || actual != expected {
+                return Err(Error::Conflict);
+            } else {
+                present |= 1 << offset;
+            }
+        }
+        Ok(present)
     }
     fn encode(
         &mut self,

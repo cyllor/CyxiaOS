@@ -39,6 +39,21 @@ impl PlanKey {
     pub fn valid(self) -> bool {
         self.boot_epoch != 0 && self.controller_epoch != 0 && self.plan_seq != 0
     }
+
+    pub fn decode(frame: &[u8]) -> Result<Self, Error> {
+        if frame.len() != 24 {
+            return Err(Error::Invalid);
+        }
+        let key = Self {
+            boot_epoch: le64(frame, 0)?,
+            controller_epoch: le64(frame, 8)?,
+            plan_seq: le64(frame, 16)?,
+        };
+        if !key.valid() {
+            return Err(Error::Invalid);
+        }
+        Ok(key)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionStatus {
@@ -433,6 +448,20 @@ pub struct PlanQueryReplyV3 {
     pub terminal_count: u16,
 }
 impl PlanQueryReplyV3 {
+    pub fn encode(self) -> Result<[u8; PLAN_QUERY_BYTES], Error> {
+        let mut frame = [0; PLAN_QUERY_BYTES];
+        frame[0..8].copy_from_slice(&self.key.boot_epoch.to_le_bytes());
+        frame[8..16].copy_from_slice(&self.key.controller_epoch.to_le_bytes());
+        frame[16..24].copy_from_slice(&self.key.plan_seq.to_le_bytes());
+        frame[24..32].copy_from_slice(&self.plan_version.to_le_bytes());
+        frame[32..34].copy_from_slice(&self.state.to_le_bytes());
+        frame[36..40].copy_from_slice(&self.result.to_le_bytes());
+        frame[40..42].copy_from_slice(&self.action_count.to_le_bytes());
+        frame[42..44].copy_from_slice(&self.terminal_count.to_le_bytes());
+        Self::decode(&frame)?;
+        Ok(frame)
+    }
+
     /// Reply status is query-only; it never grants new registration or
     /// changes a plan's actual hardware/persistent completion state.
     pub fn decode(frame: &[u8]) -> Result<Self, Error> {
@@ -443,15 +472,10 @@ impl PlanQueryReplyV3 {
             return Err(Error::Invalid);
         }
         let state = le16(frame, 32)?;
-        let key = PlanKey {
-            boot_epoch: le64(frame, 0)?,
-            controller_epoch: le64(frame, 8)?,
-            plan_seq: le64(frame, 16)?,
-        };
+        let key = PlanKey::decode(&frame[..24])?;
         let count = le16(frame, 40)?;
         let term = le16(frame, 42)?;
-        if !key.valid()
-            || !(1..=5).contains(&state)
+        if !(1..=5).contains(&state)
             || count == 0
             || usize::from(count) > MAX_ACTIONS
             || term > count
@@ -784,7 +808,11 @@ mod tests {
         raw[32..34].copy_from_slice(&4u16.to_le_bytes());
         raw[40..42].copy_from_slice(&1u16.to_le_bytes());
         raw[42..44].copy_from_slice(&1u16.to_le_bytes());
-        assert_eq!(PlanQueryReplyV3::decode(&raw).unwrap().state, 4);
+        let reply = PlanQueryReplyV3::decode(&raw).unwrap();
+        assert_eq!(reply.state, 4);
+        assert_eq!(reply.encode().unwrap(), raw);
+        assert_eq!(PlanKey::decode(&raw[..24]), Ok(reply.key));
+        assert_eq!(PlanKey::decode(&raw[..25]), Err(Error::Invalid));
         raw[42..44].copy_from_slice(&0u16.to_le_bytes());
         assert!(PlanQueryReplyV3::decode(&raw).is_err());
         raw[42..44].copy_from_slice(&1u16.to_le_bytes());

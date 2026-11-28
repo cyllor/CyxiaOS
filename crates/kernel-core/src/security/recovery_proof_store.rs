@@ -28,6 +28,7 @@ pub const LOCATOR_BYTES: usize = 104;
 const LOCATOR_DOMAIN: &[u8; 21] = b"CYX/RECOVERY-STORE/v1";
 const PAGE_DOMAIN: &[u8] = b"CYX/RECOVERY-PROOF-PAGE/v1";
 const PAGE_MAGIC: &[u8; 8] = b"CYXRPR01";
+const SPILL_PAGE_MAGIC: &[u8; 8] = b"CYXRPR02";
 const RECORDS: usize = 8;
 const PROOFS_START: usize = 160;
 const WRITER_START: usize = PROOFS_START + RECORDS * RECOVERY_PROOF_BYTES;
@@ -35,10 +36,20 @@ const WRITER_BYTES: usize = 56;
 // CPU0 keeps its existing location. Empty CPU1–3 entries reproduce the
 // zero padding of the earlier CPU0-only pages.
 const WRITER_END: usize = WRITER_START + WRITER_BYTES * ACCUMULATOR_COUNT;
+// A spill record uses the canonical non-reserved prefix of RecoveryProof v2.
+// Each CPU can retain two unresolved boot generations, even if another CPU
+// continues accumulating while all eight published records await ACK.
+const PROOF_PREFIX: usize = 160;
+const SPILL_PER_CPU: usize = 2;
+const SPILL_RECORDS: usize = SPILL_PER_CPU * ACCUMULATOR_COUNT;
+const SPILL_START: usize = WRITER_END + 40;
+const SPILL_BYTES: usize = 8 + PROOF_PREFIX;
+const SATURATED_PROOF: usize = SPILL_START + SPILL_RECORDS * SPILL_BYTES;
+const SPILL_END: usize = SATURATED_PROOF + PROOF_PREFIX;
 const PAGE_SEAL: usize = BLOCK - 32;
 const AUDIT_PAYLOAD: usize = 144;
 const ACL_BYTES: usize = 64;
-const _: () = assert!(WRITER_END <= PAGE_SEAL);
+const _: () = assert!(SPILL_END <= PAGE_SEAL);
 
 type Hash = [u8; 32];
 
@@ -132,6 +143,14 @@ impl RecoveryLocator {
         self.carrier == other.carrier
     }
 
+    pub const fn inode_slot(self) -> u32 {
+        self.inode
+    }
+
+    pub const fn physical_blocks(self) -> core::ops::Range<u32> {
+        self.first_block..self.first_block + 2
+    }
+
     fn verify_file(
         self,
         mounted: &MountEvidence,
@@ -151,13 +170,23 @@ impl RecoveryLocator {
         let offset = inode_at % BLOCK;
         let raw_inode: [u8; INODE_BYTES] =
             scratch[offset..offset + INODE_BYTES].try_into().unwrap();
-        let inode = Inode::decode(&raw_inode)?;
         let acl_at = self.inode as usize * ACL_BYTES;
         io.read(acl_home + (acl_at / BLOCK) as u32, scratch)?;
         let offset = acl_at % BLOCK;
         let raw_acl = &scratch[offset..offset + ACL_BYTES];
+        self.verify_file_metadata(&raw_inode, raw_acl)
+    }
+
+    /// Validate the signed carrier's exact immutable inode and ACL bytes.
+    /// The enclosing file owner must also reserve its two raw data blocks.
+    pub fn verify_file_metadata(
+        self,
+        raw_inode: &[u8; INODE_BYTES],
+        raw_acl: &[u8],
+    ) -> Result<(), Error> {
+        let inode = Inode::decode(raw_inode)?;
         let acl = Acl::decode(raw_acl)?;
-        if hash(&[&raw_inode, raw_acl]) != self.metadata_digest
+        if hash(&[raw_inode, raw_acl]) != self.metadata_digest
             || inode.kind != 1
             || inode.generation != self.inode_generation
             || inode.size != (2 * BLOCK) as u64
@@ -247,6 +276,283 @@ impl Writer {
                 && self.count != 0
                 && self.digest != [0; 32])
     }
+
+    fn covers(self, prior: Self) -> bool {
+        prior == Self::EMPTY
+            || self.boot > prior.boot
+            || self.boot == prior.boot
+                && (self == prior
+                    || self.generation >= prior.generation && self.count > prior.count)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProofPersistence {
+    Queued { sequence: u64 },
+    Deferred,
+    Saturated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuditStatus {
+    pub pending: u64,
+    pub retired: u64,
+    pub deferred: u64,
+    /// Historical number of events that had to be counted without a replay
+    /// slot. This count saturates and remains visible after the FIFO drains.
+    pub saturated: u64,
+    pub first_saturated_boot: u64,
+    pub last_saturated_boot: u64,
+    pub saturated_cpu_mask: u32,
+    pub reader_available: bool,
+    pub uncertain: bool,
+}
+
+impl AuditStatus {
+    pub const fn fifo_full(self) -> bool {
+        self.pending == RECORDS as u64
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct DeferredProof {
+    since: u64,
+    proof: RecoveryProofV2,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Spill {
+    operations: u64,
+    deferred: [Option<DeferredProof>; SPILL_RECORDS],
+    saturated: u64,
+    first_saturated_boot: u64,
+    last_saturated_boot: u64,
+    saturated_cpu_mask: u32,
+    last_saturated_proof: Option<RecoveryProofV2>,
+}
+
+impl Spill {
+    const EMPTY: Self = Self {
+        operations: 0,
+        deferred: [None; SPILL_RECORDS],
+        saturated: 0,
+        first_saturated_boot: 0,
+        last_saturated_boot: 0,
+        saturated_cpu_mask: 0,
+        last_saturated_proof: None,
+    };
+
+    fn decode(raw: &[u8; BLOCK], extended: bool) -> Result<Self, Error> {
+        if !extended {
+            if raw[WRITER_END..PAGE_SEAL].iter().any(|&byte| byte != 0) {
+                return Err(Error::Conflict);
+            }
+            return Ok(Self::EMPTY);
+        }
+        let mut spill = Self {
+            operations: u64at(raw, WRITER_END),
+            saturated: u64at(raw, WRITER_END + 8),
+            first_saturated_boot: u64at(raw, WRITER_END + 16),
+            last_saturated_boot: u64at(raw, WRITER_END + 24),
+            saturated_cpu_mask: u32at(raw, WRITER_END + 32),
+            last_saturated_proof: decode_proof_prefix(&raw[SATURATED_PROOF..SPILL_END])?,
+            ..Self::EMPTY
+        };
+        if spill.operations == 0
+            || raw[WRITER_END + 36..SPILL_START]
+                .iter()
+                .any(|&byte| byte != 0)
+            || raw[SPILL_END..PAGE_SEAL].iter().any(|&byte| byte != 0)
+        {
+            return Err(Error::Conflict);
+        }
+        for (index, entry) in spill.deferred.iter_mut().enumerate() {
+            let offset = SPILL_START + index * SPILL_BYTES;
+            let since = u64at(raw, offset);
+            let proof = decode_proof_prefix(&raw[offset + 8..offset + SPILL_BYTES])?;
+            *entry = match (since, proof) {
+                (0, None) => None,
+                (since, Some(proof))
+                    if since != 0 && proof.cpu_id as usize == index / SPILL_PER_CPU =>
+                {
+                    Some(DeferredProof { since, proof })
+                }
+                _ => return Err(Error::Conflict),
+            };
+        }
+        Ok(spill)
+    }
+
+    fn validate(
+        &self,
+        generation: u64,
+        boot: u64,
+        mut queued: [Writer; ACCUMULATOR_COUNT],
+        writers: &[Writer; ACCUMULATOR_COUNT],
+    ) -> Result<(), Error> {
+        for (index, entry) in self.deferred.iter().enumerate() {
+            let Some(entry) = entry else { continue };
+            let cpu_start = index / SPILL_PER_CPU * SPILL_PER_CPU;
+            if self.deferred[cpu_start..index]
+                .iter()
+                .flatten()
+                .any(|previous| previous.proof.boot_epoch == entry.proof.boot_epoch)
+            {
+                return Err(Error::Conflict);
+            }
+        }
+        let mut since = 0;
+        let retained = || self.deferred.iter().flatten();
+        for _ in retained() {
+            let entry = retained()
+                .filter(|entry| entry.since > since)
+                .min_by_key(|entry| entry.since)
+                .ok_or(Error::Conflict)?;
+            if entry.since > generation {
+                return Err(Error::Conflict);
+            }
+            since = entry.since;
+            advance_writer(&entry.proof, boot, &mut queued)?;
+        }
+        if queued
+            .iter()
+            .zip(writers)
+            .any(|(&pending, &intake)| !intake.covers(pending))
+        {
+            return Err(Error::Conflict);
+        }
+        match self.last_saturated_proof {
+            Some(proof) => {
+                let mut validated = [Writer::EMPTY; ACCUMULATOR_COUNT];
+                advance_writer(&proof, boot, &mut validated)?;
+                let cpu = proof.cpu_id as usize;
+                if self.saturated == 0
+                    || !(1..=proof.boot_epoch).contains(&self.first_saturated_boot)
+                    || self.last_saturated_boot != proof.boot_epoch
+                    || self.saturated_cpu_mask & (1 << cpu) == 0
+                    || self.saturated_cpu_mask >> ACCUMULATOR_COUNT != 0
+                    || !writers[cpu].covers(validated[cpu])
+                {
+                    return Err(Error::Conflict);
+                }
+            }
+            None if self.saturated != 0
+                || self.first_saturated_boot != 0
+                || self.last_saturated_boot != 0
+                || self.saturated_cpu_mask != 0 =>
+            {
+                return Err(Error::Conflict);
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn encode(&self, out: &mut [u8; BLOCK]) {
+        put64(out, WRITER_END, self.operations);
+        put64(out, WRITER_END + 8, self.saturated);
+        put64(out, WRITER_END + 16, self.first_saturated_boot);
+        put64(out, WRITER_END + 24, self.last_saturated_boot);
+        out[WRITER_END + 32..WRITER_END + 36]
+            .copy_from_slice(&self.saturated_cpu_mask.to_le_bytes());
+        for (index, entry) in self.deferred.iter().enumerate() {
+            if let Some(entry) = entry {
+                let offset = SPILL_START + index * SPILL_BYTES;
+                put64(out, offset, entry.since);
+                encode_proof_prefix(&entry.proof, &mut out[offset + 8..offset + SPILL_BYTES]);
+            }
+        }
+        if let Some(proof) = self.last_saturated_proof {
+            encode_proof_prefix(&proof, &mut out[SATURATED_PROOF..SPILL_END]);
+        }
+    }
+
+    fn oldest(&self) -> Option<usize> {
+        self.deferred
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.as_ref().map(|entry| (entry.since, index)))
+            .min()
+            .map(|(_, index)| index)
+    }
+
+    fn ingest(
+        &mut self,
+        proof: RecoveryProofV2,
+        prior: Writer,
+        generation: u64,
+    ) -> Result<ProofPersistence, Error> {
+        self.operations = self.operations.checked_add(1).ok_or(Error::Exhausted)?;
+        let start = proof.cpu_id as usize * SPILL_PER_CPU;
+        let rows = &mut self.deferred[start..start + SPILL_PER_CPU];
+        if let Some(existing) = rows
+            .iter_mut()
+            .flatten()
+            .find(|row| row.proof.boot_epoch == proof.boot_epoch)
+        {
+            if !can_coalesce(&existing.proof, &proof) {
+                return Err(Error::Conflict);
+            }
+            existing.proof = proof;
+            return Ok(ProofPersistence::Deferred);
+        }
+        if let Some(empty) = rows.iter_mut().find(|row| row.is_none()) {
+            *empty = Some(DeferredProof {
+                since: generation,
+                proof,
+            });
+            return Ok(ProofPersistence::Deferred);
+        }
+        // Even repeated cold starts cannot evict either retained proof. At
+        // the bound, keep a sticky event-count lower bound and the most
+        // recent actual input as a witness for the adjacent page transition.
+        let delta = if prior.boot == proof.boot_epoch {
+            proof
+                .total_count
+                .checked_sub(prior.count)
+                .ok_or(Error::Conflict)?
+        } else {
+            proof.total_count
+        };
+        if self.saturated == 0 {
+            self.first_saturated_boot = proof.boot_epoch;
+        }
+        self.saturated = self.saturated.saturating_add(delta);
+        self.last_saturated_boot = proof.boot_epoch;
+        self.saturated_cpu_mask |= 1 << proof.cpu_id;
+        self.last_saturated_proof = Some(proof);
+        Ok(ProofPersistence::Saturated)
+    }
+}
+
+fn can_coalesce(prior: &RecoveryProofV2, proof: &RecoveryProofV2) -> bool {
+    let delta = proof.total_count.checked_sub(prior.total_count);
+    let events = proof
+        .unknown_count
+        .checked_sub(prior.unknown_count)
+        .and_then(|value| value.checked_add(proof.revoke_count.checked_sub(prior.revoke_count)?))
+        .and_then(|value| {
+            value.checked_add(proof.recovery_count.checked_sub(prior.recovery_count)?)
+        });
+    proof.cpu_generation == prior.cpu_generation
+        && delta
+            .zip(events)
+            .is_some_and(|(delta, events)| delta > 0 && events <= delta)
+}
+
+fn decode_proof_prefix(raw: &[u8]) -> Result<Option<RecoveryProofV2>, Error> {
+    if raw.iter().all(|&byte| byte == 0) {
+        return Ok(None);
+    }
+    let mut canonical = [0; RECOVERY_PROOF_BYTES];
+    canonical[..PROOF_PREFIX].copy_from_slice(raw);
+    RecoveryProofV2::decode(&canonical).map(Some)
+}
+
+fn encode_proof_prefix(proof: &RecoveryProofV2, out: &mut [u8]) {
+    let mut canonical = [0; RECOVERY_PROOF_BYTES];
+    proof.encode(&mut canonical);
+    out.copy_from_slice(&canonical[..PROOF_PREFIX]);
 }
 
 #[derive(Clone, Copy)]
@@ -260,6 +566,7 @@ struct Page {
     writers: [Writer; ACCUMULATOR_COUNT],
     proofs: [Option<RecoveryProofV2>; RECORDS],
     count: usize,
+    spill: Spill,
 }
 
 impl Page {
@@ -277,13 +584,22 @@ impl Page {
         writers: [Writer::EMPTY; ACCUMULATOR_COUNT],
         proofs: [None; RECORDS],
         count: 0,
+        spill: Spill::EMPTY,
     };
 
     fn decode(raw: &[u8; BLOCK], carrier: Hash, slot: u64, last_boot: u64) -> Result<Self, Error> {
         if raw.iter().all(|&byte| byte == 0) {
             return Ok(Self::EMPTY);
         }
+        let extended = match &raw[..8] {
+            magic if magic == PAGE_MAGIC => false,
+            magic if magic == SPILL_PAGE_MAGIC => true,
+            _ => return Err(Error::Conflict),
+        };
         let seal = hash(&[PAGE_DOMAIN, &raw[..PAGE_SEAL]]);
+        if raw[8..40] != carrier || raw[PAGE_SEAL..] != seal {
+            return Err(Error::Conflict);
+        }
         let mut page = Self {
             generation: u64at(raw, 40),
             boot: u64at(raw, 48),
@@ -305,12 +621,10 @@ impl Page {
                     digest: raw[offset + 24..offset + WRITER_BYTES].try_into().unwrap(),
                 }
             }),
+            spill: Spill::decode(raw, extended)?,
             ..Self::EMPTY
         };
-        if raw[..8] != *PAGE_MAGIC
-            || raw[8..40] != carrier
-            || raw[PAGE_SEAL..] != seal
-            || page.generation == 0
+        if page.generation == 0
             || (page.generation - 1) % 2 != slot
             || !(1..=last_boot).contains(&page.boot)
             || page.count > RECORDS
@@ -331,6 +645,7 @@ impl Page {
                 .retired
                 .checked_mul(2)
                 .and_then(|n| n.checked_add(page.count as u64))
+                .and_then(|n| n.checked_add(page.spill.operations))
                 != Some(page.generation)
         {
             return Err(Error::Conflict);
@@ -343,12 +658,16 @@ impl Page {
             *slot = Some(proof);
         }
         let end = PROOFS_START + page.count * RECOVERY_PROOF_BYTES;
-        if last
+        if raw[end..WRITER_START].iter().any(|&byte| byte != 0) {
+            return Err(Error::Conflict);
+        }
+        if extended {
+            page.spill
+                .validate(page.generation, page.boot, last, &page.writers)?;
+        } else if last
             .iter()
             .zip(page.writers)
             .any(|(&retained, writer)| retained != Writer::EMPTY && retained != writer)
-            || raw[end..WRITER_START].iter().any(|&byte| byte != 0)
-            || raw[WRITER_END..PAGE_SEAL].iter().any(|&byte| byte != 0)
         {
             return Err(Error::Conflict);
         }
@@ -357,7 +676,11 @@ impl Page {
 
     fn encode(&mut self, carrier: Hash, out: &mut [u8; BLOCK]) {
         out.fill(0);
-        out[..8].copy_from_slice(PAGE_MAGIC);
+        out[..8].copy_from_slice(if self.spill.operations == 0 {
+            PAGE_MAGIC
+        } else {
+            SPILL_PAGE_MAGIC
+        });
         out[8..40].copy_from_slice(&carrier);
         for (at, v) in [
             (40, self.generation),
@@ -386,6 +709,9 @@ impl Page {
             put64(out, offset + 16, writer.count);
             out[offset + 24..offset + WRITER_BYTES].copy_from_slice(&writer.digest);
         }
+        if self.spill.operations != 0 {
+            self.spill.encode(out);
+        }
         self.seal = hash(&[PAGE_DOMAIN, &out[..PAGE_SEAL]]);
         out[PAGE_SEAL..].copy_from_slice(&self.seal);
     }
@@ -397,20 +723,13 @@ impl Page {
         {
             return false;
         }
+        if self.spill.operations != prior.spill.operations {
+            return self.follows_spill(prior);
+        }
         if self.retired == prior.retired && self.count == prior.count + 1 {
             return self.ack == prior.ack
                 && self.proofs[..prior.count] == prior.proofs[..prior.count]
-                && self.proofs[prior.count].is_some_and(|proof| {
-                    // Decode and append both validate this CPU index before
-                    // constructing a page.
-                    let cpu = proof.cpu_id as usize;
-                    let writer = Writer::from_proof(&proof);
-                    let mut writers = prior.writers;
-                    writers[cpu] = writer;
-                    proof.boot_epoch == self.boot
-                        && writer.advances(prior.writers[cpu], &proof)
-                        && self.writers == writers
-                });
+                && self.proofs[prior.count].is_some_and(|proof| self.follows_append(prior, proof));
         }
         prior.count == self.count + 1
             && prior.retired.checked_add(1) == Some(self.retired)
@@ -418,7 +737,61 @@ impl Page {
             && self.ack.generation >= prior.ack.generation
             && self.ack.digest == audit_digest(self.retired, &prior.proofs[0].unwrap())
             && self.writers == prior.writers
+            && self.spill == prior.spill
             && self.proofs[..self.count] == prior.proofs[1..prior.count]
+    }
+
+    fn follows_append(&self, prior: &Self, proof: RecoveryProofV2) -> bool {
+        if let Some(index) = prior.spill.oldest() {
+            // A deferred writer may be from an archived boot. Its intake
+            // floor already advanced on deferral, and another boot may
+            // have advanced it again. Promotion only consumes this slot.
+            let mut spill = prior.spill;
+            let pending = spill.deferred[index].take().unwrap();
+            proof == pending.proof && self.writers == prior.writers && self.spill == spill
+        } else {
+            let mut writers = prior.writers;
+            proof.boot_epoch == self.boot
+                && advance_writer(&proof, self.boot, &mut writers).is_ok()
+                && self.writers == writers
+                && self.spill == prior.spill
+        }
+    }
+
+    fn follows_spill(&self, prior: &Self) -> bool {
+        if self.retired != prior.retired
+            || self.ack != prior.ack
+            || self.count != RECORDS
+            || self.count != prior.count
+            || self.proofs != prior.proofs
+            || prior.spill.operations.checked_add(1) != Some(self.spill.operations)
+        {
+            return false;
+        }
+        let mut changed = self
+            .spill
+            .deferred
+            .iter()
+            .zip(prior.spill.deferred.iter())
+            .filter(|(current, old)| current != old);
+        let proof = match changed.next() {
+            Some((Some(record), _)) if changed.next().is_none() => record.proof,
+            None if self.spill.last_saturated_proof.is_some() => {
+                self.spill.last_saturated_proof.unwrap()
+            }
+            _ => return false,
+        };
+        if proof.boot_epoch != self.boot {
+            return false;
+        }
+        let mut writers = prior.writers;
+        let mut spill = prior.spill;
+        advance_writer(&proof, self.boot, &mut writers).is_ok()
+            && spill
+                .ingest(proof, prior.writers[proof.cpu_id as usize], self.generation)
+                .is_ok()
+            && self.writers == writers
+            && self.spill == spill
     }
 
     fn home_offset(&self) -> u32 {
@@ -448,6 +821,7 @@ fn advance_writer(
         || proof.cpu_generation == 0
         || proof.last_event_id != proof.total_count
         || proof.total_count == 0
+        || proof.flags & !(FLAG_DEGRADED | FLAG_OVERFLOW) != 0
         || proof.flags & FLAG_DEGRADED == 0
         || (proof.flags & FLAG_OVERFLOW != 0) != (proof.total_count == u64::MAX)
         || proof.chain_digest == [0; 32]
@@ -518,6 +892,7 @@ pub struct RecoveryProofStore {
     boot: u64,
     writer_generation: u64,
     reader: Option<Identity>,
+    reader_closed: bool,
     delivered: u8,
     pending_ack: Option<Ack>,
     uncertain: bool,
@@ -577,6 +952,7 @@ impl RecoveryProofStore {
             boot: 0,
             writer_generation: 0,
             reader: None,
+            reader_closed: false,
             delivered: 0,
             pending_ack: None,
             uncertain: false,
@@ -614,7 +990,84 @@ impl RecoveryProofStore {
     }
 
     pub fn reader_available(&self, actor: Identity) -> bool {
-        self.boot > 0 && !self.uncertain && self.reader == Some(actor)
+        self.check_reader(actor).is_ok()
+    }
+
+    /// EL1 closes the exact stopped consumer. Delivery alone conveys no
+    /// authority to retire a record after takeover. An ACK already admitted
+    /// still belongs to the foreground disk owner until it is settled.
+    pub fn close_reader(&mut self, actor: Identity) -> Result<(), Error> {
+        if self.boot == 0 || self.reader != Some(actor) {
+            return Err(Error::Unauthorized);
+        }
+        self.reader_closed = true;
+        self.delivered = 0;
+        Ok(())
+    }
+
+    pub fn replace_reader(
+        &mut self,
+        old: Identity,
+        policy: &ConfirmedBootPolicy<'_>,
+    ) -> Result<(), Error> {
+        if self.boot != policy.boot_epoch()
+            || !policy.matches_config_digest(self.locator.config_digest)
+        {
+            return Err(Error::Unauthorized);
+        }
+        self.replace_reader_confirmed(old, policy.service_generation(Role::Supervisor)?)
+    }
+
+    fn replace_reader_confirmed(&mut self, old: Identity, generation: u64) -> Result<(), Error> {
+        self.check_closed_reader(old)?;
+        if old.generation.checked_add(1) != Some(generation) {
+            return Err(Error::Stale);
+        }
+        if self.pending_ack.is_some() {
+            return Err(Error::Busy);
+        }
+        self.reader = Some(Identity { generation, ..old });
+        self.reader_closed = false;
+        Ok(())
+    }
+
+    /// Terminal proof for retiring a closed reader's old transport. This
+    /// only observes the read-back durable ACK and grants no reader rights.
+    pub fn retired_ack_confirmed(
+        &self,
+        old: Identity,
+        seq: u64,
+        digest: Hash,
+    ) -> Result<(), Error> {
+        self.check_closed_reader(old)?;
+        let ack = self.ack_identity(old, digest);
+        if let Some(pending) = self.pending_ack {
+            return if pending == ack && self.page.retired.checked_add(1) == Some(seq) {
+                Err(Error::Busy)
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        if self.page.retired != seq {
+            return Err(Error::Stale);
+        }
+        if self.page.ack != ack {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+
+    fn check_closed_reader(&self, actor: Identity) -> Result<(), Error> {
+        if self.boot == 0 || self.reader != Some(actor) {
+            return Err(Error::Unauthorized);
+        }
+        if !self.reader_closed {
+            return Err(Error::Busy);
+        }
+        if self.uncertain {
+            return Err(Error::Unknown);
+        }
+        Ok(())
     }
 
     /// Custody inventory suitable for the boot owner's protected report.
@@ -622,12 +1075,45 @@ impl RecoveryProofStore {
         (self.page.count as u64, self.page.retired)
     }
 
+    pub fn audit_status(&self) -> AuditStatus {
+        AuditStatus {
+            pending: self.page.count as u64,
+            retired: self.page.retired,
+            deferred: self.page.spill.deferred.iter().flatten().count() as u64,
+            saturated: self.page.spill.saturated,
+            first_saturated_boot: self.page.spill.first_saturated_boot,
+            last_saturated_boot: self.page.spill.last_saturated_boot,
+            saturated_cpu_mask: self.page.spill.saturated_cpu_mask,
+            reader_available: self
+                .reader
+                .is_some_and(|actor| self.reader_available(actor)),
+            uncertain: self.uncertain,
+        }
+    }
+
+    /// The collector remains able to account for new evidence while its
+    /// consumer is closed or the published queue is full. A ready promotion
+    /// gets priority over new intake.
+    pub fn can_persist_proof(&self) -> bool {
+        self.boot != 0 && !self.uncertain && !self.can_promote()
+    }
+
     pub fn can_append(&self) -> bool {
-        self.boot > 0 && !self.uncertain && self.page.count < RECORDS
+        self.boot != 0
+            && !self.uncertain
+            && self.page.count < RECORDS
+            && self.page.spill.oldest().is_none()
+    }
+
+    pub fn can_promote(&self) -> bool {
+        self.boot != 0
+            && !self.uncertain
+            && self.page.count < RECORDS
+            && self.page.spill.oldest().is_some()
     }
 
     fn check_reader(&self, actor: Identity) -> Result<(), Error> {
-        if self.boot == 0 || self.reader != Some(actor) {
+        if self.boot == 0 || self.reader_closed || self.reader != Some(actor) {
             return Err(Error::Unauthorized);
         }
         if self.uncertain {
@@ -737,6 +1223,65 @@ impl RecoveryProofStore {
         if next.count == RECORDS {
             return Err(Error::Capacity);
         }
+        if next.spill.oldest().is_some() {
+            return Err(Error::Busy);
+        }
+        self.validate_intake(&proof)?;
+        advance_writer(&proof, self.boot, &mut next.writers)?;
+        next.proofs[next.count] = Some(proof);
+        next.count += 1;
+        self.commit(next, io, work)
+    }
+
+    /// Make a newly observed proof durable before releasing its live writer
+    /// custody. Only an append to the FIFO assigns an audit sequence. While
+    /// full, retain a cumulative summary in the writer's spill slots or,
+    /// after they exhaust, increment the explicit saturation witness.
+    pub fn persist_proof(
+        &mut self,
+        proof: RecoveryProofV2,
+        io: &mut impl EpochBlockIo,
+        work: &mut Workspace,
+    ) -> Result<ProofPersistence, Error> {
+        if self.page.count < RECORDS {
+            self.append(proof, io, work)?;
+            return Ok(ProofPersistence::Queued {
+                sequence: self.page.retired + self.page.count as u64,
+            });
+        }
+        self.validate_intake(&proof)?;
+        let mut next = self.next_page()?;
+        advance_writer(&proof, self.boot, &mut next.writers)?;
+        let result = next.spill.ingest(
+            proof,
+            self.page.writers[proof.cpu_id as usize],
+            next.generation,
+        )?;
+        self.commit(next, io, work)?;
+        Ok(result)
+    }
+
+    /// Move the oldest unassigned summary into the next FIFO sequence as one
+    /// durable operation. An ACK of an existing record is still a separate
+    /// operation and cannot race this transition under the CPU0 owner.
+    pub fn promote(
+        &mut self,
+        io: &mut impl EpochBlockIo,
+        work: &mut Workspace,
+    ) -> Result<Option<u64>, Error> {
+        if self.page.count == RECORDS || self.page.spill.oldest().is_none() {
+            return Ok(None);
+        }
+        let mut next = self.next_page()?;
+        let index = next.spill.oldest().ok_or(Error::Conflict)?;
+        let entry = next.spill.deferred[index].take().ok_or(Error::Conflict)?;
+        next.proofs[next.count] = Some(entry.proof);
+        next.count += 1;
+        self.commit(next, io, work)?;
+        Ok(Some(self.page.retired + self.page.count as u64))
+    }
+
+    fn validate_intake(&self, proof: &RecoveryProofV2) -> Result<(), Error> {
         // A business slot reaches CPU0 only after a stopped-writer handoff.
         let generation = self
             .writer_generation
@@ -745,10 +1290,7 @@ impl RecoveryProofStore {
         if proof.boot_epoch != self.boot || proof.cpu_generation != generation {
             return Err(Error::Stale);
         }
-        advance_writer(&proof, self.boot, &mut next.writers)?;
-        next.proofs[next.count] = Some(proof);
-        next.count += 1;
-        self.commit(next, io, work)
+        Ok(())
     }
 
     fn next_page(&self) -> Result<Page, Error> {
@@ -771,6 +1313,9 @@ impl RecoveryProofStore {
         io: &mut impl EpochBlockIo,
         work: &mut Workspace,
     ) -> Result<(), Error> {
+        if next.retired.checked_add(next.count as u64).is_none() {
+            return Err(Error::Exhausted);
+        }
         if !next.follows(&self.page) {
             return Err(Error::Conflict);
         }

@@ -316,6 +316,13 @@ impl Resident {
             }
             Connection::Listening => {
                 record(2, LISTENING);
+                if super::recovery::audit_degraded() {
+                    return Ok(());
+                }
+                #[cfg(cyxia_business_package)]
+                if super::signed_control::publications_fenced() {
+                    return Ok(());
+                }
                 if socket != State::Established {
                     return Ok(());
                 }

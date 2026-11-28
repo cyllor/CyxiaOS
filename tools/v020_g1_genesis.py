@@ -1,4 +1,4 @@
-"""Generate or verify the 512 MiB G1 genesis candidate for signed scratch."""
+"""Generate or verify the 512 MiB G1 genesis golden image for signed scratch."""
 
 import argparse
 from hashlib import sha256
@@ -143,7 +143,7 @@ def verify_image(path):
         raise ValueError("genesis candidate SHA-256 differs from the pinned fixture")
     return {
         "candidate": "g1-v1-signed-scratch-genesis",
-        "golden_vector_pending": True,
+        "golden_vector_pending": False,
         "image_bytes": CAPACITY,
         "image_sha256": image_hash,
         "nonzero_blocks": len(blocks),

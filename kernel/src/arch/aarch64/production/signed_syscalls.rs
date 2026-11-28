@@ -153,8 +153,9 @@ impl Objects {
     }
 
     /// Retain queued messages and receive receipts in the closed endpoint.
-    /// The lifecycle roster never replaces its old roots during this boot.
+    /// Replacement of the role root does not reissue these object grants.
     pub(super) fn retire(&mut self, index: usize) {
+        self.task_query_mask &= !role_bit(index);
         for route in self.routes.iter_mut().flatten() {
             if route.sender == index || route.receiver == index {
                 route.queue.fence();

@@ -103,6 +103,7 @@ fn fixture() -> (Disk, SuperblockV1, ExpectedState) {
         retention_deadlines,
         writes_open: false,
         restore_phase: RestorePhase::Idle,
+        cleanup_frozen: false,
         reopen_proof_digest: [0; 32],
         restore_obligation_digest: [0; 32],
     }

@@ -3,6 +3,7 @@
 //! These checks consume the exclusive native post-replay disk view.
 //! They do not issue file capabilities, clear UNKNOWN receipts or certify
 //! that a signed startup catalog or writable production service exists.
+pub use super::file_media_unified_v1::mount::MountedSnapshots;
 use super::{
     Error,
     boot_epoch_v1::BootEpochStoreV1,
@@ -11,7 +12,7 @@ use super::{
     file_media_unified_v1::{
         BASELINE_SYSTEM_BLOCKS, BASELINE_SYSTEM_OBJECTS, UNIFIED_SYSTEM_BLOCKS,
         UNIFIED_SYSTEM_OBJECTS, UnifiedSystemKind, UnifiedSystemObject, decode_object_envelope,
-        unified_map_from_baseline,
+        mount::verify_snapshot_homes, unified_map_from_baseline,
     },
     file_media_v0199::{SuperblockV1, crc32c_zeroed},
     file_receipt_store_v0199::{self, RECEIPT_STORE_BYTES, ReceiptStoreSummary},
@@ -86,12 +87,51 @@ pub struct MountEvidence {
     pub receipts: ReceiptStoreSummary,
     pub usage: [Usage; 16],
     pub system_blocks: u32,
+    pub snapshot: Option<MountedSnapshots>,
     baseline_system: Option<[SystemObject; 4]>,
 }
 
 impl MountEvidence {
     pub(super) const fn baseline_system(&self) -> Option<&[SystemObject; 4]> {
         self.baseline_system.as_ref()
+    }
+
+    /// A historical root by itself grants neither write admission nor file access.
+    pub const fn writes_open(&self) -> bool {
+        match self.snapshot {
+            Some(snapshot) => snapshot.writes_open(),
+            None => self.baseline_system.is_some(),
+        }
+    }
+
+    /// Use the previously durable write gate to qualify committed redo.
+    /// New writes require this boot's independently qualified admission.
+    pub const fn permits_replay_of_file_writes(&self) -> bool {
+        match self.snapshot {
+            Some(snapshot) => snapshot.has_open_proof(),
+            None => self.writes_open(),
+        }
+    }
+
+    /// Qualify a verified open receipt for this running boot. Cold mount
+    /// always starts closed. The native owner must authenticate the separate
+    /// protection role, exact current boot and durable restore/open evidence.
+    pub fn authorize_snapshot_writes(
+        &mut self,
+        gate: &super::snapshot_restore_gate::RestoreGate,
+        verify_current_boot: impl FnOnce(BootEpochStoreV1) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let snapshot = self.snapshot.as_mut().ok_or(Error::Unauthorized)?;
+        snapshot.qualify_writes(gate, || verify_current_boot(self.boot))
+    }
+
+    /// Owners without native CoW may change homes only while every slot is
+    /// free. DELETING also protects its blocks until verified GC retirement.
+    pub fn may_overwrite_in_place(&self) -> bool {
+        self.writes_open()
+            && self
+                .snapshot
+                .is_none_or(|snapshot| !snapshot.retains_roots())
     }
 }
 pub struct Workspace {
@@ -112,6 +152,12 @@ impl Workspace {
             receipts: [0; RECEIPT_STORE_BYTES],
             acl: [0; ACL_STORE],
         }
+    }
+
+    /// Protected history marks from the successful exclusive mount. Query
+    /// before reusing this workspace for any different committed view.
+    pub fn history_owns(&self, block: u32) -> bool {
+        self.structure.history_owns(block)
     }
 
     /// Validate the transaction cursor of every receipt retained in the
@@ -138,6 +184,28 @@ impl Workspace {
         Ok(())
     }
 
+    /// Tie every current-epoch receipt to its independently checked redo
+    /// transaction. The mount owner has already validated store and index
+    /// structure in the committed overlay.
+    pub fn verify_resident_receipt_commits(
+        &self,
+        checkpoint: SuperblockV1,
+        mut verify: impl FnMut(usize, &super::file_media_v0199::FileReceiptV4) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        use super::file_media_v0199::{FileReceiptV4, RECEIPT_BYTES};
+
+        for (slot, raw) in self.receipts.chunks_exact(RECEIPT_BYTES).enumerate() {
+            if raw.iter().all(|&byte| byte == 0) {
+                continue;
+            }
+            let receipt = FileReceiptV4::decode(raw)?;
+            if receipt.log_epoch == checkpoint.log_epoch {
+                verify(slot, &receipt)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Check the receipt/query view captured by a successful exclusive mount
     /// after the owner independently verifies the single paired BootEpoch redo.
     /// That transaction changes only the boot and security homes, so the
@@ -148,6 +216,16 @@ impl Workspace {
         prior: &MountEvidence,
         committed: &SecurityStateStoreV2,
         config: &VerifiedOfflineConfig<'_>,
+    ) -> Result<[u8; 32], Error> {
+        self.confirmed_receipt_query_digest_metered(prior, committed, config, &mut || Ok(()))
+    }
+
+    pub fn confirmed_receipt_query_digest_metered(
+        &self,
+        prior: &MountEvidence,
+        committed: &SecurityStateStoreV2,
+        config: &VerifiedOfflineConfig<'_>,
+        checkpoint: &mut impl FnMut() -> Result<(), Error>,
     ) -> Result<[u8; 32], Error> {
         let old_security = prior.security;
         let expected = SecurityStateStoreV2 {
@@ -161,7 +239,7 @@ impl Workspace {
                 .ok_or(Error::Exhausted)?,
             ..old_security
         };
-        self.confirmed_receipt_query_digest_for(prior, committed, config, &expected)
+        self.confirmed_receipt_query_digest_for(prior, committed, config, &expected, checkpoint)
     }
 
     /// Rebind the read-only receipt view after a signed TLS transition
@@ -172,12 +250,28 @@ impl Workspace {
         committed: &SecurityStateStoreV2,
         transition: super::boot_epoch_v1::TlsBootTransition<'_>,
     ) -> Result<[u8; 32], Error> {
+        self.confirmed_receipt_query_digest_after_tls_metered(
+            prior,
+            committed,
+            transition,
+            &mut || Ok(()),
+        )
+    }
+
+    pub fn confirmed_receipt_query_digest_after_tls_metered(
+        &self,
+        prior: &MountEvidence,
+        committed: &SecurityStateStoreV2,
+        transition: super::boot_epoch_v1::TlsBootTransition<'_>,
+        checkpoint: &mut impl FnMut() -> Result<(), Error>,
+    ) -> Result<[u8; 32], Error> {
         let expected = transition.successor_state(&prior.security)?;
         self.confirmed_receipt_query_digest_for(
             prior,
             committed,
             transition.current().config(),
             &expected,
+            checkpoint,
         )
     }
 
@@ -187,9 +281,12 @@ impl Workspace {
         committed: &SecurityStateStoreV2,
         config: &VerifiedOfflineConfig<'_>,
         expected: &SecurityStateStoreV2,
+        checkpoint: &mut impl FnMut() -> Result<(), Error>,
     ) -> Result<[u8; 32], Error> {
+        checkpoint()?;
         let old_boot = BootEpochStoreV1::decode(&self.boot)?;
         let old_security = SecurityStateStoreV2::decode(&self.security)?;
+        checkpoint()?;
         let receipts = file_receipt_store_v0199::scan_receipts_with_index(
             &self.receipts,
             &self.index,
@@ -205,6 +302,7 @@ impl Workspace {
         if committed != expected {
             return Err(Error::Conflict);
         }
+        checkpoint()?;
         let _view = super::file_receipt_query_v4::MountedReceiptQuery::new(
             &self.receipts,
             &self.index,
@@ -212,8 +310,14 @@ impl Workspace {
             committed,
         )?;
         let mut digest = Sha256::new();
-        digest.update(self.receipts.as_slice());
-        digest.update(self.index.as_slice());
+        for block in self
+            .receipts
+            .chunks_exact(BLOCK)
+            .chain([self.index.as_slice()])
+        {
+            checkpoint()?;
+            digest.update(block);
+        }
         Ok(digest.finalize().into())
     }
 }
@@ -375,6 +479,7 @@ impl BaselinePayloads {
             receipts: self.receipts,
             usage,
             system_blocks,
+            snapshot: None,
             baseline_system: (expected_objects == BASELINE_SYSTEM_OBJECTS).then_some(self.system),
         })
     }
@@ -476,6 +581,75 @@ pub fn validate_unified(
         UNIFIED_SYSTEM_BLOCKS,
     )
 }
+/// Validate nonempty snapshot homes under the authenticated eight-object
+/// layout. The caller binds the manifest to the signed principal table and
+/// supplies either checkpointed or fully verified committed redo contents.
+pub fn validate_unified_resident(
+    io: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    baseline: &[SystemObject; 4],
+    snapshot: &[UnifiedSystemObject; 4],
+    principals: &[Principal; 16],
+    w: &mut Workspace,
+    policy: impl FnMut(Acl, Inode, Option<UnifiedSystemKind>) -> Result<(), Error>,
+) -> Result<MountEvidence, Error> {
+    let system = unified_map_from_baseline(baseline, snapshot)?;
+    let mut snapshots = verify_snapshot_homes(io, sb, snapshot, &mut w.index)?;
+    let payloads = read_baseline_payloads(io, sb, baseline, principals, w)?;
+    let (structure, historical_only) = file_structure_v1::scan_unified_history(
+        sb,
+        &system,
+        &mut w.structure,
+        |b, out| io.read(b, out),
+        snapshots.catalog.as_ref(),
+    )?;
+    let counters = inspect_acls(
+        &w.acl,
+        w.structure.inodes(),
+        principals,
+        |i| {
+            system
+                .iter()
+                .find(|s| usize::from(s.inode) == i)
+                .map(|s| s.kind)
+        },
+        policy,
+    )?;
+    let mut mounted = payloads.mount_evidence(
+        structure,
+        counters,
+        UNIFIED_SYSTEM_OBJECTS,
+        UNIFIED_SYSTEM_BLOCKS,
+    )?;
+    snapshots.historical_only_blocks = historical_only;
+    mounted.snapshot = Some(snapshots);
+    mounted.baseline_system = Some(*baseline);
+    Ok(mounted)
+}
+
+/// Compute the bitmap after dropping one verified retiring root. The caller
+/// retains the mount's exclusive freeze while calculating and publishing it.
+#[cfg(not(target_os = "none"))]
+pub(super) fn gc_bitmap_after(
+    io: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    baseline: &[SystemObject; 4],
+    snapshot: &[UnifiedSystemObject; 4],
+    w: &mut Workspace,
+    retained: &super::file_media_unified_v1::catalog_candidate::CatalogRecord,
+    bitmap_after: &mut [[u8; BLOCK]; 4],
+) -> Result<u32, Error> {
+    let system = unified_map_from_baseline(baseline, snapshot)?;
+    file_structure_v1::scan_gc_reclaim(
+        sb,
+        &system,
+        &mut w.structure,
+        |b, out| io.read(b, out),
+        retained,
+        bitmap_after,
+    )
+}
+
 /// Production callers must obtain the system object locations from an
 /// authenticated boot catalog. The exact signed principal table, security
 /// minima and configuration digest are then enforced before checkpoint.
@@ -499,8 +673,8 @@ mod tests {
     use crate::security::{
         file_media_unified_v1::{
             CANONICAL_BUSINESS_START, CATALOG_INODE, ENVELOPE_BYTES, RESERVED_INODE_START,
-            SNAPSHOT_CATALOG_BLOCK, SNAPSHOT_PROTECTION_BLOCK, SNAPSHOT_SLOT_START,
-            encode_object_envelope,
+            SNAPSHOT_CATALOG_BLOCK, SNAPSHOT_PROTECTION_BLOCK, SNAPSHOT_REQUEST_START,
+            SNAPSHOT_SLOT_START, encode_object_envelope, protection_candidate::ProtectionRecord,
         },
         file_media_v0199::{BITMAP_START, DATA_START, INODE_START},
         file_structure_v1::{Extent, INODE_BYTES},
@@ -558,8 +732,20 @@ mod tests {
             (record, Ok(())),
             (done, Err(Error::Conflict)),
             (committed, Ok(())),
-            (FileReceiptV4 { commit_lsn: 14, ..committed }, Err(Error::Conflict)),
-            (FileReceiptV4 { log_epoch: 3, ..committed }, Err(Error::Conflict)),
+            (
+                FileReceiptV4 {
+                    commit_lsn: 14,
+                    ..committed
+                },
+                Err(Error::Conflict),
+            ),
+            (
+                FileReceiptV4 {
+                    log_epoch: 3,
+                    ..committed
+                },
+                Err(Error::Conflict),
+            ),
         ] {
             workspace.receipts[..RECEIPT_BYTES].copy_from_slice(&receipt.encode().unwrap());
             assert_eq!(workspace.verify_checkpointed_receipts(checkpoint), expected);
@@ -831,6 +1017,637 @@ mod tests {
         })
     }
 
+    const HISTORY_FILE: u32 = 7050;
+    const HISTORY_ROOT: u32 = 7051;
+
+    fn add_snapshot(disk: &mut Disk, slot: u32, deleting: bool, physical: u32) {
+        use crate::security::file_media_unified_v1::{
+            SLOT_MIRROR_BLOCKS, SNAPSHOT_STRIDE,
+            catalog_candidate::{CatalogBinding, CatalogEntry, CatalogRecord},
+            protection_candidate::{ProtectionRecord, RestorePhase},
+            slot_candidate::{SlotDescriptor, SlotIdentity},
+        };
+        let identity = SlotIdentity {
+            fs_uuid: CHECKPOINT.fs_uuid,
+            snapshot_id: u64::from(slot) + 1,
+            slot,
+            slot_generation: 1,
+            captured_live_view_epoch: 1,
+            capture_commit_lsn: 3,
+            created_online_age_ns: 10,
+        };
+        let descriptor_home = SNAPSHOT_SLOT_START + slot * SNAPSHOT_STRIDE;
+        let mut mirrors = Sha256::new();
+        for page in 0..SLOT_MIRROR_BLOCKS {
+            let mut raw = Box::new(*disk.0[&(INODE_START + page)]);
+            if page == 0 {
+                inode(&mut raw[..INODE_BYTES], 2, 128, HISTORY_ROOT, 1);
+                inode(&mut raw[INODE_BYTES..2 * INODE_BYTES], 1, 8, physical, 1);
+            }
+            mirrors.update(&*raw);
+            disk.0.insert(descriptor_home + 1 + page, raw);
+        }
+        disk.0.insert(HISTORY_ROOT, disk.0[&ROOT].clone());
+        disk.set_allocated(HISTORY_ROOT, true);
+        disk.set_allocated(HISTORY_FILE, true);
+        let raw = disk
+            .0
+            .entry(descriptor_home)
+            .or_insert_with(|| Box::new([0; BLOCK]));
+        SlotDescriptor {
+            identity,
+            store_generation: (slot == 0).then_some(1),
+            inode_image_sha256: mirrors.finalize().into(),
+        }
+        .encode(raw)
+        .unwrap();
+        let binding = CatalogBinding {
+            identity,
+            descriptor_sha256: Sha256::digest(&**raw).into(),
+        };
+        let raw = disk.0.get_mut(&SNAPSHOT_CATALOG_BLOCK).unwrap();
+        let mut catalog =
+            CatalogRecord::decode(SNAPSHOT_CATALOG_BLOCK, raw).unwrap_or(CatalogRecord {
+                fs_uuid: CHECKPOINT.fs_uuid,
+                generation: 2,
+                entries: [CatalogEntry::Free { slot_generation: 0 }; 8],
+                next_snapshot_id: 1,
+            });
+        catalog.entries[slot as usize] = if deleting {
+            CatalogEntry::Deleting {
+                binding,
+                root_drop_commit_lsn: 4,
+            }
+        } else {
+            CatalogEntry::Active(binding)
+        };
+        catalog.next_snapshot_id = catalog.next_snapshot_id.max(identity.snapshot_id + 1);
+        catalog.encode(raw).unwrap();
+        let raw = disk.0.get_mut(&SNAPSHOT_PROTECTION_BLOCK).unwrap();
+        let mut protection = ProtectionRecord::decode(&raw[..]).unwrap_or(ProtectionRecord {
+            fs_uuid: CHECKPOINT.fs_uuid,
+            object_generation: 2,
+            protection_generation: 1,
+            live_view_epoch: 1,
+            online_age_ns: 20,
+            retention_deadlines: [0; 8],
+            writes_open: false,
+            restore_phase: RestorePhase::Idle,
+            cleanup_frozen: false,
+            reopen_proof_digest: [0; 32],
+            restore_obligation_digest: [0; 32],
+        });
+        protection.retention_deadlines[slot as usize] = 15;
+        protection.encode(raw).unwrap();
+    }
+
+    #[test]
+    fn signed_snapshot_mount_checks_each_tree_and_its_exact_bitmap_union() {
+        for deleting in [false, true] {
+            let (mut disk, baseline, snapshot) = unified_fixture();
+            let mut work = Workspace::new();
+            let verify = |disk: &mut Disk, work: &mut Workspace| {
+                validate_unified_resident(
+                    disk,
+                    CHECKPOINT,
+                    &baseline,
+                    &snapshot,
+                    &principals(),
+                    work,
+                    |_, _, _| Ok(()),
+                )
+            };
+            let genesis = verify(&mut disk, &mut work).unwrap();
+            assert!(genesis.snapshot.unwrap().catalog.is_none());
+            assert!(!genesis.writes_open());
+            assert!(!genesis.permits_replay_of_file_writes());
+            add_snapshot(&mut disk, 0, deleting, HISTORY_FILE);
+            let mounted = verify(&mut disk, &mut work).unwrap();
+            assert_eq!(mounted.snapshot.unwrap().historical_only_blocks, 2);
+            assert!(!mounted.may_overwrite_in_place());
+
+            disk.set_allocated(HISTORY_FILE, false);
+            assert_eq!(verify(&mut disk, &mut work), Err(Error::Conflict));
+            disk.set_allocated(HISTORY_FILE, true);
+            let bad_child = &mut disk.0.get_mut(&HISTORY_ROOT).unwrap()[..128];
+            p64(bad_child, 8, 99);
+            seal(bad_child, 124);
+            assert_eq!(verify(&mut disk, &mut work), Err(Error::Conflict));
+            // Even a well-formed historical mirror must reject a reference
+            // to a hidden system block and a forged open-gate digest.
+            add_snapshot(&mut disk, 0, deleting, SNAPSHOT_REQUEST_START);
+            assert_eq!(verify(&mut disk, &mut work), Err(Error::Conflict));
+            add_snapshot(&mut disk, 0, deleting, HISTORY_FILE);
+            let raw = disk.0.get_mut(&SNAPSHOT_PROTECTION_BLOCK).unwrap();
+            let mut p = ProtectionRecord::decode(&raw[..]).unwrap();
+            p.writes_open = true;
+            p.reopen_proof_digest = [1; 32];
+            p.encode(raw).unwrap();
+            assert_eq!(verify(&mut disk, &mut work), Err(Error::Conflict));
+        }
+    }
+
+    struct PowerDisk {
+        durable: Disk,
+        pending: BTreeMap<u32, Box<[u8; BLOCK]>>,
+        flushes: usize,
+        cut_at: usize,
+        cut_after_flush: bool,
+    }
+
+    impl EpochBlockIo for PowerDisk {
+        fn read(&mut self, block: u32, out: &mut [u8; BLOCK]) -> Result<(), Error> {
+            if let Some(bytes) = self.pending.get(&block) {
+                *out = **bytes;
+                Ok(())
+            } else {
+                self.durable.read(block, out)
+            }
+        }
+
+        fn write(&mut self, block: u32, bytes: &[u8; BLOCK]) -> Result<(), Error> {
+            self.pending.insert(block, Box::new(*bytes));
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), Error> {
+            self.flushes += 1;
+            if self.flushes == self.cut_at && !self.cut_after_flush {
+                self.pending.clear();
+                return Err(Error::Unknown);
+            }
+            self.durable.0.append(&mut self.pending);
+            if self.flushes == self.cut_at {
+                Err(Error::Unknown)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn superblocks(disk: &mut Disk) {
+        for (block, generation, lsn) in [(0, 1, 0), (1, 2, 4)] {
+            let mut raw = Box::new([0; BLOCK]);
+            p32(&mut raw[..], 0, 0x4359_4653);
+            p16(&mut raw[..], 4, 1);
+            p16(&mut raw[..], 6, 80);
+            p32(&mut raw[..], 8, BLOCK as u32);
+            p32(
+                &mut raw[..],
+                12,
+                super::super::file_media_v0199::BLOCK_COUNT,
+            );
+            raw[16..32].copy_from_slice(&CHECKPOINT.fs_uuid);
+            p64(&mut raw[..], 32, generation);
+            p64(&mut raw[..], 40, lsn);
+            p64(&mut raw[..], 48, generation);
+            p32(&mut raw[..], 56, BITMAP_START);
+            p32(&mut raw[..], 60, INODE_START);
+            p32(&mut raw[..], 64, DATA_START);
+            p32(&mut raw[..], 68, INODES as u32);
+            seal(&mut raw[..], 76);
+            disk.0.insert(block, raw);
+        }
+    }
+
+    #[test]
+    fn deleting_snapshot_gc_hands_off_only_checkpointed_exact_bitmap() {
+        use crate::security::{
+            file_media_unified_v1::{
+                catalog_candidate::{
+                    CatalogEntry,
+                    lifecycle::{GcVolume, GcWorkspace, retire_deleted_snapshot},
+                },
+                slot_candidate::SlotDescriptor,
+            },
+            recovery_v1::{RecoveryWorkspace, RedoWriter, recover_checkpoint_with_evidence, scan},
+        };
+        for cut_at in 0..=5 {
+            let (mut disk, baseline, snapshot) = unified_fixture();
+            // This version shares its regular file block with the live root.
+            // Only the independently owned history directory block is freed.
+            add_snapshot(&mut disk, 0, true, DATA_START);
+            disk.set_allocated(HISTORY_FILE, false);
+            superblocks(&mut disk);
+            let target = SlotDescriptor::decode(SNAPSHOT_SLOT_START, &disk.0[&SNAPSHOT_SLOT_START])
+                .unwrap()
+                .identity;
+            let mut disk = PowerDisk {
+                durable: disk,
+                pending: BTreeMap::new(),
+                flushes: 0,
+                cut_at,
+                cut_after_flush: false,
+            };
+            let mut gc = GcWorkspace::new();
+            let mut mount = Workspace::new();
+            let mut redo = RecoveryWorkspace::new();
+            let p = principals();
+            let writer = RedoWriter::open(&mut disk, &mut redo, CHECKPOINT).unwrap();
+            let result = retire_deleted_snapshot(
+                writer,
+                GcVolume {
+                    baseline: &baseline,
+                    snapshot: &snapshot,
+                    principals: &p,
+                },
+                target,
+                &mut mount,
+                &mut gc,
+                |_, _, _| Ok(()),
+                |seen, lsn| {
+                    assert_eq!(seen, target);
+                    assert_eq!(lsn, 4);
+                    Ok(())
+                },
+                |_| Ok(()),
+            );
+            if matches!(cut_at, 0 | 5) {
+                let proof = result.unwrap();
+                assert_eq!(proof.released(), 1);
+                if cut_at == 5 {
+                    disk.durable.set_allocated(HISTORY_ROOT, true);
+                    assert_eq!(
+                        proof.handoff(&mut disk, &mut gc, |_, _| panic!("changed bitmap")),
+                        Err(Error::Conflict)
+                    );
+                    continue;
+                }
+                proof
+                    .handoff(&mut disk, &mut gc, |checkpoint, bits| {
+                        let has =
+                            |block: u32| bits[0][block as usize / 8] & (1 << (block % 8)) != 0;
+                        assert_eq!(checkpoint.generation, 3);
+                        assert!(has(DATA_START));
+                        assert!(has(ROOT));
+                        assert!(has(SNAPSHOT_PROTECTION_BLOCK));
+                        assert!(!has(HISTORY_ROOT));
+                        Ok(())
+                    })
+                    .unwrap();
+                continue;
+            }
+            assert!(matches!(result, Err(Error::Unknown)), "cut {cut_at}");
+            // Cold reopen discards volatile writes, the old owner workspace,
+            // and all allocator state. A prior incomplete log cannot free.
+            let mut reread = RecoveryWorkspace::new();
+            let e = scan(&mut disk, &mut reread).unwrap();
+            assert_eq!(e.superblock, CHECKPOINT);
+            let mut verify = |disk: &mut PowerDisk, effective: SuperblockV1| {
+                validate_unified_resident(
+                    disk,
+                    effective,
+                    &baseline,
+                    &snapshot,
+                    &p,
+                    &mut mount,
+                    |_, _, _| Ok(()),
+                )
+            };
+            if cut_at <= 2 {
+                let entry = verify(&mut disk, CHECKPOINT)
+                    .unwrap()
+                    .snapshot
+                    .unwrap()
+                    .catalog
+                    .unwrap()
+                    .entries[0];
+                assert!(matches!(entry, CatalogEntry::Deleting { .. }));
+                assert_eq!(e.last_commit_lsn, CHECKPOINT.checkpoint_lsn);
+                continue;
+            }
+            recover_checkpoint_with_evidence(&mut disk, &mut reread, |disk, old| {
+                let effective = SuperblockV1 {
+                    checkpoint_lsn: e.last_commit_lsn,
+                    ..old
+                };
+                let snap = verify(disk, effective)?.snapshot.unwrap();
+                assert!(matches!(
+                    snap.catalog.unwrap().entries[0],
+                    CatalogEntry::Free { slot_generation: 1 }
+                ));
+                assert_eq!(snap.historical_only_blocks, 0);
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn restored_write_gate_requires_independent_current_durable_open() {
+        use crate::{
+            control_plane::Identity,
+            security::{
+                file_media_unified_v1::{
+                    SNAP_CAP_PROTECTION, SNAP_OP_OPEN_WRITES, SNAP_OP_RESTORE,
+                    catalog_candidate::{
+                        CatalogContext,
+                        lifecycle::{
+                            CaptureWorkspace, ExpectedState, OpenWritesRequest, commit_open_writes,
+                        },
+                    },
+                    protection_candidate::RestorePhase,
+                    request_store::{
+                        RequestRecord, RequestState, RequestStoreHeader, Watermark, record_location,
+                    },
+                    slot_candidate::SlotDescriptor,
+                },
+                recovery_v1::{
+                    RecoveryWorkspace, RedoWriter, recover_checkpoint_with_evidence, scan,
+                },
+                snapshot_restore_gate::{
+                    Commit, Phase, Prepared, Recovered, RestoreGate, RestoreKey, SnapshotKey, View,
+                },
+                snapshot_service_v4::{
+                    FileReqKey, SnapshotKey as WireKey, SnapshotRequest, encode_request,
+                },
+            },
+        };
+        for cut_at in 0..=3 {
+            let (mut disk, baseline, snapshot) = unified_fixture();
+            add_snapshot(&mut disk, 0, false, DATA_START);
+            add_snapshot(&mut disk, 3, false, DATA_START);
+            disk.set_allocated(HISTORY_FILE, false);
+            disk.set_allocated(ROOT, false);
+            inode(disk.inode_slot(0), 2, 128, HISTORY_ROOT, 1);
+            superblocks(&mut disk);
+            let descriptor =
+                SlotDescriptor::decode(SNAPSHOT_SLOT_START, &disk.0[&SNAPSHOT_SLOT_START]).unwrap();
+            let key = FileReqKey {
+                fs_uuid: CHECKPOINT.fs_uuid,
+                client_slot: 15,
+                client_generation: 1,
+                request_seq: 1,
+            };
+            let open_key = FileReqKey {
+                request_seq: 2,
+                ..key
+            };
+            let source = WireKey {
+                fs_uuid: key.fs_uuid,
+                snapshot_id: 1,
+                slot: 0,
+                slot_generation: 1,
+            };
+            let decode = |op, key: FileReqKey, epoch, body: &[u8]| {
+                let mut raw = [0; 256];
+                let len = encode_request(op, key.request_seq, Some(key), epoch, body, 9, &mut raw)
+                    .unwrap();
+                RequestRecord::pending(&SnapshotRequest::decode(&raw[..len], 9).unwrap()).unwrap()
+            };
+            let mut body = [0; 48];
+            body[..40].copy_from_slice(&source.encode().unwrap());
+            p32(&mut body, 40, 2);
+            let mut restored = decode(SNAP_OP_RESTORE, key, 1, &body);
+            restored.state = RequestState::Done;
+            restored.new_live_view_epoch = 2;
+            restored.log_epoch = 1;
+            restored.txid = 2;
+            restored.commit_lsn = 4;
+            let mut result = [0; 96];
+            result[..40].copy_from_slice(&source.encode().unwrap());
+            p64(&mut result, 40, 1);
+            p64(&mut result, 48, 2);
+            result[56..72].copy_from_slice(&key.fs_uuid);
+            p64(&mut result, 72, restored.log_epoch);
+            p64(&mut result, 80, restored.txid);
+            p32(&mut result, 88, 1);
+            restored.replace_payload(&result).unwrap();
+            restored.seal_result().unwrap();
+            body.fill(0);
+            p64(&mut body, 0, 1);
+            body[8..44].copy_from_slice(&key.encode().unwrap());
+            let open = decode(SNAP_OP_OPEN_WRITES, open_key, 2, &body);
+            let mut watermark = [Watermark::EMPTY; 16];
+            watermark[15] = Watermark {
+                client_generation: 1,
+                highest_accepted_seq: 2,
+            };
+            RequestStoreHeader {
+                fs_uuid: key.fs_uuid,
+                generation: 2,
+                watermarks: watermark,
+            }
+            .encode(disk.0.get_mut(&SNAPSHOT_REQUEST_START).unwrap())
+            .unwrap();
+            let mut page = Box::new([0; BLOCK]);
+            for (index, record) in [(56, restored), (57, open)] {
+                let (_, range) = record_location(index).unwrap();
+                record
+                    .encode((&mut page[range]).try_into().unwrap())
+                    .unwrap();
+            }
+            disk.0.insert(record_location(56).unwrap().0, page);
+            let raw = disk.0.get_mut(&SNAPSHOT_PROTECTION_BLOCK).unwrap();
+            let mut p = ProtectionRecord::decode(&raw[..]).unwrap();
+            p.live_view_epoch = 2;
+            p.restore_phase = RestorePhase::RestoredFrozen;
+            p.cleanup_frozen = true;
+            p.restore_obligation_digest = restored.result_digest;
+            p.encode(raw).unwrap();
+            let expected = ExpectedState {
+                catalog: CatalogContext {
+                    fs_uuid: key.fs_uuid,
+                    catalog_generation: 2,
+                    slot_store_generation: 1,
+                    live_view_epoch: 2,
+                    committed_lsn: 4,
+                    online_age_ns: 20,
+                },
+                catalog_sha256: Sha256::digest(&*disk.0[&SNAPSHOT_CATALOG_BLOCK]).into(),
+                protection_sha256: Sha256::digest(&*disk.0[&SNAPSHOT_PROTECTION_BLOCK]).into(),
+            };
+            let recovery = Identity {
+                id: 12,
+                generation: 1,
+            };
+            let supervisor = Identity {
+                id: 11,
+                generation: 1,
+            };
+            let view = View {
+                fs_uuid: key.fs_uuid,
+                live_epoch: 2,
+                protection_generation: 1,
+                root_hash: descriptor.inode_image_sha256,
+                retention_watermark: 20,
+            };
+            let prior = View {
+                live_epoch: 1,
+                root_hash: [1; 32],
+                ..view
+            };
+            let restore_key = RestoreKey {
+                principal: recovery,
+                request_seq: key.request_seq,
+            };
+            let index = &*disk.0[&(RECEIPTS + 6)];
+            let security = &*disk.0[&STATE_HOME];
+            let prepared = Prepared {
+                key: restore_key,
+                snapshot: SnapshotKey {
+                    fs_uuid: key.fs_uuid,
+                    snapshot_id: 1,
+                    slot: 0,
+                    generation: 1,
+                    root_hash: view.root_hash,
+                },
+                prior,
+                next_live_epoch: 2,
+                system_index_hash: Sha256::digest(index).into(),
+                security_hash: Sha256::digest(security).into(),
+                request_hash: restored.request_digest,
+            };
+            let commit = Commit {
+                key: restore_key,
+                txid: restored.txid,
+                log_epoch: restored.log_epoch,
+                commit_lsn: restored.commit_lsn,
+                view,
+                request_hash: restored.request_digest,
+            };
+            let mut gate = RestoreGate::recover_frozen(
+                view,
+                recovery,
+                supervisor,
+                Recovered::RestoredFrozen(prepared, commit),
+                index,
+                security,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+            let mut disk = PowerDisk {
+                durable: disk,
+                pending: BTreeMap::new(),
+                flushes: 0,
+                cut_at: cut_at.min(2),
+                cut_after_flush: cut_at == 3,
+            };
+            let mut redo = RecoveryWorkspace::new();
+            let mut writer = RedoWriter::open(&mut disk, &mut redo, CHECKPOINT).unwrap();
+            let mut work = CaptureWorkspace::new();
+            let request = OpenWritesRequest {
+                actor: supervisor,
+                rights: SNAP_CAP_PROTECTION,
+                key: open_key,
+            };
+            assert!(matches!(
+                commit_open_writes(
+                    &mut writer,
+                    expected,
+                    &mut gate,
+                    OpenWritesRequest {
+                        actor: recovery,
+                        ..request
+                    },
+                    &mut work,
+                    |_| panic!()
+                ),
+                Err(Error::Unauthorized)
+            ));
+            assert_eq!(gate.phase(), Phase::RestoredFrozen);
+            let opened =
+                commit_open_writes(&mut writer, expected, &mut gate, request, &mut work, |_| {
+                    Ok(())
+                });
+            if cut_at == 0 {
+                let tx = opened.unwrap().transaction();
+                assert!(gate.may_write(2, 2));
+                assert!(!gate.may_write(2, 1));
+                assert!(!gate.may_write(1, 2));
+                let checkpoint = SuperblockV1 {
+                    checkpoint_lsn: tx.commit_lsn,
+                    ..CHECKPOINT
+                };
+                let mut mounted = validate_unified_resident(
+                    &mut writer.committed_view(),
+                    checkpoint,
+                    &baseline,
+                    &snapshot,
+                    &principals(),
+                    &mut Workspace::new(),
+                    |_, _, _| Ok(()),
+                )
+                .unwrap();
+                assert!(mounted.snapshot.unwrap().has_open_proof());
+                assert!(mounted.snapshot.unwrap().protection.unwrap().cleanup_frozen);
+                assert!(mounted.permits_replay_of_file_writes());
+                assert!(!mounted.writes_open());
+                assert_eq!(
+                    mounted.authorize_snapshot_writes(&gate, |_| Err(Error::Unauthorized)),
+                    Err(Error::Unauthorized)
+                );
+                assert!(!mounted.writes_open());
+                mounted
+                    .authorize_snapshot_writes(&gate, |boot| {
+                        assert_eq!(boot.boot_epoch, 2);
+                        assert_eq!(boot.fs_uuid, CHECKPOINT.fs_uuid);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(mounted.writes_open());
+                assert!(!mounted.may_overwrite_in_place());
+            } else {
+                assert!(matches!(opened, Err(Error::Unknown)));
+                assert_eq!(gate.phase(), Phase::ReopeningUnknown);
+                assert!(!gate.may_write(2, 1));
+                assert!(!gate.may_write(2, 2));
+                let raw = &disk.durable.0[&SNAPSHOT_PROTECTION_BLOCK][..];
+                assert_eq!(
+                    ProtectionRecord::decode(raw).unwrap().restore_phase,
+                    RestorePhase::RestoredFrozen
+                );
+                if cut_at == 3 {
+                    assert_eq!(
+                        gate.reconcile_reopen(supervisor, view, |_, _| panic!("wrong generation")),
+                        Err(Error::Stale)
+                    );
+                    let mut reread = RecoveryWorkspace::new();
+                    let evidence = scan(&mut disk, &mut reread).unwrap();
+                    recover_checkpoint_with_evidence(&mut disk, &mut reread, |disk, prior| {
+                        let effective = SuperblockV1 {
+                            checkpoint_lsn: evidence.last_commit_lsn,
+                            ..prior
+                        };
+                        let mounted = validate_unified_resident(
+                            disk,
+                            effective,
+                            &baseline,
+                            &snapshot,
+                            &principals(),
+                            &mut Workspace::new(),
+                            |_, _, _| Ok(()),
+                        )?;
+                        assert!(mounted.snapshot.unwrap().has_open_proof());
+                        assert!(mounted.permits_replay_of_file_writes());
+                        assert!(!mounted.writes_open());
+                        gate.reconcile_reopen_next_protection(
+                            supervisor,
+                            view,
+                            |current, commit| {
+                                assert_eq!(current, view);
+                                assert_eq!(commit.commit_lsn, restored.commit_lsn);
+                                assert_eq!(
+                                    mounted
+                                        .snapshot
+                                        .unwrap()
+                                        .protection
+                                        .unwrap()
+                                        .protection_generation,
+                                    2
+                                );
+                                Ok(())
+                            },
+                        )?;
+                        assert!(gate.may_write(2, 2));
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+            }
+        }
+    }
+
     #[test]
     fn unified_mount_accounts_for_all_eight_hidden_objects() {
         let (mut disk, baseline, snapshot) = unified_fixture();
@@ -971,6 +1788,17 @@ mod tests {
         assert_eq!(
             w.confirmed_receipt_query_digest(&prior, &state, &config),
             Err(Error::Conflict)
+        );
+        let mut checkpoints = 0;
+        assert_eq!(
+            w.confirmed_receipt_query_digest_metered(&prior, &committed, &config, &mut || {
+                checkpoints += 1;
+                if checkpoints == 4 {
+                    return Err(Error::Busy);
+                }
+                Ok(())
+            }),
+            Err(Error::Busy)
         );
     }
 

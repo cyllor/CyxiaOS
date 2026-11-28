@@ -112,6 +112,7 @@ struct Group {
     weight: u16,
     stamp: PolicyStamp,
     applied_version: u64,
+    applied_ns: u64,
 }
 #[derive(Clone, Copy)]
 struct Thread {
@@ -391,6 +392,7 @@ impl Scheduler {
             weight: 1,
             stamp: UNSET,
             applied_version: 0,
+            applied_ns: 0,
         });
         self.group_keys[count] = key;
         self.group_count = self.group_count.checked_add(1).ok_or(Error::Capacity)?;
@@ -403,11 +405,41 @@ impl Scheduler {
         stamp: PolicyStamp,
         now: u64,
     ) -> Result<(), Error> {
+        self.set_weight(key, weight, stamp, now, now)
+    }
+
+    /// Use the protected publication time for admission while the scheduler
+    /// records the actual installation time. Publication never extends TTL.
+    pub fn install_published_weight(
+        &mut self,
+        key: ObjectKey,
+        weight: u16,
+        stamp: PolicyStamp,
+        published_ns: u64,
+        now: u64,
+    ) -> Result<(), Error> {
+        if published_ns > now {
+            return Err(Error::Range);
+        }
+        if !stamp.live(now) {
+            return Err(Error::Expired);
+        }
+        self.set_weight(key, weight, stamp, published_ns, now)
+    }
+
+    fn set_weight(
+        &mut self,
+        key: ObjectKey,
+        weight: u16,
+        stamp: PolicyStamp,
+        admitted_ns: u64,
+        now: u64,
+    ) -> Result<(), Error> {
         self.time(now)?;
         Action::CpuWeight(weight).validate()?;
         let i = self.group(key)?;
         let g = self.groups[i].as_mut().ok_or(Error::Stale)?;
-        g.stamp.accepts(stamp, now)?;
+        g.stamp.accepts(stamp, admitted_ns)?;
         if stamp.version == g.stamp.version && weight != g.weight {
             return Err(Error::Conflict);
         }
@@ -959,10 +991,7 @@ impl Scheduler {
             self.stats.quarantine_mask |= 1u64 << cpu;
             return Err(Error::Budget);
         }
-        if actual_ns != 0 {
-            let g = self.groups[t.group].as_mut().ok_or(Error::Stale)?;
-            g.applied_version = g.applied_version.max(d.policy_version);
-        }
+        let group = t.group;
         if finished_ns > end
             && self
                 .carry_business_completion(cpu, i, actual_ns, finished_ns)
@@ -977,6 +1006,15 @@ impl Scheduler {
             self.stats.overruns = self.stats.overruns.saturating_add(1);
             self.stats.quarantine_mask |= 1u64 << cpu;
             return Err(Error::Budget);
+        }
+        if actual_ns != 0 {
+            let g = self.groups[group].as_mut().ok_or(Error::Stale)?;
+            if d.policy_version > g.applied_version {
+                g.applied_version = d.policy_version;
+                g.applied_ns = finished_ns;
+            } else if d.policy_version == g.applied_version {
+                g.applied_ns = g.applied_ns.min(finished_ns);
+            }
         }
         Ok(())
     }
@@ -1139,6 +1177,32 @@ impl Scheduler {
     pub fn weight(&self, key: ObjectKey, now: u64) -> Result<u16, Error> {
         let g = self.groups[self.group(key)?].ok_or(Error::Stale)?;
         Ok(if g.stamp.live(now) { g.weight } else { 1 })
+    }
+    pub fn weight_version(&self, key: ObjectKey) -> Result<u64, Error> {
+        Ok(self.groups[self.group(key)?]
+            .ok_or(Error::Stale)?
+            .stamp
+            .version)
+    }
+    /// Verify the exact installed value and a completed dispatch that used it.
+    pub fn verify_weight_effect(
+        &self,
+        key: ObjectKey,
+        version: u64,
+        weight: u16,
+        now: u64,
+    ) -> Result<u64, Error> {
+        let group = self.groups[self.group(key)?].ok_or(Error::Stale)?;
+        if version == 0 || group.stamp.version != version || group.weight != weight {
+            return Err(Error::Stale);
+        }
+        if !group.stamp.live(now) {
+            return Err(Error::Expired);
+        }
+        if group.applied_version != version {
+            return Err(Error::NotReady);
+        }
+        Ok(group.applied_ns)
     }
     pub fn policy_receipt(&self, key: ObjectKey) -> Result<u64, Error> {
         Ok(self.groups[self.group(key)?]

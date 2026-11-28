@@ -2,9 +2,9 @@
 //! a quiescent read view, with volume and counters supplied by the caller.
 
 use super::{
-    ENVELOPE_BYTES, Error, PERIODIC_SLOTS, SNAPSHOT_CATALOG_BLOCK, SNAPSHOT_SLOT_START,
-    SNAPSHOT_SLOTS, SUPER_BYTES, UnifiedSystemKind, crc32c_zeroed, decode_envelope_header,
-    encode_object_envelope, le16, le32, le64, put16, put32, put64,
+    ENVELOPE_BYTES, Error, PERIODIC_SLOTS, SHORT_TIER_SLOTS, SNAPSHOT_CATALOG_BLOCK,
+    SNAPSHOT_SLOT_START, SNAPSHOT_SLOTS, SUPER_BYTES, UnifiedSystemKind, crc32c_zeroed,
+    decode_envelope_header, encode_object_envelope, le16, le32, le64, put16, put32, put64,
     slot_candidate::{SlotIdentity, verify_slot},
 };
 
@@ -41,7 +41,7 @@ pub enum CatalogEntry {
 }
 
 impl CatalogEntry {
-    fn binding(self) -> Option<(CatalogBinding, u64)> {
+    pub(crate) fn binding(self) -> Option<(CatalogBinding, u64)> {
         match self {
             Self::Free { .. } => None,
             Self::Active(binding) => Some((binding, 0)),
@@ -64,6 +64,16 @@ pub struct CatalogRecord {
 }
 
 impl CatalogRecord {
+    pub fn has_periodic_coverage(&self) -> bool {
+        let active = |slots: &[CatalogEntry]| {
+            slots
+                .iter()
+                .any(|entry| matches!(entry, CatalogEntry::Active(_)))
+        };
+        active(&self.entries[..SHORT_TIER_SLOTS as usize])
+            && active(&self.entries[SHORT_TIER_SLOTS as usize..PERIODIC_SLOTS as usize])
+    }
+
     pub fn encode(&self, raw: &mut [u8; SUPER_BYTES]) -> Result<(), Error> {
         let occupied = self.validate_entries()?;
         encode_object_envelope(

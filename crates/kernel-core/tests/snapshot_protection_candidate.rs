@@ -28,6 +28,10 @@ fn independent_wire_vectors_bind_the_candidate_without_opening_the_mount() {
         let record = ProtectionRecord::decode(&raw);
         assert_eq!(record.is_ok(), verdict == "accept", "{case}");
         if let Ok(record) = record {
+            assert_eq!(
+                record.cleanup_frozen,
+                matches!(case, "cleanup-frozen" | "open-and-cleanup-frozen")
+            );
             let mut reproduced = [0; SUPER_BYTES];
             record.encode(&mut reproduced).unwrap();
             assert!(raw == reproduced, "{case}");
@@ -39,5 +43,5 @@ fn independent_wire_vectors_bind_the_candidate_without_opening_the_mount() {
         );
         rows += 1;
     }
-    assert_eq!(rows, 10);
+    assert_eq!(rows, 13);
 }

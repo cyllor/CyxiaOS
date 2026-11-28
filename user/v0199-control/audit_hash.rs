@@ -1,6 +1,14 @@
-//! Scalar SHA-256 for the freestanding role's fixed 108-byte SecurityAudit preimage.
-//! Two padded blocks; no allocator, hardware privilege or external crypto service.
+//! Scalar SHA-256 for the freestanding role probes.
+//! No allocator, hardware privilege or external crypto service.
+#[allow(dead_code)]
 pub(super) fn record_digest(record: &[u8; 128]) -> [u8; 32] {
+    let mut preimage = [0; 108];
+    preimage[..12].copy_from_slice(b"CYX/AUDIT/v2");
+    preimage[12..].copy_from_slice(&record[..96]);
+    sha256(&preimage)
+}
+
+pub(super) fn sha256(bytes: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -13,12 +21,6 @@ pub(super) fn record_digest(record: &[u8; 128]) -> [u8; 32] {
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
         0xc67178f2,
     ];
-    let mut padded = [0u8; 128];
-    let prefix = b"CYX/AUDIT/v2";
-    padded[..12].copy_from_slice(prefix);
-    padded[12..108].copy_from_slice(&record[..96]);
-    padded[108] = 0x80;
-    padded[120..].copy_from_slice(&(108u64 * 8).to_be_bytes());
     let mut state = [
         0x6a09e667u32,
         0xbb67ae85,
@@ -29,7 +31,19 @@ pub(super) fn record_digest(record: &[u8; 128]) -> [u8; 32] {
         0x1f83d9ab,
         0x5be0cd19,
     ];
-    for block in padded.chunks_exact(64) {
+    let padded_len = (bytes.len() + 9).next_multiple_of(64);
+    for offset in (0..padded_len).step_by(64) {
+        let mut block = [0; 64];
+        let available = bytes.len().saturating_sub(offset).min(64);
+        if available != 0 {
+            block[..available].copy_from_slice(&bytes[offset..offset + available]);
+        }
+        if offset <= bytes.len() && available < 64 {
+            block[available] = 0x80;
+        }
+        if offset + 64 == padded_len {
+            block[56..].copy_from_slice(&((bytes.len() as u64) * 8).to_be_bytes());
+        }
         let mut w = [0u32; 64];
         for (dst, src) in w.iter_mut().zip(block.chunks_exact(4)) {
             *dst = u32::from_be_bytes([src[0], src[1], src[2], src[3]]);

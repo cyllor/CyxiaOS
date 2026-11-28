@@ -13,6 +13,8 @@ use super::{
 };
 use sha2::{Digest, Sha256};
 
+pub mod resident;
+
 const FIRST: u32 = 2;
 const END: u32 = BITMAP_START;
 const LOG_BLOCKS: usize = (END - FIRST) as usize;
@@ -64,6 +66,7 @@ pub struct RecoveryWorkspace {
     checkpoint_required: bool,
     retire_after: Option<SuperblockV1>,
     obsolete: [u8; LOG_BLOCKS],
+    resident_begins: [u16; LOG_BLOCKS / 4],
 }
 impl RecoveryWorkspace {
     pub const fn new() -> Self {
@@ -81,6 +84,7 @@ impl RecoveryWorkspace {
             checkpoint_required: false,
             retire_after: None,
             obsolete: [0; LOG_BLOCKS],
+            resident_begins: [0; LOG_BLOCKS / 4],
         }
     }
     pub fn evidence(&self) -> Option<RecoveryEvidence> {
@@ -126,6 +130,16 @@ fn read_record(
     block: u32,
     raw: &mut [u8; 2 * BLOCK],
 ) -> Result<Option<Header>, Error> {
+    read_record_with_preparation(io, block, raw, false)
+        .map(|record| record.map(|(header, _)| header))
+}
+
+fn read_record_with_preparation(
+    io: &mut impl EpochBlockIo,
+    block: u32,
+    raw: &mut [u8; 2 * BLOCK],
+    permit_missing_continuation: bool,
+) -> Result<Option<(Header, bool)>, Error> {
     if !(FIRST..END).contains(&block) {
         return Ok(None);
     }
@@ -164,12 +178,60 @@ fn read_record(
         }
         io.read(block + 1, right.try_into().map_err(|_| Error::Invalid)?)?;
     }
-    if u32at(raw, 12) != crc32c_payload(&raw[64..length])
-        || raw[length..padded].iter().any(|&v| v != 0)
+    if raw[length..padded].iter().any(|&v| v != 0) {
+        return Err(Error::Unknown);
+    }
+    let incomplete = u32at(raw, 12) != crc32c_payload(&raw[64..length]);
+    if incomplete
+        && !(permit_missing_continuation && kind == 2 && raw[BLOCK..].iter().all(|&v| v == 0))
     {
         return Err(Error::Unknown);
     }
-    Ok(Some(h))
+    Ok(Some((h, incomplete)))
+}
+
+fn after_image_home(raw: &[u8; 2 * BLOCK], index: usize, count: usize) -> Result<u32, Error> {
+    if u32at(raw, 48) != index as u32 || u32at(raw, 52) != count as u32 {
+        return Err(Error::Conflict);
+    }
+    let home = u32::try_from(u64at(raw, 40)).map_err(|_| Error::Invalid)?;
+    if !(BITMAP_START..BLOCK_COUNT).contains(&home) {
+        return Err(Error::Conflict);
+    }
+    Ok(home)
+}
+
+fn begin_count(raw: &[u8; 2 * BLOCK]) -> Result<usize, Error> {
+    let count = u32at(raw, 64) as usize;
+    if !(1..=MAX_REDO).contains(&count)
+        || u32at(raw, 68) != 0
+        || u64at(raw, 72) != count as u64 * BLOCK as u64
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(count)
+}
+
+fn verify_commit(
+    raw: &[u8; 2 * BLOCK],
+    begin: Header,
+    commit: Header,
+    count: usize,
+    digest: [u8; 32],
+) -> Result<(), Error> {
+    if commit.kind != 3
+        || commit.txid != begin.txid
+        || begin.lsn.checked_add(count as u64 + 1) != Some(commit.lsn)
+        || u64at(raw, 64) != begin.txid
+        || u64at(raw, 72) != begin.lsn
+        || u64at(raw, 80) != commit.lsn - 1
+        || u32at(raw, 88) != count as u32
+        || u32at(raw, 92) != 0
+        || raw[96..128] != digest
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(())
 }
 /// A clean/truncated suffix may contain old-epoch residue, but no later
 /// selected-epoch record. A malformed aligned candidate fails conservatively
@@ -235,13 +297,7 @@ pub fn scan(
         if begin.kind != 1 || begin.txid <= last_tx || last.checked_add(1) != Some(begin.lsn) {
             return Err(Error::Conflict);
         }
-        let n = u32at(&w.raw, 64) as usize;
-        if !(1..=MAX_REDO).contains(&n)
-            || u32at(&w.raw, 68) != 0
-            || u64at(&w.raw, 72) != n as u64 * BLOCK as u64
-        {
-            return Err(Error::Conflict);
-        }
+        let n = begin_count(&w.raw)?;
         let commit_at = at.checked_add(1 + 2 * n as u32).ok_or(Error::Invalid)?;
         if commit_at >= END {
             return Err(Error::Conflict);
@@ -257,15 +313,11 @@ pub fn scan(
             if redo.kind != 2
                 || redo.txid != begin.txid
                 || begin.lsn.checked_add(i as u64 + 1) != Some(redo.lsn)
-                || u32at(&w.raw, 48) != i as u32
-                || u32at(&w.raw, 52) != n as u32
             {
                 return Err(Error::Conflict);
             }
-            let home = u32::try_from(u64at(&w.raw, 40)).map_err(|_| Error::Invalid)?;
-            if !(BITMAP_START..BLOCK_COUNT).contains(&home)
-                || w.pending[..i].iter().any(|r| r.home == home)
-            {
+            let home = after_image_home(&w.raw, i, n)?;
+            if w.pending[..i].iter().any(|r| r.home == home) {
                 return Err(Error::Conflict);
             }
             ordered.update(u64::from(home).to_le_bytes());
@@ -282,19 +334,7 @@ pub fn scan(
             incomplete = true;
             break;
         };
-        let digest: [u8; 32] = ordered.finalize().into();
-        if commit.kind != 3
-            || commit.txid != begin.txid
-            || begin.lsn.checked_add(n as u64 + 1) != Some(commit.lsn)
-            || u64at(&w.raw, 64) != begin.txid
-            || u64at(&w.raw, 72) != begin.lsn
-            || u64at(&w.raw, 80) != commit.lsn - 1
-            || u32at(&w.raw, 88) != n as u32
-            || u32at(&w.raw, 92) != 0
-            || w.raw[96..128] != digest
-        {
-            return Err(Error::Conflict);
-        }
+        verify_commit(&w.raw, begin, commit, n, ordered.finalize().into())?;
         w.publish_rows(n, commit.lsn)?;
         last = commit.lsn;
         last_tx = commit.txid;

@@ -11,6 +11,7 @@ use super::{
 };
 pub const WINDOW_NS: u64 = 100_000_000;
 pub const LIMIT_NS: u64 = 70_000_000;
+pub const DECISION_DOMAIN_LIMIT_NS: u64 = 500_000;
 // 6ms of the 8ms coordination class belongs to model manager/supervisor.
 // EL1 coordination and dispatch overhead must not borrow those role slots.
 pub const KERNEL_COORDINATION_LIMIT_NS: u64 = 2_000_000;
@@ -183,6 +184,20 @@ impl Cpu0BudgetLedger {
     }
     pub fn aligned_window(&self) -> Option<u64> {
         self.window
+    }
+    pub fn decision_credit(&self, domain: u16, now: u64) -> Result<u64, Error> {
+        if !(1..=15).contains(&domain) {
+            return Err(Error::Invalid);
+        }
+        if now < self.last_ns {
+            return Err(Error::Clock);
+        }
+        let spent = if self.window == Some(now / WINDOW_NS) {
+            self.decision_spent[usize::from(domain - 1)]
+        } else {
+            0
+        };
+        Ok(DECISION_DOMAIN_LIMIT_NS.saturating_sub(spent))
     }
     pub fn ordinary_closed(&self) -> bool {
         self.ordinary_closed
@@ -659,12 +674,7 @@ impl Cpu0BudgetLedger {
                 }
             }
             Class::Decision => {
-                if !(1..=15).contains(&domain) {
-                    return Err(Error::Invalid);
-                }
-                if requested
-                    > 500_000u64.saturating_sub(self.decision_spent[usize::from(domain - 1)])
-                {
+                if requested > self.decision_credit(domain, now)? {
                     return Err(Error::Exhausted);
                 }
             }
@@ -773,7 +783,7 @@ impl Cpu0BudgetLedger {
             if turn.class == Class::Decision {
                 let d = &mut next.decision_spent[usize::from(turn.domain - 1)];
                 *d = d.checked_add(s.cpu_ns).ok_or(Error::Exhausted)?;
-                overrun |= *d > 500_000;
+                overrun |= *d > DECISION_DOMAIN_LIMIT_NS;
             }
             if kernel_coord {
                 next.kernel_coordination_spent = next
@@ -947,13 +957,29 @@ mod tests {
         let mut ledger = Cpu0BudgetLedger::new();
         assert_eq!(
             ledger.reserve_indexed_role_with_wall(
-                &lifecycle, 2, controller.actor, 1, Class::Decision, 1, 250_000, 1_000_000, 100,
+                &lifecycle,
+                2,
+                controller.actor,
+                1,
+                Class::Decision,
+                1,
+                250_000,
+                1_000_000,
+                100,
             ),
             Err(Error::Denied)
         );
         let reserved = ledger
             .reserve_indexed_role_with_wall(
-                &lifecycle, 2, controller.actor, 0, Class::Decision, 1, 250_000, 1_000_000, 100,
+                &lifecycle,
+                2,
+                controller.actor,
+                0,
+                Class::Decision,
+                1,
+                250_000,
+                1_000_000,
+                100,
             )
             .unwrap();
         assert_eq!(
@@ -1306,6 +1332,17 @@ mod tests {
             .reserve_role(&m, ctl, 0, Class::Decision, 1, 300_000, 17_000_000)
             .unwrap();
         q.settle(0, a, 300_000, 17_300_000).unwrap();
+        assert_eq!(q.decision_credit(1, 17_300_000), Ok(200_000));
+        assert_eq!(
+            q.decision_credit(2, 17_300_000),
+            Ok(DECISION_DOMAIN_LIMIT_NS)
+        );
+        assert_eq!(
+            q.decision_credit(1, WINDOW_NS),
+            Ok(DECISION_DOMAIN_LIMIT_NS)
+        );
+        assert_eq!(q.decision_credit(1, 17_299_999), Err(Error::Clock));
+        assert_eq!(q.decision_credit(0, 17_300_000), Err(Error::Invalid));
         assert_eq!(
             q.reserve_role(&m, pubr, 0, Class::Decision, 1, 200_001, 17_300_000),
             Err(Error::Exhausted)
@@ -1314,6 +1351,7 @@ mod tests {
             .reserve_role(&m, pubr, 0, Class::Decision, 1, 200_000, 17_300_000)
             .unwrap();
         q.settle(0, a, 200_000, 17_500_000).unwrap();
+        assert_eq!(q.decision_credit(1, 17_500_000), Ok(0));
         let a = q
             .reserve_role(&m, ops, 0, Class::Operations, 1, 2_000_000, 18_000_000)
             .unwrap();

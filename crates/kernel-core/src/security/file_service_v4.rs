@@ -3,6 +3,7 @@
 //! and does not authorize file operations. The native EL1 caller must perform
 //! credential/capability/ACL/admission checks before invoking a real file TCB.
 use super::Error;
+pub mod transactions;
 pub const REQUEST_MAGIC: u32 = 0x4359_4651;
 pub const REQUEST_VERSION: u16 = 4;
 pub const REQUEST_HEADER: usize = 32;

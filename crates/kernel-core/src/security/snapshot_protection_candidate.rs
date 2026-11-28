@@ -1,6 +1,5 @@
-//! D6 candidate wire layout for independent D7 review. Production mounts
-//! continue to use the empty-envelope decoder. Decoding a proof digest is
-//! insufficient to open writes or admit a recovery action.
+//! D6 ProtectionStore wire layout. Mount validates matching durable records,
+//! and the current boot still needs separate authority to open writes.
 
 use super::{
     Error, SNAPSHOT_SLOTS, SUPER_BYTES, UnifiedSystemKind, crc32c_zeroed, decode_envelope_header,
@@ -28,6 +27,7 @@ pub struct ProtectionRecord {
     pub retention_deadlines: [u64; SNAPSHOT_SLOTS as usize],
     pub writes_open: bool,
     pub restore_phase: RestorePhase,
+    pub cleanup_frozen: bool,
     pub reopen_proof_digest: [u8; 32],
     pub restore_obligation_digest: [u8; 32],
 }
@@ -52,7 +52,8 @@ impl ProtectionRecord {
             || le16(raw, 42)? != PAYLOAD_BYTES
             || raw[44..48] != [0; 4]
             || raw[136] > 1
-            || raw[138..144] != [0; 6]
+            || raw[138] > 1
+            || raw[139..144] != [0; 5]
             || raw[USED_BYTES..].iter().any(|&value| value != 0)
         {
             return Err(Error::Invalid);
@@ -76,6 +77,7 @@ impl ProtectionRecord {
             retention_deadlines,
             writes_open: raw[136] == 1,
             restore_phase,
+            cleanup_frozen: raw[138] == 1,
             reopen_proof_digest: raw[144..176].try_into().unwrap(),
             restore_obligation_digest: raw[176..208].try_into().unwrap(),
         };
@@ -101,6 +103,7 @@ impl ProtectionRecord {
         }
         raw[136] = u8::from(self.writes_open);
         raw[137] = self.restore_phase as u8;
+        raw[138] = u8::from(self.cleanup_frozen);
         raw[144..176].copy_from_slice(&self.reopen_proof_digest);
         raw[176..208].copy_from_slice(&self.restore_obligation_digest);
         let crc = crc32c_zeroed(raw, 32)?;

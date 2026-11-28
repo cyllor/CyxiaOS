@@ -163,6 +163,33 @@ struct Pending {
     trial: Option<TrialProof>,
 }
 
+impl Pending {
+    fn verify_apply_report_claim(
+        &self,
+        copied: BoundReport<'_>,
+        report: ApplyReportV1<'_>,
+    ) -> Result<WorkCustody, Error> {
+        let claim = self
+            .claimed
+            .get(usize::from(report.action_index))
+            .and_then(Option::as_ref)
+            .ok_or(Error::NotReady)?;
+        let work = super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
+        if claim.origin != copied.origin || !work.matches_report(report) {
+            return Err(Error::Denied);
+        }
+        match claim.custody {
+            WorkCustody::Accepted if report.completed_ns < claim.recorded_ns => Err(Error::Denied),
+            WorkCustody::NeverAccepted { report_digest }
+                if sha256(copied.bytes) != report_digest =>
+            {
+                Err(Error::Denied)
+            }
+            custody => Ok(custody),
+        }
+    }
+}
+
 /// 64 published nonterminal obligations plus one unpublished candidate.
 /// Native owner places this storage in its already accounted control pool;
 /// do not construct it on the kernel stack. No slot eviction is permitted.
@@ -217,25 +244,20 @@ pub struct RegisteredDecisionGate<'pool> {
     history_next: usize,
 }
 impl<'pool> RegisteredDecisionGate<'pool> {
-    pub fn new(
-        controller: Identity,
-        publisher: Identity,
-        boot: u64,
-        epoch: u64,
-    ) -> Result<Self, Error> {
-        if !controller.valid()
-            || !publisher.valid()
-            || controller.id == publisher.id
-            || boot == 0
-            || epoch == 0
-        {
-            return Err(Error::Invalid);
-        }
-        Ok(Self {
-            controller,
-            publisher,
-            boot_epoch: boot,
-            controller_epoch: epoch,
+    /// Preallocated, fail-closed storage that can be bound by the boot
+    /// owner without putting the protected decision history on its stack.
+    pub const fn unbound() -> Self {
+        Self {
+            controller: Identity {
+                id: 0,
+                generation: 0,
+            },
+            publisher: Identity {
+                id: 0,
+                generation: 0,
+            },
+            boot_epoch: 0,
+            controller_epoch: 0,
             fenced: false,
             last_plan_seq: 0,
             last_decision_seq: 0,
@@ -244,7 +266,59 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             terminal_owner: None,
             history: [None; TERMINAL_HISTORY],
             history_next: 0,
-        })
+        }
+    }
+
+    pub fn new(
+        controller: Identity,
+        publisher: Identity,
+        boot: u64,
+        epoch: u64,
+    ) -> Result<Self, Error> {
+        let mut gate = Self::unbound();
+        gate.bind_boot(controller, publisher, None, boot, epoch)?;
+        Ok(gate)
+    }
+
+    pub fn bind_terminal_owner(
+        &mut self,
+        controller: Identity,
+        publisher: Identity,
+        terminal_owner: Identity,
+        boot: u64,
+        epoch: u64,
+    ) -> Result<(), Error> {
+        self.bind_boot(controller, publisher, Some(terminal_owner), boot, epoch)
+    }
+
+    fn bind_boot(
+        &mut self,
+        controller: Identity,
+        publisher: Identity,
+        terminal_owner: Option<Identity>,
+        boot: u64,
+        epoch: u64,
+    ) -> Result<(), Error> {
+        if self.boot_epoch != 0 {
+            return Err(Error::Busy);
+        }
+        if !controller.valid()
+            || !publisher.valid()
+            || controller.id == publisher.id
+            || boot == 0
+            || epoch == 0
+            || terminal_owner.is_some_and(|owner| {
+                !owner.valid() || owner.id == controller.id || owner.id == publisher.id
+            })
+        {
+            return Err(Error::Invalid);
+        }
+        self.controller = controller;
+        self.publisher = publisher;
+        self.boot_epoch = boot;
+        self.controller_epoch = epoch;
+        self.terminal_owner = terminal_owner;
+        Ok(())
     }
 
     /// Native EL1 must assign an independently authenticated terminal owner
@@ -256,14 +330,8 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         boot: u64,
         epoch: u64,
     ) -> Result<Self, Error> {
-        if !terminal_owner.valid()
-            || terminal_owner.id == controller.id
-            || terminal_owner.id == publisher.id
-        {
-            return Err(Error::Invalid);
-        }
-        let mut gate = Self::new(controller, publisher, boot, epoch)?;
-        gate.terminal_owner = Some(terminal_owner);
+        let mut gate = Self::unbound();
+        gate.bind_terminal_owner(controller, publisher, terminal_owner, boot, epoch)?;
         Ok(gate)
     }
 
@@ -385,6 +453,26 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             .is_some_and(|p| p.status == PendingStatus::Frozen)
     }
 
+    /// EL1 transfers terminal custody after proving the prior Supervisor
+    /// stopped and the next generation owns its endpoint. State for
+    /// already accepted plans and their completion remains with the gate.
+    pub fn replace_terminal_owner(
+        &mut self,
+        old: Identity,
+        next: Identity,
+        verify_takeover: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if self.terminal_owner != Some(old) || !old.valid() {
+            return Err(Error::Denied);
+        }
+        if next.id != old.id || old.generation.checked_add(1) != Some(next.generation) {
+            return Err(Error::Stale);
+        }
+        verify_takeover()?;
+        self.terminal_owner = Some(next);
+        Ok(())
+    }
+
     /// Stop new registrations, publications and execution claims. The
     /// exact old terminal/recovery obligations remain accessible.
     pub fn fence(&mut self, supervisor: Identity) -> Result<(), Error> {
@@ -440,7 +528,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         expected_actor: Identity,
         context: &TrustedRegistrationScope,
     ) -> Result<(), Error> {
-        if actor != expected_actor {
+        if self.boot_epoch == 0 || !actor.valid() || actor != expected_actor {
             return Err(Error::Denied);
         }
         // The boot and controller identities are required even for an exact
@@ -1830,7 +1918,47 @@ impl<'pool> RegisteredDecisionGate<'pool> {
             .find(|r| (r.boot_epoch, r.controller_epoch, r.plan_seq) == (boot, epoch, seq)))
     }
 
-    /// Terminal integration from exact copied 0x43 ApplyReport v1 bytes.
+    /// Verify a copied report against this endpoint's actual accepted work.
+    /// The resulting claim still requires independent effect verification.
+    pub(super) fn verify_executor_report<'report>(
+        &self,
+        copied: BoundReport<'report>,
+        binding: ExecutorBindingV1,
+        scope: TrustedApplyScope,
+    ) -> Result<ApplyReportV1<'report>, Error> {
+        let report = ApplyReportV1::decode(copied.bytes)?;
+        if report.domain_id != binding.domain || report.target.id != binding.target.id {
+            return Err(Error::Denied);
+        }
+        if report.target != binding.target
+            || report.executor_generation != binding.executor_generation
+            || scope.boot_epoch != self.boot_epoch
+            || report.key.boot_epoch != self.boot_epoch
+            || report.key.controller_epoch != self.controller_epoch
+            || report.plan_version != scope.plan_version
+        {
+            return Err(Error::Stale);
+        }
+        if report.completed_ns > scope.now_ns {
+            return Err(Error::Denied);
+        }
+        let pending = self.lookup(report.key.plan_seq).ok_or(Error::Stale)?;
+        if pending.status != PendingStatus::AdapterAccepted {
+            return Err(Error::NotReady);
+        }
+        if !matches!(
+            pending.verify_apply_report_claim(copied, report)?,
+            WorkCustody::Accepted
+        ) {
+            return Err(Error::Denied);
+        }
+        if report.state == apply_report_v1::ActionStatus::Unknown {
+            return Err(Error::NotReady);
+        }
+        Ok(report)
+    }
+
+    /// Terminal integration from exact copied ApplyReport v1 bytes.
     ///
     /// This method still requires a TRUE native EL1 evidence verifier:
     /// signed/authenticated executor identity, device/redo completion,
@@ -1876,27 +2004,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
         // independently sealed never-accepted no-effect terminal.
         for copied in report_frames {
             let r = ApplyReportV1::decode(copied.bytes)?;
-            let i = usize::from(r.action_index);
-            let claim = pending
-                .claimed
-                .get(i)
-                .and_then(|v| v.as_ref())
-                .ok_or(Error::NotReady)?;
-            let work = super::apply_work_v1::ApplyWorkV1::decode(claim.frame.bytes())?;
-            if claim.origin != copied.origin || !work.matches_report(r) {
-                return Err(Error::Denied);
-            }
-            match claim.custody {
-                WorkCustody::Accepted if r.completed_ns < claim.recorded_ns => {
-                    return Err(Error::Denied);
-                }
-                WorkCustody::NeverAccepted { report_digest }
-                    if sha256(copied.bytes) != report_digest =>
-                {
-                    return Err(Error::Denied);
-                }
-                _ => (),
-            }
+            pending.verify_apply_report_claim(*copied, r)?;
         }
         // Retain the exact causal sidecar from registration, not a new
         // model-supplied explanation. A missing pair never becomes a label.
@@ -1981,7 +2089,7 @@ impl<'pool> RegisteredDecisionGate<'pool> {
     /// all high-water keys remain burned. In-flight/unknown work is never
     /// freed without an independent native terminal/recovery proof.
     pub fn expire_unpublished(&mut self, actor: Identity, now_ns: u64) -> Result<bool, Error> {
-        if actor != self.controller {
+        if !actor.valid() || actor != self.controller {
             return Err(Error::Denied);
         }
         if let Some(p) = self.frozen_or_legacy_busy() {
@@ -3231,6 +3339,71 @@ mod tests {
             super::super::feedback_v0199::CausalLabel::NoAdoption
         );
     }
+    #[test]
+    fn supervisor_takeover_preserves_an_accepted_apply_obligation() {
+        let bytes = profile_bytes();
+        let catalog = Profile::parse(&bytes).unwrap();
+        let plan = plan_bytes();
+        let records = [decision(&plan, &bytes)];
+        let ctx = trusted(&bytes);
+        let frozen = frozen(&[2, 4], &[2, 0]);
+        let mut gate = RegisteredDecisionGate::new_with_terminal_owner(
+            CONTROLLER, PUBLISHER, SUPERVISOR, 1, 2,
+        )
+        .unwrap();
+        gate.register_rule_only(CONTROLLER, &plan, &records, &catalog, &frozen, ctx)
+            .unwrap();
+        gate.publish_once(
+            PUBLISHER,
+            &plan,
+            &records,
+            &catalog,
+            &frozen,
+            ctx,
+            || Ok(()),
+        )
+        .unwrap();
+        claim_test_work(&mut gate, &plan);
+        let replacement = Identity {
+            generation: SUPERVISOR.generation + 1,
+            ..SUPERVISOR
+        };
+        assert_eq!(
+            gate.replace_terminal_owner(SUPERVISOR, replacement, || Err(Error::Denied)),
+            Err(Error::Denied)
+        );
+        gate.replace_terminal_owner(SUPERVISOR, replacement, || Ok(()))
+            .unwrap();
+        assert_eq!(gate.fence(SUPERVISOR), Err(Error::Denied));
+
+        let report = executor_report(1);
+        let reports = [BoundReport {
+            bytes: &report,
+            origin: apply_report_v1::ReportOrigin::Kernel,
+        }];
+        let bindings = [verified_binding()];
+        assert_eq!(
+            gate.settle_verified_apply_reports(
+                SUPERVISOR,
+                &plan,
+                &reports,
+                &bindings,
+                verified_scope(),
+                |_, _| panic!("old supervisor reached verifier")
+            ),
+            Err(Error::Denied)
+        );
+        gate.settle_verified_apply_reports(
+            replacement,
+            &plan,
+            &reports,
+            &bindings,
+            verified_scope(),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn native_apply_reports_require_supervisor_and_real_completion_proof() {
         let bytes = profile_bytes();

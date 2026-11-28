@@ -61,7 +61,7 @@ impl ReceiptKey {
         Ok(())
     }
 
-    fn encode(self) -> [u8; RECEIPT_KEY_BYTES] {
+    pub fn encode(self) -> [u8; RECEIPT_KEY_BYTES] {
         let mut out = [0; RECEIPT_KEY_BYTES];
         out[..16].copy_from_slice(&self.fs_uuid);
         out[16..24].copy_from_slice(&self.issued_boot_epoch.to_le_bytes());

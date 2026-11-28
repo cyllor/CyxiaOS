@@ -79,6 +79,7 @@ pub enum Recovered {
     CommitUnknown(Prepared),
     RestoredFrozen(Prepared, Commit),
     ReopeningUnknown(Prepared, Commit),
+    ReopeningNextProtectionUnknown(Prepared, Commit),
 }
 pub struct RestoreGate {
     recovery: Identity,
@@ -87,6 +88,7 @@ pub struct RestoreGate {
     phase: Phase,
     pending: Option<Prepared>,
     last: Option<(Prepared, Commit)>,
+    reopening_protection_generation: Option<u64>,
 }
 impl RestoreGate {
     /// Actual native file owner must already have closed new write
@@ -111,6 +113,7 @@ impl RestoreGate {
             phase: Phase::Frozen,
             pending: None,
             last: None,
+            reopening_protection_generation: None,
         })
     }
     /// Reconstruct exactly one retained restore obligation from a complete
@@ -156,22 +159,33 @@ impl RestoreGate {
                     None,
                 )
             }
-            Recovered::RestoredFrozen(p, c) | Recovered::ReopeningUnknown(p, c) => {
+            Recovered::RestoredFrozen(p, c)
+            | Recovered::ReopeningUnknown(p, c)
+            | Recovered::ReopeningNextProtectionUnknown(p, c) => {
                 Self::check_prepared(p, index, security)?;
                 Self::check_commit(p, c)?;
                 if c.view != view {
                     return Err(Error::Conflict);
                 }
                 (
-                    if matches!(state, Recovered::ReopeningUnknown(..)) {
-                        Phase::ReopeningUnknown
-                    } else {
+                    if matches!(state, Recovered::RestoredFrozen(..)) {
                         Phase::RestoredFrozen
+                    } else {
+                        Phase::ReopeningUnknown
                     },
                     None,
                     Some((p, c)),
                 )
             }
+        };
+        let reopening_protection_generation = match state {
+            Recovered::ReopeningUnknown(..) => Some(view.protection_generation),
+            Recovered::ReopeningNextProtectionUnknown(..) => Some(
+                view.protection_generation
+                    .checked_add(1)
+                    .ok_or(Error::Exhausted)?,
+            ),
+            _ => None,
         };
         // The verifier must establish the entire current durable history,
         // exact retained keys, current root, closed write gate and native
@@ -184,6 +198,7 @@ impl RestoreGate {
             phase,
             pending,
             last,
+            reopening_protection_generation,
         })
     }
     fn check_prepared(p: Prepared, index: &[u8], security: &[u8]) -> Result<(), Error> {
@@ -409,6 +424,30 @@ impl RestoreGate {
         expected: View,
         verify_open: impl FnOnce(View, Commit) -> Result<(), Error>,
     ) -> Result<(), Error> {
+        self.reopen_to(actor, expected, expected.protection_generation, verify_open)
+    }
+
+    /// D7 OPEN_WRITES simultaneously publishes the next protection generation.
+    pub fn reopen_next_protection(
+        &mut self,
+        actor: Identity,
+        expected: View,
+        verify_open: impl FnOnce(View, Commit) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let next = expected
+            .protection_generation
+            .checked_add(1)
+            .ok_or(Error::Exhausted)?;
+        self.reopen_to(actor, expected, next, verify_open)
+    }
+
+    fn reopen_to(
+        &mut self,
+        actor: Identity,
+        expected: View,
+        generation: u64,
+        verify_open: impl FnOnce(View, Commit) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         if actor != self.reopen {
             return Err(Error::Unauthorized);
         }
@@ -420,7 +459,10 @@ impl RestoreGate {
         // response. Keep the software write gate closed; never repeat the
         // side-effecting writer until an independent read-only proof.
         self.phase = Phase::ReopeningUnknown;
+        self.reopening_protection_generation = Some(generation);
         verify_open(expected, c)?;
+        self.view.protection_generation = generation;
+        self.reopening_protection_generation = None;
         self.phase = Phase::Open;
         Ok(())
     }
@@ -430,6 +472,36 @@ impl RestoreGate {
         expected: View,
         verify_current_open: impl FnOnce(View, Commit) -> Result<(), Error>,
     ) -> Result<(), Error> {
+        self.reconcile_reopen_to(
+            actor,
+            expected,
+            expected.protection_generation,
+            verify_current_open,
+        )
+    }
+
+    /// Recover a lost OPEN_WRITES reply by proving the exact successor
+    /// protection generation. This never reissues the write transaction.
+    pub fn reconcile_reopen_next_protection(
+        &mut self,
+        actor: Identity,
+        expected: View,
+        verify_current_open: impl FnOnce(View, Commit) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let next = expected
+            .protection_generation
+            .checked_add(1)
+            .ok_or(Error::Exhausted)?;
+        self.reconcile_reopen_to(actor, expected, next, verify_current_open)
+    }
+
+    fn reconcile_reopen_to(
+        &mut self,
+        actor: Identity,
+        expected: View,
+        generation: u64,
+        verify_current_open: impl FnOnce(View, Commit) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         if actor != self.reopen {
             return Err(Error::Unauthorized);
         }
@@ -437,8 +509,13 @@ impl RestoreGate {
         {
             return Err(Error::Busy);
         }
+        if self.reopening_protection_generation != Some(generation) {
+            return Err(Error::Stale);
+        }
         let (_, c) = self.last.ok_or(Error::Unknown)?;
         verify_current_open(expected, c)?;
+        self.view.protection_generation = generation;
+        self.reopening_protection_generation = None;
         self.phase = Phase::Open;
         Ok(())
     }

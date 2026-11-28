@@ -74,29 +74,36 @@ pub(super) fn verified_pair_state(
     sb: SuperblockV1,
     config: volume::Config<'_>,
 ) -> Result<SecurityStateStoreV2, SecurityError> {
-    verified_pair_state_for(disk, sb, |state| {
-        if let Some(config) = config {
-            config.check_committed(state)?;
-        }
-        if *state != volume::expected_state(sb.generation, config)? {
-            return Err(SecurityError::Conflict);
-        }
-        Ok(())
-    })
+    verified_pair_state_for(
+        disk,
+        sb,
+        |_| Ok(()),
+        |state| {
+            if let Some(config) = config {
+                config.check_committed(state)?;
+            }
+            if *state != volume::expected_state(sb.generation, config)? {
+                return Err(SecurityError::Conflict);
+            }
+            Ok(())
+        },
+    )
 }
 
 #[cfg_attr(
     not(any(feature = "v020-production-media-signed", cyxia_startup_catalog, test)),
     allow(dead_code)
 )]
-pub(super) fn verified_pair_state_for(
-    disk: &mut impl EpochBlockIo,
+pub(super) fn verified_pair_state_for<D: EpochBlockIo>(
+    disk: &mut D,
     sb: SuperblockV1,
+    checkpoint: impl FnOnce(&mut D) -> Result<(), SecurityError>,
     verify_state: impl FnOnce(&SecurityStateStoreV2) -> Result<(), SecurityError>,
 ) -> Result<SecurityStateStoreV2, SecurityError> {
     // SAFETY: synchronous, non-overlapping use of this CPU0-owned workspace.
     let pair = unsafe { &mut *core::ptr::addr_of_mut!(PAIR) };
     pair.read(disk, FIRST_LOG_BLOCK)?;
+    checkpoint(disk)?;
     let state = verify_pair_state(pair, sb)?;
     verify_state(&state)?;
     Ok(state)

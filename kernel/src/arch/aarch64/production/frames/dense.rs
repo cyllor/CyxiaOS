@@ -1,6 +1,6 @@
 //! The canonical FrameMeta owner in the native 1 GiB profiles.
 //! Static classifications are subregions of the reserved boot arena.
-//! CPU0 owns all changes to the physical record table.
+//! CPU0 initializes and publishes the physical record table.
 
 use super::super::role_loader::high_leaf;
 #[cfg(feature = "v020-production-frame-pool")]
@@ -177,10 +177,7 @@ pub(super) fn exercise(manifest: &NativeRoleManifest) -> Result<(), LedgerError>
         slot: index as u32,
         generation: actor.generation,
     };
-    let mut ledger = native_ledger()
-        .ok_or(LedgerError::Unauthorized)?
-        .try_borrow_mut()
-        .map_err(|_| LedgerError::Busy)?;
+    let mut ledger = native_ledger()?;
     let before = ledger.inventory()?;
     let mut handles = [None; PROBE_PAGES];
     for slot in &mut handles {

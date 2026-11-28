@@ -12,8 +12,9 @@
 //!   `register_production_statics`, guarded by the REGISTERED swap, on CPU0
 //!   before any secondary CPU or EL0 role runs. REGISTERED_PAGES publishes the
 //!   ledger to the boot CPU for checked copy-window and device operations.
-//! * NATIVE_LEDGER is initialized once. Its RefCell and the underlying rows
-//!   are accessed only by CPU0. An IRQ does not acquire a ledger borrow.
+//! * NATIVE_LEDGER is initialized once. Its native gate serializes CPU0 and,
+//!   when explicitly provisioned, the sole business memory owner's foreground.
+//!   An IRQ does not acquire the gate.
 //! * REGISTERED and the inventory counters (atomics): CPU0 only. REGISTERED
 //!   makes the registration one-shot; the counters carry seal-time evidence.
 //! * `__sec_n_start` / `__sec_n_end` (linker symbols): only their addresses are
@@ -39,7 +40,10 @@ use super::{BACKING, Backing, COPY_BUFFER, CopyBuffer, ROLE_COUNT, TABLES, Table
 use super::{EXEC_TARGET, ExecTarget, PLAN_POOL, PLAN_POOL_BYTES, evidence};
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use core::{cell::RefCell, mem::MaybeUninit};
+use core::{
+    mem::MaybeUninit,
+    ops::{Deref, DerefMut},
+};
 use cyxia_contracts::{MemoryRegion, PhysAddr, RegionKind};
 #[cfg(not(all(
     feature = "prototype-memory",
@@ -101,7 +105,8 @@ const FATAL_FRAME_META: u64 = 0x5731_1290;
     any(feature = "v020-production-frame-pool", cyxia_startup_catalog)
 )))]
 static mut ROWS_BACKING: [FrameMeta; ROWS] = [FrameMeta::ZERO; ROWS];
-static mut NATIVE_LEDGER: MaybeUninit<RefCell<Ledger<'static>>> = MaybeUninit::uninit();
+static mut NATIVE_LEDGER: MaybeUninit<Ledger<'static>> = MaybeUninit::uninit();
+static LEDGER_HELD: AtomicBool = AtomicBool::new(false);
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 static REGISTERED_PAGES: AtomicU64 = AtomicU64::new(0);
 static PERMANENT_ROWS: AtomicU64 = AtomicU64::new(0);
@@ -250,18 +255,59 @@ fn register_production_statics() -> Result<(Inventory, u64), Error> {
 fn install_ledger(ledger: Ledger<'static>) {
     // SAFETY: the exclusive boot claim has already been taken. The caller
     // publishes REGISTERED_PAGES only after the slot is initialized.
-    unsafe { addr_of_mut!(NATIVE_LEDGER).write(MaybeUninit::new(RefCell::new(ledger))) };
+    unsafe { addr_of_mut!(NATIVE_LEDGER).write(MaybeUninit::new(ledger)) };
 }
 
-fn native_ledger() -> Option<&'static RefCell<Ledger<'static>>> {
-    if cyxia_arch_aarch64::cpu::registered_slot() != Some(0)
+struct NativeLedgerGuard;
+
+impl Deref for NativeLedgerGuard {
+    type Target = Ledger<'static>;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: a guard is minted only after initialization and acquisition.
+        unsafe { &*addr_of!(NATIVE_LEDGER).cast() }
+    }
+}
+
+impl DerefMut for NativeLedgerGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: the guard releases the sole foreground access on drop.
+        unsafe { &mut *addr_of_mut!(NATIVE_LEDGER).cast() }
+    }
+}
+
+impl Drop for NativeLedgerGuard {
+    fn drop(&mut self) {
+        LEDGER_HELD.store(false, Ordering::Release);
+    }
+}
+
+fn acquire_ledger(slot: usize) -> Result<NativeLedgerGuard, LedgerError> {
+    if cyxia_arch_aarch64::cpu::registered_slot() != Some(slot)
         || REGISTERED_PAGES.load(Ordering::Acquire) == 0
     {
-        return None;
+        return Err(LedgerError::Unauthorized);
     }
-    // SAFETY: the acquire observes publication. Only the registered CPU0
-    // foreground and its synchronous SVC dispatcher can borrow this cell.
-    Some(unsafe { (*addr_of!(NATIVE_LEDGER)).assume_init_ref() })
+    LEDGER_HELD
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .map_err(|_| LedgerError::Busy)?;
+    Ok(NativeLedgerGuard)
+}
+
+fn native_ledger() -> Result<NativeLedgerGuard, LedgerError> {
+    acquire_ledger(0)
+}
+
+#[cfg(cyxia_business_task_services)]
+pub(super) fn with_business_ledger<T>(
+    access: impl FnOnce(&mut Ledger<'static>) -> Result<T, LedgerError>,
+) -> Result<T, LedgerError> {
+    let slot = cyxia_arch_aarch64::cpu::registered_slot().ok_or(LedgerError::Unauthorized)?;
+    if slot != 0 && slot != super::signed_business::GROUP_CPU {
+        return Err(LedgerError::Unauthorized);
+    }
+    let mut ledger = acquire_ledger(slot)?;
+    access(&mut ledger)
 }
 
 #[cfg(any(cyxia_startup_catalog, feature = "v020-production-diagnostic"))]
@@ -270,20 +316,14 @@ pub(super) fn statically_pinned_control_span(span: core::ops::Range<u64>) -> boo
 }
 
 fn statically_pinned_span(span: core::ops::Range<u64>, class: StaticClass) -> bool {
-    native_ledger()
-        .and_then(|ledger| ledger.try_borrow().ok())
-        .is_some_and(|ledger| ledger.statically_pinned(span, class))
+    native_ledger().is_ok_and(|ledger| ledger.statically_pinned(span, class))
 }
 
 pub(crate) fn claim_static_dma(
     span: core::ops::Range<u64>,
     owner: Owner,
 ) -> Result<(), LedgerError> {
-    native_ledger()
-        .ok_or(LedgerError::Unauthorized)?
-        .try_borrow_mut()
-        .map_err(|_| LedgerError::Busy)?
-        .claim_static_dma(span, owner)
+    native_ledger()?.claim_static_dma(span, owner)
 }
 
 /// Registered static pages: the class tallies, never the unregistered gaps.

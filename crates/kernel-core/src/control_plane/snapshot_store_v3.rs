@@ -130,11 +130,27 @@ impl SnapshotStore {
         g: ViewGrant,
         verify_actual_cap: impl FnOnce(ViewGrant) -> Result<(), Error>,
     ) -> Result<(), Error> {
+        self.register_protected_view(g, |grant| {
+            manifest.check_snapshot_view(grant.holder, grant.endpoint, 0, grant.view)?;
+            verify_actual_cap(grant)
+        })
+    }
+
+    /// The native adapter proves the exact holder, endpoint and view against
+    /// its live protected registry. This also supports independently signed
+    /// deployments that provision a subset of the full role manifest.
+    pub fn register_protected_view(
+        &mut self,
+        g: ViewGrant,
+        verify_view: impl FnOnce(ViewGrant) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         if self.boot == 0 {
             return Err(Error::NotReady);
         }
         if g.cap == 0
             || g.selector == 0
+            || !g.holder.valid()
+            || g.endpoint == 0
             || g.allowed_fields == 0
             || g.allowed_fields & !FIELD_MASK != 0
             || !self
@@ -150,13 +166,12 @@ impl SnapshotStore {
         {
             return Err(Error::Denied);
         }
-        manifest.check_snapshot_view(g.holder, g.endpoint, 0, g.view)?;
+        verify_view(g)?;
         let slot = self
             .grants
             .iter_mut()
             .find(|v| v.is_none())
             .ok_or(Error::Exhausted)?;
-        verify_actual_cap(g)?;
         *slot = Some(g);
         Ok(())
     }
@@ -321,8 +336,42 @@ impl SnapshotStore {
         now_ns: u64,
         verify_live_cap: impl FnOnce(ViewGrant) -> Result<(), Error>,
     ) -> Result<[u8; SNAPSHOT_BYTES], Error> {
+        self.read_protected(
+            actor,
+            cpu,
+            cap,
+            domain,
+            selector,
+            ledger,
+            cores,
+            now_ns,
+            |grant| {
+                manifest.check_snapshot_view(actor, grant.endpoint, cpu, grant.view)?;
+                verify_live_cap(grant)
+            },
+        )
+    }
+
+    /// Read the exact registered view only after the native adapter proves
+    /// that its independently provisioned rights and generation are live.
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_protected(
+        &self,
+        actor: Identity,
+        cpu: usize,
+        cap: u64,
+        domain: u16,
+        selector: u64,
+        ledger: u64,
+        cores: u64,
+        now_ns: u64,
+        verify_view: impl FnOnce(ViewGrant) -> Result<(), Error>,
+    ) -> Result<[u8; SNAPSHOT_BYTES], Error> {
         if self.boot == 0 {
             return Err(Error::NotReady);
+        }
+        if cpu != 0 {
+            return Err(Error::Denied);
         }
         let grant = *self
             .grants
@@ -332,8 +381,7 @@ impl SnapshotStore {
                 g.cap == cap && g.holder == actor && g.selector == selector && g.domain == domain
             })
             .ok_or(Error::Denied)?;
-        manifest.check_snapshot_view(actor, grant.endpoint, cpu, grant.view)?;
-        verify_live_cap(grant)?;
+        verify_view(grant)?;
         let r = self
             .targets
             .iter()

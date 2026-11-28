@@ -5,17 +5,29 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::control_plane::Identity;
 use crate::security::{
     Error,
     epoch_redo_v0199::EpochBlockIo,
     file_media_unified_v1::{
-        INODE_START, PERIODIC_SLOTS, SHORT_TIER_SLOTS, SNAPSHOT_CATALOG_BLOCK,
-        SNAPSHOT_PROTECTION_BLOCK, SNAPSHOT_STRIDE, SUPER_BYTES,
+        BITMAP_START, INODE_START, PERIODIC_SLOTS, SHORT_TIER_SLOTS, SNAP_CAP_PROTECTION,
+        SNAP_OP_OPEN_WRITES, SNAP_OP_RESTORE, SNAPSHOT_CATALOG_BLOCK, SNAPSHOT_PROTECTION_BLOCK,
+        SNAPSHOT_REQUEST_START, SNAPSHOT_STRIDE, SUPER_BYTES, SuperblockV1, UnifiedSystemKind,
+        UnifiedSystemObject, cap_word_valid,
         protection_candidate::{ProtectionRecord, RestorePhase},
+        request_store::{
+            RequestRecord, RequestState, RequestStoreHeader, inspect_request_store,
+            record_location, record_partition,
+        },
         slot_candidate::{SlotDescriptor, SlotIdentity, validate_mirror_page},
+        unified_superblock_pair,
     },
+    file_mount_v1::{self, Acl, Workspace as MountWorkspace},
+    file_structure_v1::{Inode, SystemObject},
+    offline_config_v1::Principal,
     recovery_v1::{CommittedRedo, RedoImage, RedoTransaction, RedoWriter},
-    snapshot_restore_gate::SnapshotKey,
+    snapshot_restore_gate::{RestoreGate, SnapshotKey},
+    snapshot_service_v4::{FileReqKey, Operation},
 };
 
 use super::{
@@ -300,6 +312,7 @@ pub fn mark_expired<I: EpochBlockIo>(
     let slot = identity.slot as usize;
     if protection.writes_open
         || protection.restore_phase != RestorePhase::Idle
+        || protection.cleanup_frozen
         || protection.online_age_ns < protection.retention_deadlines[slot]
     {
         return Err(Error::Busy);
@@ -335,4 +348,371 @@ pub fn mark_expired<I: EpochBlockIo>(
         }],
         reserve,
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenWritesRequest {
+    pub actor: Identity,
+    pub rights: u32,
+    pub key: FileReqKey,
+}
+
+/// Complete a reserved OPEN_WRITES request under the independent protection
+/// role. The prior restore must be durably completed, and the two records
+/// must identify the same live epoch and exact restore transaction. The
+/// write gate changes only after the protection and terminal record images
+/// commit together. Any lost reply keeps the in-memory gate UNKNOWN.
+pub fn commit_open_writes<I: EpochBlockIo>(
+    writer: &mut RedoWriter<'_, I>,
+    expected: ExpectedState,
+    gate: &mut RestoreGate,
+    request: OpenWritesRequest,
+    work: &mut CaptureWorkspace,
+    reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
+) -> Result<CommittedRedo, Error> {
+    if !cap_word_valid(request.rights)
+        || request.rights & SNAP_CAP_PROTECTION == 0
+        || request.key.client_slot != 15
+    {
+        return Err(Error::Unauthorized);
+    }
+    let (catalog, mut protection) = read_current(writer, expected)?;
+    let view = gate.view();
+    if protection.restore_phase != RestorePhase::RestoredFrozen
+        || protection.writes_open
+        || view.fs_uuid != protection.fs_uuid
+        || view.live_epoch != protection.live_view_epoch
+        || view.protection_generation != protection.protection_generation
+    {
+        return Err(Error::Stale);
+    }
+    if !catalog.has_periodic_coverage() {
+        return Err(Error::Busy);
+    }
+
+    let [page, gate_page, ..] = &mut work.pages;
+    writer.read_committed(SNAPSHOT_REQUEST_START, page)?;
+    let header = RequestStoreHeader::decode(page)?.ok_or(Error::Conflict)?;
+    let mut open = None;
+    let requests = inspect_request_store(
+        expected.catalog.fs_uuid,
+        header.generation,
+        expected.catalog.committed_lsn,
+        |home, out| writer.read_committed(home, out),
+        |record| {
+            if record.key == request.key {
+                open = Some(*record);
+            }
+            Ok(())
+        },
+    )?;
+    if requests.nonterminal != 1 {
+        return Err(Error::Busy);
+    }
+    let open = open.ok_or(Error::Stale)?;
+    if open.operation != SNAP_OP_OPEN_WRITES
+        || open.state != RequestState::Pending
+        || open.old_live_view_epoch != protection.live_view_epoch
+    {
+        return Err(Error::Stale);
+    }
+    let Operation::OpenWrites {
+        protection_generation,
+        restore,
+    } = Operation::decode(open.operation, open.payload())?
+    else {
+        return Err(Error::Invalid);
+    };
+    if protection_generation != protection.protection_generation || restore.client_slot != 15 {
+        return Err(Error::Stale);
+    }
+
+    // Both recovery requests must be in the physically reserved class.
+    let first = record_partition(15).ok_or(Error::Invalid)?.start;
+    let (home, _) = record_location(first)?;
+    writer.read_committed(home, page)?;
+    let mut open_index = None;
+    let mut restored = None;
+    for index in record_partition(15).ok_or(Error::Invalid)? {
+        let (row_home, range) = record_location(index)?;
+        if row_home != home {
+            return Err(Error::Conflict);
+        }
+        let raw = &page[range];
+        if raw.iter().all(|&byte| byte == 0) {
+            continue;
+        }
+        let record = RequestRecord::decode(raw)?;
+        if record == open {
+            open_index = Some(index);
+        }
+        if record.key == restore {
+            restored = Some(record);
+        }
+    }
+    let slot = open_index.ok_or(Error::Conflict)?;
+    let restored = restored.ok_or(Error::Stale)?;
+    if restored.operation != SNAP_OP_RESTORE
+        || restored.state != RequestState::Done
+        || restored.new_live_view_epoch != protection.live_view_epoch
+        || restored.result_digest != protection.restore_obligation_digest
+    {
+        return Err(Error::Conflict);
+    }
+
+    let plan = writer.prepare(2)?;
+    protection.object_generation = protection
+        .object_generation
+        .checked_add(1)
+        .ok_or(Error::Exhausted)?;
+    protection.protection_generation = protection
+        .protection_generation
+        .checked_add(1)
+        .ok_or(Error::Exhausted)?;
+    let mut terminal = open;
+    terminal.state = RequestState::Done;
+    terminal.new_live_view_epoch = protection.live_view_epoch;
+    terminal.log_epoch = plan.log_epoch;
+    terminal.txid = plan.txid;
+    terminal.commit_lsn = plan.commit_lsn;
+    let mut result = [0; 16];
+    result[..8].copy_from_slice(&protection.protection_generation.to_le_bytes());
+    result[8..12].copy_from_slice(&u32::from(protection.cleanup_frozen).to_le_bytes());
+    terminal.replace_payload(&result)?;
+    terminal.seal_result()?;
+    open.permits_transition(&terminal)?;
+    let (_, range) = record_location(slot)?;
+    terminal.encode((&mut page[range]).try_into().map_err(|_| Error::Invalid)?)?;
+    protection.writes_open = true;
+    protection.restore_phase = RestorePhase::Idle;
+    protection.restore_obligation_digest = [0; 32];
+    protection.reopen_proof_digest = terminal.result_digest;
+    protection.encode(gate_page)?;
+    let images = [
+        RedoImage {
+            home,
+            contents: page,
+        },
+        RedoImage {
+            home: SNAPSHOT_PROTECTION_BLOCK,
+            contents: gate_page,
+        },
+    ];
+    let mut committed = None;
+    gate.reopen_next_protection(request.actor, view, |_, restore_commit| {
+        if restore_commit.key.request_seq != restored.key.request_seq
+            || restore_commit.txid != restored.txid
+            || restore_commit.log_epoch != restored.log_epoch
+            || restore_commit.commit_lsn != restored.commit_lsn
+            || restore_commit.request_hash != restored.request_digest
+        {
+            return Err(Error::Conflict);
+        }
+        committed = Some(writer.append(plan, &images, reserve)?);
+        Ok(())
+    })?;
+    committed.ok_or(Error::Unknown)
+}
+
+/// Reuses the file owner's GC pages while all new writes are fenced.
+pub struct GcWorkspace {
+    bitmap: [[u8; SUPER_BYTES]; 4],
+    catalog: [u8; SUPER_BYTES],
+    protection: [u8; SUPER_BYTES],
+}
+
+impl GcWorkspace {
+    pub const fn new() -> Self {
+        Self {
+            bitmap: [[0; SUPER_BYTES]; 4],
+            catalog: [0; SUPER_BYTES],
+            protection: [0; SUPER_BYTES],
+        }
+    }
+}
+
+impl Default for GcWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<GcWorkspace>() <= 48 * 1024);
+
+pub struct GcVolume<'a> {
+    pub baseline: &'a [SystemObject; 4],
+    pub snapshot: &'a [UnifiedSystemObject; 4],
+    pub principals: &'a [Principal; 16],
+}
+
+/// Move-only proof of a fully checkpointed allocation change. Software
+/// remains fenced while the owner installs this exact bitmap revision.
+pub struct CheckpointedGc {
+    checkpoint: SuperblockV1,
+    bitmap_sha256: [u8; 32],
+    released: u32,
+}
+
+impl CheckpointedGc {
+    pub const fn released(&self) -> u32 {
+        self.released
+    }
+
+    pub const fn checkpoint(&self) -> SuperblockV1 {
+        self.checkpoint
+    }
+
+    /// Re-observe the durable homes under the same exclusive ownership
+    /// before handing the new generation to the real allocator. A lost
+    /// handoff result must be reconciled from its exact allocator generation.
+    pub fn handoff(
+        self,
+        io: &mut impl EpochBlockIo,
+        work: &mut GcWorkspace,
+        install_once: impl FnOnce(SuperblockV1, &[[u8; SUPER_BYTES]; 4]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        io.read(0, &mut work.catalog)?;
+        io.read(1, &mut work.protection)?;
+        if unified_superblock_pair(&work.catalog, &work.protection)? != self.checkpoint {
+            return Err(Error::Stale);
+        }
+        for (i, page) in work.bitmap.iter_mut().enumerate() {
+            io.read(BITMAP_START + i as u32, page)?;
+        }
+        if bitmap_hash(&work.bitmap) != self.bitmap_sha256 {
+            return Err(Error::Conflict);
+        }
+        install_once(self.checkpoint, &work.bitmap)
+    }
+}
+
+fn bitmap_hash(bitmap: &[[u8; SUPER_BYTES]; 4]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    for page in bitmap {
+        digest.update(page);
+    }
+    digest.finalize().into()
+}
+
+/// Retire one previously dropped root. Two full root censuses compute the
+/// exact bitmap delta while the file owner keeps writes and each external
+/// pin fenced. One redo commits the bitmap, catalog and retention together.
+/// Allocation remains closed until a complete checkpoint and matching raw
+/// homes have been confirmed. No user request can supply the pin proof.
+#[allow(clippy::too_many_arguments)]
+pub fn retire_deleted_snapshot<I: EpochBlockIo>(
+    mut writer: RedoWriter<'_, I>,
+    volume: GcVolume<'_>,
+    target: SlotIdentity,
+    mount_work: &mut MountWorkspace,
+    work: &mut GcWorkspace,
+    mut policy: impl FnMut(Acl, Inode, Option<UnifiedSystemKind>) -> Result<(), Error>,
+    prove_quiescent: impl FnOnce(SlotIdentity, u64) -> Result<(), Error>,
+    reserve: impl FnOnce(&RedoTransaction) -> Result<(), Error>,
+) -> Result<CheckpointedGc, Error> {
+    let epoch = writer.evidence().ok_or(Error::Unknown)?;
+    let before = SuperblockV1 {
+        checkpoint_lsn: epoch.last_commit_lsn,
+        ..epoch.superblock
+    };
+    let prior = file_mount_v1::validate_unified_resident(
+        &mut writer.committed_view(),
+        before,
+        volume.baseline,
+        volume.snapshot,
+        volume.principals,
+        mount_work,
+        &mut policy,
+    )?;
+    let staged = prior.snapshot.ok_or(Error::Unauthorized)?;
+    let mut catalog = staged.catalog.ok_or(Error::Conflict)?;
+    let mut protection = staged.protection.ok_or(Error::Conflict)?;
+    let slot = target.slot as usize;
+    let Some(CatalogEntry::Deleting {
+        binding,
+        root_drop_commit_lsn,
+    }) = catalog.entries.get(slot)
+    else {
+        return Err(Error::Stale);
+    };
+    if binding.identity != target || *root_drop_commit_lsn > before.checkpoint_lsn {
+        return Err(Error::Conflict);
+    }
+    if protection.writes_open
+        || protection.restore_phase != RestorePhase::Idle
+        || protection.retention_deadlines[slot] > protection.online_age_ns
+        || staged.requests.nonterminal != 0
+    {
+        return Err(Error::Busy);
+    }
+    prove_quiescent(target, *root_drop_commit_lsn)?;
+    catalog.entries[slot] = CatalogEntry::Free {
+        slot_generation: target.slot_generation,
+    };
+    catalog.generation = catalog.generation.checked_add(1).ok_or(Error::Exhausted)?;
+    protection.retention_deadlines[slot] = 0;
+    protection.object_generation = protection
+        .object_generation
+        .checked_add(1)
+        .ok_or(Error::Exhausted)?;
+    let released = file_mount_v1::gc_bitmap_after(
+        &mut writer.committed_view(),
+        before,
+        volume.baseline,
+        volume.snapshot,
+        mount_work,
+        &catalog,
+        &mut work.bitmap,
+    )?;
+
+    catalog.encode(&mut work.catalog)?;
+    protection.encode(&mut work.protection)?;
+    let bitmap_sha256 = bitmap_hash(&work.bitmap);
+    let plan = writer.prepare(6)?;
+    let images: [RedoImage<'_>; 6] = core::array::from_fn(|at| match at {
+        4 => RedoImage {
+            home: SNAPSHOT_CATALOG_BLOCK,
+            contents: &work.catalog,
+        },
+        5 => RedoImage {
+            home: SNAPSHOT_PROTECTION_BLOCK,
+            contents: &work.protection,
+        },
+        _ => RedoImage {
+            home: BITMAP_START + at as u32,
+            contents: &work.bitmap[at],
+        },
+    });
+    let commit = writer.append(plan, &images, reserve)?;
+    let (_, checkpoint) = writer.checkpoint_verified(|io, current| {
+        let effective = SuperblockV1 {
+            checkpoint_lsn: commit.transaction().commit_lsn,
+            ..current
+        };
+        let mounted = file_mount_v1::validate_unified_resident(
+            io,
+            effective,
+            volume.baseline,
+            volume.snapshot,
+            volume.principals,
+            mount_work,
+            policy,
+        )?;
+        let observed = mounted.snapshot.ok_or(Error::Conflict)?;
+        if observed.catalog != Some(catalog) || observed.protection != Some(protection) {
+            return Err(Error::Conflict);
+        }
+        for (i, page) in work.bitmap.iter_mut().enumerate() {
+            io.read(BITMAP_START + i as u32, page)?;
+        }
+        if bitmap_hash(&work.bitmap) != bitmap_sha256 {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    })?;
+    Ok(CheckpointedGc {
+        checkpoint,
+        bitmap_sha256,
+        released,
+    })
 }

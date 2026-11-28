@@ -22,7 +22,7 @@ class GenesisTests(unittest.TestCase):
     def test_sparse_image_matches_pinned_vector_and_independent_structure_reader(self):
         produced = genesis.generate_image(self.path)
         self.assertEqual(genesis.verify_image(self.path), produced)
-        self.assertTrue(produced["golden_vector_pending"])
+        self.assertFalse(produced["golden_vector_pending"])
         self.assertEqual(produced["nonzero_blocks"], 31)
         stat = self.path.stat()
         self.assertEqual(stat.st_size, 512 * 1024 * 1024)

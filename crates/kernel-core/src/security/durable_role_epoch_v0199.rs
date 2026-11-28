@@ -146,7 +146,7 @@ impl ConfirmedBootPolicy<'_> {
     }
 
     pub fn service_generation(&self, role: Role) -> Result<u64, Error> {
-        self.epochs.service_generation(role)
+        self.epochs.running_service_generation(role)
     }
 
     pub(super) fn verify_tls_installation(
@@ -298,6 +298,45 @@ impl DurableEpochGate {
             key_manifest_hash: config.header().key_manifest_hash,
         })
     }
+
+    /// A prepared service transition fences its own role while the exact
+    /// committed generations for other roles remain usable in this boot.
+    pub(super) fn confirmed_running_policy(
+        &self,
+        config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+    ) -> Result<ConfirmedBootPolicy<'_>, Error> {
+        if !self.paired_confirmed {
+            return Err(Error::Unauthorized);
+        }
+        self.verify_startup_config(config)?;
+        Ok(ConfirmedBootPolicy {
+            epochs: self,
+            boot: self.running_boot_epoch()?,
+            config_digest: config.digest(),
+            key_manifest_hash: config.header().key_manifest_hash,
+        })
+    }
+
+    fn running_boot_epoch(&self) -> Result<u64, Error> {
+        if !self.boot_confirmed
+            || self.pending.is_some_and(|p| {
+                !matches!(p.ticket.change, Change::Restart(_) | Change::Isolate(_))
+            })
+        {
+            return Err(Error::Busy);
+        }
+        Ok(self.committed.last_boot_epoch)
+    }
+
+    fn running_service_generation(&self, role: Role) -> Result<u64, Error> {
+        self.running_boot_epoch()?;
+        if self.pending.is_some_and(|p| {
+            matches!(p.ticket.change, Change::Restart(stop) | Change::Isolate(stop) if stop.role == role)
+        }) {
+            return Err(Error::Busy);
+        }
+        self.committed_service_generation(role)
+    }
     fn slot(&self, role: Role) -> Result<usize, Error> {
         self.slots
             .iter()
@@ -312,6 +351,10 @@ impl DurableEpochGate {
         if self.boot_epoch().is_none() {
             return Err(Error::Busy);
         }
+        self.committed_service_generation(role)
+    }
+
+    fn committed_service_generation(&self, role: Role) -> Result<u64, Error> {
         let at = self.slot(role)?;
         if self.committed.isolated_service_bitmap & (1u64 << at) != 0 {
             return Err(Error::Unauthorized);
@@ -934,6 +977,11 @@ mod tests {
         assert_eq!(decoded.state_generation, 9);
         assert_eq!(q.service_generation(Role::Security), Err(Error::Busy));
         assert_eq!(q.boot_epoch(), None);
+        assert_eq!(
+            q.running_service_generation(Role::Security),
+            Err(Error::Busy)
+        );
+        assert_eq!(q.running_service_generation(Role::Operations), Ok(4));
         // A retry of the historical boot receipt cannot return a new success
         // while the restart transaction is pending/UNKNOWN.
         assert_eq!(

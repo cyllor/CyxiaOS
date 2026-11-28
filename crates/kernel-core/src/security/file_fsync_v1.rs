@@ -13,7 +13,9 @@ use super::{
     file_auth_context_v1::{AdmissionLedgerV1, Linearization},
     file_auth_v3::{Completion, operation_digest},
     file_index_v0199::{FileStreamIndexV4, STREAMS_PER_GROUP, SecurityStateStoreV2},
-    file_media_unified_v1::FILE_TRANSACTION_WORKSPACE_KIB,
+    file_media_unified_v1::{
+        BUSINESS_INODES, CANONICAL_BUSINESS_START, FILE_TRANSACTION_WORKSPACE_KIB,
+    },
     file_media_v0199::{
         BITMAP_START, BLOCK_COUNT, DATA_START, FileReceiptV4, INODE_START, RECEIPT_BYTES,
         crc32c_zeroed,
@@ -330,6 +332,7 @@ pub fn commit_segment_with_floor<I: EpochBlockIo>(
     if inode_id == 0
         || inode_id >= INODES
         || system.iter().any(|object| object.inode == job.inode_id)
+        || job.mounted.snapshot.is_some() && inode_id >= BUSINESS_INODES as usize
     {
         return Err(Error::Unauthorized);
     }
@@ -354,6 +357,17 @@ pub fn commit_segment_with_floor<I: EpochBlockIo>(
     {
         return Err(Error::Stale);
     }
+    let allocation_floor = if let Some(snapshot) = &job.mounted.snapshot {
+        if !job.mounted.may_overwrite_in_place() {
+            return Err(Error::Busy);
+        }
+        snapshot.verify_current(&mut work.scratch, |home, page| {
+            writer.read_committed(home, page)
+        })?;
+        allocation_floor.max(CANONICAL_BUSINESS_START)
+    } else {
+        allocation_floor
+    };
 
     let inode_offset = inode_id * INODE_BYTES;
     let inode_home = INODE_START + (inode_offset / BLOCK) as u32;

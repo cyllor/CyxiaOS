@@ -29,9 +29,9 @@ unsafe extern "C" {
     static empty_l1: u8;
     static high_l1: u8;
     static __copy_window_l3: u8;
-    #[cfg(feature = "unified-runtime")]
+    #[cfg(any(feature = "unified-runtime", cyxia_business_task_services))]
     static __copy_secondary_l1: u8;
-    #[cfg(feature = "unified-runtime")]
+    #[cfg(any(feature = "unified-runtime", cyxia_business_task_services))]
     static __copy_secondary_l3: u8;
 }
 
@@ -41,7 +41,7 @@ fn slot_path(slot: usize) -> Option<(u64, *mut u64)> {
             ptr::addr_of!(high_l1) as u64,
             ptr::addr_of!(__copy_window_l3) as u64,
         ),
-        #[cfg(feature = "unified-runtime")]
+        #[cfg(any(feature = "unified-runtime", cyxia_business_task_services))]
         1..=super::SECONDARY_COPY_WINDOWS => {
             let offset = (slot as u64 - 1) * PAGE_SIZE;
             (

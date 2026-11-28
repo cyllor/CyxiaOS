@@ -7,9 +7,9 @@ use super::{
     Error,
     durable_role_epoch_v0199::{
         Change, CommitEvidence, ConfirmedBootPolicy, DurableEpochGate, Outcome, PreparedEpoch,
-        RedoPlacement, SlotBinding,
+        RedoPlacement, SlotBinding, StopEvidence,
     },
-    epoch_redo_v0199::EpochBlockIo,
+    epoch_redo_v0199::{EpochBlockIo, OneStateRedo, ServiceRestartAppend},
     file_index_v0199::SecurityStateStoreV2,
     file_media_v0199::{
         BLOCK_COUNT, DATA_START, SUPER_BYTES as BLOCK, SuperblockV1, crc32c_payload, crc32c_zeroed,
@@ -655,6 +655,37 @@ impl BootEpochAuthority {
         config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
     ) -> Result<ConfirmedBootPolicy<'_>, Error> {
         self.gate.confirmed_boot_policy(config)
+    }
+
+    pub fn confirmed_running_policy(
+        &self,
+        config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+    ) -> Result<ConfirmedBootPolicy<'_>, Error> {
+        self.gate.confirmed_running_policy(config)
+    }
+
+    pub fn prepare_role_restart(
+        &mut self,
+        log: &mut OneStateRedo,
+        superblock: SuperblockV1,
+        placement: RedoPlacement,
+        config: &super::offline_config_v1::VerifiedOfflineConfig<'_>,
+        stop: StopEvidence,
+        verify_stop: impl FnOnce(StopEvidence) -> Result<(), Error>,
+    ) -> Result<ServiceRestartAppend, Error> {
+        self.gate.confirmed_config_boot(config)?;
+        log.prepare_restart(&mut self.gate, superblock, placement, stop, verify_stop)
+    }
+
+    pub fn step_role_restart(
+        &mut self,
+        io: &mut impl EpochBlockIo,
+        log: &OneStateRedo,
+        work: &mut ServiceRestartAppend,
+        superblock_raw: &[u8; BLOCK],
+        scratch: &mut [u8; BLOCK],
+    ) -> Result<Option<Outcome>, Error> {
+        log.step_restart(io, &mut self.gate, work, superblock_raw, scratch)
     }
 
     /// The confirmed boot epoch, if a paired transaction was fully confirmed

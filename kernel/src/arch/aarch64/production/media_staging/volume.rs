@@ -100,6 +100,10 @@ const SNAPSHOTS: [UnifiedSystemObject; SNAPSHOT_ENVELOPE_COUNT] = [
 #[derive(Clone, Copy)]
 pub(super) enum SnapshotLayout {
     LegacyZero,
+    #[cfg(any(test, cyxia_startup_catalog))]
+    SignedUnified {
+        root_owner: Principal,
+    },
     #[cfg(feature = "v020-production-fsync-scratch")]
     BaselineFsyncFile,
     EmptyEnvelopes,
@@ -109,6 +113,11 @@ pub(super) enum SnapshotLayout {
 }
 
 impl SnapshotLayout {
+    #[cfg(any(test, cyxia_startup_catalog))]
+    pub(super) const fn signed_unified(self) -> bool {
+        matches!(self, Self::SignedUnified { .. })
+    }
+
     const fn allocated(self) -> bool {
         matches!(
             self,
@@ -124,6 +133,8 @@ impl SnapshotLayout {
 
     const fn file_owner_rights(self) -> Option<u32> {
         match self {
+            #[cfg(any(test, cyxia_startup_catalog))]
+            Self::SignedUnified { .. } => None,
             #[cfg(feature = "v020-production-fsync-scratch")]
             Self::BaselineFsyncFile => Some(file_format_v1::SCRATCH_FSYNC_FILE_OWNER_RIGHTS),
             Self::AllocatedEnvelopesWithFile => Some(SCRATCH_FILE_OWNER_RIGHTS),
@@ -255,6 +266,8 @@ pub(super) fn format(
     let slot = unsafe { &mut *core::ptr::addr_of_mut!(FORMAT) };
     let w = slot.write(FormatWorkspace::new());
     let e = match snapshots {
+        #[cfg(any(test, cyxia_startup_catalog))]
+        SnapshotLayout::SignedUnified { .. } => return Err(SecurityError::Unauthorized),
         SnapshotLayout::LegacyZero => file_format_v1::format(disk, BLOCK_COUNT, &manifest, w)?,
         #[cfg(feature = "v020-production-fsync-scratch")]
         SnapshotLayout::BaselineFsyncFile => {
@@ -601,51 +614,171 @@ pub(super) fn validate_resident_homes(
     validate_resident_homes_for(disk, checkpoint, epoch, TlsBootPolicy::new(config, None)?)
 }
 
-#[cfg(any(test, cyxia_startup_catalog))]
+#[cfg(test)]
 pub(super) fn validate_resident_homes_for(
     disk: &mut impl EpochBlockIo,
     checkpoint: SuperblockV1,
     epoch: u64,
     policy: TlsBootPolicy<'_>,
 ) -> Result<MountEvidence, SecurityError> {
+    validate_resident_homes_for_layout(disk, checkpoint, epoch, policy, SnapshotLayout::LegacyZero)
+}
+
+#[cfg(any(test, cyxia_startup_catalog))]
+pub(super) fn validate_resident_homes_for_layout(
+    disk: &mut impl EpochBlockIo,
+    checkpoint: SuperblockV1,
+    epoch: u64,
+    policy: TlsBootPolicy<'_>,
+    snapshots: SnapshotLayout,
+) -> Result<MountEvidence, SecurityError> {
     let config = policy.config();
     // SAFETY: the one-shot CPU0 mount excludes other MOUNT borrows.
     let workspace = unsafe { &mut *core::ptr::addr_of_mut!(MOUNT) };
-    let mounted = file_mount_v1::validate_signed(
-        disk,
-        checkpoint,
-        &SYSTEM,
-        config,
-        workspace,
-        |acl, inode, system| {
-            if let Some(kind) = system {
-                return staging_acl(
+    let ordinary = |acl: Acl, inode: Inode| {
+        // Ordinary owner and parent were checked by the joined ACL/structure
+        // scan. Neither runtime delegation nor the fixed system reserve can
+        // be claimed through an ordinary inode.
+        if acl.system_rights != 0
+            || inode.runs[..usize::from(inode.extents)]
+                .iter()
+                .any(|run| run.physical < CANONICAL_BUSINESS_START)
+        {
+            return Err(SecurityError::Unauthorized);
+        }
+        Ok(())
+    };
+    let mounted = match snapshots {
+        SnapshotLayout::LegacyZero => file_mount_v1::validate_signed(
+            disk,
+            checkpoint,
+            &SYSTEM,
+            config,
+            workspace,
+            |acl, inode, system| {
+                let Some(kind) = system else {
+                    return ordinary(acl, inode);
+                };
+                staging_acl(
                     acl,
                     inode,
                     Some(UnifiedSystemKind::from_baseline(kind)),
                     SnapshotLayout::LegacyZero,
                     config.principals()[0],
                     0,
-                );
-            }
-            // No service delegation is present in the resident's verified
-            // policy. The owner and parent of each ordinary inode were
-            // checked by the joined ACL/structure scan.
-            if acl.system_rights != 0
-                || inode.runs[..usize::from(inode.extents)]
-                    .iter()
-                    .any(|run| run.physical < CANONICAL_BUSINESS_START)
-            {
+                )
+            },
+        )?,
+        SnapshotLayout::SignedUnified { root_owner } => {
+            if !config.principals().contains(&root_owner) {
                 return Err(SecurityError::Unauthorized);
             }
-            Ok(())
-        },
-    )?;
-    if mounted.security != policy.resident_state(epoch)? || mounted.boot.boot_epoch != epoch {
+            file_mount_v1::validate_unified_resident(
+                disk,
+                checkpoint,
+                &SYSTEM,
+                &SNAPSHOTS,
+                config.principals(),
+                workspace,
+                |acl, inode, system| {
+                    let Some(kind) = system else {
+                        if acl.inode_id == 0 && acl.principal != root_owner {
+                            return Err(SecurityError::Unauthorized);
+                        }
+                        return ordinary(acl, inode);
+                    };
+                    let expected = Acl {
+                        inode_id: u32::from(kind.inode_slot()),
+                        state: 1,
+                        inode_generation: 1,
+                        principal: config.principals()[0],
+                        owner_rights: 0,
+                        system_rights: SYSTEM_RIGHTS,
+                        acl_generation: 1,
+                        parent: 0,
+                    };
+                    if acl != expected
+                        || inode.parent_generation != 1
+                        || inode.durable_write_seq != 0
+                    {
+                        return Err(SecurityError::Unauthorized);
+                    }
+                    Ok(())
+                },
+            )?
+        }
+        _ => return Err(SecurityError::Unauthorized),
+    };
+    policy.verify_resident_state(&mounted.security, epoch)?;
+    if mounted.boot.boot_epoch != epoch {
         return Err(SecurityError::Conflict);
     }
     workspace.verify_checkpointed_receipts(checkpoint)?;
     Ok(mounted)
+}
+
+/// Check only immutable layout facts before resolving a pending redo. Snapshot
+/// objects may contain partially materialized after-images at this point.
+#[cfg(any(test, cyxia_startup_catalog))]
+pub(super) fn verify_resident_layout(
+    disk: &mut impl EpochBlockIo,
+    sb: SuperblockV1,
+    snapshots: SnapshotLayout,
+) -> Result<(), SecurityError> {
+    match snapshots {
+        SnapshotLayout::LegacyZero => unified_map(disk, sb, snapshots).map(|_| ()),
+        SnapshotLayout::SignedUnified { .. } => {
+            use cyxia_kernel_core::security::file_structure_v1::INODE_BYTES;
+            const PER_PAGE: usize = BLOCK_BYTES / INODE_BYTES;
+            let objects = checked_map()?;
+            let mut raw = [0; BLOCK_BYTES];
+            // All eight fixed inode records share one immutable inode page.
+            disk.read(
+                unified::INODE_START + u32::from(unified::SYSTEM_INODE_START) / PER_PAGE as u32,
+                &mut raw,
+            )?;
+            for object in objects {
+                let offset = (usize::from(object.inode) % PER_PAGE) * INODE_BYTES;
+                let inode = Inode::decode(&raw[offset..offset + INODE_BYTES])?;
+                let blocks = object.kind.blocks();
+                if inode.kind != 1
+                    || inode.generation != object.generation
+                    || inode.extents != 1
+                    || inode.size != u64::from(blocks) * BLOCK_BYTES as u64
+                    || inode.runs[0]
+                        != (Extent {
+                            logical: 0,
+                            physical: object.first_block,
+                            count: blocks,
+                        })
+                {
+                    return Err(SecurityError::Conflict);
+                }
+            }
+            Ok(())
+        }
+        _ => Err(SecurityError::Unauthorized),
+    }
+}
+
+#[cfg(any(test, cyxia_startup_catalog))]
+pub(super) fn verify_resident_receipt_commits(
+    checkpoint: SuperblockV1,
+    verify: impl FnMut(
+        usize,
+        &cyxia_kernel_core::security::file_media_v0199::FileReceiptV4,
+    ) -> Result<(), SecurityError>,
+) -> Result<(), SecurityError> {
+    // SAFETY: the exclusive CPU0 mount has completed and released MOUNT.
+    let workspace = unsafe { &*core::ptr::addr_of!(MOUNT) };
+    workspace.verify_resident_receipt_commits(checkpoint, verify)
+}
+
+#[cfg(any(test, cyxia_startup_catalog))]
+pub(super) fn resident_history_owns(block: u32) -> bool {
+    // SAFETY: queried by the same CPU0 recovery owner after mount completed.
+    let workspace = unsafe { &*core::ptr::addr_of!(MOUNT) };
+    workspace.history_owns(block)
 }
 
 /// Validate the signed FSYNC diagnostic's persisted file and paired epoch.
@@ -695,11 +828,12 @@ pub(super) fn confirmed_receipt_query_digest(
     mounted: &MountEvidence,
     committed: &SecurityStateStoreV2,
     config: &VerifiedOfflineConfig<'_>,
+    checkpoint: &mut impl FnMut() -> Result<(), SecurityError>,
 ) -> Result<[u8; 32], SecurityError> {
     // SAFETY: same one-shot CPU0 owner as validate_homes; all mutable
     // workspace borrows have ended, and no other CPU can access MOUNT.
     let workspace = unsafe { &*core::ptr::addr_of!(MOUNT) };
-    workspace.confirmed_receipt_query_digest(mounted, committed, config)
+    workspace.confirmed_receipt_query_digest_metered(mounted, committed, config, checkpoint)
 }
 
 #[cfg(any(test, cyxia_startup_catalog))]
@@ -707,10 +841,13 @@ pub(super) fn confirm_tls_receipts(
     mounted: &MountEvidence,
     committed: &SecurityStateStoreV2,
     transition: cyxia_kernel_core::security::boot_epoch_v1::TlsBootTransition<'_>,
+    checkpoint: &mut impl FnMut() -> Result<(), SecurityError>,
 ) -> Result<[u8; 32], SecurityError> {
     // SAFETY: this follows the same one-shot CPU0 mount as ordinary BootEpoch.
     let workspace = unsafe { &*core::ptr::addr_of!(MOUNT) };
-    workspace.confirmed_receipt_query_digest_after_tls(mounted, committed, transition)
+    workspace.confirmed_receipt_query_digest_after_tls_metered(
+        mounted, committed, transition, checkpoint,
+    )
 }
 
 fn checked_map() -> Result<[UnifiedSystemObject; unified::UNIFIED_SYSTEM_OBJECTS], SecurityError> {
@@ -839,6 +976,10 @@ pub(super) fn unified_map(
         return Err(SecurityError::Conflict);
     }
     match snapshots {
+        #[cfg(any(test, cyxia_startup_catalog))]
+        SnapshotLayout::SignedUnified { .. } => {
+            verify_resident_layout(disk, sb, snapshots)?;
+        }
         #[cfg(feature = "v020-production-fsync-scratch")]
         SnapshotLayout::BaselineFsyncFile => {
             require_zero_blocks(disk, SNAPSHOT_CATALOG_BLOCK..CANONICAL_BUSINESS_START)?;

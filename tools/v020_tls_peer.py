@@ -21,9 +21,10 @@ FRAME_BYTES = HEADER.size + CHALLENGE_BYTES
 X509_V_FLAG_NO_CHECK_TIME = 0x200000
 
 
-def _load_identity(context: ssl.SSLContext, name: str) -> bytes:
-    cert = (FIXTURES / f"{name}-test-cert.der").read_bytes()
-    key = (FIXTURES / f"{name}-test-key.der").read_bytes()
+def _load_identity(context: ssl.SSLContext, name: str, identity: Path | None = None) -> bytes:
+    cert_path = FIXTURES / f"{name}-test-cert.der" if identity is None else identity / "cert.der"
+    key_path = FIXTURES / f"{name}-test-key.der" if identity is None else identity / "key.der"
+    cert, key = cert_path.read_bytes(), key_path.read_bytes()
     # CPython load_cert_chain takes filenames. NamedTemporaryFile creates
     # a private file and removes it as soon as OpenSSL imports the pair.
     with tempfile.NamedTemporaryFile() as pem:
@@ -35,7 +36,8 @@ def _load_identity(context: ssl.SSLContext, name: str) -> bytes:
     return cert
 
 
-def exchange(port: int, timeout: float = 5.0, *, orderly_close: bool = False) -> dict:
+def exchange(port: int, timeout: float = 5.0, *, orderly_close: bool = False,
+             server_identity: Path | None = None, peer_identity: Path | None = None) -> dict:
     """Exchange one unpredictable read-only Echo frame with a pinned fixture guest.
 
     Both byte counts refer to the application frame. An invalid or incomplete
@@ -51,7 +53,11 @@ def exchange(port: int, timeout: float = 5.0, *, orderly_close: bool = False) ->
             raise TimeoutError("TLS Echo peer deadline")
         return left
 
-    server_cert = (FIXTURES / "b-test-cert.der").read_bytes()
+    require_pair = (server_identity is None) == (peer_identity is None)
+    if not require_pair:
+        raise ValueError("supply both disposable TLS identities")
+    server_path = FIXTURES / "b-test-cert.der" if server_identity is None else server_identity / "cert.der"
+    server_cert = server_path.read_bytes()
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_3
     context.check_hostname = False
@@ -62,7 +68,7 @@ def exchange(port: int, timeout: float = 5.0, *, orderly_close: bool = False) ->
         context.set_groups("X25519")
     else:
         context.set_ecdh_curve("X25519")
-    client_cert = _load_identity(context, "a")
+    client_cert = _load_identity(context, "a", peer_identity)
 
     # OpenSSL can complete a server-only handshake even with a client key
     # configured. Require the client CertificateVerify in this handshake.
