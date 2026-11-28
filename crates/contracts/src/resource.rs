@@ -1,4 +1,8 @@
 use crate::*;
+
+/// Shared 100 ms accounting window in ResourceSchema.v1.
+pub const CPU_ACCOUNTING_WINDOW_NS: u64 = 100_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetLimit(pub PageCount);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

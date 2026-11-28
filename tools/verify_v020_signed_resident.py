@@ -488,11 +488,17 @@ def boot(binary: str, elf: Path, output: Path, timeout: float, disk: Path | None
                                                    expect_business=expect_business))
             if geometry is not None:
                 samples = verify_resident_budget(lines, progress)
+                runtime_recovery = []
+                for line in lines:
+                    label = line.partition(" ")[0]
+                    if label in ("V020_G1_SNAPSHOT_RUNTIME_BUDGET", "V020_G1_FILE_RUNTIME_BUDGET"):
+                        runtime_recovery.extend(rows([line], label))
                 result.update(verify_signed_trace(
                     (output / TRACE_FILE).read_bytes(), epoch, result["roles"],
                     [used for _, used, _ in recovery], samples,
                     media_budget=result["media_budget"], frame_budget=result["frame_budget"],
                     business_entropy_budget=result.get("business_entropy_budget"),
+                    runtime_recovery=runtime_recovery,
                 ))
             require(sha(elf) == elf_digest, "kernel ELF changed during the run")
             result["status"] = "PASS"

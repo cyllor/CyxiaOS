@@ -819,7 +819,7 @@ class NativeSecurityWiring(unittest.TestCase):
         self.assertLess(adapter.index("registered_role_abi(index, member, captured_ttbr0)"),
                         adapter.index("decode_aarch64_authorized_svc_v3("))
         self.assertLess(adapter.index("services.permits(&caller, operation, first)"),
-                        adapter.index("services.dispatch(&caller, call)"))
+                        adapter.index("services.dispatch(&caller, call, policy)"))
         self.assertIn("captured | CAPTURED", signed)
         self.assertNotIn("trapped_ttbr0()", adapter)
         quantum = signed.split("fn run_quantum(", 1)[1].split("fn run_tasks(", 1)[0]

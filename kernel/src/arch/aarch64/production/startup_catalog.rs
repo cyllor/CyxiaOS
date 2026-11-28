@@ -236,6 +236,55 @@ pub(super) fn file_volume(
     Ok(current)
 }
 
+#[cfg(cyxia_lifecycle_package_signature)]
+pub(super) fn snapshot_authority(
+    config: &VerifiedOfflineConfig<'_>,
+    checkpoint: &mut impl FnMut() -> Result<(), Error>,
+) -> Result<Option<SnapshotAuthority>, Error> {
+    let wire = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/startup-catalog/snapshot-authority.bin"
+    ));
+    let signature = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/startup-catalog/snapshot-authority.sig"
+    ));
+    if wire.is_empty() && signature.is_empty() {
+        return Ok(None);
+    }
+    let volume = include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/file-volume.bin"));
+    let volume_signature =
+        include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/file-volume.sig"));
+    checkpoint()?;
+    UnifiedFileVolume::verify(config, CATALOG.boot_public_key, volume, volume_signature)?
+        .ok_or(Error::Unauthorized)?;
+    checkpoint()?;
+    SnapshotAuthority::verify(
+        &CATALOG,
+        config,
+        super::role_loader::lifecycle_package_digests(),
+        volume.as_slice().try_into().map_err(|_| Error::Invalid)?,
+        wire.as_slice().try_into().map_err(|_| Error::Invalid)?,
+        signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Invalid)?,
+    )
+    .map(Some)
+}
+
+#[cfg(all(cyxia_startup_catalog, not(cyxia_lifecycle_package_signature)))]
+pub(super) fn snapshot_authority(
+    _: &VerifiedOfflineConfig<'_>,
+    _: &mut impl FnMut() -> Result<(), Error>,
+) -> Result<Option<SnapshotAuthority>, Error> {
+    // Signing-input builds publish no live grants.
+    Err(Error::Unauthorized)
+}
+
+#[cfg(cyxia_startup_catalog)]
+use cyxia_kernel_core::security::startup_catalog_v0199::snapshot_authority::SnapshotAuthority;
+
 #[cfg(cyxia_startup_catalog)]
 static mut SIGNATURE_WORK: [u8; MAX_SIGNED_BYTES] = [0; MAX_SIGNED_BYTES];
 
@@ -299,6 +348,24 @@ pub(super) fn qualify_file_owner(
         package_digest,
         grant,
         signature,
+    )
+}
+
+#[cfg(cyxia_file_read_client)]
+pub(super) fn qualify_file_client(
+    config: &VerifiedOfflineConfig<'_>,
+    business: [u8; 32],
+    owner: [u8; 32],
+) -> Result<cyxia_kernel_core::security::startup_catalog_v0199::file_owner::FileClientGrant, Error>
+{
+    use cyxia_kernel_core::security::startup_catalog_v0199::file_owner::FileClientGrant;
+    FileClientGrant::verify(
+        &CATALOG,
+        config,
+        business,
+        owner,
+        include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/file-client.bin")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/startup-catalog/file-client.sig")),
     )
 }
 

@@ -7,7 +7,9 @@ use cyxia_kernel_core::security::boot_epoch_v1::{TlsBootPolicy, TlsBootTransitio
 #[cfg(test)]
 use cyxia_kernel_core::security::offline_config_v1::VerifiedOfflineConfig;
 #[cfg(any(test, cyxia_startup_catalog))]
-use cyxia_kernel_core::security::recovery_proof_store::RecoveryLocator;
+use cyxia_kernel_core::security::{
+    recovery_proof_store::RecoveryLocator, startup_catalog_v0199::snapshot_authority::SnapshotAuthority,
+};
 use cyxia_kernel_core::security::{
     Error,
     boot_epoch_v1::BootEpochStoreV1,
@@ -119,6 +121,7 @@ pub(super) fn recover_resident_with_reconciliation(
         transition,
         volume::SnapshotLayout::LegacyZero,
         None,
+        None,
     )
 }
 
@@ -130,6 +133,7 @@ pub(super) fn recover_resident_for_layout(
     transition: Option<TlsBootTransition<'_>>,
     snapshots: volume::SnapshotLayout,
     carrier: Option<RecoveryLocator>,
+    snapshot_authority: Option<SnapshotAuthority>,
 ) -> Result<(SuperblockV1, MountEvidence, BootLogRecovery), Error> {
     if transition.is_some_and(|t| t.current().config().digest() != current.config().digest()) {
         return Err(Error::Conflict);
@@ -138,7 +142,9 @@ pub(super) fn recover_resident_for_layout(
         current: BootPolicy::Resident(current),
         predecessor: transition.map(|t| BootPolicy::Resident(t.previous())),
     };
-    if let Some(recovered) = resident::reconcile(disk, sb, &policies, snapshots, carrier)? {
+    if let Some(recovered) =
+        resident::reconcile(disk, sb, &policies, snapshots, carrier, snapshot_authority)?
+    {
         return Ok(recovered);
     }
     recover_boot_pair_for(

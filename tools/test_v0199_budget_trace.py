@@ -119,6 +119,45 @@ class BudgetTraceTests(unittest.TestCase):
             verify_trace(self.evidence(version=4), self.summary,
                          boot_accounting=(3, self.rows[2][0], 2_450_000))
 
+    def test_256m_early_boot_overrun_cannot_be_accepted_as_success(self):
+        # Reproduce both measured debit shapes from 46130235312, not an
+        # attestation of a new QEMU run. Extra rows alone cannot replenish
+        # coordination credit; the second capture exceeds it in one gap.
+        for debits in ((1_880_699, 220_990), (2_351_746,)):
+            with self.subTest(debits=debits):
+                self.start = 10_000_000
+                wall, counter = self.start, 1_000
+                self.rows = []
+                for debit in (*debits, 100):
+                    wall += 10_000_000
+                    counter += debit
+                    self.rows.append((wall, counter, 0, 0, 0, wall - 16))
+                total = sum(debits) + 100
+                self.summary = [total, total, total, 0, self.start, wall,
+                                0, 0, 0, total, 0, 0]
+                with self.assertRaisesRegex(ValueError, "EL1 coordination sublimit"):
+                    verify_trace(self.evidence(version=4), self.summary,
+                                 boot_accounting=(len(debits), self.rows[-2][0], sum(debits)))
+
+    def test_boot_reports_follow_timer_readiness_in_diagnostic_source(self):
+        # Supplemental wiring guard, never a native timing or G4 proof.
+        root = Path(__file__).resolve().parents[1] / "kernel/src/arch/aarch64"
+        boot = (root / "boot.rs").read_text()
+        smp = (root / "smp.rs").read_text()
+        self.assertEqual(boot.count('budget.observe_boot_phase();'), 1)
+        before = boot.split('budget.observe_boot_phase();', 1)[0]
+        self.assertIn('assert_eq!(vbar, core::ptr::addr_of!(exception_vectors) as u64);', before)
+        for block in ('log(b"BOOT_ENTRY', 'log(b"HIGH_VA_OK'):
+            self.assertIn('#[cfg(not(feature = "v0199-control-bringup"))]\n    {\n        ' + block, before)
+        run = smp.split('pub fn run(', 1)[1]
+        early = run.split('gic().enable(irq).unwrap();', 1)[1].split('init_memory();', 1)[0]
+        markers = ['super::log(b"BOOT_ENTRY', 'super::log(b"PLATFORM_OK',
+                   'super::log(b"HIGH_VA_OK', 'super::clock::init(info);']
+        for marker in markers:
+            before_marker, early = early.split(marker, 1)
+            self.assertIn('budget.boot_checkpoint();', before_marker)
+        self.assertIn('budget.boot_checkpoint();', early)
+
     def test_grant_must_precede_deadline_and_have_enough_credit(self):
         end, counter, _, deadline, scope, lower = self.rows[1]
         self.rows[1] = end, counter, 310_000, deadline, scope, lower

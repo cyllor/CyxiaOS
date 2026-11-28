@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 sha2 = { version = "=0.10.9", default-features = false }
 cyxia-arch = { path = "../arch", optional = true }
+cyxia-contracts = { path = "../contracts" }
 
 [features]
 # Historical cluster wire codec, offline migration reference only.

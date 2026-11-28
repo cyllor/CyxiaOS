@@ -20,8 +20,9 @@ use cyxia_kernel_core::security::{
     recovery_proof_store::RecoveryLocator,
     recovery_v1::{
         RedoTransaction,
-        resident::{Journal, Record, head_epoch},
+        resident::{Journal, Record, head_epoch, snapshot::ProtectionReplay},
     },
+    startup_catalog_v0199::snapshot_authority::SnapshotAuthority,
 };
 
 const RECEIPTS: u32 = volume::RECEIPTS_HOME;
@@ -39,6 +40,7 @@ pub(super) fn reconcile(
     policies: &Policies<'_>,
     snapshots: volume::SnapshotLayout,
     locator: Option<RecoveryLocator>,
+    snapshot_authority: Option<SnapshotAuthority>,
 ) -> Result<Option<Recovered>, Error> {
     let mut raw = [0; BLOCK];
     disk.read(volume::FIRST_LOG_BLOCK, &mut raw)?;
@@ -76,7 +78,14 @@ pub(super) fn reconcile(
             policy,
             snapshots,
         )?;
-        let mut chain = Chain::new(prior, policies, snapshots, carrier);
+        let mut chain = Chain::new(
+            prior,
+            policies,
+            snapshots,
+            carrier,
+            snapshot_authority,
+            true,
+        );
         // SAFETY: synchronous cold staging alone owns the recovery workspace.
         let verified =
             Journal::inspect(disk, unsafe { workspace() }, checkpoint, Some(prior), |r| {
@@ -109,7 +118,14 @@ pub(super) fn reconcile(
         Ok(_) => return Err(Error::Conflict),
     };
     let policy = resident_policy(policies, &base, checkpoint.generation)?;
-    let mut chain = Chain::new(checkpoint, policies, snapshots, carrier);
+    let mut chain = Chain::new(
+        checkpoint,
+        policies,
+        snapshots,
+        carrier,
+        snapshot_authority,
+        false,
+    );
     // Read-only inspection bounds every allowed home in every transaction,
     // including preparations and images overwritten later in the chain.
     let mut journal = Journal::inspect(disk, unsafe { workspace() }, checkpoint, None, |record| {
@@ -154,6 +170,12 @@ pub(super) fn reconcile(
     {
         return Err(Error::Conflict);
     }
+    chain.snapshot_replay.verify(
+        &mut journal.raw_view(),
+        checkpoint,
+        preflight.snapshot.as_ref(),
+        &mut raw,
+    )?;
     if snapshots.signed_unified() {
         journal.check_home_targets(|home| {
             if home >= CANONICAL_BUSINESS_START && volume::resident_history_owns(home) {
@@ -183,6 +205,20 @@ pub(super) fn reconcile(
     })?;
     if selected != next {
         return Err(Error::Conflict);
+    }
+    #[cfg(target_os = "none")]
+    if let Some((operation, lsn)) = chain.snapshot_replay.committed_operation() {
+        use cyxia_kernel_core::security::file_media_unified_v1::SNAP_OP_FREEZE_SET;
+        super::super::report(
+            if operation == SNAP_OP_FREEZE_SET {
+                "V020_SEC_F_SNAPSHOT_FREEZE_REPLAY"
+            } else {
+                "V020_SEC_F_SNAPSHOT_OPEN_REPLAY"
+            },
+            checkpoint.generation,
+            lsn,
+            next.generation,
+        );
     }
     Ok(Some((next, preflight, BootLogRecovery::Replayed)))
 }
@@ -258,12 +294,17 @@ struct Chain<'a, 'p> {
     policies: &'p Policies<'a>,
     unified: bool,
     carrier: Option<Carrier>,
+    retiring: bool,
     tx: Option<RedoTransaction>,
     current: Option<SecurityStateStoreV2>,
     state: Option<SecurityStateStoreV2>,
     images: u32,
     file_change: bool,
     file_changed: bool,
+    ordinary_seen: bool,
+    snapshot_replay: ProtectionReplay,
+    snapshot_authority: Option<SnapshotAuthority>,
+    snapshot_principal_generation: u64,
 }
 
 impl<'a, 'p> Chain<'a, 'p> {
@@ -272,18 +313,25 @@ impl<'a, 'p> Chain<'a, 'p> {
         policies: &'p Policies<'a>,
         snapshots: volume::SnapshotLayout,
         carrier: Option<Carrier>,
+        snapshot_authority: Option<SnapshotAuthority>,
+        retiring: bool,
     ) -> Self {
         Self {
             checkpoint,
             policies,
             unified: snapshots.signed_unified(),
             carrier,
+            retiring,
             tx: None,
             current: None,
             state: None,
             images: 0,
             file_change: false,
             file_changed: false,
+            ordinary_seen: false,
+            snapshot_replay: ProtectionReplay::default(),
+            snapshot_authority,
+            snapshot_principal_generation: 0,
         }
     }
 
@@ -302,16 +350,44 @@ impl<'a, 'p> Chain<'a, 'p> {
                 let tx = self.tx.ok_or(Error::Conflict)?;
                 match self.current {
                     None => self.boot_image(home, contents)?,
-                    Some(current) if home == volume::SECURITY_HOME && tx.log_blocks == 4 => {
+                    Some(current)
+                        if home == volume::SECURITY_HOME
+                            && tx.log_blocks == 4
+                            && !self.snapshot_replay.in_progress() =>
+                    {
                         let next = SecurityStateStoreV2::decode(contents)?;
                         role_restart::verify_successor(current, next)?;
+                        self.snapshot_replay.role_restart()?;
                         self.state = Some(next);
                     }
-                    Some(_) => self.file_image(home, contents)?,
+                    Some(_)
+                        if self.unified
+                            && (self.snapshot_replay.in_progress()
+                                || ProtectionReplay::is_snapshot_home(home)) =>
+                    {
+                        if self.ordinary_seen || self.snapshot_principal_generation == 0 {
+                            return Err(Error::Unauthorized);
+                        }
+                        self.snapshot_replay.image(
+                            tx,
+                            self.images,
+                            home,
+                            contents,
+                            self.snapshot_principal_generation,
+                        )?;
+                    }
+                    Some(_) => {
+                        if self.snapshot_replay.touched() {
+                            return Err(Error::Unauthorized);
+                        }
+                        self.ordinary_seen = true;
+                        self.file_image(home, contents)?;
+                    }
                 }
                 self.images += 1;
             }
             Record::End { committed } => {
+                self.snapshot_replay.finish(committed, self.retiring)?;
                 if committed {
                     self.current = self.state.or(self.current);
                     self.file_changed |= self.file_change;
@@ -326,8 +402,14 @@ impl<'a, 'p> Chain<'a, 'p> {
         match (self.images, home) {
             (0, volume::SECURITY_HOME) => {
                 let state = SecurityStateStoreV2::decode(contents)?;
-                self.policies
+                let policy = self
+                    .policies
                     .policy_for(&state, self.checkpoint.generation)?;
+                self.snapshot_principal_generation = self
+                    .snapshot_authority
+                    .zip(policy.config())
+                    .and_then(|(authority, config)| authority.replay_principal(config).ok())
+                    .map_or(0, |principal| principal.generation);
                 self.state = Some(state);
             }
             (1, volume::BOOT_HOME) => {

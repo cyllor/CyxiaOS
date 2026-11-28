@@ -15,7 +15,7 @@ use cyxia_kernel_core::security::{
     durable_role_epoch_v0199::ConfirmedBootPolicy,
     file_auth_v3::{
         ADMIT_REPLY_BYTES, ADMIT_REQUEST_BYTES, AdmitRequestV3, COMPLETE_REPLY_BYTES,
-        COMPLETE_REQUEST_BYTES, CompleteRequestV1, E_SCHEMA, E_STALE, FILE_SERVICE_ROLE,
+        COMPLETE_REQUEST_BYTES, CompleteRequestV1, E_SCHEMA, FILE_SERVICE_ROLE,
     },
     startup_catalog_v0199::file_owner::{BYTES, FileOwnerGrant},
     syscall::Syscall,
@@ -24,6 +24,11 @@ use cyxia_kernel_core::security::{
 use sha2::{Digest, Sha256};
 
 pub(super) use cyxia_kernel_core::security::startup_catalog_v0199::file_owner::CPU;
+
+#[cfg(cyxia_file_read_client)]
+pub(super) mod client_read;
+#[cfg(cyxia_file_read_client)]
+pub(super) mod durable;
 
 const ASID: u8 = 0xB5;
 const AUTH_TAG: u64 = 0xf200;
@@ -43,6 +48,11 @@ pub(super) struct ApprovedPackage {
 impl ApprovedPackage {
     pub(super) fn budget_ns(&self) -> u64 {
         self.grant.budget_ns
+    }
+
+    #[cfg(cyxia_file_read_client)]
+    pub(super) fn image_digest(&self) -> [u8; 32] {
+        self.image
     }
 }
 
@@ -134,6 +144,8 @@ pub(super) fn prepare(
     })
     .ok_or(Error::Busy)?
     .map_err(|_| Error::Denied)?;
+    #[cfg(cyxia_file_read_client)]
+    client_read::bind_owner(epoch, actor)?;
     // SAFETY: CPU0 writes this owner once before opening the business epoch.
     unsafe {
         (*addr_of_mut!(OWNER)).write(Owner {
@@ -174,6 +186,45 @@ impl Owner {
         }
     }
 
+    fn stack(&self) -> StoppedStack {
+        StoppedStack::new(
+            backing(),
+            self.window.stack_top,
+            self.root,
+            self.actor,
+            ASID,
+        )
+    }
+}
+
+/// Exact private stack registration for a pinned task. Both file endpoints
+/// use this only while that task is stopped on CPU3.
+#[derive(Clone, Copy)]
+pub(super) struct StoppedStack {
+    storage: *mut Backing,
+    top: u64,
+    root: u64,
+    actor: Identity,
+    asid: u8,
+}
+
+impl StoppedStack {
+    pub(super) const fn new(
+        storage: *mut Backing,
+        top: u64,
+        root: u64,
+        actor: Identity,
+        asid: u8,
+    ) -> Self {
+        Self {
+            storage,
+            top,
+            root,
+            actor,
+            asid,
+        }
+    }
+
     fn visit_stack(
         &self,
         address: u64,
@@ -181,16 +232,16 @@ impl Owner {
         mut visit: impl FnMut(u64, usize, usize) -> Result<(), i64>,
     ) -> Result<(), i64> {
         use super::super::EFAULT;
-        let base = self.window.stack_top - ROLE_STACK_BYTES as u64;
+        let base = self.top - ROLE_STACK_BYTES as u64;
         if bytes == 0
             || address < base
             || address
                 .checked_add(bytes as u64)
-                .is_none_or(|end| end > self.window.stack_top)
+                .is_none_or(|end| end > self.top)
         {
             return Err(EFAULT);
         }
-        let store = backing();
+        let store = self.storage;
         // SAFETY: the current worker owns its stopped context and these
         // pinned tables. EL0 cannot write any table or change either root.
         let (upper, lower, middle, leaf, stack) = unsafe {
@@ -231,7 +282,43 @@ impl Owner {
         Ok(())
     }
 
-    fn file_auth(&self, args: [u64; 6]) -> Result<(), i64> {
+    fn copy_in(&self, address: u64, bytes: &mut [u8]) -> Result<(), i64> {
+        self.visit_stack(address, bytes.len(), |phys, at, len| {
+            // SAFETY: visit_stack verified the pinned mapping and the
+            // scheduler held the single writer stopped on this core.
+            unsafe {
+                crate::machine::copy_window::copy_in(
+                    phys,
+                    self.actor,
+                    self.asid,
+                    &mut bytes[at..at + len],
+                )
+            }
+            .map_err(|_| super::super::EFAULT)
+        })
+    }
+
+    #[cfg(cyxia_file_read_client)]
+    fn copy_out(&self, address: u64, bytes: &[u8]) -> Result<(), i64> {
+        self.visit_stack(address, bytes.len(), |phys, at, len| {
+            // SAFETY: same stopped, pinned stack and disjoint EL1 buffer.
+            match unsafe {
+                crate::machine::copy_window::copy_out_and_check(
+                    phys,
+                    self.actor,
+                    self.asid,
+                    &bytes[at..at + len],
+                )
+            } {
+                Ok(true) => Ok(()),
+                _ => Err(super::super::EFAULT),
+            }
+        })
+    }
+}
+
+impl Owner {
+    fn file_auth(&self, epoch: u64, args: [u64; 6]) -> Result<(), i64> {
         use super::super::{E_AUTH, EFAULT};
         let [_, input, bytes, selector, output, capacity] = args;
         if selector != 0 {
@@ -247,36 +334,46 @@ impl Owner {
         if capacity < reply_bytes {
             return Err(EFAULT);
         }
-        self.visit_stack(output, capacity, |_, _, _| Ok(()))?;
+        let stack = self.stack();
+        stack.visit_stack(output, capacity, |_, _, _| Ok(()))?;
         let mut copied = [0; ADMIT_REQUEST_BYTES];
-        self.visit_stack(input, bytes, |phys, at, len| {
-            // SAFETY: visit_stack verified the pinned mapping and the
-            // scheduler held the single writer stopped on this core.
-            unsafe {
-                crate::machine::copy_window::copy_in(
-                    phys,
-                    self.actor,
-                    ASID,
-                    &mut copied[at..at + len],
-                )
-            }
-            .map_err(|_| EFAULT)
-        })?;
+        stack.copy_in(input, &mut copied[..bytes])?;
         let frame = &copied[..bytes];
-        let row = if bytes == ADMIT_REQUEST_BYTES {
-            AdmitRequestV3::decode(frame).map_err(|_| i64::from(E_SCHEMA))?;
-            5
+        if bytes == ADMIT_REQUEST_BYTES {
+            let request = AdmitRequestV3::decode(frame).map_err(|_| i64::from(E_SCHEMA))?;
+            #[cfg(cyxia_file_read_client)]
+            {
+                let mut reply = [0; ADMIT_REPLY_BYTES];
+                client_read::admit(epoch, self.actor, &request)?
+                    .encode(&mut reply)
+                    .map_err(client_read::errno)?;
+                return stack.copy_out(output, &reply);
+            }
+            #[cfg(not(cyxia_file_read_client))]
+            {
+                let _ = (request, epoch);
+                EVIDENCE[5].fetch_add(1, Ordering::Release);
+            }
         } else {
-            CompleteRequestV1::decode(frame).map_err(|_| i64::from(E_SCHEMA))?;
-            6
-        };
-        // This deployment has no registered FILE_SERVICE clients or prepared
-        // admissions yet. An exact frame cannot establish either one.
-        EVIDENCE[row].fetch_add(1, Ordering::Release);
-        Err(i64::from(E_STALE))
+            let request = CompleteRequestV1::decode(frame).map_err(|_| i64::from(E_SCHEMA))?;
+            #[cfg(cyxia_file_read_client)]
+            {
+                client_read::complete(epoch, self.actor, &request)?;
+                return stack.copy_out(output, &[0; COMPLETE_REPLY_BYTES]);
+            }
+            #[cfg(not(cyxia_file_read_client))]
+            {
+                let _ = (request, epoch);
+                EVIDENCE[6].fetch_add(1, Ordering::Release);
+            }
+        }
+        #[cfg(not(cyxia_file_read_client))]
+        Err(i64::from(
+            cyxia_kernel_core::security::file_auth_v3::E_STALE,
+        ))
     }
 
-    fn syscall(&mut self) -> RunState {
+    fn syscall(&mut self, epoch: u64) -> RunState {
         let result = decode_aarch64_authorized_svc_v3(
             ABI_VERSION,
             self.context.esr,
@@ -284,12 +381,26 @@ impl Owner {
             |op, selector| match op {
                 Syscall::Exit | Syscall::Yield | Syscall::Sleep | Syscall::Clock => true,
                 Syscall::ServiceCall => selector == self.selector,
+                #[cfg(cyxia_file_read_client)]
+                Syscall::IpcRecv => client_read::work_selector(epoch) == Ok(selector),
                 _ => false,
             },
         );
         match result {
             Ok(call) if call.operation == Syscall::ServiceCall => {
-                self.context.regs[0] = self.file_auth(call.args).err().unwrap_or(0) as u64;
+                #[cfg(cyxia_file_read_client)]
+                let start = super::timer::cpu_ticks();
+                self.context.regs[0] = self.file_auth(epoch, call.args).err().unwrap_or(0) as u64;
+                #[cfg(cyxia_file_read_client)]
+                client_read::meter_auth(call.args[2], start);
+                RunState::Runnable
+            }
+            #[cfg(cyxia_file_read_client)]
+            Ok(call) if call.operation == Syscall::IpcRecv => {
+                let start = super::timer::cpu_ticks();
+                let result = client_read::receive(epoch, self.stack(), call.args);
+                self.context.regs[0] = result.unwrap_or_else(|error| error) as u64;
+                client_read::meter_work(start);
                 RunState::Runnable
             }
             Ok(call) => {
@@ -343,7 +454,7 @@ pub(super) fn drive(
             signed_exec_trap::Return::Timer
             | signed_exec_trap::Return::Yield
             | signed_exec_trap::Return::Emulated => RunState::Runnable,
-            signed_exec_trap::Return::Syscall => owner.syscall(),
+            signed_exec_trap::Return::Syscall => owner.syscall(epoch),
             signed_exec_trap::Return::TerminateTask => {
                 fault = Some((owner.actor, owner.context.esr, owner.context.far));
                 RunState::Exited
@@ -384,6 +495,8 @@ pub(super) fn retire(slot: usize, epoch: u64) {
         return;
     };
     LIVE.store(0, Ordering::Release);
+    #[cfg(cyxia_file_read_client)]
+    client_read::fence(epoch, key.generation);
     PREPARED.store(0, Ordering::Release);
     // SAFETY: the only CPU that could enter this owner has returned to EL1
     // and stopped the scheduler path. This backing is never restaged in boot.

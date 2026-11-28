@@ -1,6 +1,8 @@
 """Independent disk fixtures exercise the v2 checker without the Rust encoder."""
 from pathlib import Path
 import hashlib
+import json
+import shutil
 import struct
 import sys
 import tempfile
@@ -170,7 +172,6 @@ class SnapshotVolume(unittest.TestCase):
         self.assertEqual(result['garbage_blocks'], 0)
 
     def test_g1_export_keeps_live_and_historical_versions_and_watermarks(self):
-        import json
         from v020_g1_export_v2 import export_volume
 
         self.capture()
@@ -235,6 +236,90 @@ class SnapshotVolume(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'v2 superblock pair'):
             export_volume(self.path, output)
         self.assertFalse(output.exists())
+
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL required for signed authority vectors')
+    def test_g1_export_authenticates_old_state_and_each_active_acl_view(self):
+        from test_v020_signed_scratch_vector import sign_scratch_fixture, signed_vector
+        from v020_g1_export_v2 import export_volume
+        from v020_g1_migration_authority import verify_archive
+
+        self.capture()
+        boot = bytearray(self.read(4241))
+        struct.pack_into('<Q', boot, 24, 6)
+        struct.pack_into('<I', boot, 32, crc32c(boot[:32]))
+        self.write(4241, boot)
+        system_inodes = bytearray(self.read(4116))
+        system_inodes[256:512] = node(225, 1, 64, 224, 4241, sequence=6)
+        self.write(4116, system_inodes)
+        root = self.path.parent
+        sidecar = root / 'authority'
+        sidecar.mkdir()
+        anchor = root / 'trusted-old-key.bin'
+        anchor.write_bytes(bytes.fromhex('d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a'))
+        config = signed_vector(sidecar, uuid=UUID)
+        (sidecar / 'offline-config.bin').write_bytes(config)
+        security = bytearray(BLOCK)
+        struct.pack_into('<IHH16s6Q8xQ32s16Q', security, 0, 0x43595353, 2, 248, UUID,
+                         7, 1, 1, 1, 2, 6, 1, hashlib.sha256(config).digest(), *([2] * 16))
+        (sidecar / 'security-state.bin').write_bytes(seal(security, 72))
+        rows = bytearray()
+        for view in (0, 7):
+            for index, rights in ((0, 1 << 14), (1, 1 << 8)):
+                acl = bytearray(64)
+                struct.pack_into('<II3QIIQI', acl, 0, index, 1, 1, 1, 1, rights, 0, 4, 0)
+                rows.extend(struct.pack('<II', view, 0) + seal(acl, 60))
+        acl_file = sidecar / 'file-acl-views.bin'
+        acl_file.write_bytes(rows)
+
+        original = root / 'plain.zip'
+        export_volume(self.path, original)
+        with zipfile.ZipFile(original) as archive:
+            manifest = archive.read('manifest.json')
+        message = root / 'authority-message.bin'
+        options = {'authority_dir': sidecar, 'trusted_old_key': anchor}
+        export_volume(self.path, message, prepare_authority_message=True, **options)
+        expected = (b'CYX/G1-MIGRATION/LEGACY-AUTHORITY/v1' + hashlib.sha256(manifest).digest()
+                    + hashlib.sha256(config).digest() + hashlib.sha256(security).digest()
+                    + hashlib.sha256(rows).digest())
+        self.assertEqual(message.read_bytes(), expected)
+        signature = sign_scratch_fixture(sidecar, expected)
+        (sidecar / 'legacy-authority.sig').write_bytes(signature)
+        output = root / 'verified.zip'
+        report = export_volume(self.path, output, **options)
+        self.assertEqual(report['source_authority']['acl_rows'], 4)
+        self.assertEqual(verify_archive(output, anchor)['status'], 'VERIFIED_SOURCE_AUTHORITY')
+        with zipfile.ZipFile(output) as archive:
+            self.assertEqual(archive.read('manifest.json'), manifest)
+            self.assertEqual(archive.read('authority/legacy-authority.sig'), signature)
+            self.assertEqual(archive.read('authority/security-state.bin'), security)
+            changed_payload = root / 'modified-archive.zip'
+            name = f"objects/{hashlib.sha256(b'A' * BLOCK).hexdigest()}"
+            with zipfile.ZipFile(changed_payload, 'x') as modified:
+                for item in archive.namelist():
+                    modified.writestr(item, b'Z' * BLOCK if item == name else archive.read(item))
+        with self.assertRaisesRegex(ValueError, 'contents differ from signed manifest'):
+            verify_archive(changed_payload, anchor)
+
+        missing = root / 'missing-authority.zip'
+        stale_security = bytearray(security)
+        struct.pack_into('<Q', stale_security, 64, 5)
+        (sidecar / 'security-state.bin').write_bytes(seal(stale_security, 72))
+        with self.assertRaisesRegex(ValueError, 'committed BootEpoch'):
+            export_volume(self.path, missing, **options)
+        self.assertFalse(missing.exists())
+        (sidecar / 'security-state.bin').write_bytes(security)
+        acl_file.write_bytes(rows[:-72])
+        with self.assertRaisesRegex(ValueError, 'complete ACL coverage'):
+            export_volume(self.path, missing, **options)
+        self.assertFalse(missing.exists())
+
+        altered = bytearray(rows[80:144])
+        struct.pack_into('<I', altered, 32, 1 << 9)
+        rows[80:144] = seal(altered, 60)
+        acl_file.write_bytes(rows)
+        with self.assertRaisesRegex(ValueError, 'signature verification failed'):
+            export_volume(self.path, missing, **options)
+        self.assertFalse(missing.exists())
 
     def test_snapshot_digest_and_required_old_allocation_fail_closed(self):
         self.capture()

@@ -95,7 +95,7 @@ use super::file_auth_v3::{
 pub const MAX_AUTH_PRINCIPALS: usize = 16;
 
 /// Contract bound for the admission ledger; native sizing is a later gate
-/// (see module doc note 6). Records are never evicted.
+/// (see module doc note 6). Records retire only on a verified terminal ACK.
 pub const ADMISSION_LEDGER_CAPACITY: usize = 16;
 
 /// EL1-internal protected AuthContext identity (§8.5, §9.6.1). No wire
@@ -356,7 +356,7 @@ pub enum RegisterOutcome {
 /// Bounded admission ledger keyed by (auth_context_id, request_seq), bound
 /// to one confirmed boot epoch, with a single admission gate. Enforces the
 /// §9.6.1 idempotency/conflict matrix, in-flight lifecycle, terminal
-/// irreversibility and UNKNOWN retention. Records are never evicted.
+/// irreversibility and UNKNOWN retention. No record is implicitly evicted.
 pub struct AdmissionLedgerV1 {
     boot_epoch: u64,
     entries: [Option<LedgerEntry>; ADMISSION_LEDGER_CAPACITY],
@@ -424,6 +424,37 @@ impl AdmissionLedgerV1 {
             .iter()
             .flatten()
             .find(|e| e.admission_id == admission_id)
+    }
+
+    /// The native volatile owner has separately checked the original holder,
+    /// exact result digest and contiguous retirement order. Only that owner
+    /// can retire a verified terminal admission and release its ledger slot.
+    pub fn retire_terminal(
+        &mut self,
+        admission_id: u64,
+        key: LedgerKey,
+        evidence_digest: [u8; 32],
+    ) -> Result<(), Error> {
+        let slot = self
+            .entries
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|entry| entry.admission_id == admission_id))
+            .ok_or(Error::Stale)?;
+        let entry = slot.ok_or(Error::Stale)?;
+        if entry.key != key {
+            return Err(Error::Conflict);
+        }
+        match entry.completion {
+            Completion::Terminal {
+                evidence_digest: digest,
+                ..
+            } if digest == evidence_digest => {
+                *slot = None;
+                Ok(())
+            }
+            Completion::Terminal { .. } => Err(Error::Conflict),
+            _ => Err(Error::Busy),
+        }
     }
 
     fn entry_by_admission_mut(&mut self, admission_id: u64) -> Option<&mut LedgerEntry> {
@@ -1228,6 +1259,67 @@ mod tests {
             led.register(&ctx, &first, &facts(1, Verdict::Admitted)),
             Ok(RegisterOutcome::Replay { .. })
         ));
+    }
+
+    #[test]
+    fn volatile_retirement_requires_original_key_and_terminal_evidence() {
+        let ctx = issuer().issue(9, FILE_SERVICE_ROLE).unwrap();
+        let request = frozen(ctx.auth_context_id, 19);
+        let key = LedgerKey {
+            auth_context_id: ctx.auth_context_id,
+            request_seq: 19,
+        };
+        let mut ledger = ledger();
+        let RegisterOutcome::Admitted { admission_id, .. } = ledger
+            .register(&ctx, &request, &facts(1, Verdict::Admitted))
+            .unwrap()
+        else {
+            panic!()
+        };
+        let evidence = [0x52; 32];
+        assert_eq!(
+            ledger.retire_terminal(admission_id, key, evidence),
+            Err(Error::Busy)
+        );
+        ledger
+            .complete(
+                FILE_SERVICE_ROLE,
+                false,
+                &report(admission_id, TerminalState::Unknown, [0; 32]),
+            )
+            .unwrap();
+        assert_eq!(
+            ledger.retire_terminal(admission_id, key, evidence),
+            Err(Error::Busy)
+        );
+        ledger
+            .complete(
+                FILE_SERVICE_ROLE,
+                false,
+                &report(admission_id, TerminalState::Done, evidence),
+            )
+            .unwrap();
+        assert_eq!(
+            ledger.retire_terminal(
+                admission_id,
+                LedgerKey {
+                    request_seq: 20,
+                    ..key
+                },
+                evidence
+            ),
+            Err(Error::Conflict)
+        );
+        assert_eq!(
+            ledger.retire_terminal(admission_id, key, [1; 32]),
+            Err(Error::Conflict)
+        );
+        assert_eq!(ledger.retire_terminal(admission_id, key, evidence), Ok(()));
+        assert!(ledger.is_empty());
+        assert_eq!(
+            ledger.retire_terminal(admission_id, key, evidence),
+            Err(Error::Stale)
+        );
     }
 
     #[test]

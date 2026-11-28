@@ -12,6 +12,7 @@ from tempfile import TemporaryDirectory
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import check_v2_filesystem as legacy
+import v020_g1_migration_authority as authority
 from verify_smp import require
 
 
@@ -127,27 +128,48 @@ def export_committed(archive, current, source, digest, superblocks):
         "snapshots": snapshots,
         "legacy_members": members,
     }
-    archive.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    return {"status": "EXPORTED", "source_sha256": digest, "fs_uuid": source["uuid"],
-            "boot_epoch": verified["boot_epoch"], "snapshots": len(snapshots), "objects": len(written)}
+    return manifest, len(written)
 
 
-def export_volume(source, destination):
+def export_volume(source, destination, *, authority_dir=None, trusted_old_key=None,
+                  prepare_authority_message=False):
     """Publish the archived committed view only after a complete read-only check."""
+    require((authority_dir is None) == (trusted_old_key is None)
+            and (not prepare_authority_message or authority_dir is not None),
+            "source authority requires both evidence and an external trusted key")
     if os.path.lexists(destination):
         raise FileExistsError(f"export path already exists: {destination}")
     before = source_stamp(source)
     digest, superblocks = check_source(source)
     with TemporaryDirectory(prefix=".cyx-g1-export-", dir=destination.parent) as temporary:
         staged = Path(temporary) / "export.zip"
+        selected = staged
         with staged.open("xb") as out:
             with legacy.committed_volume(source) as (current, volume):
                 with ZipFile(out, "w", compression=ZIP_DEFLATED, compresslevel=1) as archive:
-                    report = export_committed(archive, current, volume, digest, superblocks)
+                    manifest, objects = export_committed(archive, current, volume, digest, superblocks)
+                    manifest_wire = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+                    archive.writestr("manifest.json", manifest_wire)
+                    report = {"status": "EXPORTED", "source_sha256": digest, "fs_uuid": volume["uuid"],
+                              "boot_epoch": manifest["boot_epoch"], "snapshots": len(manifest["snapshots"]),
+                              "objects": objects}
+                    if authority_dir is not None:
+                        public, signing_message, rows, members = authority.prepare(
+                            authority_dir, trusted_old_key, manifest, manifest_wire)
+                        if prepare_authority_message:
+                            selected = Path(temporary) / "legacy-authority-to-sign.bin"
+                            with selected.open("xb") as message:
+                                message.write(signing_message)
+                                message.flush()
+                                os.fsync(message.fileno())
+                            report["status"] = "AUTHORITY_MESSAGE_PREPARED"
+                        else:
+                            report["source_authority"] = authority.attach(
+                                archive, authority_dir, public, signing_message, rows, members)
             require(source_stamp(source) == before, "legacy source changed during export")
             out.flush()
             os.fsync(out.fileno())
-        os.link(staged, destination)
+        os.link(selected, destination)
     return report
 
 
@@ -155,9 +177,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--authority-dir", type=Path, help="old signed configuration, security state and ACL views")
+    parser.add_argument("--trusted-old-key", type=Path, help="externally confirmed raw 32-byte Ed25519 public key")
+    parser.add_argument("--prepare-authority-message", action="store_true",
+                        help="publish the exact detached message instead of the checked archive")
     args = parser.parse_args()
     try:
-        report = export_volume(args.source, args.output)
+        report = export_volume(args.source, args.output, authority_dir=args.authority_dir,
+                               trusted_old_key=args.trusted_old_key,
+                               prepare_authority_message=args.prepare_authority_message)
     except (OSError, ValueError) as error:
         parser.exit(1, f"{error}\n")
     print(json.dumps(report, indent=2, sort_keys=True))

@@ -42,8 +42,11 @@ extern "C" fn boot_entry() -> ! {
         })
     }
     .unwrap();
-    log(b"BOOT_ENTRY v1 EL1 CPU0 BOOTSTRAP\n");
-    log(b"PLATFORM_OK DTB RAM UART GIC TIMER BOOTSTRAP\n");
+    #[cfg(not(feature = "v0199-control-bringup"))]
+    {
+        log(b"BOOT_ENTRY v1 EL1 CPU0 BOOTSTRAP\n");
+        log(b"PLATFORM_OK DTB RAM UART GIC TIMER BOOTSTRAP\n");
+    }
     let sp: u64;
     let vbar: u64;
     unsafe {
@@ -52,8 +55,14 @@ extern "C" fn boot_entry() -> ! {
     }
     assert!(sp >= HIGH && boot_entry as *const () as u64 >= HIGH);
     assert_eq!(vbar, core::ptr::addr_of!(exception_vectors) as u64);
-    log(b"HIGH_VA_OK BOOTSTRAP\n");
-    clock::init(&info);
+    #[cfg(not(feature = "v0199-control-bringup"))]
+    {
+        log(b"HIGH_VA_OK BOOTSTRAP\n");
+        clock::init(&info);
+    }
+    // In the eight-role diagnostic, finish the DTB/UART/vector prefix here.
+    // The SMP entry enables CPU0's timer before the boot reports and RTC
+    // discovery, so they can be accounted at real replenishment boundaries.
     #[cfg(feature = "v0199-control-bringup")]
     budget.observe_boot_phase();
     #[cfg(feature = "unified-runtime")]

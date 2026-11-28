@@ -2,7 +2,7 @@
 //! CPU0 owns the retained device and advances at most one I/O per turn.
 
 #[cfg(cyxia_startup_catalog)]
-use super::{Disk, authority, volume};
+use super::{Disk, RuntimeJournal, authority, volume};
 use cyxia_kernel_core::control_plane::role_manifest_v0199::ROLE_COUNT;
 use cyxia_kernel_core::security::{Error, file_index_v0199::SecurityStateStoreV2};
 #[cfg(cyxia_startup_catalog)]
@@ -106,10 +106,15 @@ impl RestartJournal {
         })
     }
 
+    pub(super) fn pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub(super) fn advance(
         &mut self,
         epochs: &mut BootEpochAuthority,
         config: &VerifiedOfflineConfig<'_>,
+        runtime: Option<&mut RuntimeJournal>,
         stop: StopEvidence,
         checkpoint: &mut dyn FnMut() -> Result<(), Error>,
         verify_stop: impl FnOnce(StopEvidence) -> Result<(), Error>,
@@ -123,7 +128,20 @@ impl RestartJournal {
             Some(append) if append.matches_stop(stop) => append,
             Some(_) => return Err(Error::Busy),
             None => {
-                let next = placement(self.checkpoint, self.completed)?;
+                let next = if let Some(runtime) = runtime {
+                    let tx = runtime.workspace.next_transaction(1)?;
+                    RedoPlacement {
+                        fs_uuid: tx.fs_uuid,
+                        log_epoch: tx.log_epoch,
+                        first: tx.first_log_block,
+                        state_home: volume::SECURITY_HOME,
+                        boot_home: None,
+                        txid: tx.txid,
+                        commit_lsn: tx.commit_lsn,
+                    }
+                } else {
+                    placement(self.checkpoint, self.completed)?
+                };
                 self.pending = Some(epochs.prepare_role_restart(
                     log,
                     self.checkpoint,
@@ -153,6 +171,13 @@ impl RestartJournal {
         };
         if role != stop.role || stop.generation.checked_add(1) != Some(generation) {
             return Err(Error::Conflict);
+        }
+        if let Some(runtime) = runtime {
+            let state = SecurityStateStoreV2::decode(log.image())?;
+            verify_successor(runtime.mounted.security, state)?;
+            let proof = append.verified_redo().ok_or(Error::Unknown)?;
+            runtime.workspace.include_service_restart(proof)?;
+            runtime.mounted.security = state;
         }
         self.completed += 1;
         self.pending = None;

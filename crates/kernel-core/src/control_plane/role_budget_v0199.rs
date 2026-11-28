@@ -9,7 +9,7 @@ use super::{
         CONTROL_CPU, NativeRoleManifest, ROLE_COUNT, Role, ValidatedRoleManifest,
     },
 };
-pub const WINDOW_NS: u64 = 100_000_000;
+pub use cyxia_contracts::CPU_ACCOUNTING_WINDOW_NS as WINDOW_NS;
 pub const LIMIT_NS: u64 = 70_000_000;
 pub const DECISION_DOMAIN_LIMIT_NS: u64 = 500_000;
 // 6ms of the 8ms coordination class belongs to model manager/supervisor.
@@ -1279,6 +1279,95 @@ mod tests {
                 .actual_ns,
             1
         );
+    }
+
+    #[test]
+    fn g1_control_window_retains_full_recovery_debit() {
+        let manifest = manifest();
+        let mut ledger = Cpu0BudgetLedger::new();
+        let mut now = 0;
+        ledger.start_continuous(0, now, || Ok(())).unwrap();
+        let settle = |ledger: &mut Cpu0BudgetLedger, turn: Turn, now: &mut u64| {
+            let duration = turn.reserved_ns();
+            let sample = [MeasuredSegment {
+                start_ns: *now,
+                end_ns: *now + duration,
+                cpu_ns: duration,
+            }];
+            let result = ledger
+                .settle_measured(0, turn, &sample, duration, |_, _| Ok(()))
+                .unwrap();
+            assert_eq!(result.actual_ns, duration);
+            assert!(!result.overrun && !result.crossed_window);
+            *now += duration;
+        };
+        let run_role =
+            |ledger: &mut Cpu0BudgetLedger, now: &mut u64, role: usize, class, domain, ns| {
+                let turn = ledger
+                    .reserve_role(
+                        &manifest,
+                        manifest.members[role].actor,
+                        0,
+                        class,
+                        domain,
+                        ns,
+                        *now,
+                    )
+                    .unwrap();
+                settle(ledger, turn, now);
+            };
+        for domain in 1..=15 {
+            run_role(
+                &mut ledger,
+                &mut now,
+                0,
+                Class::Operations,
+                domain,
+                2_000_000,
+            );
+            let role = if domain <= 8 { 2 } else { 3 };
+            run_role(
+                &mut ledger,
+                &mut now,
+                role,
+                Class::Decision,
+                domain,
+                DECISION_DOMAIN_LIMIT_NS,
+            );
+        }
+        for domain in 1..=4 {
+            run_role(&mut ledger, &mut now, 1, Class::Security, domain, 2_000_000);
+        }
+        run_role(&mut ledger, &mut now, 5, Class::Coordination, 0, 3_000_000);
+        run_role(&mut ledger, &mut now, 7, Class::Coordination, 0, 3_000_000);
+        let coordination = ledger
+            .reserve_kernel(0, Class::Coordination, 2_000_000, now)
+            .unwrap();
+        settle(&mut ledger, coordination, &mut now);
+        run_role(&mut ledger, &mut now, 4, Class::Optional, 0, 4_000_000);
+        run_role(&mut ledger, &mut now, 6, Class::Optional, 0, 4_500_000);
+        assert_eq!(ledger.total_spent(), Ok(62_000_000));
+        assert_eq!(ledger.spent(Class::Recovery), 0);
+        assert_eq!(
+            ledger.reserve_kernel(0, Class::Coordination, 1, now),
+            Err(Error::Exhausted)
+        );
+
+        let recovery = ledger
+            .reserve_kernel(0, Class::Recovery, 8_000_000, now)
+            .unwrap();
+        assert_eq!(
+            ledger.reserve_kernel(0, Class::Coordination, 1, now),
+            Err(Error::Busy)
+        );
+        settle(&mut ledger, recovery, &mut now);
+        assert_eq!(ledger.spent(Class::Recovery), 8_000_000);
+        assert_eq!(ledger.total_spent(), Ok(70_000_000));
+        assert_eq!(
+            ledger.reserve_kernel(0, Class::Recovery, 1, now),
+            Err(Error::Exhausted)
+        );
+        assert!(!ledger.ordinary_closed());
     }
 
     #[test]

@@ -27,6 +27,7 @@ use crate::control_plane::Identity;
 pub const FILE_REQ_KEY_BYTES: usize = 36;
 pub const SNAPSHOT_KEY_BYTES: usize = 40;
 pub const PRINCIPALS: u32 = 16;
+pub const RECOVERY_SLOT: u32 = PRINCIPALS - 1;
 // FileServiceReply v3 states from §9.6.1.
 pub(super) const BOUND: u16 = 2;
 pub(super) const DONE: u16 = 3;
@@ -426,7 +427,7 @@ impl<'a> SnapshotRequest<'a> {
                     (grant.enrollment, key.client_slot),
                     (SnapshotEnrollment::Ordinary, 0..=13)
                         | (SnapshotEnrollment::InternalMaintenance, 14)
-                        | (SnapshotEnrollment::RecoverySupervisor, 15)
+                        | (SnapshotEnrollment::RecoverySupervisor, RECOVERY_SLOT)
                 )
             {
                 return Err(Error::Unauthorized);

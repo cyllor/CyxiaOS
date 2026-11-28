@@ -47,6 +47,12 @@ mod task_services;
 pub(super) use task_services::GROUP_CPU;
 #[cfg(cyxia_file_owner_package)]
 mod file_owner;
+#[cfg(cyxia_file_owner_package)]
+mod file_owner_budget;
+#[cfg(cyxia_file_read_client)]
+pub(super) use file_owner::client_read::{stage as stage_file_client, writable as file_client_writable};
+#[cfg(cyxia_file_read_client)]
+pub(super) use file_owner::durable::{pending as file_runtime_pending, turn as file_runtime_turn};
 
 const BUSINESS_CORES: usize = 3;
 const PAGE: usize = 4096;
@@ -161,13 +167,17 @@ pub(super) fn authorize(config: &VerifiedOfflineConfig<'_>) -> Result<ApprovedPa
     let digest = Sha256::digest(PACKAGE).into();
     startup_catalog::qualify_business_package(config, digest, SIGNATURE)
         .map_err(|_| Error::Denied)?;
+    #[cfg(cyxia_file_owner_package)]
+    let file_owner = file_owner::qualify(config)?;
+    #[cfg(cyxia_file_read_client)]
+    file_owner::client_read::qualify(config, digest, file_owner.image_digest())?;
     Ok(ApprovedPackage {
         config: config.digest(),
         digest,
         #[cfg(cyxia_business_task_services)]
         grant: task_services::qualify(config, digest)?,
         #[cfg(cyxia_file_owner_package)]
-        file_owner: file_owner::qualify(config)?,
+        file_owner,
     })
 }
 
@@ -437,6 +447,15 @@ pub(super) fn prepare(
     }
     let storage = backing(slot - 1);
     let args = &[][..];
+    #[cfg(cyxia_file_read_client)]
+    let file_args;
+    #[cfg(cyxia_file_read_client)]
+    let args = if slot == file_owner::CPU {
+        file_args = file_owner::client_read::bootstrap(epoch)?;
+        &file_args[..]
+    } else {
+        args
+    };
     #[cfg(cyxia_business_task_services)]
     let bootstrap;
     #[cfg(cyxia_business_task_services)]
@@ -447,6 +466,24 @@ pub(super) fn prepare(
         args
     };
     let context = stage_package(storage, package, addresses, args)?;
+    #[cfg(cyxia_file_read_client)]
+    if slot == file_owner::CPU {
+        let client = thread(slot, epoch);
+        let root = pa(unsafe { addr_of!((*storage).root).cast() }).0;
+        file_owner::client_read::bind_client(
+            epoch,
+            file_owner::StoppedStack::new(
+                storage,
+                addresses.stack_top,
+                root,
+                Identity {
+                    id: client.id,
+                    generation: client.generation,
+                },
+                0xB0 + slot as u8,
+            ),
+        )?;
+    }
     let ordinary_group = ObjectKey {
         id: BUSINESS_THREAD_ID_BASE,
         generation: epoch,
@@ -537,7 +574,15 @@ pub(super) fn prepare_file_owner(
             stack_top,
             ..base
         },
-    )
+    )?;
+    file_owner_budget::configure(
+        policy.boot_epoch(),
+        policy
+            .file_service_generation()
+            .map_err(|_| Error::Denied)?,
+        package.file_owner.budget_ns(),
+    );
+    Ok(())
 }
 
 pub(super) fn open(policy: &ConfirmedBootPolicy<'_>) -> Result<u64, Error> {
@@ -768,6 +813,12 @@ pub(crate) fn worker(slot: usize) -> ! {
     #[cfg(cyxia_business_task_services)]
     let mut group = task_services::take(slot, epoch);
     let exit_margin = EXIT_MARGIN_NS;
+    #[cfg(cyxia_file_read_client)]
+    let exit_margin = if slot == file_owner::CPU {
+        file_owner::EXIT_MARGIN_NS
+    } else {
+        exit_margin
+    };
     #[cfg(cyxia_business_task_services)]
     let exit_margin = if group.is_some() {
         TASK_SERVICE_EXIT_MARGIN_NS
@@ -992,19 +1043,37 @@ pub(crate) fn worker(slot: usize) -> ! {
                     if let Some(group) = group.as_mut() {
                         break 'turn group.syscall(context, &mut sleeping_until);
                     }
+                    #[cfg(cyxia_file_read_client)]
+                    if file_owner::client_read::client_syscall(
+                        epoch,
+                        Identity {
+                            id: thread.id,
+                            generation: thread.generation,
+                        },
+                        context,
+                    ) {
+                        break 'turn RunState::Runnable;
+                    }
                     lifecycle_syscall(context, &mut sleeping_until)
                 }
             }
         };
-        let settled = loop {
+        let (settled, _cost, _finished_ns) = loop {
             if let Some(settled) = try_scheduler(|scheduler| {
                 let cost = timer::cpu_elapsed_ns(started);
-                scheduler.complete(dispatch, cost, next, now_ns())
+                let finished_ns = now_ns();
+                (
+                    scheduler.complete(dispatch, cost, next, finished_ns),
+                    cost,
+                    finished_ns,
+                )
             }) {
                 break settled;
             }
             poll_later();
         };
+        #[cfg(cyxia_file_owner_package)]
+        file_owner_budget::observe(slot, dispatch, _cost, _finished_ns, settled.is_ok());
         drop(permit);
         if settled.is_err() {
             retire(

@@ -81,6 +81,7 @@ fn running_role_redo_preserves_peers_and_cold_mount_reconciles_exactly_once() {
             boot_epoch_v1::TlsBootPolicy,
             durable_role_epoch_v0199::{Outcome, RedoPlacement, StopEvidence},
             epoch_redo_v0199::OneStateRedo,
+            recovery_v1::{RecoveryWorkspace, RedoWriter, resident::Journal},
         },
     };
 
@@ -121,6 +122,13 @@ fn running_role_redo_preserves_peers_and_cold_mount_reconciles_exactly_once() {
             blank.blocks.remove(&block);
         }
         let mut epochs = allocate(&mut blank);
+        let mut workspace = Box::new(RecoveryWorkspace::new());
+        let next = Journal::inspect(disk, &mut workspace, checkpoint, None, |_| Ok(()))
+            .unwrap()
+            .into_writer()
+            .unwrap()
+            .prepare(1)
+            .unwrap();
         disk.fail_before_write = fail_write;
         disk.fail_before_flush = fail_flush;
         let stop = StopEvidence {
@@ -131,11 +139,11 @@ fn running_role_redo_preserves_peers_and_cold_mount_reconciles_exactly_once() {
         let placement = RedoPlacement {
             fs_uuid: checkpoint.fs_uuid,
             log_epoch: checkpoint.log_epoch,
-            first,
+            first: next.first_log_block,
             state_home: volume::SECURITY_HOME,
             boot_home: None,
-            txid: 2,
-            commit_lsn: 7,
+            txid: next.txid,
+            commit_lsn: next.commit_lsn,
         };
         let mut log = OneStateRedo::zeroed();
         let mut scratch = [0; BLOCK_BYTES];
@@ -171,8 +179,18 @@ fn running_role_redo_preserves_peers_and_cold_mount_reconciles_exactly_once() {
                 assert_eq!(running.service_generation(Role::Supervisor), Ok(2));
                 assert_eq!(disk.first_flush_writes, Some(3));
                 assert_eq!((disk.writes, disk.flushes), (4, 2));
+                let proof = pending.verified_redo().unwrap();
+                workspace.include_service_restart(proof).unwrap();
+                assert_eq!(workspace.include_service_restart(proof), Err(Error::Conflict));
+                let mut writer = RedoWriter::resume_exclusive(disk, &mut workspace, checkpoint).unwrap();
+                writer.read_committed_at(volume::SECURITY_HOME, next.commit_lsn, &mut scratch).unwrap();
+                assert_eq!(scratch, *log.image());
+                let successor = writer.prepare(1).unwrap();
+                assert_eq!((successor.first_log_block, successor.txid, successor.begin_lsn),
+                           (first + 4, next.txid + 1, next.commit_lsn + 1));
             }
             Err(Error::Unknown) => {
+                assert!(pending.verified_redo().is_none());
                 assert_eq!(
                     running.service_generation(Role::Supervisor),
                     Err(Error::Busy)

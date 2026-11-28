@@ -12,7 +12,7 @@ use super::{
 };
 use crate::security::{
     epoch_redo_v0199::EpochBlockIo,
-    snapshot_service_v4::{SnapshotKey, request_digest},
+    snapshot_service_v4::{RECOVERY_SLOT, SnapshotKey, request_digest},
 };
 use sha2::{Digest, Sha256};
 
@@ -40,6 +40,13 @@ impl MountedSnapshots {
 
     pub const fn has_open_proof(&self) -> bool {
         self.durable_open
+    }
+
+    pub(crate) fn record_freeze(&mut self, protection: ProtectionRecord, page: &[u8; SUPER_BYTES]) {
+        self.protection = Some(protection);
+        self.protection_sha256 = hash(page);
+        self.durable_open = false;
+        self.write_qualified = false;
     }
 
     /// A completed RESTORE matched to this committed protection/view state.
@@ -260,7 +267,7 @@ pub(crate) fn verify_snapshot_homes(
                 committed_deletions |= bit;
             }
             if let Some(p) = protection {
-                if row.key.client_slot != 15 {
+                if row.key.client_slot != RECOVERY_SLOT {
                     return Ok(());
                 }
                 if (p.writes_open || p.restore_phase == RestorePhase::RestoredFrozen)

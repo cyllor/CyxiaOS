@@ -1,4 +1,4 @@
-pub const WINDOW_NS: u64 = 100_000_000;
+pub use cyxia_contracts::CPU_ACCOUNTING_WINDOW_NS as WINDOW_NS;
 pub const POLICY_NS: u64 = 10_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
