@@ -105,6 +105,46 @@ class VerdictTests(unittest.TestCase):
                         self.assertEqual(row["status"], "INVALID_EVIDENCE")
                         self.assertEqual(row["reason"], "evidence manifest does not bind the run and proof key")
 
+    def test_empty_not_run_record_must_match_explicit_frozen_evidence(self):
+        # 安§0.9: count and digest are frozen identity fields even for
+        # NOT_RUN. A zero-evidence record must not hide a committed extent.
+        zero = "00" * 32
+        for pair in ((0x10001, 1), (0x10009, 2), (0x10002, 4), (0x1000a, 3)):
+            with self.subTest(pair=pair), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                manifest, verdict = self.setup_run(root, pair=pair)
+                locked = json.loads(manifest)
+                item = locked["proofs"][0]
+                original_digest = item.pop("evidence_digest")
+                item.pop("evidence_count")
+                record = bytearray(verdict.read_bytes())
+                struct.pack_into("<H", record, 20, 0)
+                struct.pack_into("<II", record, 32, 2, 0)
+                record[256:288] = bytes(32)
+                record[288:] = hashlib.sha256(b"CYX/VERDICT/v4"+record[:288]).digest()
+                verdict.write_bytes(record)
+
+                def check(binding):
+                    raw = json.dumps({**locked, "proofs": [{**item, **binding}]}).encode()
+                    report = v.aggregate(raw, v.digest(raw), root)
+                    return next(row for row in report["proofs"]
+                                if (row["test_id"], v.CLASSES[row["proof_class"]]) == pair)
+
+                for binding in (
+                    {"evidence_count": 1, "evidence_digest": original_digest},
+                    {"evidence_count": 1},
+                    {"evidence_digest": original_digest},
+                    {"evidence_count": 0, "evidence_digest": original_digest},
+                ):
+                    with self.subTest(binding=binding):
+                        row = check(binding)
+                        self.assertEqual(row["status"], "INVALID_EVIDENCE")
+                        self.assertIn("differs from frozen input", row["reason"])
+                for binding in ({}, {"evidence_count": 0}, {"evidence_digest": zero},
+                                {"evidence_count": 0, "evidence_digest": zero}):
+                    with self.subTest(binding=binding):
+                        self.assertEqual(check(binding)["status"], "NOT_RUN")
+
     def test_stable_ids_and_required_runtime_proofs_are_enforced(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

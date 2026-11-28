@@ -212,11 +212,16 @@ def aggregate(manifest_raw, locked_digest, root, *, a53_lock=None):
                 require(hash_value(item.get("platform_lock_sha256")) == a53_lock["manifest_sha256"]
                         and v["binary_hash"] == a53_lock["boot_image_sha256"],
                         "ARCH_A53 platform or kernel differs from the frozen input")
-            if v["evidence_count"]:
+            # Even an empty NOT_RUN record must match an explicitly
+            # frozen count/digest. Only a legacy unbound empty record may
+            # omit those fields; a nonempty record always requires both.
+            if v["evidence_count"] or "evidence_count" in item:
                 require(v["evidence_count"] == item.get("evidence_count"),
                         "evidence count differs from frozen input")
+            if v["evidence_count"] or "evidence_digest" in item:
                 require(v["evidence_digest"] == item.get("evidence_digest"),
                         "evidence digest differs from frozen input")
+            if v["evidence_count"]:
                 # Digest of the exact external manifest bytes; each member's
                 # SHA256/size is then independently read from the archive.
                 m=safe_file(root,f'evidence/{stem}.json').read_bytes()
